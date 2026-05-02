@@ -4714,6 +4714,7 @@ dependencies = [
  "clap",
  "dashmap",
  "libafl",
+ "libafl_bolts",
  "parking_lot",
  "postcard",
  "rand 0.8.6",

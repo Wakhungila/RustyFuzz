@@ -1,6 +1,6 @@
 use revm::{
     interpreter::Interpreter,
-    Database, Inspector, context::EvmContext,
+    Database, Inspector, EvmContext,
 };
 use bitvec::prelude::*;
 
@@ -15,9 +15,9 @@ impl<'a> CoverageInspector<'a> {
 }
 
 impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
-    fn step(&mut self, interp: &mut Interpreter, _context: &mut EvmContext<DB>) {
-        let pc = interp.program_counter(); 
-        let opcode = interp.current_opcode(); 
+    fn step(&mut self, interp: &mut Interpreter, _context: &mut EvmContext<'_, DB>) {
+        let pc = interp.program_counter();
+        let opcode = interp.current_opcode();
         
         // Calculate a hash of PC and Opcode
         let hash = (pc ^ (opcode as usize)) % self.coverage.len();

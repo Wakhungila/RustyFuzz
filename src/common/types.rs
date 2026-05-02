@@ -1,8 +1,8 @@
-use revm::primitives::{Address, U256, Env};
-use revm::db::{CacheDB, EmptyDB}; // Ensure the 'std' feature is enabled in revm
+use revm::primitives::{Address, U256, TxEnv};
+use revm::db::{CacheDB, EmptyDB};
 use std::sync::Arc;
 use parking_lot::RwLock;
-use bitvec::prelude::BitVec;
+use bitvec::prelude::{BitVec, Lsb0};
 
 #[derive(Clone, Debug)]
 pub enum ChainId {
@@ -18,7 +18,7 @@ pub enum ChainState {
 pub struct Snapshot {
     pub id: u64,
     pub state: Arc<RwLock<ChainState>>,
-    pub coverage: BitVec,
+    pub coverage: BitVec<u8, Lsb0>,
     pub waypoints: Vec<Waypoint>,
     pub depth: u32,
 }

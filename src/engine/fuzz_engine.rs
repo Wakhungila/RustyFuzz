@@ -18,7 +18,7 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
     let mut current_snapshot = Snapshot {
         id: 0,
         state: Arc::new(RwLock::new(initial_chain_state)),
-        coverage: bitvec::bitvec![0; 1024 * 64], // Example bitmap
+        coverage: bitvec::bitvec![u8, Lsb0; 0; 1024 * 64],
         waypoints: vec![],
         depth: 0,
     };
@@ -42,19 +42,19 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
         drop(state_guard); // Release the lock before execution
 
         let dummy_tx = SingletonTx {
-            calldata: vec![],
+            input: vec![],
             caller: Default::default(),
             value: Default::default(),
         };
 
         println!("Executing dummy transaction...");
-        match evm_executor.execute(&mut cloned_state, &dummy_tx) {
+        match evm_executor.execute(&mut cloned_state, &dummy_tx, current_snapshot.coverage.as_mut_bitslice()) {
             Ok(_) => {
                 // After execution, create a new snapshot for the 'after' state
                 let after_snapshot = Snapshot {
                     id: current_snapshot.id + 1,
                     state: Arc::new(RwLock::new(cloned_state)),
-                    coverage: bitvec::bitvec![0; 1024 * 64], // Update with actual coverage
+                    coverage: bitvec::bitvec![u8, Lsb0; 0; 1024 * 64], // Update with actual coverage
                     waypoints: vec![],
                     depth: current_snapshot.depth + 1,
                 };

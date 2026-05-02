@@ -1,6 +1,7 @@
 use crate::common::types::{SingletonTx, ChainState};
-use revm::{Evm, primitives::SpecId};
-use revm::handler::register::inspector_handle_register;
+use revm::Evm;
+use revm::primitives::SpecId;
+use revm::inspector_handle_register;
 use crate::evm::inspector::CoverageInspector;
 use bitvec::prelude::*;
 

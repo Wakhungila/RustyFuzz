@@ -2,17 +2,16 @@ use libafl::{
     prelude::*,
     state::{StdState, HasCorpus},
     feedbacks::Feedback,
-    corpus::StdCorpus,
-    events::EventManager,
     corpus::InMemoryCorpus,
 };
 use libafl_bolts::{Named, rands::RomuDuoJrRand};
+use libafl_bolts::rands::Rand;
 use crate::common::types::SingletonTx;
 use revm::primitives::U256;
+use std::borrow::Cow;
 
 // Define the state type that LibAFL will use to manage the corpus of Snapshots
 // Note: StdRand usually comes from libafl::prelude or libafl_bolts
-pub type FuzzState<I> = StdState<I, StdCorpus<I>, RomuDuoJrRand, StdCorpus<I>>;
 pub type FuzzState<I> = StdState<I, InMemoryCorpus<I>, RomuDuoJrRand, InMemoryCorpus<I>>;
 
 /// Mutators for SingletonTx focusing on Calldata (input) and Value.
@@ -43,7 +42,10 @@ pub fn mutate_tx(tx: &mut SingletonTx, rand: &mut RomuDuoJrRand) {
 pub struct EvmCoverageFeedback;
 
 impl Named for EvmCoverageFeedback {
-    fn name(&self) -> &str { "EvmCoverageFeedback" }
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("EvmCoverageFeedback");
+        &NAME
+    }
 }
 
 impl<S> Feedback<S> for EvmCoverageFeedback 
