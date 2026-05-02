@@ -4,11 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Bring alloy back (you are using it heavily)
-alloy = { version = "0.7", features = ["full"] }
+alloy = { version = "1", features = ["full"] }
 
-# Lock revm to a version that still has your APIs
-revm = "=3.3.0"
+revm = { version = "25", default-features = false, features = ["std", "serde", "memory_limit", "secp256k1", "portable"] }
 
 libafl = "0.13.2"
 libafl_bolts = "0.13.2"
