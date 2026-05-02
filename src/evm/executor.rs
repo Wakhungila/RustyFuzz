@@ -1,5 +1,4 @@
 use crate::common::types::{SingletonTx, ChainState};
-use revm::Evm;
 use revm::primitives::SpecId;
 use revm::inspector_handle_register;
 use crate::evm::inspector::CoverageInspector;
@@ -22,7 +21,7 @@ impl EvmExecutor {
 
         let mut inspector = CoverageInspector::new(coverage);
 
-        let mut evm = Evm::builder()
+        let mut evm = revm::Evm::builder()
             .with_db(revm_state)
             .with_external_context(&mut inspector)
             .with_spec_id(SpecId::CANCUN)

@@ -1,5 +1,6 @@
 use crate::common::types::{Snapshot, ChainState};
-use revm::database::{CacheDB, EmptyDB};
+use revm::db::{CacheDB, EmptyDB};
+use bitvec::prelude::Lsb0;
 
 pub fn new_evm_snapshot(id: u64, initial_state: CacheDB<EmptyDB>) -> Snapshot {
     Snapshot {

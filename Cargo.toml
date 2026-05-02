@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 alloy = { version = "1", features = ["full"] }
-revm = { version = "25", default-features = false, features = ["std", "serde", "memory_limit", "secp256k1", "portable"] }
+revm = "=3.3.0"
 libafl = "0.13.2"
 libafl_bolts = "0.13.2"
 

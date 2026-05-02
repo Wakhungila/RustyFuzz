@@ -6,6 +6,7 @@ use crate::common::oracle::{VulnerabilityOracle, ReentrancyOracle};
 use crate::engine::exploit_synthesizer::synthesize_poc;
 use std::sync::Arc;
 use parking_lot::RwLock;
+use bitvec::prelude::Lsb0;
 
 pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
     println!("RustyFuzz campaign started on {}", config.chain);
