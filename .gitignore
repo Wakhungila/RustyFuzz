@@ -1,0 +1,37 @@
+# Standard Rust ignores
+/target/
+**/*.rs.bk
+
+# IDE-specific files
+.idea/
+.vscode/
+*.iml
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+
+# Build artifacts
+# Cargo.lock is usually committed for applications, but ignored for libraries.
+/Cargo.toml.orig
+/Cargo.lock.orig
+
+# Fuzzer-specific outputs
+/fuzz_output/
+/crash_reports/
+/corpus/
+/solutions/
+/logs/
+
+# Profiling and coverage data
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.dSYM
+
+# Dependencies that might be downloaded or built locally
+/z3/
