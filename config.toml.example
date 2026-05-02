@@ -1,0 +1,12 @@
+
+### 3. `RustyFuzz/config.toml.example`
+
+```toml
+rpc_url = "https://eth-mainnet.g.alchemy.com/v2/..."
+fork_block = 21000000
+chain = "evm"          # or "svm"
+target_contract = "0x..."
+timeout_secs = 3600
+corpus_dir = "./corpus"
+report_dir = "./reports"
+llm_enabled = false

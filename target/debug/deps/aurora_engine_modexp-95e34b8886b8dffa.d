@@ -1,0 +1,10 @@
+/mnt/c/Users/vwakh/Desktop/RustyFuzz/target/debug/deps/aurora_engine_modexp-95e34b8886b8dffa.d: /home/pin0ccs/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.2.0/src/lib.rs /home/pin0ccs/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.2.0/src/arith.rs /home/pin0ccs/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.2.0/src/maybe_std.rs /home/pin0ccs/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.2.0/src/mpnat.rs
+
+/mnt/c/Users/vwakh/Desktop/RustyFuzz/target/debug/deps/libaurora_engine_modexp-95e34b8886b8dffa.rlib: /home/pin0ccs/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.2.0/src/lib.rs /home/pin0ccs/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.2.0/src/arith.rs /home/pin0ccs/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.2.0/src/maybe_std.rs /home/pin0ccs/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.2.0/src/mpnat.rs
+
+/mnt/c/Users/vwakh/Desktop/RustyFuzz/target/debug/deps/libaurora_engine_modexp-95e34b8886b8dffa.rmeta: /home/pin0ccs/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.2.0/src/lib.rs /home/pin0ccs/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.2.0/src/arith.rs /home/pin0ccs/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.2.0/src/maybe_std.rs /home/pin0ccs/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.2.0/src/mpnat.rs
+
+/home/pin0ccs/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.2.0/src/lib.rs:
+/home/pin0ccs/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.2.0/src/arith.rs:
+/home/pin0ccs/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.2.0/src/maybe_std.rs:
+/home/pin0ccs/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.2.0/src/mpnat.rs:

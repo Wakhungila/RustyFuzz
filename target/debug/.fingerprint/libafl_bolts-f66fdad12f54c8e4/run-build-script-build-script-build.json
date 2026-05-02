@@ -1,0 +1,1 @@
+{"rustc":7458672600737419911,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[4972569449101217337,"build_script_build",false,17325131525834129811]],"local":[{"RerunIfChanged":{"output":"debug/build/libafl_bolts-f66fdad12f54c8e4/output","paths":["build.rs"]}}],"rustflags":[],"config":0,"compile_kind":0}
