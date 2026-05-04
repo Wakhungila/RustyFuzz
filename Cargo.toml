@@ -4,49 +4,45 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# EVM & Blockchain - compatible with Rust 1.63
-revm = { version = "14", default-features = false, features = ["std", "serde", "memory_limit"] }
-revm-primitives = "3"
-alloy-primitives = "0.4"
-alloy-json-abi = "0.4"
-alloy-dyn-abi = "0.4"
+# Core Fuzzing Engine
+libafl = "0.15.4"
+libafl_bolts = "0.15.4"
 
-# Fuzzing - older version compatible with Rust 1.63
-libafl = "0.9"
-libafl_bolts = "0.9"
+# EVM & Ethereum Tooling
+revm = { version = "14.0", features = ["std", "serde", "alloydb"] }
+alloy = { version = "1.5.7", features = ["full", "node-bindings", "rpc-types-debug"] }
+alloy-dyn-abi = "0.8"
+alloy-json-abi = "0.8"
 
 # Async & Networking
 tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["json"] }
 async-trait = "0.1"
-
-# CLI
-clap = { version = "4", features = ["derive"] }
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Serialization & Data
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bincode = "1.3"
-toml = "0.7"
+postcard = { version = "1.0", features = ["use-std"] }
+toml = "0.8"
 hex = "0.4"
-bitvec = "1.0"
 
-# Concurrency & Utils
-dashmap = "5.5"
+# Utilities
+clap = { version = "4.6", features = ["derive"] }
+bitvec = "1.0"
+dashmap = "6.0"
 parking_lot = "0.12"
-chrono = { version = "0.4", features = ["serde"] }
-url = "2.4"
+chrono = "0.4"
+url = "2.5"
 anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
 
-# Optional
-z3 = { version = "0.11", optional = true }
-reqwest = { version = "0.11", features = ["json"], optional = true }
+# Optional Features
+z3 = { version = "0.12", optional = true }
 
 [features]
 default = []
 z3 = ["dep:z3"]
-llm = ["dep:reqwest"]
+llm = []

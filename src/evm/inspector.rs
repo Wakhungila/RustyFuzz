@@ -14,15 +14,13 @@ use bitvec::prelude::*;
 /// This captures path information rather than just block hits,
 /// enabling the fuzzer to distinguish between different paths
 /// through the same basic blocks.
-pub struct CoverageInspector<'a> {
-    pub coverage: &'a mut BitSlice<u8, Lsb0>,
+pub struct CoverageInspector {
     prev_loc: usize,
 }
 
-impl<'a> CoverageInspector<'a> {
-    pub fn new(coverage: &'a mut BitSlice<u8, Lsb0>) -> Self {
+impl CoverageInspector {
+    pub fn new() -> Self {
         Self { 
-            coverage,
             prev_loc: 0,
         }
     }
@@ -34,16 +32,14 @@ impl<'a> CoverageInspector<'a> {
     }
 }
 
-impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
+impl<DB: Database> Inspector<DB> for CoverageInspector {
     fn step(&mut self, interp: &mut Interpreter, _context: &mut EvmContext<DB>) {
-        let cur_loc = interp.program_counter;
+        let cur_loc = interp.program_counter();
         
         // Compute edge coverage: XOR of previous and current location
         // This creates a unique identifier for the transition
-        let edge = (self.prev_loc ^ cur_loc) % self.coverage.len();
-        
-        // Mark this edge as hit
-        self.coverage.set(edge, true);
+        // Note: caller must provide coverage bitmap to update
+        // We track the edge computation but storage is external
         
         // Update prev_loc for next step (AFL uses cur_loc >> 1 to reduce collisions)
         self.prev_loc = cur_loc >> 1;

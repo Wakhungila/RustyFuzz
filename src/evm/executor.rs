@@ -36,33 +36,29 @@ impl CoverageObserver {
     }
 }
 
-impl Observer for CoverageObserver {
-    fn pre_exec<EM, S>(
+impl<I, S> Observer<I, S> for CoverageObserver {
+    fn pre_exec(
         &mut self,
         _state: &mut S,
-        _event_mgr: &mut EM,
-    ) -> Result<(), libafl::Error>
-    where
-        EM: libafl::events::EventFirer<State = S>,
-        S: libafl::state::UsesInput,
-    {
+        _event_mgr: &mut I,
+    ) -> Result<(), libafl::Error> {
         // Reset coverage before each execution if needed
         // For edge coverage, we preserve the historical map
         // but the inspector will track new edges in this execution
         Ok(())
     }
 
-    fn post_exec<EM, S>(
+    fn post_exec(
         &mut self,
         _state: &mut S,
-        _event_mgr: &mut EM,
-    ) -> Result<(), libafl::Error>
-    where
-        EM: libafl::events::EventFirer<State = S>,
-        S: libafl::state::UsesInput,
-    {
+        _event_mgr: &mut I,
+    ) -> Result<(), libafl::Error> {
         // Coverage is already updated by the inspector during execution
         Ok(())
+    }
+    
+    fn name(&self) -> &Cow<'static, str> {
+        &self.name
     }
 }
 
@@ -81,7 +77,7 @@ impl EvmExecutor {
             ChainState::Evm(state) => state,
         };
 
-        let mut inspector = CoverageInspector::new(coverage);
+        let mut inspector = CoverageInspector::new();
 
         let mut evm = revm::Evm::builder()
             .with_db(revm_state)

@@ -279,13 +279,13 @@ impl<'a> TraceInspector<'a> {
 }
 
 impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
-    fn step(&mut self, interp: &mut Interpreter, context: &mut EvmContext<DB>) {
+    fn step(&mut self, interp: &mut Interpreter, context: &mut EvmContext) {
         if !self.capture_steps || self.trace.steps.len() >= self.max_steps {
             return;
         }
         
         let step = TraceStep {
-            pc: interp.program_counter,
+            pc: interp.program_counter(),
             opcode: interp.current_opcode(),
             gas_remaining: interp.gas.remaining(),
             stack_depth: interp.stack.len(),
@@ -298,7 +298,7 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
     
     fn call(
         &mut self,
-        context: &mut EvmContext<DB>,
+        context: &mut EvmContext,
         inputs: &mut CallInputs,
     ) -> Option<CallOutcome> {
         self.current_depth += 1;
@@ -327,7 +327,7 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
     
     fn call_end(
         &mut self,
-        _context: &mut EvmContext<DB>,
+        _context: &mut EvmContext,
         _inputs: &CallInputs,
         outcome: CallOutcome,
     ) -> CallOutcome {
@@ -345,7 +345,7 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
     
     fn create(
         &mut self,
-        _context: &mut EvmContext<DB>,
+        _context: &mut EvmContext,
         inputs: &mut CreateInputs,
     ) -> Option<CreateOutcome> {
         self.current_depth += 1;
@@ -365,7 +365,7 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
     
     fn create_end(
         &mut self,
-        _context: &mut EvmContext<DB>,
+        _context: &mut EvmContext,
         _inputs: &CreateInputs,
         outcome: CreateOutcome,
     ) -> CreateOutcome {
@@ -381,7 +381,7 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
         outcome
     }
     
-    fn log(&mut self, _interp: &mut Interpreter, _context: &mut EvmContext<DB>, log: &Log) {
+    fn log(&mut self, _interp: &mut Interpreter, _context: &mut EvmContext, log: &Log) {
         self.trace.logs.push(ParsedLog {
             address: log.address,
             topics: log.topics().iter().map(|t| U256::from_be_bytes(t.0)).collect(),
@@ -394,7 +394,7 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
     
     fn sstore(
         &mut self,
-        _context: &mut EvmContext<DB>,
+        _context: &mut EvmContext,
         address: Address,
         index: U256,
         value: U256,
