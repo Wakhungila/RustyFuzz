@@ -305,7 +305,7 @@ impl<'a> TaintInspector<'a> {
 }
 
 impl<'a, DB: Database> Inspector<DB> for TaintInspector<'a> {
-    fn step(&mut self, interp: &mut Interpreter, _context: &mut EvmContext<DB>) {
+    fn step(&mut self, interp: &mut Interpreter, _context: &mut EvmContext) {
         let opcode = interp.current_opcode();
         let stack = &mut interp.stack;
         let stack_len = stack.len();
@@ -484,7 +484,7 @@ impl<'a, DB: Database> Inspector<DB> for TaintInspector<'a> {
     
     fn call(
         &mut self,
-        _context: &mut EvmContext<DB>,
+        _context: &mut EvmContext,
         inputs: &mut revm::interpreter::CallInputs,
     ) -> Option<revm::interpreter::CallOutcome> {
         self.current_depth += 1;
@@ -517,7 +517,7 @@ impl<'a, DB: Database> Inspector<DB> for TaintInspector<'a> {
     
     fn call_end(
         &mut self,
-        _context: &mut EvmContext<DB>,
+        _context: &mut EvmContext,
         _inputs: &revm::interpreter::CallInputs,
         outcome: revm::interpreter::CallOutcome,
     ) -> revm::interpreter::CallOutcome {
