@@ -6,3 +6,4 @@ pub mod hybrid;
 pub mod engine;
 pub mod chain;
 pub mod config;
+pub mod oracles;

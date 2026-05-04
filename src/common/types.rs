@@ -1,5 +1,5 @@
 use revm::primitives::{Address, U256, TxEnv};
-use revm::db::{CacheDB, EmptyDB};
+use revm::db::CacheDB;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use bitvec::prelude::{BitVec, Lsb0};
@@ -9,9 +9,13 @@ pub enum ChainId {
     Evm(u64),
 }
 
+/// Type alias for the forked database type used in production fuzzing.
+/// Uses AlloyDB to fetch state from RPC on-demand.
+pub type ForkedDb = CacheDB<revm::db::AlloyDB<alloy::transports::http::Http<reqwest::Client>, u64>>;
+
 #[derive(Clone)]
 pub enum ChainState {
-    Evm(CacheDB<EmptyDB>),
+    Evm(Arc<RwLock<ForkedDb>>),
 }
 
 #[derive(Clone)]
