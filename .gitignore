@@ -1,6 +1,1 @@
-```
-# Rust/Cargo specific
-target/
-Cargo.lock
-**/*.rs.bk
-```
+Nothing should be ignored based on the provided file changes, as they only include source code files (.rs) and a markdown file (.md).
