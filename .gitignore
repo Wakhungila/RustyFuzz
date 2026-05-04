@@ -1,37 +1,52 @@
-# Standard Rust ignores
-/target/
-**/*.rs.bk
+```
+# Compiled and build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.exe
+*.out
 
-# IDE-specific files
-.idea/
+# Rust-specific
+target/
+Cargo.lock
+
+# Dependencies
+node_modules/
+**/node_modules/
+venv/
+.venv/
+.env
+.env.local
+.env.*
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Editors
 .vscode/
-*.iml
+.idea/
+*.swp
+*.swo
 
-# OS-specific files
+# System files
 .DS_Store
 Thumbs.db
 
-# Environment variables
-.env
+# Coverage
+coverage/
+htmlcov/
+.coverage
 
-# Build artifacts
-# Cargo.lock is usually committed for applications, but ignored for libraries.
-/Cargo.toml.orig
-/Cargo.lock.orig
-
-# Fuzzer-specific outputs
-/fuzz_output/
-/crash_reports/
-/corpus/
-/solutions/
-/logs/
-
-# Profiling and coverage data
-*.profraw
-*.profdata
-*.gcda
-*.gcno
-*.dSYM
-
-# Dependencies that might be downloaded or built locally
-/z3/
+# Cache directories
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+.cargo/
+```
