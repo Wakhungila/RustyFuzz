@@ -35,7 +35,7 @@ impl<'a> CoverageInspector<'a> {
 }
 
 impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
-    fn step(&mut self, interp: &mut Interpreter, _context: &mut EvmContext<'_, DB>) {
+    fn step(&mut self, interp: &mut Interpreter, _context: &mut EvmContext<DB>) {
         let cur_loc = interp.program_counter;
         
         // Compute edge coverage: XOR of previous and current location
@@ -53,7 +53,7 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
     fn initialize_interp(
         &mut self,
         _interp: &mut Interpreter,
-        _context: &mut EvmContext<'_, DB>,
+        _context: &mut EvmContext<DB>,
     ) {
         self.reset();
     }
