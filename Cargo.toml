@@ -5,8 +5,13 @@ edition = "2021"
 
 [dependencies]
 alloy = { version = "1", features = ["full"] }
-revm = { version = "25", default-features = false, features = ["std", "serde", "memory_limit", "secp256k1", "portable"] }
+alloy-dyn-abi = "1"
+alloy-json-abi = "1"
+
+revm = { version = "25", default-features = false, features = ["std", "serde", "memory_limit", "secp256k1", "portable", "alloydb"] }
+
 libafl = "0.13.2"
+libafl_bolts = "0.13.2"
 
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
@@ -28,6 +33,7 @@ dashmap = "6.0"
 parking_lot = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
 url = "2.5"
+hex = "0.4"
 
 z3 = { version = "0.12", optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
