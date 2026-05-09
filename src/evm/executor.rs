@@ -13,10 +13,12 @@ impl EvmExecutor {
     pub fn execute(
         &self, 
         chain_state: &mut ChainState, 
+        block_env: &mut revm::primitives::BlockEnv,
         tx: &SingletonTx,
         coverage: &mut BitSlice<u8, Lsb0>,
         dataflow: &mut crate::evm::dataflow::DataflowRegistry,
         waypoints: &mut Vec<crate::common::types::Waypoint>,
+        _tx_idx: usize,
     ) -> anyhow::Result<u64> {
         let revm_state = match chain_state {
             ChainState::Evm(state) => state,
@@ -27,6 +29,7 @@ impl EvmExecutor {
         let mut evm = revm::Evm::builder()
             .with_db(revm_state)
             .with_external_context(&mut inspector)
+            .with_block_env(block_env.clone())
             .with_spec_id(SpecId::CANCUN)
             .modify_tx_env(|revm_tx| *revm_tx = tx.to_revm_tx_env())
             .append_handler_register(inspector_handle_register)

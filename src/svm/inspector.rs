@@ -56,14 +56,40 @@ impl<'a> SvmCoverageInspector<'a> {
         // If an instruction succeeded, but we know (via Waypoints/Mutator) that 
         // a required signer was toggled to 'false', this is a critical vulnerability.
         for account in &instruction.accounts {
-            if !account.is_signer && self.is_known_privileged_account(account.pubkey) && result.result.is_ok() {
-                // In a production loop, this would trigger a specific VulnType::MissingSignerCheck
+            if !account.is_signer && result.result.is_ok() {
+                if self.is_known_privileged_account(account.pubkey) {
+                    instruction_waypoints.push(Waypoint::Comparison {
+                        op: 0xEE, // Marker for Missing Signer Check
+                        lhs: U256::from(1),
+                        rhs: U256::ZERO,
+                        pc: 0,
+                        calldata_offset: None,
+                    });
+                }
             }
+        }
+
+        // Capture CPI patterns to detect privilege escalation (e.g. Solayer account reuse)
+        // We record the instruction as a potential CPI if it targets a program
+        // and utilizes accounts as signers that are typically managed by the caller program.
+        if result.result.is_ok() {
+            self.waypoints.push(Waypoint::SvmCpiCall {
+                caller_program: [0u8; 32], // Caller is the program being fuzzed
+                callee_program: instruction.program_id.to_bytes(),
+                instruction_data: instruction.data.clone(),
+                accounts: instruction.accounts.iter().map(|a| a.pubkey.to_bytes()).collect(),
+                signers: instruction.accounts.iter()
+                    .filter(|a| a.is_signer)
+                    .map(|a| a.pubkey.to_bytes())
+                    .collect(),
+            });
         }
     }
 
-    fn is_known_privileged_account(&self, _pubkey: solana_sdk::pubkey::Pubkey) -> bool {
+    fn is_known_privileged_account(&self, pubkey: solana_sdk::pubkey::Pubkey) -> bool {
         // Heuristic: identify accounts that usually require signers (Vaults, Admins)
-        true
+        // In production, this would cross-reference with a registry of accounts 
+        // that had 'is_signer: true' in initial seeds or previous successful snapshots.
+        pubkey.to_string().contains("admin") || pubkey.to_string().contains("vault")
     }
 }

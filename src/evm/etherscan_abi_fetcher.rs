@@ -1,0 +1,64 @@
+use alloy::primitives::Address;
+use alloy_json_abi::JsonAbi;
+use anyhow::{anyhow, Result};
+use reqwest::Client;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::Arc;
+use parking_lot::RwLock;
+
+/// Etherscan API response structure for ABI fetching.
+#[derive(Deserialize, Debug)]
+struct EtherscanResponse {
+    status: String,
+    message: String,
+    result: String, // This contains the JSON ABI string
+}
+
+/// EtherscanAbiFetcher: Dynamically pulls and caches contract ABIs from Etherscan.
+/// This eliminates manual ABI input and enables the fuzzer to understand new contracts.
+pub struct EtherscanAbiFetcher {
+    client: Client,
+    api_key: String,
+    base_url: String,
+    cache: Arc<RwLock<HashMap<Address, JsonAbi>>>,
+}
+
+impl EtherscanAbiFetcher {
+    pub fn new(api_key: String, base_url: String) -> Self {
+        Self {
+            client: Client::new(),
+            api_key,
+            base_url,
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Fetches the ABI for a given contract address from Etherscan.
+    pub async fn fetch_abi(&self, address: Address) -> Result<JsonAbi> {
+        // Check cache first
+        {
+            let cache_read = self.cache.read();
+            if let Some(abi) = cache_read.get(&address) {
+                return Ok(abi.clone());
+            }
+        }
+
+        let url = format!(
+            "{}?module=contract&action=getabi&address={:?}&apikey={}",
+            self.base_url, address, self.api_key
+        );
+
+        let response: EtherscanResponse = self.client.get(&url).send().await?.json().await?;
+
+        if response.status != "1" {
+            return Err(anyhow!("Etherscan API error: {}", response.message));
+        }
+
+        let abi: JsonAbi = serde_json::from_str(&response.result)?;
+        
+        // Cache the fetched ABI
+        self.cache.write().insert(address, abi.clone());
+        Ok(abi)
+    }
+}

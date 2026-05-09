@@ -13,6 +13,7 @@ pub struct SnapshotCorpus {
     pub children_map: HashMap<u64, Vec<u64>>,
     pub metadata: HashMap<u64, SnapshotMetadata>,
     pub global_read_hotspots: HashMap<(Address, B256), usize>,
+    pub priority_gap_map: BitVec<u8, Lsb0>, // Edges identified as "uncovered" by Forge
 }
 
 pub struct SnapshotMetadata {
@@ -32,6 +33,7 @@ impl SnapshotCorpus {
             children_map: HashMap::new(),
             metadata: HashMap::new(),
             global_read_hotspots: HashMap::new(),
+            priority_gap_map: bitvec![u8, Lsb0; 0; 65536],
         }
     }
 
@@ -52,26 +54,39 @@ impl SnapshotCorpus {
         });
     }
 
-    /// Power Schedule: Selects a snapshot weighted by its coverage score.
-    /// Higher coverage = Higher probability of being selected.
+    /// Directed Power Schedule: Prioritizes snapshots that are likely to fill
+    /// gaps identified in existing Forge coverage runs.
     pub fn select_snapshot<R: Rand>(&mut self, rand: &mut R) -> Option<u64> {
         if self.snapshots.is_empty() {
             return None;
         }
 
-        let total_score: usize = self.metadata.values().map(|m| m.coverage_score).sum();
-        if total_score == 0 {
+        // Calculate energy per snapshot: base coverage + "Gap Potential"
+        let mut weighted_ids = Vec::new();
+        for (id, meta) in &self.metadata {
+            let snap = self.snapshots.get(id).unwrap().read();
+            
+            // Heuristic: Intersect current snapshot coverage with the gap map.
+            // If this branch is "near" a gap, give it a 10x multiplier.
+            let gap_intersection = (snap.coverage.clone() & self.priority_gap_map.clone()).count_ones();
+            let energy = meta.coverage_score + (gap_intersection * 10);
+            
+            weighted_ids.push((*id, energy));
+        }
+
+        let total_energy: usize = weighted_ids.iter().map(|(_, e)| *e).sum();
+        if total_energy == 0 {
             // Fallback to random if no coverage yet
             let keys: Vec<u64> = self.snapshots.keys().cloned().collect();
             return Some(keys[rand.below(keys.len() as u64) as usize]);
         }
 
-        let mut p = rand.below(total_score as u64) as usize;
-        for (id, meta) in &self.metadata {
-            if p < meta.coverage_score {
-                return Some(*id);
+        let mut p = rand.below(total_energy as u64) as usize;
+        for (id, energy) in weighted_ids {
+            if p < energy {
+                return Some(id);
             }
-            p -= meta.coverage_score;
+            p -= energy;
         }
 
         self.snapshots.keys().next().cloned()

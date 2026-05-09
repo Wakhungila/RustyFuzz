@@ -37,15 +37,21 @@ pub struct Snapshot {
     pub gas_used: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum TaintSource {
+    Calldata(usize),             // offset in current transaction calldata
+    Storage(usize, usize),       // (tx_index, original_calldata_offset)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Waypoint {
-    Dataflow { slot: Vec<u8>, influenced: bool },
+    Dataflow { address: Address, slot: Vec<u8>, influenced: bool },
     Comparison { 
         op: u8, 
         lhs: U256, 
         rhs: U256, 
         pc: usize,
-        calldata_offset: Option<usize> // The "Elite" touch: pinpoint the byte to change
+        taint_source: Option<TaintSource>,
     },
     StaticCall {
         caller: alloy::primitives::Address,
@@ -57,13 +63,89 @@ pub enum Waypoint {
         op: u8,
         lhs: U256,
         rhs: U256,
+        third: Option<U256>, // For ternary ops like ADDMOD/MULMOD
         pc: usize,
-        calldata_offset: Option<usize>,
+        taint_source: Option<TaintSource>,
+    },
+    StorageRead {
+        address: Address,
+        slot: B256,
+        value: U256,
+        pc: usize,
+        read_tx_idx: usize,
+        taint_source: Option<TaintSource>,
+    },
+    StorageWrite {
+        address: Address,
+        slot: Vec<u8>,
+        value: U256,
+        pc: usize,
+        tx_idx: usize,
+        taint_source_of_value: Option<TaintSource>,
+    },
+    TransientStorageRead {
+        address: Address,
+        slot: B256,
+        value: U256,
+        pc: usize,
+    },
+    TransientStorageWrite {
+        address: Address,
+        slot: B256,
+        value: U256,
+        pc: usize,
     },
     MappingDerivation {
         base_slot: U256,
         key: U256,
         derived_slot: B256,
+    },
+    StorageRead {
+        address: Address,
+        slot: B256,
+        value: U256,
+        pc: usize,
+        read_tx_idx: usize,
+        taint_source: Option<TaintSource>, // The taint source of the value read from storage
+    },
+    MappingDerivation {
+        base_slot: U256,
+        key: U256,
+        derived_slot: B256,
+    },
+    FlashloanExecution {
+        lender: Address,
+        token: Address,
+        amount: U256,
+        fee: U256,
+        is_repaid: bool,
+    },
+    GovernanceAction {
+        target: Address,
+        selector: [u8; 4],
+        caller: Address,
+    },
+    TokenCallback {
+        target: Address,
+        selector: [u8; 4],
+        data: Vec<u8>,
+    },
+    SvmCpiCall {
+        caller_program: [u8; 32],
+        callee_program: [u8; 32],
+        instruction_data: Vec<u8>,
+        accounts: Vec<[u8; 32]>,
+        signers: Vec<[u8; 32]>,
+    },
+    BranchPath {
+        pc: usize,
+        taken: bool,
+        constraint: Waypoint, // The Comparison waypoint associated with this branch
+    },
+    MevSignal {
+        victim_caller: Address,
+        slippage_harvested: U256,
+        is_sandwich: bool,
     },
 }
 
@@ -73,6 +155,7 @@ pub struct SingletonTx {
     pub caller: alloy::primitives::Address,
     pub to: alloy::primitives::Address,
     pub value: alloy::primitives::U256,
+    pub is_victim: bool, // If true, this TX represents a 'fixed' mainnet victim for MEV simulation
 }
 
 impl SingletonTx {

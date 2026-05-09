@@ -1,0 +1,25 @@
+name: RustyFuzz Security Benchmarks
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    name: Vulnerability Oracle Regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Z3
+        run: sudo apt-get update && sudo apt-get install -y libz3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --features "z3"
+
+      - name: Run Benchmarks
+        run: cargo test --test benchmarks --release --features "z3"
+
+      - name: Verify Documentation Examples
+        run: cargo test --doc

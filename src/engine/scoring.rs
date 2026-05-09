@@ -34,10 +34,12 @@ impl ScoringEngine {
         // A. Reachability (0-100): Based on call depth and sequence complexity
         let reachability = if seq_len <= 1 { 100 } else if seq_len <= 3 { 80 } else { 50 };
 
-        // B. Privilege Escalation (0-100): Did we hit AccessControl or DelegateCall patterns?
+        // B. Privilege Escalation (0-100): Weighted heavily for Pashov's triage workflow.
+        // Access control bypasses are the highest-priority findings.
         let privilege = match vuln {
             VulnType::PrivilegeEscalation => 100,
-            _ => if trace.calls.iter().any(|c| c.is_delegate) { 60 } else { 0 },
+            VulnType::GovernanceParameterManipulation => 90,
+            _ => if trace.calls.iter().any(|c| c.is_delegate) { 70 } else { 0 },
         };
 
         // C. Economic Impact (0-100): funds_drained / TVL
@@ -49,24 +51,26 @@ impl ScoringEngine {
             0
         };
 
-        // D. Exploitability (0-100): Inverse of sequence length
-        let exploitability = 100 / (seq_len as u32).max(1);
+        // D. Exploitability (0-100): Shorter sequences are much easier to report.
+        let exploitability = if seq_len <= 2 { 100 } else { 100 / (seq_len as u32) };
 
         // E. State Corruption (0-100): Intensity of storage modifications
         let state_corruption = ((trace.state_changes.len() as u32 * 100) / 50).min(100);
 
-        // F. Invariant Boost: If it's an invariant violation, boost score by 40 points
-        let invariant_boost: u32 = match vuln {
+        // F. Criticality Multipliers: Boost findings that map to known P0 archetypes.
+        let boost: u32 = match vuln {
             VulnType::InvariantViolation(_) | VulnType::UniswapV3LiquidityAsymmetry => 4000, // 40.0 * 100
+            VulnType::MevSandwichExploit | VulnType::VaultDonationAttack => 3000,
             _ => 0,
         };
 
-        let mut total = (reachability * 25)
-            + (privilege * 25)
-            + (economic_impact * 25)
-            + (exploitability * 15)
+        // Adjusted weights: Prioritize Privilege (30%) and Impact (30%) over sequence complexity.
+        let mut total = (reachability * 20)
+            + (privilege * 30)
+            + (economic_impact * 30)
+            + (exploitability * 10)
             + (state_corruption * 10)
-            + invariant_boost;
+            + boost;
 
         total = total.min(10000);
 

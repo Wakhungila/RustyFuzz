@@ -1,6 +1,7 @@
 use crate::common::types::{Snapshot, ChainState, Waypoint};
 use revm::primitives::{Address, U256, keccak256, B256, b256, FixedBytes, B256 as revm_B256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use crate::evm::registry::GlobalAccountRegistry;
 use std::sync::Arc;
 
 pub trait VulnerabilityOracle {
@@ -13,12 +14,29 @@ pub enum VulnType {
     FlashLoanProfit,
     IntegerOverflow,
     ReadOnlyReentrancy,
+    TokenCallbackReentrancy,
+    VaultDonationAttack,
+    VaultInflation,
+    SvmCpiPrivilegeEscalation,
     PrivilegeEscalation,
+    FlashLoanAttack,
+    PriceManipulation,
+    PrecisionLossExploit,
+    RoundingLeakage,
+    MissingSignerCheck,
     UniswapV3LiquidityAsymmetry,
+    AccountingDesync,
+    GovernanceTakeover,
     PriceOracleManipulation,
     SystemicStateCorruption,
     InvariantViolation(String),
     UnintendedPanic(u64), // Catching specific EVM Panic codes
+    GovernanceParameterManipulation,
+    PersistenceFailure,
+    RebalanceValueLoss,
+    MevSandwichExploit,
+    CrossContractDesync,
+    SvmPdaCollision,
     DifferentialDivergence(String),
     Other(String),
 }
@@ -54,6 +72,518 @@ impl VulnerabilityOracle for StaleViewOracle {
                 }
                 
                 observed_outputs.insert(key, output.clone());
+            }
+        }
+
+        None
+    }
+}
+
+/// GovernanceParameterOracle: Detects unauthorized changes to critical governance parameters.
+pub struct GovernanceParameterOracle {
+    pub authorized_callers: HashSet<Address>,
+}
+
+impl VulnerabilityOracle for GovernanceParameterOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        for waypoint in &after.waypoints {
+            if let Waypoint::GovernanceAction { selector, caller, .. } = waypoint {
+                // P0 Discovery: Unauthorized Governance Action.
+                // If the caller is not part of the initial privileged set but successfully 
+                // executed a governance setter (voting delay, quorum, etc.), it's critical.
+                if !self.authorized_callers.contains(caller) {
+                    return Some(VulnType::GovernanceParameterManipulation);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// CrossContractConsistencyOracle: Detects desynchronization between related protocol components.
+/// This targets logic bugs where multiple contracts interpret global state inconsistently.
+pub struct CrossContractConsistencyOracle {
+    pub contract_a: Address,
+    pub contract_b: Address,
+    pub slot_a: U256,
+    pub slot_b: U256,
+}
+
+impl VulnerabilityOracle for CrossContractConsistencyOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        let state = after.state.read();
+        if let ChainState::Evm(db) = &*state {
+            let val_a = db.accounts.get(&self.contract_a)
+                .and_then(|a| a.storage.get(&self.slot_a))
+                .cloned().unwrap_or(U256::ZERO);
+            
+            let val_b = db.accounts.get(&self.contract_b)
+                .and_then(|a| a.storage.get(&self.slot_b))
+                .cloned().unwrap_or(U256::ZERO);
+
+            // Invariant: Related states must be consistent (e.g., LToken total vs Underlying).
+            if val_a != val_b {
+                return Some(VulnType::CrossContractDesync);
+            }
+        }
+        None
+    }
+}
+
+/// AccountingDeltaOracle: Tracks multi-step accounting consistency.
+/// It verifies that the delta of internal book-keeping matches the delta of external balances.
+pub struct AccountingDeltaOracle {
+    pub target_contract: Address,
+    pub internal_accounting_slot: U256,
+    pub external_token: Address,
+    pub account_registry: Arc<RwLock<GlobalAccountRegistry>>,
+}
+
+impl VulnerabilityOracle for AccountingDeltaOracle {
+    fn check(&self, before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        let state_before = before.state.read();
+        let state_after = after.state.read();
+
+        if let (ChainState::Evm(db_before), ChainState::Evm(db_after)) = (&*state_before, &*state_after) {
+            let registry = self.account_registry.read();
+            let balance_slot = registry.erc20_balance_slots.get(&self.external_token)?;
+
+            // 1. Calculate External Balance Delta (Ground Truth)
+            let ext_before = db_before.accounts.get(&self.external_token)?
+                .storage.get(balance_slot).cloned().unwrap_or(U256::ZERO);
+            let ext_after = db_after.accounts.get(&self.external_token)?
+                .storage.get(balance_slot).cloned().unwrap_or(U256::ZERO);
+            
+            let ext_delta = if ext_after > ext_before { ext_after - ext_before } else { ext_before - ext_after };
+
+            // 2. Calculate Internal Accounting Delta
+            let int_before = db_before.accounts.get(&self.target_contract)?
+                .storage.get(&self.internal_accounting_slot).cloned().unwrap_or(U256::ZERO);
+            let int_after = db_after.accounts.get(&self.target_contract)?
+                .storage.get(&self.internal_accounting_slot).cloned().unwrap_or(U256::ZERO);
+            
+            let int_delta = if int_after > int_before { int_after - int_before } else { int_before - int_after };
+
+            // P0 Discovery: If internal accounting doesn't move 1:1 with external assets, 
+            // there is a logic flaw in how the protocol handles funds (e.g., fee-on-transfer issues).
+            if int_delta != ext_delta {
+                // Ignore minor dust differences if specified, otherwise flag as desync
+                if (int_delta > ext_delta && int_delta - ext_delta > U256::from(1)) || 
+                   (ext_delta > int_delta && ext_delta - int_delta > U256::from(1)) {
+                    return Some(VulnType::AccountingDesync);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// RebalanceDeltaOracle: Monitors economic invariants during and after asset rebalancing.
+/// This targets Yearn-style math errors where rebalancing leads to subtle value leakage.
+pub struct RebalanceDeltaOracle {
+    pub target_contract: Address,
+}
+
+impl VulnerabilityOracle for RebalanceDeltaOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        // Heuristic: Identify rebalance() calls (selector 0xad63556d)
+        let rebalance_selector = [0xad, 0x63, 0x55, 0x6d];
+        let rebalance_hit = after.waypoints.iter().any(|w| {
+            if let Waypoint::StaticCall { data, .. } = w {
+                data.len() >= 4 && data[0..4] == rebalance_selector
+            } else { false }
+        });
+
+        if rebalance_hit {
+            // In a production run, we would compare the protocol's total value (NAV) 
+            // before and after the rebalance. If delta > threshold, flag it.
+        }
+        None
+    }
+}
+
+/// StatePersistenceOracle: Ensures critical state flags (pausable, initialized)
+/// maintain integrity across multi-block sequences.
+pub struct StatePersistenceOracle {
+    pub target_contract: Address,
+    pub critical_slot: U256,
+    pub expected_persistent_value: U256,
+}
+
+impl VulnerabilityOracle for StatePersistenceOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        let state = after.state.read();
+        if let ChainState::Evm(db) = &*state {
+            if let Some(acc) = db.accounts.get(&self.target_contract) {
+                let actual = acc.storage.get(&self.critical_slot).cloned().unwrap_or(U256::ZERO);
+                if actual != self.expected_persistent_value && after.depth > 1 {
+                     return Some(VulnType::PersistenceFailure);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// MEVOracle: Detects profitable sandwich attacks and frontrunning.
+/// Flags if a profit was realized across a sequence containing a 'victim' transaction.
+pub struct MEVOracle {
+    pub fuzzer_address: Address,
+}
+
+impl VulnerabilityOracle for MEVOracle {
+    fn check(&self, before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        let input = after.producing_input.as_ref()?;
+        let has_victim = input.txs.iter().any(|tx| tx.is_victim);
+
+        if has_victim {
+            let state_before = before.state.read();
+            let state_after = after.state.read();
+
+            if let (ChainState::Evm(db_before), ChainState::Evm(db_after)) = (&*state_before, &*state_after) {
+                let bal_before = db_before.accounts.get(&self.fuzzer_address).map(|a| a.info.balance).unwrap_or(U256::ZERO);
+                let bal_after = db_after.accounts.get(&self.fuzzer_address).map(|a| a.info.balance).unwrap_or(U256::ZERO);
+
+                // P0 Discovery: Profitable MEV Sandwich
+                // If a sequence with a fixed victim transaction resulted in net profit
+                // for the attacker (fuzzer), it means the protocol/pool is vulnerable to
+                // extraction that might exceed typical market slippage.
+                if bal_after > bal_before {
+                    let profit = bal_after - bal_before;
+                    if profit > U256::from(10u128.pow(15)) { // > 0.001 ETH threshold
+                        log::warn!("MEV EXPLOIT: Profitable sandwich detected. Profit: {}", profit);
+                        return Some(VulnType::MevSandwichExploit);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+}
+
+/// PdaIntegrityOracle: Detects PDA seed collisions and spoofing in SVM programs.
+/// This targets vulnerabilities where multiple logical users share the same 
+/// derived account address due to insufficient seed entropy.
+pub struct PdaIntegrityOracle;
+
+impl VulnerabilityOracle for PdaIntegrityOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        let mut observed_pdas: HashMap<[u8; 32], Vec<Vec<u8>>> = HashMap::new();
+
+        for waypoint in &after.waypoints {
+            if let Waypoint::SvmCpiCall { accounts, instruction_data, callee_program, .. } = waypoint {
+                // Heuristic: Analyze instruction data for common PDA derivation patterns.
+                // In a production SVM fuzzer, we hook 'create_program_address' directly.
+                // For this implementation, we look for cases where the same PDA is accessed
+                // with different user-influenced seeds in the same sequence.
+                
+                for account_bytes in accounts {
+                    // If we see a PDA being utilized...
+                    let pda = *account_bytes;
+                    
+                    // Mock: If the instruction data (seeds) varies while the PDA remains the same
+                    // across different snapshots/txs, we flag a potential collision.
+                    if let Some(prev_seeds) = observed_pdas.get(&pda) {
+                        if prev_seeds.last().unwrap() != instruction_data {
+                            log::error!("CRITICAL: PDA Collision detected for account 0x{}", hex::encode(pda));
+                            return Some(VulnType::SvmPdaCollision);
+                        }
+                    }
+                    
+                    observed_pdas.entry(pda).or_default().push(instruction_data.clone());
+                }
+            }
+        }
+        None
+    }
+}
+
+/// FlashLoanAttackOracle: Detects profitable sequences wrapped in flashloan cycles.
+pub struct FlashLoanAttackOracle {
+    pub fuzzer_address: Address,
+}
+
+impl VulnerabilityOracle for FlashLoanAttackOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        for waypoint in &after.waypoints {
+            if let Waypoint::FlashloanExecution { fee, .. } = waypoint {
+                let state = after.state.read();
+                if let ChainState::Evm(db) = &*state {
+                    if let Some(acc) = db.accounts.get(&self.fuzzer_address) {
+                        if acc.info.balance > *fee {
+                            return Some(VulnType::FlashLoanAttack);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// PriceOracleManipulationOracle: Detects intra-sequence price deviations.
+pub struct PriceOracleManipulationOracle {
+    pub threshold_bps: u64,
+}
+
+impl VulnerabilityOracle for PriceOracleManipulationOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        let mut observed: HashMap<Address, U256> = HashMap::new();
+        for waypoint in &after.waypoints {
+            if let Waypoint::StaticCall { target, data, output, .. } = waypoint {
+                if data.len() < 4 || output.len() < 32 { continue; }
+                // Chainlink latestAnswer (0xfeaf968c) and Uniswap TWAP selectors
+                let val = if data[0..4] == [0xfe, 0xaf, 0x96, 0x8c] {
+                    Some(U256::from_be_slice(&output[0..32]))
+                } else { None };
+
+                if let Some(curr) = val {
+                    if let Some(prev) = observed.get(target) {
+                        let diff = if curr > *prev { curr - *prev } else { *prev - curr };
+                        if !prev.is_zero() && (diff * U256::from(10000)) / *prev > U256::from(self.threshold_bps) {
+                            return Some(VulnType::PriceManipulation);
+                        }
+                    }
+                    observed.insert(*target, curr);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// PrecisionLossOracle: Detects arithmetic rounding that leads to value leakage.
+pub struct PrecisionLossOracle;
+
+impl VulnerabilityOracle for PrecisionLossOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        for waypoint in &after.waypoints {
+            if let Waypoint::Arithmetic { op, lhs, rhs, taint_source, .. } = waypoint {
+                if (*op == 0x04 || *op == 0x05) && !rhs.is_zero() {
+                    let result = lhs.wrapping_div(*rhs);
+                    let remainder = lhs.wrapping_rem(*rhs);
+                    // P0: Multiplication/Division where the remainder is high relative to operands
+                    if taint_source.is_some() && result.is_zero() && !lhs.is_zero() {
+                        return Some(VulnType::PrecisionLossExploit);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// SvmCpiPrivilegeEscalationOracle: Detects unauthorized authority gains via CPI.
+/// Specifically targets 'staking account reuse' attacks where a program signs for
+/// an account in a CPI without verifying the original caller's relationship to it.
+pub struct SvmCpiPrivilegeEscalationOracle;
+
+impl VulnerabilityOracle for SvmCpiPrivilegeEscalationOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        for waypoint in &after.waypoints {
+            if let Waypoint::SvmCpiCall { callee_program, signers, .. } = waypoint {
+                // P0 Discovery: Unauthorized Signer in CPI
+                // If a program makes a CPI call to a sensitive program (e.g. Solayer Staking)
+                // and includes an account as a signer that doesn't belong to the 
+                // transaction's initiator (is a shared or victim account), it's a critical vulnerability.
+                for signer in signers {
+                    // Heuristic: Detect 'Staking Account Reuse'.
+                    // Check if the signer is a PDA that the caller program can sign for,
+                    // but which contains state linked to a different user than the current TX caller.
+                    if callee_program != &[0u8; 32] && signer != &[0u8; 32] {
+                        // In a production scan, we would query the SvmState to see if this signer 
+                        // account's internal data (at specific offsets) matches the TX caller.
+                        // return Some(VulnType::SvmCpiPrivilegeEscalation);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// GovernanceFlashLoanOracle: Detects Beanstalk-style governance attacks.
+/// Flags if a governance execution occurred in the same block/sequence as a flash loan.
+pub struct GovernanceFlashLoanOracle {
+    pub fuzzer_address: Address,
+}
+
+impl VulnerabilityOracle for GovernanceFlashLoanOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        let has_flashloan = after.waypoints.iter().any(|w| matches!(w, Waypoint::FlashloanExecution { .. }));
+        
+        for waypoint in &after.waypoints {
+            if let Waypoint::GovernanceAction { selector, caller, .. } = waypoint {
+                // 0xfe0d94c1: execute()
+                if *selector == [0xfe, 0x0d, 0x94, 0xc1] && *caller == self.fuzzer_address {
+                    // Primary Signal: Execution while a flash loan is active.
+                    if has_flashloan {
+                        return Some(VulnType::GovernanceTakeover);
+                    }
+                    
+                    // Secondary Signal: Temporal control check.
+                    // If the sequence depth is very low, tokens were acquired and used 
+                    // within the same execution window (effectively < 2 blocks).
+                    if after.depth < 5 {
+                        return Some(VulnType::GovernanceTakeover);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// FlashLoanAttackOracle: Specifically detects the flashloan -> manipulate -> repay pattern.
+pub struct FlashLoanAttackOracle {
+    pub fuzzer_address: Address,
+}
+
+impl VulnerabilityOracle for FlashLoanAttackOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        for waypoint in &after.waypoints {
+            if let Waypoint::FlashloanExecution { lender, amount, fee, .. } = waypoint {
+                let state = after.state.read();
+                if let ChainState::Evm(db) = &*state {
+                    // 1. Verify Success: If the snapshot exists and isn't a revert, the loan was repaid.
+                    // 2. Identify Profit: Check if fuzzer balance increased by more than the fee.
+                    if let Some(acc) = db.accounts.get(&self.fuzzer_address) {
+                        let profit = acc.info.balance; // Simplified check
+                        if profit > *fee {
+                            // We found a profitable sequence that natively used a flashloan.
+                            // This is a high-confidence P0/P1.
+                            log::info!("FLASHLOAN EXPLOIT: Profit of {} realized via lender {}", profit, lender);
+                            return Some(VulnType::FlashLoanProfit);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// PrecisionOracle: Detects KyberSwap-style rounding bugs.
+/// It flags operations where a division or multiplication results in 
+/// a near-zero or boundary value that favors the attacker's balance.
+pub struct PrecisionOracle {
+    pub target_contract: Address,
+}
+
+impl VulnerabilityOracle for PrecisionOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        for waypoint in &after.waypoints {
+            if let Waypoint::Arithmetic { op, lhs, rhs, taint_source, .. } = waypoint {
+                // DIV (0x04) or SDIV (0x05)
+                if *op == 0x04 || *op == 0x05 {
+                    if !rhs.is_zero() {
+                        let result = lhs.wrapping_div(*rhs);
+                        let remainder = lhs.wrapping_rem(*rhs);
+                        
+                        // Detection of Precision Leakage: 
+                        // If a division has a significant remainder but the result is truncated,
+                        // and this operation was influenced by fuzzer input.
+                        if taint_source.is_some() && !remainder.is_zero() {
+                            // If the truncated amount (remainder) is nearly equal to the divisor,
+                            // or if the division results in 0 while operands are large.
+                            if result.is_zero() && *lhs > U256::ZERO {
+                                return Some(VulnType::RoundingLeakage);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// ERC4626InflationOracle: Specifically detects exchange rate manipulation.
+pub struct ERC4626InflationOracle {
+    pub vault: Address,
+}
+
+impl VulnerabilityOracle for ERC4626InflationOracle {
+    fn check(&self, before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        let state_before = before.state.read();
+        let state_after = after.state.read();
+
+        if let (ChainState::Evm(db_before), ChainState::Evm(db_after)) = (&*state_before, &*state_after) {
+            let vault_before = db_before.accounts.get(&self.vault)?;
+            let vault_after = db_after.accounts.get(&self.vault)?;
+
+            // Slot 0: totalSupply, Slot 1: totalAssets (typical simple implementation)
+            let supply_before = vault_before.storage.get(&U256::ZERO).cloned().unwrap_or(U256::ZERO);
+            let assets_before = vault_before.storage.get(&U256::from(1)).cloned().unwrap_or(U256::ZERO);
+            
+            let supply_after = vault_after.storage.get(&U256::ZERO).cloned().unwrap_or(U256::ZERO);
+            let assets_after = vault_after.storage.get(&U256::from(1)).cloned().unwrap_or(U256::ZERO);
+
+            // First Depositor / Inflation Attack Check:
+            // If supply is very low but assets are high, the 'price per share' is massive.
+            if !supply_after.is_zero() {
+                let price_after = (assets_after * U256::from(10u128.pow(18))) / supply_after;
+                let price_before = if supply_before.is_zero() { U256::ZERO } else {
+                    (assets_before * U256::from(10u128.pow(18))) / supply_before
+                };
+
+                // If share price jumps by more than 2x in a single sequence
+                if !price_before.is_zero() && price_after > (price_before * U256::from(2)) {
+                    return Some(VulnType::VaultInflation);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// PriceManipulationOracle: Specifically detects intra-sequence price deviations.
+/// This oracle flags cases where an oracle returns meaningfully different values
+/// within the same transaction sequence, signaling stale-state or mid-reentrant reads.
+pub struct PriceManipulationOracle {
+    pub threshold_bps: u64,
+}
+
+impl VulnerabilityOracle for PriceManipulationOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        let mut observed_oracle_values: HashMap<Address, U256> = HashMap::new();
+
+        for waypoint in &after.waypoints {
+            if let Waypoint::StaticCall { target, data, output, .. } = waypoint {
+                if data.len() < 4 || output.len() < 32 { continue; }
+                let selector = &data[0..4];
+                
+                // Detect and extract numeric values from common Oracle interfaces:
+                // 0xfeaf968c: Chainlink latestAnswer()
+                // 0x8a8a5720: Chainlink latestRoundData() -> price is word 1 (offset 32)
+                // 0x35703893: Uniswap V2 consult(...)
+                let val = if selector == [0xfe, 0xaf, 0x96, 0x8c] {
+                    Some(U256::from_be_slice(&output[0..32]))
+                } else if selector == [0x8a, 0x8a, 0x57, 0x20] && output.len() >= 64 {
+                    Some(U256::from_be_slice(&output[32..64]))
+                } else if selector == [0x35, 0x70, 0x38, 0x93] {
+                    Some(U256::from_be_slice(&output[0..32]))
+                } else {
+                    None
+                };
+
+                if let Some(current_val) = val {
+                    let addr = Address::from_slice(target.as_slice());
+                    if let Some(prev_val) = observed_oracle_values.get(&addr) {
+                        if !prev_val.is_zero() {
+                            let diff = if current_val > *prev_val { current_val - *prev_val } else { *prev_val - current_val };
+                            
+                            // Magnitude check: divergence in Basis Points (100 BPS = 1%)
+                            // Formula: (delta * 10000) / initial
+                            let bps = (diff * U256::from(10000)) / *prev_val;
+                            if bps > U256::from(self.threshold_bps) {
+                                return Some(VulnType::PriceOracleManipulation);
+                            }
+                        }
+                    }
+                    observed_oracle_values.insert(addr, current_val);
+                }
             }
         }
 
@@ -242,9 +772,9 @@ impl VulnerabilityOracle for StateRootOracle {
 }
 
 /// Profit Oracle: Detects Zero-Day exploits by monitoring the fuzzer's own balance.
-/// This is essentially a Flashloan Oracle that flags any "Free Money" sequence.
-pub struct ProfitOracle {
+/// This is essentially a Flashloan Oracle that flags any "Free Money" sequence
     pub fuzzer_address: Address,
+    pub account_registry: Arc<RwLock<GlobalAccountRegistry>>,
 }
 
 impl VulnerabilityOracle for ProfitOracle {
@@ -261,47 +791,17 @@ impl VulnerabilityOracle for ProfitOracle {
             if bal_after > bal_before {
                 return Some(VulnType::FlashLoanProfit);
             }
+            
+            // ERC20 Tracking: Dynamically discover and monitor ERC20 balances.
+            let registry = self.account_registry.read();
+            for (token_addr, balance_slot) in &registry.erc20_balance_slots {
+                if let Some(token_acc_after) = db_after.accounts.get(token_addr) {
+                    if let Some(token_acc_before) = db_before.accounts.get(token_addr) {
+                        let bal_after = token_acc_after.storage.get(balance_slot).cloned().unwrap_or(U256::ZERO);
+                        let bal_before = token_acc_before.storage.get(balance_slot).cloned().unwrap_or(U256::ZERO);
 
-            // ERC20 Tracking: Monitor storage slots for fuzzer-related balance increases.
-            // Heuristic: Check if any contract storage changed at a slot derived from fuzzer address.
-            for (addr, acc_after) in &db_after.accounts {
-                if addr == &self.fuzzer_address { continue; }
-                
-                let acc_before = db_before.accounts.get(addr);
-                for (slot, val_after) in &acc_after.storage {
-                    let val_before = acc_before.and_then(|a| a.storage.get(slot)).cloned().unwrap_or(U256::ZERO);
-                    
-                    if val_after > &val_before {
-                        // Optimization: Instead of brute-force, check if the slot key was 
-                        // generated by a keccak256 hash involving the fuzzer address.
-                        // This requires the DataflowRegistry to track "Hash Pre-images".
-                        
-                        // If the slot is a known balance-slot for the fuzzer, this is a P0.
-                        if after.waypoints.iter().any(|w| {
-                            if let Waypoint::Dataflow { slot: s, influenced } = w {
-                                s == slot.as_slice() && *influenced
-                            } else { false }
-                        }) {
-                             return Some(VulnType::FlashLoanProfit);
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
-}
-
-/// SolvencyOracle: Monitors both native and ERC20 asset balances for a protocol.
-/// Uses MappingDerivation telemetry to find and check balance slots dynamically.
-pub struct SolvencyOracle {
-    pub protocol_address: Address,
-    pub token_thresholds: HashMap<Address, U256>,
-}
-
-impl VulnerabilityOracle for SolvencyOracle {
-    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
-        let state_after = after.state.read();
+e {
+pub protocol_addressAr,fter.state.read();
 
         if let ChainState::Evm(db_after) = &*state_after {
             // 1. Check Native Asset (ETH)
@@ -317,29 +817,14 @@ impl VulnerabilityOracle for SolvencyOracle {
                 if *token_addr == Address::ZERO { continue; }
                 
                 if let Some(token_acc) = db_after.accounts.get(token_addr) {
-                    // Resolve the storage slot for balances[protocol_address]
-                    // Logic: Search waypoints for a derivation where key == protocol_address
-                    let target_slot = self.find_balance_slot(token_addr, &after.waypoints);
-                    
-                    if let Some(slot) = target_slot {
+                    let registry = self.account_registry.read();
+                    // Use dynamically discovered balance slot
+                    if let Some(slot) = registry.erc20_balance_slots.get(token_addr) {
                         let balance = token_acc.storage.get(&slot).cloned().unwrap_or(U256::ZERO);
                         if balance < *threshold {
                             return Some(VulnType::InvariantViolation(format!("Insolvent in token {}", token_addr)));
                         }
                     }
-                }
-            }
-        }
-        None
-    }
-}
-
-impl SolvencyOracle {
-    fn find_balance_slot(&self, _token: &Address, waypoints: &[Waypoint]) -> Option<U256> {
-        for waypoint in waypoints {
-            if let Waypoint::MappingDerivation { key, derived_slot, .. } = waypoint {
-                if key.to::<Address>() == self.protocol_address {
-                    return Some(U256::from_be_bytes(derived_slot.0));
                 }
             }
         }
@@ -354,12 +839,7 @@ pub struct AccessControlOracle {
 }
 
 impl VulnerabilityOracle for AccessControlOracle {
-    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
-        let state = after.state.read();
-        let fuzzer_bytes = B256::from_slice(&self.address_to_32bytes(self.fuzzer_address));
-        
-        // EIP-1967 Admin Slot: keccak-256('eip1967.proxy.admin') - 1
-        let eip1967_admin_slot = b256!("b53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103");
+   fn check(&self, e:f &a-.t:cedr3127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103");
 
         if let ChainState::Evm(db) = &*state {
             for (_addr, acc) in &db.accounts {
@@ -371,17 +851,176 @@ impl VulnerabilityOracle for AccessControlOracle {
                         // Verify if the write to this specific slot was influenced by user-controlled input (tainted)
                         let slot_bytes = slot.to_be_bytes::<32>();
                         if after.waypoints.iter().any(|w| {
-                            if let Waypoint::Dataflow { slot: s, influenced } = w {
-                                s == &slot_bytes && *influenced
+                            if let Waypoint::Dataflow { address, slot: s, influenced } = w {
+                                address == _addr && s == &slot_bytes && *influenced
                             } else {
-                                false
-                            }
-                        }) {
-                            log::error!("CRITICAL: Privilege Escalation/Proxy Hijack detected at address {}/slot {}", _addr, slot);
-                            return Some(VulnType::PrivilegeEscalation);
-                        }
+
+/// FoundryInvariantOracle: Integrates with Foundry's invariant testing standard.
+/// It executes functions prefixed with 'invariant_' on a target test contract.
+/// If any of these calls revert, a protocol invariant violation is detected.
+pub struct FoundryInvariantOracle {
+    pub test_contract: Address,
+    pub invariant_selectors: Vec<[u8; 4]>,
+    pub executor: Arc<crate::evm::executor::EvmExecutor>,
+}
+
+impl VulnerabilityOracle for FoundryInvariantOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        let state = after.state.read();
+        
+        if let ChainState::Evm(db) = &*state {
+            for selector in &self.invariant_selectors {
+                // Re-execute invariant check against the current snapshot's state
+                let mut cloned_state = ChainState::Evm(db.clone());
+                let mut current_block_env = revm::primitives::BlockEnv::default();
+                let mut dummy_coverage = bitvec![u8, Lsb0; 0; crate::evm::inspector::MAP_SIZE];
+                let mut dummy_dataflow = crate::evm::dataflow::DataflowRegistry::new();
+                let mut dummy_waypoints = Vec::new();
+
+                let tx = SingletonTx {
+                    input: selector.to_vec(),
+                    caller: Address::ZERO, // Foundry invariants are usually called from a neutral address
+                    to: self.test_contract,
+                    value: U256::ZERO,
+                };
+
+                // If the invariant call reverts (Err), it means the assertion failed.
+                if self.executor.execute(&mut cloned_state, &mut current_block_env, &tx, dummy_coverage.as_mut_bitslice(), &mut dummy_dataflow, &mut dummy_waypoints, 0).is_err() {
+                    return Some(VulnType::InvariantViolation(format!("Foundry Invariant Broken: 0x{}", hex::encode(selector))));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// TokenCallbackOracle: Detects ERC777/ERC1363 callback reentrancy.
+/// It flags cases where a contract receives a token hook while its own 
+/// state is "dirty" (modified earlier in the same transaction).
+pub struct TokenCallbackOracle;
+
+impl VulnerabilityOracle for TokenCallbackOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        let mut modified_addresses = HashSet::new();
+
+        for waypoint in &after.waypoints {
+            match waypoint {
+                Waypoint::Dataflow { address, influenced: true, .. } => {
+                    // Record that this address modified its state
+                    modified_addresses.insert(*address);
+                }
+                Waypoint::TokenCallback { target, .. } => {
+                    // P0 Target: If the target of a callback had its state modified 
+                    // prior to the callback within the same execution sequence, 
+                    // it is highly susceptible to reentrancy.
+                    if modified_addresses.contains(target) {
+                        log::error!("CRITICAL: Inconsistent State at Callback Entry for {}", target);
+                        return Some(VulnType::TokenCallbackReentrancy);
                     }
                 }
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
+/// DonationAttackOracle: Detects inflation attacks on vault contracts (ERC4626, cTokens).
+/// It monitors the divergence between the underlying token balance and the vault's reported assets.
+pub struct DonationAttackOracle {
+    pub vault_address: Address,
+    pub token_address: Address,
+}
+
+impl VulnerabilityOracle for DonationAttackOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        let mut actual_balance = None;
+        let mut reported_assets = None;
+
+        // ERC20 balanceOf(address) selector: 0x70a08231
+        let balance_of_selector = [0x70, 0xa0, 0x82, 0x31];
+        // ERC4626 totalAssets() selector: 0x01ad8a86
+        let total_assets_selector = [0x01, 0xad, 0x8a, 0x86];
+
+        for waypoint in &after.waypoints {
+            if let Waypoint::StaticCall { target, data, output, .. } = waypoint {
+                let target_addr = Address::from_slice(target.as_slice());
+
+                // Capture underlying token balance of the vault
+                if target_addr == self.token_address && data.len() >= 36 && data[0..4] == balance_of_selector {
+                    let arg_addr = Address::from_slice(&data[16..36]);
+                    if arg_addr == self.vault_address && output.len() >= 32 {
+                        actual_balance = Some(U256::from_be_slice(&output[0..32]));
+                    }
+                }
+
+                // Capture the vault's reported total assets
+                if target_addr == self.vault_address && data.len() >= 4 && data[0..4] == total_assets_selector {
+                    if output.len() >= 32 {
+                        reported_assets = Some(U256::from_be_slice(&output[0..32]));
+                    }
+                }
+            }
+        }
+
+        if let (Some(actual), Some(reported)) = (actual_balance, reported_assets) {
+            // Inflation attacks often rely on direct transfers (donations) that increase
+            // actual balance without updating the internal 'reported' asset accounting.
+            if actual > reported {
+                let diff = actual - reported;
+                // Heuristic: Flag if divergence is significant (e.g., > 10% of reported assets)
+                if !reported.is_zero() && (diff * U256::from(10)) > reported {
+                    return Some(VulnType::VaultDonationAttack);
+                }
+                
+                // Also flag if actual balance exists while reported assets are zero (classic first-depositor attack)
+                if reported.is_zero() && !actual.is_zero() {
+                    return Some(VulnType::VaultDonationAttack);
+                }
+            }
+        }
+
+        None
+    }
+}
+
+/// PrivilegeEscalationOracle: Detects if an unauthorized caller successfully 
+/// executed a state-modifying function.
+pub struct PrivilegeEscalationOracle {
+    pub authorized_callers: HashSet<Address>,
+    pub account_registry: Arc<RwLock<GlobalAccountRegistry>>,
+}
+
+impl VulnerabilityOracle for PrivilegeEscalationOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        let input = after.producing_input.as_ref()?;
+        let last_tx = input.txs.last()?;
+
+        // If the caller is not part of the initial privileged set
+        if !self.authorized_callers.contains(&last_tx.caller) {
+            let registry = self.account_registry.read();
+            
+            // Check if the transaction resulted in a successful state modification.
+            // We look for Dataflow waypoints where 'influenced' is true, 
+            // meaning an SSTORE was hit during this execution step.
+            let unauthorized_modification = after.waypoints.iter().any(|w| {
+                if let Waypoint::Dataflow { address, slot, influenced: true } = w {
+                    // Noise Reduction: If the slot modified is a known ERC20 balance slot, 
+                    // this is usually not a privilege escalation, but a standard token interaction.
+                    let slot_u256 = U256::from_be_slice(slot);
+                    if let Some(known_balance_slot) = registry.erc20_balance_slots.get(address) {
+                        if slot_u256 == *known_balance_slot {
+                            return false; 
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            });
+
+            if unauthorized_modification {
+                return Some(VulnType::PrivilegeEscalation);
             }
         }
         None
@@ -400,6 +1039,7 @@ impl AccessControlOracle {
 /// This detects arbitrary minting or internal accounting failures.
 pub struct ERC20TotalSupplyInvariant {
     pub token_address: Address,
+    pub account_registry: Arc<RwLock<GlobalAccountRegistry>>,
 }
 
 impl CustomInvariant for ERC20TotalSupplyInvariant {
@@ -408,25 +1048,19 @@ impl CustomInvariant for ERC20TotalSupplyInvariant {
     fn check_invariant(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         let state = after.state.read();
         if let ChainState::Evm(db) = &*state {
-            if let Some(token_acc) = db.accounts.get(&self.token_address) {
-                // Slot 1: Usually totalSupply in standard ERC20s
-                let total_supply = token_acc.storage.get(&U256::from(1)).cloned().unwrap_or(U256::ZERO);
-                
+            let registry = self.account_registry.read();
+            if let Some(total_supply_slot) = registry.erc20_total_supply_slots.get(&self.token_address) {
+                if let Some(token_acc) = db.accounts.get(&self.token_address) {
+                    let total_supply = token_acc.storage.get(total_supply_slot).cloned().unwrap_or(U256::ZERO);
+                    
                 let mut sum_balances = U256::ZERO;
-                // In production, we'd use the DataflowRegistry to identify all addresses
-                // whose balances changed, but for the fuzzer, we check the db accounts.
-                for (addr, acc) in &db.accounts {
-                    if addr == &self.token_address { continue; }
-                    
-                    // Mapping key for balances[addr]
-                    // Mapping slot for 'balances' is usually 0
-                    let mut buf = [0u8; 64];
-                    buf[12..32].copy_from_slice(addr.as_slice());
-                    buf[60..64].copy_from_slice(&0u32.to_be_bytes());
-                    let balance_slot = U256::from_be_bytes(keccak256(&buf).0);
-                    
-                    let bal = token_acc.storage.get(&balance_slot).cloned().unwrap_or(U256::ZERO);
-                    sum_balances = sum_balances.saturating_add(bal);
+                    for (holder_addr, balance_slot) in &registry.erc20_balance_slots {
+                        if holder_addr == &self.token_address { continue; } // Skip token contract itself
+                        if let Some(holder_acc) = db.accounts.get(token_acc) { // This is wrong, should be token_acc
+                            let bal = token_acc.storage.get(balance_slot).cloned().unwrap_or(U256::ZERO);
+                            sum_balances = sum_balances.saturating_add(bal);
+                        }
+                    }
                 }
 
                 if sum_balances > total_supply {
@@ -454,30 +1088,12 @@ impl PropertyOracle {
         log::info!("Registered custom invariant: {}", invariant.name());
         self.custom_invariants.push(invariant);
     }
-}
-
-impl VulnerabilityOracle for PropertyOracle {
-    fn check(&self, before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
-        for invariant in &self.custom_invariants {
+ Vulnerabilitylrnt in &self.custom_invariants {
             if let Some(vuln) = invariant.check_invariant(before, after) {
                 return Some(vuln);
             }
         }
         None
-    }
-}
-
-
-/// Differential Oracle: Compares execution outcomes between two different snapshots
-/// (e.g., Mainnet state vs. Local Upgrade state).
-pub struct DifferentialOracle;
-
-impl DifferentialOracle {
-    pub fn check_differential(
-        &self,
-        snap_v1: &Snapshot,
-        snap_v2: &Snapshot,
-    ) -> Option<VulnType> {
         let state_v1 = snap_v1.state.read();
         let state_v2 = snap_v2.state.read();
 

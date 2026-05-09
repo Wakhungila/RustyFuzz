@@ -1,5 +1,5 @@
 use alloy::providers::Provider;
-use alloy::rpc::types::eth::BlockNumberOrTag;
+use alloy::rpc::types::eth::{BlockNumberOrTag, BlockTransactions};
 use crate::common::types::{SingletonTx, EvmInput};
 use revm::primitives::{Address, U256};
 use std::sync::Arc;
@@ -20,24 +20,25 @@ impl<P: Provider> SeedIngester<P> {
         let mut seeds = Vec::new();
         let latest_block = self.provider.get_block_number().await?;
         
-        // Look back 10 blocks for relevant activity
-        for i in 0..10 {
+        // Extended search depth to find valid protocol interactions
+        let search_depth = 100;
+        
+        for i in 0..search_depth {
             if seeds.len() >= max_seeds { break; }
             
             let block_num = latest_block.saturating_sub(i);
+            // Request full transaction objects to minimize RPC roundtrips
             let block = self.provider.get_block_by_number(block_num.into(), true).await?;
             
             if let Some(b) = block {
-                for tx in b.transactions.hashes() {
-                    let full_tx = self.provider.get_transaction_by_hash(*tx).await?;
-                    if let Some(t) = full_tx {
-                        // Filter for transactions targeting our contract
+                if let BlockTransactions::Full(txs) = b.transactions {
+                    for t in txs {
                         if t.to == Some(target) {
                             let input = EvmInput {
                                 txs: vec![SingletonTx {
                                     input: t.input.to_vec(),
                                     caller: t.from,
-                                    to: t.to.unwrap_or_default(),
+                                    to: t.to.unwrap(),
                                     value: t.value,
                                 }],
                                 base_snapshot_id: 0,
@@ -45,8 +46,8 @@ impl<P: Provider> SeedIngester<P> {
                             };
                             seeds.push(input);
                         }
+                        if seeds.len() >= max_seeds { break; }
                     }
-                    if seeds.len() >= max_seeds { break; }
                 }
             }
         }
