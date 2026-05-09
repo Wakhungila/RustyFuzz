@@ -7,14 +7,16 @@ use libafl_bolts::{HasLen, rands::Rand, Error};
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use borsh::{BorshSerialize, BorshDeserialize};
+use crate::common::types::Waypoint;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SvmInput {
     pub instructions: Vec<Instruction>,
     pub base_snapshot_id: u64,
     pub account_overrides: HashMap<Pubkey, Vec<u8>>, // For mutating account data directly
+    pub waypoints: Vec<Vec<Waypoint>>, // Execution feedback per instruction
 }
 
 impl Input for SvmInput {
@@ -48,7 +50,36 @@ where
             return Ok(MutationResult::Skipped);
         }
 
-        let mutation_type = rand.below(100);
+        let mut mutation_type = rand.below(100);
+
+        // High-Priority: Taint-Guided Instruction Data Mutation (Concolic-like)
+        // If waypoints are available, prioritize negating comparison conditions.
+        if mutation_type < 20 && !input.waypoints.is_empty() {
+            let instruction_idx = rand.below(input.instructions.len() as u64) as usize;
+            if let Some(instruction_waypoints) = input.waypoints.get(instruction_idx) {
+                let comparisons: Vec<&Waypoint> = instruction_waypoints
+                    .iter()
+                    .filter(|w| matches!(w, Waypoint::Comparison { calldata_offset: Some(_), .. }))
+                    .collect();
+
+                if !comparisons.is_empty() {
+                    let waypoint = comparisons[rand.below(comparisons.len() as u64) as usize];
+                    if let Waypoint::Comparison { calldata_offset: Some(offset), .. } = waypoint {
+                        let instruction_data = &mut input.instructions[instruction_idx].data;
+                        if instruction_data.len() > *offset {
+                            // Heuristic: Flip a bit at the identified offset to negate the comparison.
+                            // This simulates a concolic solver's output for instruction data.
+                            instruction_data[*offset] ^= (1 << rand.below(8)) as u8;
+                            return Ok(MutationResult::Mutated);
+                        }
+                    }
+                }
+            }
+            // If no suitable waypoint was found for concolic mutation, fall through to other types.
+            mutation_type = rand.below(80); // Adjust probability for other mutations
+        }
+
+        // Other mutation strategies
         let res = match mutation_type {
             0..=15 => {
                 // Anchor-Aware Account Data Mutation (Borsh-aligned)

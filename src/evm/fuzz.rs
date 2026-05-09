@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, sync::Arc, collections::HashMap};
 use crate::evm::registry::GlobalAccountRegistry;
 use parking_lot::RwLock;
-use crate::engine::concolic::ConcolicSolver;
+use crate::engine::concolic::{ConcolicSolver, ConcolicHint};
 use hashlink::LruCache;
 
 /// Maximum number of entries allowed in the decode cache before eviction is triggered.
@@ -28,7 +28,7 @@ pub struct AbiRegistry {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EvmInput {
     pub txs: Vec<SingletonTx>, // Change to a sequence for multi-step exploits
-    pub base_snapshot_id: u64,
+    pub base_snapshot_id: u64, // The ID of the snapshot this input was derived from
     pub waypoints: Vec<Vec<Waypoint>>, // execution feedback per transaction
 }
 
@@ -73,7 +73,7 @@ where
             let ctx = z3::Context::new(&cfg);
             let solver = ConcolicSolver::new(&ctx);
 
-            // Enable multi-transaction discovery by attempting to solve constraints 
+            // Enable multi-transaction symbolic path discovery by attempting to solve constraints 
             // from any point in the transaction sequence.
             let tx_idx = rand.below(input.txs.len() as u64) as usize;
             if let Some(tx_waypoints) = input.waypoints.get(tx_idx) {
@@ -87,7 +87,7 @@ where
                     if let Some(hint) = solver.solve_hint(waypoint) {
                         if let Waypoint::Comparison { calldata_offset: Some(offset), .. } = waypoint {
                             let tx = &mut input.txs[tx_idx];
-                            // Apply the solver-generated hint at the precise calldata offset.
+                            // Apply the solver-generated hint at the precise calldata offset within the transaction.
                             // This enables deterministic bypassing of guards like access control.
                             if tx.input.len() >= offset + 32 {
                                 tx.input[*offset..*offset + 32].copy_from_slice(&hint);
@@ -105,7 +105,7 @@ where
                 let new_tx = SingletonTx {
                     input: vec![0, 0, 0, 0], // Placeholder for a default/random selector
                     caller: Address::random(),
-                    to: Address::ZERO,
+                    to: Address::random(), // New transactions should target random addresses
                     value: U256::ZERO,
                 };
                 input.txs.push(new_tx);

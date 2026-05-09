@@ -40,7 +40,7 @@ impl SvmExecutor {
         }).collect();
 
         // Apply account overrides from the fuzzer input
-        for (pubkey, data) in &input.account_overrides {
+        for (pubkey, data) in &input.account_overrides { // This should be applied to the `state` clone, not `accounts_to_process`
             if let Some(account) = accounts_to_process.iter_mut().find(|(pk, _)| pk == pubkey) {
                 account.1.data = data.clone();
             }
@@ -49,7 +49,9 @@ impl SvmExecutor {
         // Execute each instruction in the translated transaction
         for instruction in input.instructions.iter() {
             let result = mollusk.process_instruction(instruction, &accounts_to_process);
-            inspector.observe_instruction(instruction, &result);
+            let mut instruction_waypoints = Vec::new();
+            inspector.observe_instruction(instruction, &result, &mut instruction_waypoints);
+            waypoints.push(instruction_waypoints); // Store waypoints per instruction
         }
 
         // Update the SvmState with the resulting account changes.

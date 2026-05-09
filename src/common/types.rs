@@ -5,6 +5,7 @@ use std::ops::Range;
 use parking_lot::RwLock;
 use serde::{Serialize, Deserialize};
 use bitvec::prelude::{BitVec, Lsb0};
+use crate::evm::fuzz::EvmInput;
 use crate::svm::bridge::SvmAccount;
 
 #[derive(Clone, Debug)]
@@ -30,6 +31,7 @@ pub struct Snapshot {
     pub id: u64,
     pub state: Arc<RwLock<ChainState>>,
     pub coverage: BitVec<u8, Lsb0>,
+    pub producing_input: Option<EvmInput>, // The input that generated this snapshot
     pub waypoints: Vec<Waypoint>,
     pub depth: u32,
 }
@@ -59,7 +61,7 @@ pub enum Waypoint {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct SingletonTx {
     pub input: Vec<u8>,
     pub caller: alloy::primitives::Address,

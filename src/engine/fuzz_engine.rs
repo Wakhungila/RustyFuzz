@@ -1,6 +1,6 @@
-use crate::common::types::{Snapshot, ChainState, SingletonTx};
+use crate::common::types::{Snapshot, ChainState, SingletonTx, Waypoint};
 use crate::config::Config;
-use crate::evm::fork::create_fork_db;
+use crate::evm::fork::{create_fork_db, create_fork_block_env};
 use crate::evm::executor::EvmExecutor;
 use crate::common::oracle::{VulnerabilityOracle, ReentrancyOracle, ProfitOracle, SolvencyOracle};
 use crate::engine::exploit_synthesizer::synthesize_poc;
@@ -28,10 +28,10 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
     // 1. Create initial state from fork
     let initial_cache_db = create_fork_db(&config.rpc_url, config.fork_block).await?;
     let initial_chain_state = ChainState::Evm(initial_cache_db.clone()); 
-
+    let initial_block_env = create_fork_block_env(&config.rpc_url, config.fork_block).await?;
     {
         let mut corpus = snapshot_corpus.write();
-        corpus.add_snapshot(0, 0, crate::evm::snapshot::new_evm_snapshot(0, initial_cache_db));
+        corpus.add_snapshot(0, 0, crate::evm::snapshot::new_evm_snapshot(0, initial_cache_db, None));
     }
 
     let evm_executor = EvmExecutor::new();
@@ -61,13 +61,14 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
         let mut state_guard = current_snapshot.state.write();
         let mut cloned_state = state_guard.clone();
         drop(state_guard);
+        let mut current_block_env = initial_block_env.clone();
 
         // Structured input generation
         let mut input = EvmInput {
             txs: vec![SingletonTx {
                 input: vec![0x00, 0x00, 0x00, 0x00], // Start with a dummy selector
                 caller: Default::default(),
-                to: Address::ZERO,
+                to: Address::random(), // Target a random address for initial exploration
                 value: Default::default(),
             }],
             base_snapshot_id: base_id,
@@ -79,12 +80,13 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
         // Execute the sequence
         let mut last_snapshot = current_snapshot.clone();
         for tx in &input.txs {
-            let mut step_coverage = last_snapshot.coverage.clone();
-            let mut waypoints = Vec::new();
-            match evm_executor.execute(&mut cloned_state, tx, step_coverage.as_mut_bitslice(), &mut dataflow_registry, &mut waypoints) {
+            let mut tx_coverage = last_snapshot.coverage.clone();
+            let mut tx_waypoints = Vec::new();
+            match evm_executor.execute(&mut cloned_state, &mut current_block_env, tx, tx_coverage.as_mut_bitslice(), &mut dataflow_registry, &mut tx_waypoints) {
                 Ok(_) => {
                     let after_snapshot = Snapshot {
                         id: last_snapshot.id + 1,
+                        producing_input: Some(input.clone()), // Store the input that led to this state
                         state: Arc::new(RwLock::new(cloned_state.clone())),
                         coverage: step_coverage,
                         waypoints,

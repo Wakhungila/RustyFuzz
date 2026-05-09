@@ -1,6 +1,7 @@
 use mollusk_svm::result::InstructionResult;
 use solana_sdk::instruction::Instruction;
 use bitvec::prelude::*;
+use solana_sdk::instruction::AccountMeta;
 use solana_sdk::hash::Hash as SolanaHash; // Use Solana's Hash for instruction hashing
 use crate::common::types::Waypoint;
 use revm::primitives::U256;
@@ -18,7 +19,11 @@ impl<'a> SvmCoverageInspector<'a> {
     }
 
     /// Records instruction metadata and outcome to influence the fuzzing feedback loop.
-    pub fn observe_instruction(&mut self, instruction: &Instruction, result: &InstructionResult) {
+    pub fn observe_instruction(
+        &mut self, 
+        instruction: &Instruction, 
+        result: &InstructionResult,
+        instruction_waypoints: &mut Vec<Waypoint>) {
         // Map the program ID and instruction discriminator to a coverage bit.
         // To achieve more "BPF-level" coverage without direct BPF hooks,
         // we hash a combination of program ID, instruction data, and involved accounts.
