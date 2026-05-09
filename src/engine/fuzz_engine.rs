@@ -20,6 +20,10 @@ use libafl_bolts::rands::Rand;
 pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
     log::info!("RustyFuzz campaign started on {} using {} cores", config.chain, num_cpus::get());
 
+    // Load sensitive configuration from .env
+    dotenvy::dotenv().ok();
+    let notifier = crate::common::notifier::DiscordNotifier::new();
+
     // For a fuzzer, we use LibAFL's Launcher to spawn processes/threads
     // For brevity, we demonstrate the multi-threaded coordination logic here.
     let mut snapshot_corpus = Arc::new(RwLock::new(SnapshotCorpus::new()));
@@ -88,8 +92,8 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
                         id: last_snapshot.id + 1,
                         producing_input: Some(input.clone()), // Store the input that led to this state
                         state: Arc::new(RwLock::new(cloned_state.clone())),
-                        coverage: step_coverage,
-                        waypoints,
+                        coverage: tx_coverage,
+                        waypoints: tx_waypoints,
                         depth: last_snapshot.depth + 1,
                     };
 
@@ -101,9 +105,19 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
                             log::error!("VULN DISCOVERED IN SEQUENCE: {:?} at depth {}", vuln_type, after_snapshot.depth);
                             
                             // Generate hardware-backed proof of discovery
+                            let mut mrenclave = None;
                             if let Ok(report) = sgx_executor.generate_attestation_report(format!("{:?}", vuln_type).as_bytes()) {
                                 log::info!("SGX Attestation generated for exploit. MRENCLAVE: {:?}", report.enclave_identity);
+                                mrenclave = Some(report.enclave_identity);
                             }
+
+                            // Generate a signed Proof-of-Concept for the finding
+                            let poc = after_snapshot.producing_input.as_ref().map(|input| {
+                                synthesize_poc(input, &vuln_type)
+                            });
+
+                            // Dispatch remote notification
+                            let _ = notifier.notify_discovery(&vuln_type, &after_snapshot, mrenclave.as_deref(), poc).await;
 
                             // Industry grade: Trigger the Minimizer to refine the sequence
                         }
