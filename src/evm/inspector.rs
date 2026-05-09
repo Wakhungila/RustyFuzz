@@ -24,6 +24,7 @@ pub struct CoverageInspector<'a> {
     pub current_tx_idx: usize, // Index of the current transaction in the sequence
     pub symbolic_storage_map: HashMap<(Address, B256), TaintSource>, // (addr, slot) -> TaintSource of value
     pub transient_taint_map: HashMap<(Address, B256), TaintSource>, // EIP-1153 support
+    pub memory_taint: HashMap<usize, TaintSource>, // offset -> TaintSource
 }
 
 impl<'a> CoverageInspector<'a> {
@@ -41,6 +42,7 @@ impl<'a> CoverageInspector<'a> {
             current_tx_idx,
             symbolic_storage_map: HashMap::new(),
             transient_taint_map: HashMap::new(),
+            memory_taint: HashMap::new(),
         }
     }
 }
@@ -57,6 +59,35 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
                 if let Ok(offset_val) = interp.stack.peek(0) {
                     let offset = offset_val.to::<usize>();
                     self.taint_stack.push(Some(TaintSource::Calldata(offset)));
+                }
+            }
+            opcode::CALLDATACOPY => {
+                if let (Ok(dest), Ok(src), Ok(len)) = (interp.stack.peek(0), interp.stack.peek(1), interp.stack.peek(2)) {
+                    let dest = dest.to::<usize>();
+                    let src = src.to::<usize>();
+                    let len = len.to::<usize>();
+                    // Propagate taint from calldata to memory
+                    for i in 0..len {
+                        self.memory_taint.insert(dest + i, TaintSource::Calldata(src + i));
+                    }
+                }
+            }
+            opcode::MLOAD => {
+                if let Ok(offset_val) = interp.stack.peek(0) {
+                    let offset = offset_val.to::<usize>();
+                    let taint = self.memory_taint.get(&offset).cloned();
+                    self.taint_stack.push(taint);
+                    return;
+                }
+                self.taint_stack.push(None);
+            }
+            opcode::MSTORE | opcode::MSTORE8 => {
+                if let (Ok(offset_val), Some(taint)) = (interp.stack.peek(0), self.taint_stack.last().cloned().flatten()) {
+                    let offset = offset_val.to::<usize>();
+                    let size = if opcode == opcode::MSTORE { 32 } else { 1 };
+                    for i in 0..size {
+                        self.memory_taint.insert(offset + i, taint.clone());
+                    }
                 }
             }
             // Propagation for stack operations

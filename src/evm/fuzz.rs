@@ -77,12 +77,14 @@ where
             // from any point in the transaction sequence.
             let tx_idx = rand.below(input.txs.len() as u64) as usize;
             if let Some(tx_waypoints) = input.waypoints.get(tx_idx) {
+                // Priority: Solve for 'BranchPath' first to explore new control flow
                 let mut candidates: Vec<_> = tx_waypoints
                     .iter()
-                    .filter(|w| matches!(w, Waypoint::Comparison { taint_source: Some(_), .. } | Waypoint::Arithmetic { taint_source: Some(_), .. }))
+                    .filter(|w| matches!(w, Waypoint::BranchPath { .. } | Waypoint::Comparison { taint_source: Some(_), .. }))
                     .collect();
 
                 if !candidates.is_empty() {
+                    // Higher selection energy for BranchPath waypoints
                     let waypoint = candidates[rand.below(candidates.len() as u64) as usize];
                     if let Some(hint) = solver.solve_hint(waypoint) {
                         if let Some(ts) = match waypoint {

@@ -53,5 +53,5 @@ default = ["notifier"]
 z3 = ["dep:z3"]
 llm = ["dep:reqwest"]
 notifier = ["dep:reqwest"]
-sgx = ["dep:sgx_types", "dep:aes-gcm-siv"]
+sgx = ["dep:sgx_types", "dep:aes-gcm-siv"] # Note: Requires SGX SDK environment for compilation
 etherscan = ["dep:reqwest", "dep:alloy-json-abi"]

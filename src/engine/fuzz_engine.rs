@@ -169,12 +169,15 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
 
     // --- LibAFL Harness Setup ---
     
-    // 1. Observer: Tracks coverage during execution
-    let mut coverage_map = bitvec![u8, Lsb0; 0; MAP_SIZE];
-    // In a real LibAFL harness, we'd use a MapObserver linked to the shared coverage memory.
+    // 1. Observer: Link the coverage map to LibAFL
+    // Note: In a production multi-process setup, this would be backed by shared memory (shmem)
+    let mut coverage_map = [0u8; MAP_SIZE];
+    let observer = unsafe { StdMapObserver::from_mut_ptr("edges", coverage_map.as_mut_ptr(), MAP_SIZE) };
 
     // 2. Feedback: Defines what makes an input "interesting"
-    let mut feedback = EvmCoverageFeedback;
+    // MaxMapFeedback maximizes the bits set in the coverage observer
+    let mut feedback = MaxMapFeedback::new(&observer);
+    
     let mut objective = (); // Wrap oracles here for solution detection
 
     // 3. State: Holds corpus and RNG
