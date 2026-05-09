@@ -95,21 +95,29 @@ impl VulnerabilityOracle for UniswapV3InvariantOracle {
 
             if ticks_touched.is_empty() { return None; }
 
-            // Optimization: Instead of scanning all storage, we use the Dataflow waypoints
-            // to identify only the ticks that were actually touched or modified in this sequence.
-            let touched_slots: Vec<U256> = after.waypoints.iter()
-                .filter_map(|w| if let Waypoint::MappingDerivation { derived_slot, base_slot, .. } = w {
-                    if *base_slot == U256::from(5) { Some(U256::from_be_bytes(derived_slot.0)) } else { None }
-                } else { None })
-                .collect();
+            // Real-world logic: Reconstruct the active liquidity sum by iterating 
+            // through all initialized ticks found in storage.
+            let mut calculated_liquidity: i128 = 0;
+            let slot0 = pool.storage.get(&U256::ZERO).cloned().unwrap_or(U256::ZERO);
+            let current_tick = self.extract_tick_from_slot0(slot0);
 
-            if touched_slots.is_empty() { return None; }
+            for (slot, value) in &pool.storage {
+                if let Some(tick_index) = self.get_tick_index_for_slot(slot, &after.waypoints) {
+                    // In V3, liquidityNet is at the start of the Tick struct (int128)
+                    let liquidity_net = (value & U256::from(u128::MAX)).to::<i128>();
+                    
+                    // Cross-reference: only sum ticks that are crossable at the current price
+                    if tick_index <= current_tick {
+                        calculated_liquidity = calculated_liquidity.saturating_add(liquidity_net);
+                    }
+                }
+            }
 
-            // For Uniswap V3, global liquidity must equal the sum of liquidityNet 
-            // for all ticks in the current range.
-            // This production implementation would perform a partial sum check 
-            // specifically against the active tick's liquidity global state.
-            // (Full summation logic truncated for brevity, now utilizes touched_slots)
+            // Critical P0: If the sum of net liquidity across active ticks != global liquidity,
+            // the pool's accounting has desynchronized (e.g. KyberSwap exploit).
+            if U256::from(calculated_liquidity.unsigned_abs()) != global_liquidity {
+                return Some(VulnType::UniswapV3LiquidityAsymmetry);
+            }
         }
         None
     }
@@ -284,14 +292,11 @@ impl VulnerabilityOracle for ProfitOracle {
     }
 }
 
-/// Solvency Oracle: Checks if a lending protocol's critical asset balance falls below a threshold.
-/// In a real-world scenario, this would involve calling specific view functions (e.g., totalAssets(), totalLiabilities())
-/// or reading specific storage slots to determine the protocol's solvency.
+/// SolvencyOracle: Monitors both native and ERC20 asset balances for a protocol.
+/// Uses MappingDerivation telemetry to find and check balance slots dynamically.
 pub struct SolvencyOracle {
     pub protocol_address: Address,
-    pub critical_asset_threshold: U256, // e.g., minimum ETH balance
-    // pub total_assets_slot: Option<U256>, // For reading specific storage slots
-    // pub total_liabilities_slot: Option<U256>,
+    pub token_thresholds: HashMap<Address, U256>,
 }
 
 impl VulnerabilityOracle for SolvencyOracle {
@@ -299,13 +304,42 @@ impl VulnerabilityOracle for SolvencyOracle {
         let state_after = after.state.read();
 
         if let ChainState::Evm(db_after) = &*state_after {
-            if let Some(account) = db_after.accounts.get(&self.protocol_address) {
-                // Simple check: Is the protocol's ETH balance below a critical threshold?
-                if account.info.balance < self.critical_asset_threshold {
-                    return Some(VulnType::InvariantViolation(format!(
-                        "Solvency broken: Protocol {} balance {} < threshold {}",
-                        self.protocol_address, account.info.balance, self.critical_asset_threshold
-                    )));
+            // 1. Check Native Asset (ETH)
+            if let Some(acc) = db_after.accounts.get(&self.protocol_address) {
+                let eth_threshold = self.token_thresholds.get(&Address::ZERO).cloned().unwrap_or(U256::ZERO);
+                if acc.info.balance < eth_threshold {
+                    return Some(VulnType::InvariantViolation("Protocol ETH Insolvency".into()));
+                }
+            }
+
+            // 2. Check ERC20 Assets via Storage Inference
+            for (token_addr, threshold) in &self.token_thresholds {
+                if *token_addr == Address::ZERO { continue; }
+                
+                if let Some(token_acc) = db_after.accounts.get(token_addr) {
+                    // Resolve the storage slot for balances[protocol_address]
+                    // Logic: Search waypoints for a derivation where key == protocol_address
+                    let target_slot = self.find_balance_slot(token_addr, &after.waypoints);
+                    
+                    if let Some(slot) = target_slot {
+                        let balance = token_acc.storage.get(&slot).cloned().unwrap_or(U256::ZERO);
+                        if balance < *threshold {
+                            return Some(VulnType::InvariantViolation(format!("Insolvent in token {}", token_addr)));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+impl SolvencyOracle {
+    fn find_balance_slot(&self, _token: &Address, waypoints: &[Waypoint]) -> Option<U256> {
+        for waypoint in waypoints {
+            if let Waypoint::MappingDerivation { key, derived_slot, .. } = waypoint {
+                if key.to::<Address>() == self.protocol_address {
+                    return Some(U256::from_be_bytes(derived_slot.0));
                 }
             }
         }
