@@ -1,9 +1,8 @@
 use crate::common::types::{SingletonTx, ChainState};
 use revm::primitives::SpecId;
-use revm::inspector_handle_register;
+use revm::{inspector_handle_register, DatabaseCommit};
 use crate::evm::inspector::CoverageInspector;
 use bitvec::prelude::*;
-use revm::DatabaseCommit;
 
 pub struct EvmExecutor {}
 
@@ -11,8 +10,8 @@ impl EvmExecutor {
     pub fn new() -> Self { EvmExecutor {} }
 
     pub fn execute(
-        &self, 
-        chain_state: &mut ChainState, 
+        &self,
+        chain_state: &mut ChainState,
         block_env: &mut revm::primitives::BlockEnv,
         tx: &SingletonTx,
         coverage: &mut [u8],
@@ -24,7 +23,7 @@ impl EvmExecutor {
             ChainState::Evm(state) => state,
         };
 
-        let mut inspector = CoverageInspector::new(coverage, dataflow, waypoints);
+        let mut inspector = CoverageInspector::new(coverage, dataflow, waypoints, _tx_idx);
 
         let mut evm = revm::Evm::builder()
             .with_db(revm_state)
@@ -35,18 +34,12 @@ impl EvmExecutor {
             .append_handler_register(inspector_handle_register)
             .build();
 
-        // Execute the transaction
         let result = evm.transact().map_err(|e| anyhow::anyhow!("EVM Execution Error: {:?}", e))?;
-        
-        // Only commit the state to the DB if the transaction didn't hit a fatal system error.
-        // Reverts (ExitKind::Revert) are committed so the fuzzer can explore error-handling branches.
+
         if !result.result.is_halt() {
             evm.context.evm.db.commit(result.state);
-        } else {
-            anyhow::bail!("EVM Halt: {:?}", result.result);
         }
 
-        let gas_used = result.result.gas_used();
-        Ok(gas_used)
+        Ok(result.result.gas_used())
     }
 }

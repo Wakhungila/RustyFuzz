@@ -30,15 +30,6 @@ libafl_bolts = "0.13.2"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EVM STACK  (feature = "evm")
-#
-# Using [dependencies.X] table syntax — valid TOML 1.0.
-# Inline { } multi-line tables are TOML 1.1 only. Cargo uses TOML 1.0.
-#
-# revm 25.0.0 confirmed features (verified from crates.io):
-#   std, serde, memory_limit, secp256k1, portable — all exist.
-# revm default features include: secp256k1, portable, c-kzg, blst, tracer.
-# With default-features = false we disable all, then re-add only what we need.
-# Omitting c-kzg and blst removes heavy C deps. Add back if you need EIP-4844.
 # ─────────────────────────────────────────────────────────────────────────────
 [dependencies.revm]
 version          = "25"
@@ -86,19 +77,20 @@ optional = true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SVM STACK  (feature = "svm")
-# Exact-pinned to =2.0.18 — mollusk-svm 0.0.10 was published against 2.0.x.
+# Pins removed — let Cargo resolve a compatible solana-sdk version that
+# satisfies mollusk-svm 0.0.10's ^2.1 requirement.
 # DO NOT enable evm + svm in the same binary.
 # ─────────────────────────────────────────────────────────────────────────────
 [dependencies.solana-sdk]
-version  = "=2.0.18"
+version  = "^2.1"
 optional = true
 
 [dependencies.solana-client]
-version  = "=2.0.18"
+version  = "^2.1"
 optional = true
 
 [dependencies.solana-rpc-client-api]
-version  = "=2.0.18"
+version  = "^2.1"
 optional = true
 
 [dependencies.mollusk-svm]
@@ -121,7 +113,7 @@ features = ["full"]
 version = "0.1"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI  — clap "4.6" does not exist. "4" resolves to latest 4.x safely.
+# CLI
 # ─────────────────────────────────────────────────────────────────────────────
 [dependencies.clap]
 version  = "4"
@@ -139,7 +131,6 @@ features = ["env-filter"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SERIALIZATION
-# Removed bincode — redundant with postcard.
 # ─────────────────────────────────────────────────────────────────────────────
 [dependencies.serde]
 version  = "1"

@@ -5,6 +5,7 @@ pub mod fuzz;
 pub mod inspector;
 #[cfg(feature = "sgx")]
 pub mod sgx_executor;
+
 pub mod registry;
 pub mod dataflow;
 pub mod seed_ingester;
