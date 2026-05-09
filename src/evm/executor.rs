@@ -13,13 +13,15 @@ impl EvmExecutor {
         &self, 
         chain_state: &mut ChainState, 
         tx: &SingletonTx,
-        coverage: &mut BitSlice<u8, Lsb0>
+        coverage: &mut BitSlice<u8, Lsb0>,
+        dataflow: &mut crate::evm::dataflow::DataflowRegistry,
+        waypoints: &mut Vec<crate::common::types::Waypoint>,
     ) -> anyhow::Result<()> {
         let revm_state = match chain_state {
             ChainState::Evm(state) => state,
         };
 
-        let mut inspector = CoverageInspector::new(coverage);
+        let mut inspector = CoverageInspector::new(coverage, dataflow, waypoints);
 
         let mut evm = revm::Evm::builder()
             .with_db(revm_state)

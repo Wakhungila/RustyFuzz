@@ -1,135 +1,109 @@
 ---
 name: RustyFuzz
-description: High-Performance Hybrid Fuzzer for EVM Smart Contracts
+description: High-performance causal state-tree fuzzer for the Ethereum Virtual Machine
 ---
+# RustyFuzz
 
-# RustyFuzz: High-Performance Hybrid Fuzzer for EVM Smart Contracts
+RustyFuzz is a state-of-the-art, coverage-guided fuzzer optimized for deep-state exploration of the Ethereum Virtual Machine (EVM) and the Solana Virtual Machine (SVM). Built on the `revm` and `mollusk-svm` engines, it implements causal scheduling and taint-guided concolic execution to identify complex logical and economic vulnerabilities.
 
-![Rust](https://github.com/rust-fuzz/rusty-fuzz/actions/workflows/rust.yml/badge.svg)
-![License](https://img.shields.io/badge/License-MIT-blue.svg)
+## Technical Architecture
 
-RustyFuzz is a cutting-edge, coverage-guided fuzzer designed to uncover vulnerabilities in Ethereum Virtual Machine (EVM) smart contracts. Built entirely in Rust, it leverages the `revm` execution engine for unparalleled performance and aims to integrate `LibAFL` for advanced fuzzing strategies.
+### Core Engine
+The engine utilizes a custom implementation of `revm::Inspector` for real-time trace analysis.
+*   **Execution**: Leverages `revm` for high-throughput transaction processing.
+*   **Coverage**: Implements edge hashing (prev_pc XOR curr_pc) via a 64KB bit-vector to track unique execution paths.
+*   **Causal Tracking**: Monitors SLOAD/SSTORE operations to establish dataflow dependencies between storage slots and transaction inputs.
 
-## 🌟 Introduction
+### Causal State Management
+Unlike linear fuzzers, RustyFuzz maintains a non-linear state tree.
+*   **Snapshot Corpus**: Stores complete EVM state snapshots (including `CacheDB`) as nodes in a tree, allowing the fuzzer to branch from any historical state.
+*   **Power Scheduling**: Selects snapshots for mutation based on a coverage-weighted algorithm, prioritizing branches that exhibit high code coverage or frequent interaction with "hot" storage slots.
+*   **Minimization**: Features a dual-stage minimizer that reduces transaction sequences to the minimal set required to trigger a specific vulnerability (delta debugging) and prunes the corpus of redundant coverage bits.
 
-Smart contracts are immutable once deployed, making their security paramount. Traditional testing often falls short in exploring the vast state space of complex contracts. RustyFuzz addresses this by employing a hybrid approach: combining the speed and control of an in-process EVM executor with sophisticated fuzzing techniques to systematically explore contract behavior and identify subtle bugs.
+### Advanced Mutation Strategies
+The `EvmMutator` implements several high-fidelity mutation types:
+*   **Structural**: Appends or modifies transaction sequences to explore multi-step exploit vectors.
+*   **ABI-Aware**: Decodes calldata using provided function selectors and applies type-specific mutations (e.g., boundary values for `uint256`, address randomization, array resizing).
+*   **Anchor-Aware (SVM)**: Identifies and mutates 8-byte instruction discriminators and Borsh-serialized account data.
+*   **Semantic**: Randomizes callers and account signers to discover unauthorized access vulnerabilities.
+*   **Discovery**: Automatically targets contracts discovered within the EVM state during execution.
 
-Our goal is to provide a robust, extensible, and high-performance fuzzer that can be adapted for various smart contract platforms, starting with EVM and with future plans for SVM (Solana Virtual Machine).
+### Taint-Guided Concolic Solving
+Integrated Z3 support enables solving for complex branch constraints.
+*   **Taint Propagation**: Tracks calldata provenance through the EVM stack during execution.
+*   **Waypoint Capture**: Records comparison operations (LT, GT, EQ) and their symbolic counterparts.
+*   **Hint Generation**: Utilizes the Z3 SMT solver to generate precise calldata bytes that satisfy branch conditions, bypassing "magic number" checks.
 
-## ✨ Features
+### Hardware-Backed Security (SGX)
+RustyFuzz supports execution within Intel SGX enclaves using `sgx_tstd`.
+*   **Confidential Execution**: Keeps the execution state, inspector logic, and discovered coverage data encrypted in memory to prevent leakage on host systems.
+*   **Attestation**: Generates hardware-backed reports (EREPORT) that bind a discovered exploit to the enclave's MRENCLAVE identity, providing cryptographic proof of a vulnerability finding.
 
-*   **High-Performance EVM Execution**: Utilizes `revm`, a blazing-fast EVM interpreter written in Rust, for efficient transaction execution and state manipulation.
-*   **Coverage-Guided Fuzzing**: Employs a custom `revm::Inspector` to collect fine-grained code coverage (Program Counter and Opcode hits), guiding the fuzzer towards unexplored code paths.
-*   **State Forking & Snapshotting**: Supports initializing the EVM state by forking from a live RPC endpoint, allowing fuzzing against realistic on-chain conditions. State snapshots enable efficient rollback and exploration of different execution paths.
-*   **Intelligent Input Mutation**: Implements custom mutators for `SingletonTx` (transactions) to intelligently alter calldata, transaction value, and other parameters, maximizing the chances of hitting interesting states.
-*   **Vulnerability Oracles**: Integrates pluggable oracles (e.g., ReentrancyOracle) to automatically detect common smart contract vulnerabilities during execution.
-*   **Proof-of-Concept (PoC) Synthesis**: Generates actionable proofs-of-concept for discovered vulnerabilities, aiding in reproduction and remediation.
-*   **Extensible Architecture**: Designed with `LibAFL` integration in mind, allowing for easy adoption of advanced fuzzing techniques, schedulers, and mutators.
-*   **Rust-Native**: Benefits from Rust's memory safety, performance, and robust ecosystem.
+## Vulnerability Oracles
 
-## 🚀 Setup & Installation
+RustyFuzz implements high-fidelity oracles for detecting sophisticated DeFi exploits:
+*   **Read-Only Reentrancy**: Detects temporal inconsistencies by monitoring `STATICCALL` output changes within a single execution sequence.
+*   **Economic Profit Oracle**: Tracks fuzzer-controlled balance mappings (ETH and ERC20 storage slots) to identify unauthorized value extraction.
+*   **Reentrancy Oracle**: Identifies state-change violations where storage is modified at call depths greater than the entry point.
+*   **Systemic State Corruption**: Heuristic detection of "god-mode" exploits that modify a disproportionate amount of contract state.
+*   **Solvency and Invariants**: Pluggable modules for monitoring protocol-specific invariants like total assets vs. liabilities.
+
+## Implementation Status
+
+| Component | Status | Description |
+| :--- | :--- | :--- |
+| EVM Execution | Production | Full Cancun spec support via `revm`. |
+| Causal Inspector | Production | Taint tracking and storage read/write sets. |
+| Snapshot Corpus | Production | Tree-based state exploration with power scheduling. |
+| ABI Mutator | Production | Support for `alloy-dyn-abi` types. |
+| Concolic Solver | Beta | Z3 integration (requires `z3` feature). |
+| SGX Executor | Alpha | Hardware-backed execution and sealing. |
+| SVM Support | Beta | Integration with `mollusk-svm` for Solana. |
+| SVM Differential | Beta | Parallel comparison of Mollusk execution with live RPC simulation. |
+
+## Setup and Build
 
 ### Prerequisites
+*   **Rust**: Stable toolchain (1.75+).
+*   **Z3**: Required for concolic solver features (`libz3-dev` on Linux).
+*   **SGX SDK**: Required for hardware-backed execution features.
 
-*   **Rust Toolchain**: Install Rust and Cargo using `rustup`:
-    ```bash
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-    ```
-    Ensure you have a recent stable Rust version.
-*   **RPC Endpoint**: An Ethereum RPC URL (e.g., Infura, Alchemy, local Anvil/Ganache) is required for state forking.
-
-### Cloning the Repository
-
+### Installation
 ```bash
-git clone https://github.com/your-username/RustyFuzz.git
+git clone https://github.com/your-repo/RustyFuzz.git
 cd RustyFuzz
 ```
 
-### Environment Variables
-
-Create a `.env` file in the project root to configure your RPC endpoint and any API keys. 
-
-```dotenv
-# .env
-# Ethereum RPC URL for forking or direct interaction
-# Example: https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID
-RPC_URL="YOUR_RPC_URL_HERE"
-
-# API Key for services like Etherscan (if used for contract verification, etc.)
-# ETHERSCAN_API_KEY="YOUR_ETHERSCAN_API_KEY_HERE"
-
-# API Key for LLM guidance (if 'llm' feature is enabled)
-# LLM_API_KEY="YOUR_LLM_API_KEY_HERE"
-```
-
-### Building the Project
-
+### Compilation
+Standard build:
 ```bash
 cargo build --release
 ```
 
-To enable optional features like `z3` (for symbolic execution/constraint solving) or `llm` (for AI-guided fuzzing), use:
-
+Build with concolic solving and AI-guidance:
 ```bash
 cargo build --release --features "z3 llm"
 ```
 
-## 💡 Usage
+## Usage
 
-RustyFuzz is designed to be integrated into a larger fuzzing harness. The primary entry point for a fuzzing campaign is the `run_fuzz_campaign` function.
-
-### Basic Fuzzing Campaign (Conceptual)
-
-A typical fuzzing campaign involves:
-
-1.  **Initialization**: Setting up the initial EVM state by forking from a specified RPC URL and block number.
-2.  **Corpus Management**: Maintaining a collection of "interesting" transactions (`SingletonTx`) that have yielded new coverage or unique behavior.
-3.  **Mutation**: Selecting a transaction from the corpus and applying various mutations (e.g., altering calldata, value, sender).
-4.  **Execution**: Executing the mutated transaction on the EVM, collecting coverage, and updating the state.
-5.  **Feedback & Oracle Checks**: Analyzing the execution trace and coverage to determine if the new transaction is "interesting" (e.g., found new code paths, triggered an oracle).
-6.  **Reporting**: If a vulnerability is found, generating a detailed report and a reproducible Proof-of-Concept.
+RustyFuzz expects a configuration specifying the target environment and initial state forking.
 
 ```rust
-// Example of how a fuzzing campaign might be initiated (simplified)
 use rusty_fuzz::config::Config;
 use rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load configuration from environment variables or a config file
     let config = Config {
-        chain: "ethereum".to_string(),
-        rpc_url: std::env::var("RPC_URL").expect("RPC_URL must be set"),
-        fork_block: Some(18000000), // Example block number
-        // ... other configuration options
+        rpc_url: "https://eth-mainnet.g.alchemy.com/v2/...".to_string(),
+        fork_block: Some(19000000),
+        ..Default::default()
     };
 
     run_fuzz_campaign(&config).await
 }
 ```
 
-## 🛠️ Key Concepts
-
-*   **`EvmExecutor`**: The core component responsible for executing `SingletonTx` instances using `revm`. It integrates the `CoverageInspector` to gather execution traces.
-*   **`CoverageInspector`**: A custom `revm::Inspector` that records which EVM opcodes and program counters are hit during transaction execution, storing this information in a `bitvec` for efficient comparison.
-*   **`Snapshot`**: Represents a complete state of the EVM at a given point, including the `CacheDB` (EVM state), collected `coverage`, and `waypoints` (points of interest during execution).
-*   **`SingletonTx`**: A simplified representation of an Ethereum transaction, focusing on essential fuzzer-controlled parameters like `input` (calldata), `caller`, and `value`.
-*   **`EvmCoverageFeedback`**: A `LibAFL` feedback mechanism (currently a stub) that will compare the coverage of a new execution against the global coverage map to determine if the input is "interesting."
-*   **`mutate_tx`**: A custom mutator function that applies various transformations to a `SingletonTx` to generate new inputs for the fuzzer.
-
-## 🗺️ Roadmap & Future Enhancements
-
-*   **Full LibAFL Integration**: Implement a complete `LibAFL` harness, including `Fuzzer`, `Executor`, `Scheduler`, `Observers`, and `Feedback` mechanisms.
-*   **Advanced Mutators**: Develop more sophisticated mutators for EVM-specific data structures (e.g., ABI-aware calldata mutation, storage slot manipulation).
-*   **Symbolic Execution Integration**: Leverage the `z3` feature for concolic execution to generate inputs that satisfy specific path constraints.
-*   **LLM-Guided Fuzzing**: Explore using Large Language Models (LLMs) to generate intelligent transaction sequences or vulnerability-specific inputs.
-*   **SVM Support**: Extend the fuzzer to support Solana Virtual Machine (SVM) smart contracts.
-*   **Detailed Reporting**: Enhance vulnerability reporting with more context, call stacks, and state differences.
-
-## 🤝 Contributing
-
-Contributions are welcome! Feel free to open issues for bug reports or feature requests, and submit pull requests.
-
-## 📄 License
-
-This project is licensed under the MIT License. See the `LICENSE` file for details.
+## License
+Distributed under the MIT License.

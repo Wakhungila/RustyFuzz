@@ -1,3 +1,5 @@
 pub mod fuzz_engine;
 pub mod exploit_synthesizer;
 pub mod mitigation;
+pub mod minimizer;
+pub mod corpus_minimizer;

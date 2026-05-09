@@ -32,6 +32,17 @@ parking_lot = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
 url = "2.5"
 
+hashlink = "0.9"
+rayon = "1.10"
+borsh = { version = "1.5", features = ["derive"] }
+solana-sdk = "1.18"
+solana-client = "1.18"
+solana-rpc-client-api = "1.18"
+mollusk-svm = "0.0.1"
+aes-gcm-siv = "0.11"
+sgx_types = "2.0"
+sha2 = "0.10" # Added for SVM differential fuzzer
+
 z3 = { version = "0.12", optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 

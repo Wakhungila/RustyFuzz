@@ -1,15 +1,23 @@
-use alloy::providers::ProviderBuilder;
-use revm::db::{CacheDB, EmptyDB};
+use alloy::providers::{Provider, ProviderBuilder, RootProvider};
+use alloy::transports::http::Http;
+use revm::db::{CacheDB, EmptyDB, alloydb::AlloyDB};
 use url::Url;
+use reqwest::Client;
+use revm::primitives::BlockEnv;
 
-pub async fn create_fork_db(rpc_url: &str, block: Option<u64>) -> anyhow::Result<CacheDB<EmptyDB>> {
+pub async fn create_fork_db(rpc_url: &str, block_number: Option<u64>) -> anyhow::Result<CacheDB<AlloyDB<Http<Client>, EmptyDB, RootProvider<Http<Client>>>>> {
     let url: Url = rpc_url.parse()?;
-    let _provider = ProviderBuilder::new().connect_http(url);
-
-    // In a production fuzzer, you would use AlloyDB here to 
-    // bridge CacheDB with the RPC provider.
-    let mut db = CacheDB::new(EmptyDB::default());
+    let provider = ProviderBuilder::new().on_http(url);
     
-    // Logic to wrap the provider into a revm-compatible Database backend goes here
-    Ok(db)
+    let block_id = match block_number {
+        Some(n) => alloy::eips::BlockId::number(n),
+        None => alloy::eips::BlockId::latest(),
+    };
+
+    // AlloyDB provides a Database implementation for revm that fetches
+    // state from a remote RPC on-demand (SSTORE/SLOAD).
+    let alloy_db = AlloyDB::new(provider, block_id).unwrap();
+    let cache_db = CacheDB::new(alloy_db);
+    
+    Ok(cache_db)
 }

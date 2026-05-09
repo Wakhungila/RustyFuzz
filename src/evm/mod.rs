@@ -3,3 +3,6 @@ pub mod fork;
 pub mod snapshot;
 pub mod fuzz;
 pub mod inspector;
+pub mod sgx_executor;
+pub mod registry;
+pub mod dataflow;
