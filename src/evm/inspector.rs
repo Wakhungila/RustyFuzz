@@ -147,6 +147,17 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
         self.last_pc = pc;
     }
 
+    fn call(&mut self, _context: &mut EvmContext<'_, DB>, inputs: &mut CallInputs) -> Option<CallOutcome> {
+        // P0 Target: Arbitrary Call Injection
+        // If the CALL target was derived from calldata (tainted), a malicious actor
+        // can redirect protocol flow to their own contract.
+        let target_tainted = self.taint_stack.iter().rev().nth(0).cloned().flatten().is_some();
+        if target_tainted {
+            // Log a high-severity waypoint for the ArbitraryCallOracle
+        }
+        None
+    }
+
     fn call_end(&mut self, _context: &mut EvmContext<'_, DB>, inputs: &CallInputs, outcome: CallOutcome) -> CallOutcome {
         // Read-only reentrancy typically involves a staticcall returning inconsistent state.
         // We record the outcome of all staticcalls to check for divergences later.

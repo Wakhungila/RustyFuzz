@@ -135,7 +135,7 @@ where
                     Ok(MutationResult::Skipped)
                 }
             }
-            46..=70 => {
+            46..=60 => {
                 // Account Layout: Swap accounts within an instruction to test authorization bypasses
                 let idx = rand.below(input.instructions.len() as u64) as usize;
                 let accounts = &mut input.instructions[idx].accounts;
@@ -155,6 +155,14 @@ where
                 } else {
                     Ok(MutationResult::Skipped)
                 }
+            }
+            61..=70 => {
+                // Account Substitution: Replace the program ID of a random instruction 
+                // with a unique Pubkey (simulating a fuzzer-controlled malicious program).
+                // This targets bugs like "Arbitrary CPI" or "Wormhole guardian spoofing".
+                let idx = rand.below(input.instructions.len() as u64) as usize;
+                input.instructions[idx].program_id = Pubkey::new_unique();
+                Ok(MutationResult::Mutated)
             }
             _ => {
                 // Data Layout: Mutate instruction data (opcodes, discriminators, and parameters)

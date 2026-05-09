@@ -13,6 +13,7 @@ pub enum VulnType {
     FlashLoanProfit,
     IntegerOverflow,
     ReadOnlyReentrancy,
+    PrivilegeEscalation,
     UniswapV3LiquidityAsymmetry,
     PriceOracleManipulation,
     SystemicStateCorruption,
@@ -309,6 +310,49 @@ impl VulnerabilityOracle for SolvencyOracle {
             }
         }
         None
+    }
+}
+
+/// AccessControlOracle: Detects if the fuzzer managed to set itself as an owner or admin.
+/// This targets Parity-style uninitialized ownership and Proxy Admin hijacks.
+pub struct AccessControlOracle {
+    pub fuzzer_address: Address,
+}
+
+impl VulnerabilityOracle for AccessControlOracle {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        let state = after.state.read();
+        let fuzzer_bytes = B256::from_slice(&self.address_to_32bytes(self.fuzzer_address));
+
+        if let ChainState::Evm(db) = &*state {
+            for (_addr, acc) in &db.accounts {
+                for (slot, value) in &acc.storage {
+                    if B256::from(value.to_be_bytes::<32>()) == fuzzer_bytes {
+                        // Verify if the write to this specific slot was influenced by user-controlled input (tainted)
+                        let slot_bytes = slot.to_be_bytes::<32>();
+                        if after.waypoints.iter().any(|w| {
+                            if let Waypoint::Dataflow { slot: s, influenced } = w {
+                                s == &slot_bytes && *influenced
+                            } else {
+                                false
+                            }
+                        }) {
+                            log::error!("CRITICAL: Privilege Escalation detected at address {}/slot {}", _addr, slot);
+                            return Some(VulnType::PrivilegeEscalation);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+impl AccessControlOracle {
+    fn address_to_32bytes(&self, addr: Address) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[12..32].copy_from_slice(addr.as_slice());
+        b
     }
 }
 

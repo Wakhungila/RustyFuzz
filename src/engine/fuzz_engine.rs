@@ -6,6 +6,7 @@ use crate::common::oracle::{VulnerabilityOracle, ReentrancyOracle, ProfitOracle,
 use crate::engine::exploit_synthesizer::synthesize_poc;
 use crate::evm::fuzz::{EvmInput, EvmMutator, AbiRegistry};
 use crate::evm::sgx_executor::SgxExecutor;
+use crate::evm::seed_ingester::SeedIngester;
 use crate::evm::corpus::SnapshotCorpus;
 use crate::evm::registry::GlobalAccountRegistry;
 use crate::evm::dataflow::DataflowRegistry;
@@ -30,17 +31,48 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
     // For brevity, we demonstrate the multi-threaded coordination logic here.
     let mut snapshot_corpus = Arc::new(RwLock::new(SnapshotCorpus::new()));
     let mut rand = StdRand::with_seed(0);
+    let mut dataflow_registry = DataflowRegistry::new();
+    let evm_executor = EvmExecutor::new();
 
-    // 1. Create initial state from fork
-    let initial_cache_db = create_fork_db(&config.rpc_url, config.fork_block).await?;
-    let initial_chain_state = ChainState::Evm(initial_cache_db.clone()); 
+    // 1. Create initial state and block environment from fork
+    let mut initial_cache_db = create_fork_db(&config.rpc_url, config.fork_block).await?;
     let initial_block_env = create_fork_block_env(&config.rpc_url, config.fork_block).await?;
+    
+    // 2. High-Fidelity Bootstrapping: Ingest mainnet seeds
+    let provider = alloy::providers::ProviderBuilder::new().on_http(config.rpc_url.parse()?);
+    let ingester = SeedIngester::new(provider);
+    let target_contract = Address::from_slice(&[0xaa; 20]); // Target protocol
+    let initial_seeds = ingester.ingest_from_target(target_contract, 50).await.unwrap_or_default();
+
     {
         let mut corpus = snapshot_corpus.write();
-        corpus.add_snapshot(0, 0, crate::evm::snapshot::new_evm_snapshot(0, initial_cache_db, None));
-    }
+        // Add root snapshot
+        corpus.add_snapshot(0, 0, crate::evm::snapshot::new_evm_snapshot(0, initial_cache_db.clone()));
 
-    let evm_executor = EvmExecutor::new();
+        // Execute initial seeds to warm up the corpus with realistic states
+        let mut id_counter = 1;
+        for seed in initial_seeds {
+            let mut warm_state = ChainState::Evm(initial_cache_db.clone());
+            let mut warm_env = initial_block_env.clone();
+            let mut coverage = bitvec![u8, Lsb0; 0; 65536];
+            let mut waypoints = Vec::new();
+            
+            if let Ok(gas) = evm_executor.execute(&mut warm_state, &seed.txs[0], coverage.as_mut_bitslice(), &mut dataflow_registry, &mut waypoints) {
+                let snap = Snapshot {
+                    id: id_counter,
+                    state: Arc::new(RwLock::new(warm_state)),
+                    coverage,
+                    producing_input: Some(seed),
+                    waypoints,
+                    depth: 1,
+                    gas_used: gas,
+                };
+                corpus.add_snapshot(id_counter, 0, snap);
+                id_counter += 1;
+            }
+        }
+    }
+    
     let sgx_executor = SgxExecutor::new(0); // Hardware enclave instance
     let abi_registry = Arc::new(AbiRegistry::default());
     let account_registry = Arc::new(RwLock::new(GlobalAccountRegistry::default()));

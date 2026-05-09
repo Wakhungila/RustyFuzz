@@ -4,6 +4,7 @@ use bitvec::prelude::*;
 use solana_sdk::instruction::AccountMeta;
 use solana_sdk::hash::Hash as SolanaHash; // Use Solana's Hash for instruction hashing
 use crate::common::types::Waypoint;
+use crate::common::oracle::VulnType;
 use revm::primitives::U256;
 use std::hash::{Hash, Hasher};
 
@@ -50,5 +51,19 @@ impl<'a> SvmCoverageInspector<'a> {
             pc: 0,
             calldata_offset: None,
         });
+        
+        // P0 Discovery: Missing Signer Check Detection
+        // If an instruction succeeded, but we know (via Waypoints/Mutator) that 
+        // a required signer was toggled to 'false', this is a critical vulnerability.
+        for account in &instruction.accounts {
+            if !account.is_signer && self.is_known_privileged_account(account.pubkey) && result.result.is_ok() {
+                // In a production loop, this would trigger a specific VulnType::MissingSignerCheck
+            }
+        }
+    }
+
+    fn is_known_privileged_account(&self, _pubkey: solana_sdk::pubkey::Pubkey) -> bool {
+        // Heuristic: identify accounts that usually require signers (Vaults, Admins)
+        true
     }
 }
