@@ -2,7 +2,7 @@ use revm::{
     interpreter::{Interpreter, CallInputs, CallOutcome, CallScheme, opcode},
     Database, Inspector, EvmContext,
 };
-use bitvec::prelude::{BitSlice, Lsb0};
+use bitvec::prelude::{BitSlice, Lsb0}; // Keep for legacy snapshots if needed
 use crate::evm::dataflow::DataflowRegistry;
 use crate::common::types::{Waypoint, TaintSource};
 use revm::primitives::{U256, B256, Address};
@@ -10,11 +10,11 @@ use std::collections::{HashSet, HashMap};
 
 /// Industry standard: Use a fixed-size map for coverage to allow
 /// JIT-like performance and SIMD-optimized comparisons in the feedback loop.
-pub const MAP_SIZE: usize = 65536;
+pub const MAP_SIZE: usize = 262144; // Increased to 256KB to reduce collisions (Honggfuzz-style precision)
 
 #[derive(Debug)]
 pub struct CoverageInspector<'a> {
-    pub coverage: &'a mut BitSlice<u8, Lsb0>,
+    pub coverage: &'a mut [u8], // Move to hitcounts
     pub dataflow: &'a mut DataflowRegistry,
     pub waypoints: &'a mut Vec<Waypoint>,
     pub taint_stack: Vec<Option<TaintSource>>, // Mirror stack: stores taint source
@@ -22,14 +22,17 @@ pub struct CoverageInspector<'a> {
     pub write_set: HashSet<(Address, B256)>,
     pub last_pc: usize,
     pub current_tx_idx: usize, // Index of the current transaction in the sequence
+    pub instruction_count: u64, // Virtual Performance Counter: total instructions
+    pub gas_consumed: u64,         // Virtual Performance Counter: total gas
     pub symbolic_storage_map: HashMap<(Address, B256), TaintSource>, // (addr, slot) -> TaintSource of value
     pub transient_taint_map: HashMap<(Address, B256), TaintSource>, // EIP-1153 support
     pub memory_taint: HashMap<usize, TaintSource>, // offset -> TaintSource
+    pub known_initialized_slots: HashSet<(Address, B256)>, // Track slots written in current or previous TXs
 }
 
 impl<'a> CoverageInspector<'a> {
     pub fn new(
-        coverage: &'a mut BitSlice<u8, Lsb0>,
+        coverage: &'a mut [u8],
         dataflow: &'a mut DataflowRegistry,
         waypoints: &'a mut Vec<Waypoint>,
         current_tx_idx: usize,
@@ -40,9 +43,12 @@ impl<'a> CoverageInspector<'a> {
             read_set: HashSet::new(), write_set: HashSet::new(),
             last_pc: 0,
             current_tx_idx,
+            instruction_count: 0,
+            gas_consumed: 0,
             symbolic_storage_map: HashMap::new(),
             transient_taint_map: HashMap::new(),
             memory_taint: HashMap::new(),
+            known_initialized_slots: HashSet::new(),
         }
     }
 }
@@ -147,22 +153,34 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
             }
         }
 
-        // Industry standard: Use edge hashing (prev_pc XOR curr_pc)
+        // Precision Edge Hashing: mimicking hardware-level branch tracking
         if opcode == 0x56 || opcode == 0x57 {
-            let edge_hash = (pc ^ (self.last_pc >> 1)) % self.coverage.len();
+            // Better entropy for the hash to further reduce collisions
+            let edge_hash = (pc ^ (self.last_pc.wrapping_rotate_left(1))) % MAP_SIZE;
             
-            // Instead of just setting a bit, we increment a hitcount (represented as 1 in bitvec for now)
-            // In a production fuzzer, use a [u8; MAP_SIZE] for hitcounts
-            if !self.coverage.get(edge_hash).unwrap() {
-                self.coverage.set(edge_hash, true);
-            }
+            // Increment hitcount. Standard AFL/Honggfuzz bucket strategy (1, 2, 4, 8, 16...) 
+            // is usually applied in the feedback loop, but we increment here.
+            self.coverage[edge_hash] = self.coverage[edge_hash].saturating_add(1);
         }
+
+        // Virtual Performance Counters: Track metrics that signal "interesting" inputs
+        self.instruction_count += 1;
+        // Note: Real gas per opcode is available in context/interp depending on the step
 
         // Causal Tracking: Monitor SLOAD (0x54) and SSTORE (0x55)
         if opcode == 0x54 || opcode == 0x55 {
             if let Ok(slot_val) = interp.stack.peek(0) {
                 let addr = interp.contract.address;
                 let slot = B256::from(slot_val.to_be_bytes::<32>());
+
+                // Logic Sanitizer: Detect Uninitialized Storage Reads
+                // If a slot is read before being written to in the protocol lifecycle,
+                // it might indicate a missing initializer or an uninitialized state bug.
+                if !self.known_initialized_slots.contains(&(addr, slot)) {
+                    // Log a high-severity waypoint for uninitialized access
+                    self.waypoints.push(Waypoint::Dataflow { address: addr, slot: slot.to_vec(), influenced: false });
+                }
+
                 if opcode == 0x54 {
                     self.read_set.insert((addr, slot));
                 } else {
@@ -184,6 +202,8 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
                 let slot = B256::from(slot_val.to_be_bytes::<32>());
 
                 self.dataflow.mark_influenced(address, slot);
+                // Mark this slot as initialized for the logic sanitizer
+                self.known_initialized_slots.insert((address, slot));
 
                 // If the value being stored is tainted, convert its source to a 
                 // persistent Storage source so subsequent reads know which TX produced it.

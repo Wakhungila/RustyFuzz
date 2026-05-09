@@ -58,20 +58,27 @@ impl VulnerabilityOracle for StaleViewOracle {
     fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         // Map of (target, calldata) -> output
         let mut observed_outputs: HashMap<(Address, Vec<u8>), Vec<u8>> = HashMap::new();
+        let mut state_changed = false;
 
         for waypoint in &after.waypoints {
-            if let Waypoint::StaticCall { target, data, output, .. } = waypoint {
-                let key = (Address::from_slice(target.as_slice()), data.clone());
-                
-                if let Some(previous_output) = observed_outputs.get(&key) {
-                    // If the same view function returned a different value 
-                    // in the same transaction sequence, the state is inconsistent.
-                    if previous_output != output {
-                        return Some(VulnType::ReadOnlyReentrancy);
-                    }
+            match waypoint {
+                Waypoint::StorageWrite { .. } | Waypoint::TransientStorageWrite { .. } => {
+                    state_changed = true;
                 }
-                
-                observed_outputs.insert(key, output.clone());
+                Waypoint::StaticCall { target, data, output, .. } => {
+                    let key = (Address::from_slice(target.as_slice()), data.clone());
+                    
+                    if let Some(previous_output) = observed_outputs.get(&key) {
+                        // P0 Target: If the view output changes and we know state was 
+                        // modified in between, this is a confirmed Read-Only Reentrancy bug.
+                        if previous_output != output && state_changed {
+                            log::error!("CRITICAL: Read-Only Reentrancy detected in sequence at target {}", key.0);
+                            return Some(VulnType::ReadOnlyReentrancy);
+                        }
+                    }
+                    observed_outputs.insert(key, output.clone());
+                }
+                _ => {}
             }
         }
 

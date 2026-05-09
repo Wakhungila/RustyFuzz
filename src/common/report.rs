@@ -24,6 +24,7 @@ pub struct EvidenceChain {
     pub storage_diffs: Vec<StorageDiff>,
     pub gas_estimate: u64,
     pub poc_file: String,
+    pub dedupe_hash: String, // Fingerprint for automated triage
     pub timestamp: String,
 }
 
@@ -40,6 +41,13 @@ pub fn generate_finding_report(
     let timestamp = Utc::now().to_rfc3339();
     let label = scoring_engine.get_label(score);
     
+    // Generate a dedupe hash based on the vulnerability type and the 
+    // last 5 waypoints (execution context). This ensures unique bugs are 
+    // grouped together regardless of the specific input values.
+    let context_data: Vec<u8> = after.waypoints.iter().rev().take(5)
+        .flat_map(|w| postcard::to_allocvec(w).unwrap_or_default()).collect();
+    let dedupe_hash = format!("0x{:x}", keccak256(&[format!("{:?}", vuln).as_bytes(), &context_data].concat()));
+
     // 1. Extract Minimal Transaction Sequence
     let txs = after.producing_input.as_ref()
         .map(|i| i.txs.clone())
@@ -56,6 +64,7 @@ pub fn generate_finding_report(
         storage_diffs: storage_diffs.clone(),
         gas_estimate: after.gas_used,
         poc_file: poc_path.to_string(),
+        dedupe_hash,
         timestamp: timestamp.clone(),
     };
 

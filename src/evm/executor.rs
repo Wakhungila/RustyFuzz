@@ -15,7 +15,7 @@ impl EvmExecutor {
         chain_state: &mut ChainState, 
         block_env: &mut revm::primitives::BlockEnv,
         tx: &SingletonTx,
-        coverage: &mut BitSlice<u8, Lsb0>,
+        coverage: &mut [u8],
         dataflow: &mut crate::evm::dataflow::DataflowRegistry,
         waypoints: &mut Vec<crate::common::types::Waypoint>,
         _tx_idx: usize,
@@ -35,11 +35,18 @@ impl EvmExecutor {
             .append_handler_register(inspector_handle_register)
             .build();
 
-        let result = evm.transact()?;
-        evm.context.evm.db.commit(result.state);
+        // Execute the transaction
+        let result = evm.transact().map_err(|e| anyhow::anyhow!("EVM Execution Error: {:?}", e))?;
         
-        let gas_used = result.result.gas_used();
+        // Only commit the state to the DB if the transaction didn't hit a fatal system error.
+        // Reverts (ExitKind::Revert) are committed so the fuzzer can explore error-handling branches.
+        if !result.result.is_halt() {
+            evm.context.evm.db.commit(result.state);
+        } else {
+            anyhow::bail!("EVM Halt: {:?}", result.result);
+        }
 
+        let gas_used = result.result.gas_used();
         Ok(gas_used)
     }
 }
