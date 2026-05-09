@@ -42,7 +42,9 @@ impl SvmDifferentialFuzzer {
             )?;
 
             // 2. Execute via RPC simulation
-            let simulation_result = self.rpc_client.simulate_transaction(transaction)?;
+            // Construct a valid Solana transaction from the fuzzed instructions
+            let tx = Transaction::new_with_payer(&input.instructions, Some(&Pubkey::default()));
+            let simulation_result = self.rpc_client.simulate_transaction(&tx)?;
 
             if let Some(err) = simulation_result.value.err {
                 return Ok(Some(VulnType::DifferentialDivergence(format!(
@@ -54,7 +56,7 @@ impl SvmDifferentialFuzzer {
             if let Some(accounts) = simulation_result.value.accounts {
                 for (i, rpc_acc) in accounts.into_iter().enumerate() {
                     if let Some(rpc_acc) = rpc_acc { // RPC account data
-                        let pubkey = transaction.message.account_keys[i];
+                        let pubkey = tx.message.account_keys[i];
                         if let Some(local_acc) = local_state.accounts.get(&pubkey.to_bytes()) {
                             if local_acc.lamports != rpc_acc.lamports {
                                 return Ok(Some(VulnType::DifferentialDivergence(format!(

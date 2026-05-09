@@ -22,6 +22,7 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
 
     // Load sensitive configuration from .env
     dotenvy::dotenv().ok();
+    #[cfg(feature = "notifier")]
     let notifier = crate::common::notifier::DiscordNotifier::new();
 
     // For a fuzzer, we use LibAFL's Launcher to spawn processes/threads
@@ -117,6 +118,7 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
                             });
 
                             // Dispatch remote notification
+                            #[cfg(feature = "notifier")]
                             let _ = notifier.notify_discovery(&vuln_type, &after_snapshot, mrenclave.as_deref(), poc).await;
 
                             // Industry grade: Trigger the Minimizer to refine the sequence

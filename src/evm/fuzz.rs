@@ -111,7 +111,7 @@ where
                 input.txs.push(new_tx);
                 return Ok(MutationResult::Mutated);
             }
-            0..=15 => {
+            6..=15 => {
                 // Semantic Mutation: Change the caller to a privileged or malicious actor
                 let idx = rand.below(input.txs.len() as u64) as usize;
                 input.txs[idx].caller = Address::random();
@@ -134,22 +134,18 @@ where
                     selector.copy_from_slice(&tx.input[0..4]);
                     
                     // 1. Retrieve or build the tuple type from the type cache
-                    let tuple_type = {
-                        let cache = self.type_cache.read();
-                        cache.get(&selector).cloned()
-                    }.or_else(|| {
+                    let tuple_type = self.type_cache.read().get(&selector).cloned().or_else(|| {
                         self.abi_registry.functions.get(&selector).map(|types| {
                             let t = DynSolType::Tuple(types.clone());
                             self.type_cache.write().insert(selector, t.clone());
                             t
                         })
-                    };
+                    });
 
                     if let Some(tuple_type) = tuple_type {
                         let calldata = &tx.input[4..];
                         
                         // 2. Attempt to retrieve decoded value from LRU cache
-                        // We use a write lock because LruCache::get updates the access order
                         let mut decoded = self.decode_cache.write().get(calldata).cloned();
 
                         if decoded.is_none() {
