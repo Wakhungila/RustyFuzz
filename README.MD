@@ -1,11 +1,7 @@
----
-name: RustyFuzz
-description: High-Performance Hybrid Fuzzer for EVM Smart Contracts
----
 
 # RustyFuzz: High-Performance Hybrid Fuzzer for EVM Smart Contracts
 
-![Rust](https://sl1nk.com/wj1wwg8)
+![Rust](https://www.pinterest.com/pin/315603886389784971/)
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
 
 RustyFuzz is a cutting-edge, coverage-guided fuzzer designed to uncover vulnerabilities in Ethereum Virtual Machine (EVM) smart contracts. Built entirely in Rust, it leverages the `revm` execution engine for unparalleled performance and aims to integrate `LibAFL` for advanced fuzzing strategies.
