@@ -144,6 +144,27 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
             }
         }
 
+        // Capture Mapping Derivations for high-fidelity Oracle reasoning
+        if opcode == opcode::SHA3 {
+            if let (Ok(offset), Ok(size)) = (interp.stack.peek(0), interp.stack.peek(1)) {
+                let offset = offset.to::<usize>();
+                let size = size.to::<usize>();
+                
+                // Industry standard: mappings usually involve 64 bytes (key + base_slot)
+                if size == 64 {
+                    let data = interp.shared_memory.slice(offset, size);
+                    let key = U256::from_be_slice(&data[0..32]);
+                    let base_slot = U256::from_be_slice(&data[32..64]);
+                    
+                    self.waypoints.push(Waypoint::MappingDerivation {
+                        base_slot,
+                        key,
+                        derived_slot: keccak256(data),
+                    });
+                }
+            }
+        }
+
         self.last_pc = pc;
     }
 

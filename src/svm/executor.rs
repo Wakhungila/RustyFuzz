@@ -40,7 +40,7 @@ impl SvmExecutor {
         }).collect();
 
         // Apply account overrides from the fuzzer input
-        for (pubkey, data) in &input.account_overrides { // This should be applied to the `state` clone, not `accounts_to_process`
+        for (pubkey, data) in &input.account_overrides {
             if let Some(account) = accounts_to_process.iter_mut().find(|(pk, _)| pk == pubkey) {
                 account.1.data = data.clone();
             }

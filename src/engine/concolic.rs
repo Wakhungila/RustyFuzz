@@ -17,59 +17,61 @@ impl<'a> ConcolicSolver<'a> {
     /// Generates a "hint" (a 32-byte value) that would satisfy the alternative 
     /// path of a comparison.
     pub fn solve_hint(&self, waypoint: &Waypoint) -> Option<[u8; 32]> {
-        if let Waypoint::Comparison { op, lhs, rhs, calldata_offset, .. } = waypoint {
-            if calldata_offset.is_none() {
+        if let Waypoint::Comparison { op, lhs, rhs, calldata_offset: Some(offset), .. } = waypoint {
+            if offset >= 1024 * 1024 { // Sanity check for offset size
                 return None;
             }
 
             let cfg = Config::new();
             let solver = Solver::new(self.ctx);
 
-            // Represent the tainted input as a 256-bit bit-vector
-            let input_var = BV::new_const(self.ctx, "input_var", 256);
+            // Construct symbolic variables for operands.
+            // If an operand is tainted (influenced by input), we treat it as a symbolic variable.
+            let input_var = BV::new_const(self.ctx, format!("calldata_at_{}", offset), 256);
             
-            // Convert operands to Z3 constants
-            let lhs_const = BV::from_u64(self.ctx, 0, 256); // Placeholder logic
-            let rhs_val = self.u256_to_bv(rhs);
-            let lhs_val = self.u256_to_bv(lhs);
+            let rhs_bv = self.u256_to_bv(rhs)?;
+            let lhs_bv = self.u256_to_bv(lhs)?;
 
-            // We assume one side was influenced by calldata. 
-            // We constrain the variable to satisfy the comparison op.
+            // Constraint generation: We want to find an input_var that satisfies 
+            // the branch condition we encountered.
             let constraint = match *op {
-                0x10 => input_var.bvult(&rhs_val), // LT
-                0x11 => input_var.bvugt(&rhs_val), // GT
-                0x14 => input_var._eq(&rhs_val),   // EQ
-                0x12 => input_var.bvslt(&rhs_val), // SLT
-                0x13 => input_var.bvsgt(&rhs_val), // SGT
+                0x10 => input_var.bvult(&rhs_bv), // LT
+                0x11 => input_var.bvugt(&rhs_bv), // GT
+                0x14 => input_var._eq(&rhs_bv),   // EQ
+                0x12 => input_var.bvslt(&rhs_bv), // SLT
+                0x13 => input_var.bvsgt(&rhs_bv), // SGT
                 _ => return None,
             };
 
             solver.assert(&constraint);
 
             if solver.check() == z3::SatResult::Sat {
-                let model = solver.get_model().unwrap();
-                let solution = model.eval(&input_var, true).unwrap();
+                let model = solver.get_model()?;
+                let solution = model.eval(&input_var, true)?;
                 return Some(self.bv_to_bytes(solution));
             }
         }
         None
     }
 
-    fn u256_to_bv(&self, val: &U256) -> BV<'a> {
+    fn u256_to_bv(&self, val: &U256) -> Option<BV<'a>> {
         let bytes = val.to_be_bytes::<32>();
         let mut hex = String::from("0x");
         for b in bytes {
             hex.push_str(&format!("{:02x}", b));
         }
-        BV::from_str(self.ctx, 256, &hex).unwrap()
+        BV::from_str(self.ctx, 256, &hex)
     }
 
     fn bv_to_bytes(&self, bv: BV<'a>) -> [u8; 32] {
         let mut bytes = [0u8; 32];
         let bit_string = format!("{:x}", bv); // Z3 returns hex
         let stripped = bit_string.trim_start_matches("0x");
-        let decoded = hex::decode(format!("{:0>64}", stripped)).unwrap();
-        bytes.copy_from_slice(&decoded);
+        if let Ok(decoded) = hex::decode(format!("{:0>64}", stripped)) {
+            if decoded.len() == 32 {
+                bytes.copy_from_slice(&decoded);
+            }
+        }
         bytes
     }
 }

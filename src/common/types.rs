@@ -60,6 +60,11 @@ pub enum Waypoint {
         pc: usize,
         calldata_offset: Option<usize>,
     },
+    MappingDerivation {
+        base_slot: U256,
+        key: U256,
+        derived_slot: B256,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]

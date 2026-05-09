@@ -24,11 +24,15 @@ pub struct SgxExecutor {
     // In a production enclave, this might hold sensitive keys for 
     // decrypting state snapshots or signing PoCs.
     pub enclave_id: u64,
+    pub sealing_nonce_counter: std::sync::atomic::AtomicU64,
 }
 
 impl SgxExecutor {
     pub fn new(enclave_id: u64) -> Self {
-        Self { enclave_id }
+        Self { 
+            enclave_id,
+            sealing_nonce_counter: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     /// Executes a transaction within the enclave boundary.
@@ -67,10 +71,25 @@ impl SgxExecutor {
 
     /// Securely seal the state to disk.
     pub fn seal_state(&self, state: &ChainState) -> Result<Vec<u8>> {
-        // 1. Derive or retrieve the enclave-bound sealing key.
-        // In a real SGX app, you'd use the SGX Sealing Key (MRENCLAVE-based).
-        let key_bytes = [0u8; 32]; // Placeholder: Use actual SGX EGETKEY logic here
-        let cipher = Aes256GcmSiv::new_from_slice(&key_bytes)
+        // 1. Hardware Key Derivation (EGETKEY)
+        let mut key_request = sgx_key_request_t::default();
+        key_request.key_name = SGX_KEYSELECT_SEAL as u16;
+        
+        let mut sealing_key = sgx_key_128bit_t::default();
+        unsafe {
+            let status = sgx_get_key(&key_request, &mut sealing_key);
+            match status {
+                sgx_status_t::SGX_SUCCESS => (),
+                sgx_status_t::SGX_ERROR_INVALID_PARAMETER => {
+                    return Err(anyhow::anyhow!("SGX Key Derivation: Invalid key request parameters"));
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("SGX Hardware Error: EGETKEY status {:?}", status));
+                }
+            }
+        }
+
+        let cipher = Aes256GcmSiv::new_from_slice(&sealing_key)
             .map_err(|_| anyhow::anyhow!("Invalid Key Length"))?;
 
         // 2. Serialize the state. 
@@ -79,8 +98,14 @@ impl SgxExecutor {
             .map_err(|e| anyhow::anyhow!("Serialization failed: {}", e))?;
 
         // 3. Generate a Nonce. 
-        // For GCM-SIV, a fixed or counter-based nonce is safer than random if entropy is low.
-        let nonce = Nonce::from_slice(b"unique nonce"); // 12-byte nonce
+        // High-rigor: Use a 12-byte nonce consisting of a counter and the enclave ID.
+        // This ensures no two state snapshots ever share a key/nonce pair.
+        let count = self.sealing_nonce_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[0..8].copy_from_slice(&count.to_le_bytes());
+        nonce_bytes[8..12].copy_from_slice(&(self.enclave_id as u32).to_le_bytes());
+        
+        let nonce = Nonce::from_slice(&nonce_bytes);
 
         // 4. Encrypt and Seal
         let ciphertext = cipher

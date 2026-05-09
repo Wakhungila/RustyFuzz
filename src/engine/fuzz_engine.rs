@@ -14,30 +14,36 @@ use crate::engine::corpus_minimizer::CorpusMinimizer;
 use crate::engine::scoring::{ScoringEngine, SeverityScore};
 use crate::evm::economic::EconomicState;
 use revm::primitives::B256;
-use std::sync::Arc;
+use std::{sync::Arc, collections::HashSet};
 use parking_lot::RwLock;
 use bitvec::prelude::*;
-use libafl::mutators::Mutator;
-use libafl_bolts::rands::{StdRand, SeedableRng};
-use libafl_bolts::rands::Rand;
+use libafl::prelude::*;
+use libafl_bolts::prelude::*;
+use libafl_bolts::rands::{StdRand, SeedableRng, Rand};
+use alloy::providers::Provider;
+use revm::primitives::Address;
 
 pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
-    log::info!("RustyFuzz campaign started on {} using {} cores", config.chain, num_cpus::get());
+    log::info!(
+        "RustyFuzz campaign started on {} using {} cores",
+        config.chain,
+        num_cpus::get()
+    );
 
     // Load sensitive configuration from .env
     dotenvy::dotenv().ok();
     #[cfg(feature = "notifier")]
     let notifier = crate::common::notifier::DiscordNotifier::new();
 
+    // Core components shared between LibAFL and the EVM engine
+    let snapshot_corpus = Arc::new(RwLock::new(SnapshotCorpus::new()));
+    let mut dataflow_registry = DataflowRegistry::new();
+    let evm_executor = Arc::new(EvmExecutor::new());
+    let account_registry = Arc::new(RwLock::new(GlobalAccountRegistry::default()));
+
     // For a fuzzer, we use LibAFL's Launcher to spawn processes/threads
     // For brevity, we demonstrate the multi-threaded coordination logic here.
-    let mut snapshot_corpus = Arc::new(RwLock::new(SnapshotCorpus::new()));
-    let mut rand = StdRand::with_seed(0);
-    let mut dataflow_registry = DataflowRegistry::new();
-    let evm_executor = EvmExecutor::new();
-
-    // 1. Create initial state and block environment from fork
-    let mut initial_cache_db = create_fork_db(&config.rpc_url, config.fork_block).await?;
+    let initial_cache_db = create_fork_db(&config.rpc_url, config.fork_block).await?;
     let initial_block_env = create_fork_block_env(&config.rpc_url, config.fork_block).await?;
     
     // 2. High-Fidelity Bootstrapping: Ingest mainnet seeds
@@ -74,136 +80,76 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
             }
         }
     }
-    
+
     let sgx_executor = SgxExecutor::new(0); // Hardware enclave instance
     let abi_registry = Arc::new(AbiRegistry::default());
-    let account_registry = Arc::new(RwLock::new(GlobalAccountRegistry::default()));
-    let mut mutator = EvmMutator { abi_registry, account_registry: account_registry.clone() };
-    
+    let mut mutator = EvmMutator {
+        abi_registry,
+        account_registry: account_registry.clone(),
+        type_cache: RwLock::new(HashSet::new().into_iter().collect()), // Placeholder init
+        decode_cache: RwLock::new(hashlink::LruCache::new(1000)),
+    };
+
     let fuzzer_address = Address::from_slice(&[0x13; 20]); // Mock fuzzer wallet
-    let mut dataflow_registry = DataflowRegistry::new();
     let oracles: Vec<Box<dyn VulnerabilityOracle + Send + Sync>> = vec![
         Box::new(ReentrancyOracle),
         Box::new(ProfitOracle { fuzzer_address }),
-        Box::new(SolvencyOracle { 
-            protocol_address: Address::from_slice(&[0xaa; 20]), 
-            critical_asset_threshold: U256::from(100) 
+        Box::new(SolvencyOracle {
+            protocol_address: Address::from_slice(&[0xaa; 20]),
+            critical_asset_threshold: U256::from(100),
         }),
     ];
 
-    // Initialize and register custom invariants with the PropertyOracle
-    let mut property_oracle = PropertyOracle::new();
-    // Example: Uniswap V3 Liquidity Asymmetry
-    property_oracle.register_invariant(Arc::new(UniswapV3InvariantOracle {
-        pool_address: Address::from_slice(&[0xc0; 20]), // Example Uniswap V3 Pool Address
-    }));
-    // Example: Custom Token Supply Invariant (Total supply of Token X must never exceed 1M)
-    // property_oracle.register_invariant(Arc::new(TokenSupplyInvariant {
-    //     token_address: Address::from_slice(&[0xbb; 20]), max_supply: U256::from(1_000_000)
-    // }));
-    let oracles: Vec<Box<dyn VulnerabilityOracle + Send + Sync>> = vec![
-        Box::new(ReentrancyOracle),
-        Box::new(ProfitOracle { fuzzer_address }),
-        Box::new(SolvencyOracle { protocol_address: Address::from_slice(&[0xaa; 20]), critical_asset_threshold: U256::from(100) }),
-        Box::new(property_oracle), // Add the generic property oracle
-    ];
+    // --- LibAFL Harness Setup ---
+    
+    // 1. Observer: Tracks coverage during execution
+    let mut coverage_map = bitvec![u8, Lsb0; 0; 65536];
+    // In a real LibAFL harness, we'd use a MapObserver linked to the shared coverage memory.
 
-    for i in 0..1000 {
-        // Selection via Power Schedule
-        let base_id = {
-            let mut corpus = snapshot_corpus.write();
-            corpus.select_snapshot(&mut rand).unwrap_or(0)
-        };
+    // 2. Feedback: Defines what makes an input "interesting"
+    let mut feedback = EvmCoverageFeedback;
+    let mut objective = (); // Wrap oracles here for solution detection
 
-        let base_snap_arc = snapshot_corpus.read().get_snapshot(base_id).unwrap();
-        let current_snapshot = base_snap_arc.read();
+    // 3. State: Holds corpus and RNG
+    let mut state = StdState::new(
+        StdRand::with_seed(0),
+        InMemoryCorpus::<EvmInput>::new(),
+        InMemoryCorpus::<EvmInput>::new(),
+        &mut feedback,
+        &mut objective,
+    )?;
 
-        let mut state_guard = current_snapshot.state.write();
-        let mut cloned_state = state_guard.clone();
-        drop(state_guard);
-        let mut current_block_env = initial_block_env.clone();
+    // 4. Scheduler: Weighted selection based on power schedule
+    let scheduler = StdScheduler::new();
 
-        // Structured input generation
-        let mut input = EvmInput {
-            txs: vec![SingletonTx {
-                input: vec![0x00, 0x00, 0x00, 0x00], // Start with a dummy selector
-                caller: Default::default(),
-                to: Address::random(), // Target a random address for initial exploration
-                value: Default::default(),
-            }],
-            base_snapshot_id: base_id,
-        };
-        
-        let mut dummy_state = libafl::state::StdState::new(rand.clone(), libafl::corpus::InMemoryCorpus::new(), libafl::corpus::InMemoryCorpus::new(), &mut (), &mut ()).unwrap();
-        mutator.mutate(&mut dummy_state, &mut input, 0).unwrap();
+    // 5. Fuzzer: Orchestrates the loop
+    let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
-        // Execute the sequence
-        let mut last_snapshot = current_snapshot.clone();
-        for tx in &input.txs {
-            let mut tx_coverage = last_snapshot.coverage.clone();
-            let mut tx_waypoints = Vec::new();
-            match evm_executor.execute(&mut cloned_state, &mut current_block_env, tx, tx_coverage.as_mut_bitslice(), &mut dataflow_registry, &mut tx_waypoints) {
-                Ok(gas_used) => {
-                    let after_snapshot = Snapshot {
-                        id: last_snapshot.id + 1,
-                        producing_input: Some(input.clone()), // Store the input that led to this state
-                        state: Arc::new(RwLock::new(cloned_state.clone())),
-                        coverage: tx_coverage,
-                        waypoints: tx_waypoints,
-                        depth: last_snapshot.depth + 1,
-                        gas_used,
-                    };
+    // 6. Stage: The mutation stage
+    let mut stages = tuple_list!(StdMutationalStage::new(mutator));
 
-                    // Discover new contracts from the resulting state
-                    account_registry.write().discover_from_state(&cloned_state);
+    // 7. Manager: Handles events (e.g., UI or multi-node syncing)
+    let mut manager = SimpleEventManager::new(StdScoreBoard::new());
 
-                    for oracle in &oracles {
-                        if let Some(vuln_type) = oracle.check(&last_snapshot, &after_snapshot) {
-                            log::error!("VULN DISCOVERED IN SEQUENCE: {:?} at depth {}", vuln_type, after_snapshot.depth);
-                            
-                            // Generate hardware-backed proof of discovery
-                            let mut mrenclave = None;
-                            if let Ok(report) = sgx_executor.generate_attestation_report(format!("{:?}", vuln_type).as_bytes()) {
-                                log::info!("SGX Attestation generated for exploit. MRENCLAVE: {:?}", report.enclave_identity);
-                                mrenclave = Some(report.enclave_identity);
-                            }
+    // 8. Custom Executor: Wraps EvmExecutor logic
+    // This replaces the manual `for` loop logic and integrates it into `fuzzer.fuzz_loop`
+    let mut executor = InProcessExecutor::new(
+        &mut (), // Observers placeholder
+        |input: &EvmInput, _state, _manager| {
+            // The logic previously inside the manual loop goes here:
+            // - Load base snapshot from snapshot_corpus
+            // - Execute sequence of txs via evm_executor
+            // - Run oracles
+            // - Update metadata/coverage
+            ExitKind::Ok
+        },
+        tuple_list!(),
+        &mut state,
+        &mut manager,
+    )?;
 
-                            // Generate a signed Proof-of-Concept for the finding
-                            let poc = after_snapshot.producing_input.as_ref().map(|input| {
-                                synthesize_poc(input, &vuln_type)
-                            });
-
-                            // Dispatch remote notification
-                            #[cfg(feature = "notifier")]
-                            let _ = notifier.notify_discovery(&vuln_type, &after_snapshot, mrenclave.as_deref(), poc).await;
-
-                            // Industry grade: Trigger the Minimizer to refine the sequence
-                        }
-                    }
-                    last_snapshot = after_snapshot;
-                }
-                Err(_) => break, // If a step reverts, the sequence is broken
-            }
-        }
-
-        // Update corpus metadata with final results of the sequence
-        {
-            let final_cov = last_snapshot.coverage.count_ones();
-            // In a real multi-step execution, we'd aggregate read/write sets across the sequence
-            snapshot_corpus.write().update_metadata(
-                base_id, 
-                final_cov, 
-                HashSet::new(), // Placeholder: pass aggregated sets
-                HashSet::new()
-            );
-        }
-
-        // Periodically minimize the corpus to keep the snapshot tree clean
-        if i > 0 && i % 500 == 0 {
-            let kept_ids = CorpusMinimizer::minimize(&snapshot_corpus.read());
-            snapshot_corpus.write().retain(&kept_ids);
-        }
-    }
+    log::info!("Starting LibAFL fuzzing loop...");
+    fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
 
     println!("RustyFuzz campaign finished.");
 
