@@ -34,6 +34,7 @@ pub struct Snapshot {
     pub producing_input: Option<EvmInput>, // The input that generated this snapshot
     pub waypoints: Vec<Waypoint>,
     pub depth: u32,
+    pub gas_used: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -178,11 +178,10 @@ where
 impl EvmMutator {
     fn mutate_sol_value<R: Rand>(&self, value: &mut DynSolValue, rand: &mut R) {
         match value {
-            DynSolValue::Array(ref mut elements, _) => {
+            DynSolValue::Array(ref mut elements, ty) => {
                 if elements.is_empty() {
-                    // Add a new element if array is empty
-                    // Requires knowing the element type, which is part of DynSolType::Array
-                    // For now, we'll skip adding if empty, or add a default if type is known.
+                    // Grow the array by generating a default value for the inner type
+                    elements.push(self.generate_default_sol_value(ty, rand));
                 } else {
                     let choice = rand.below(100);
                     if choice < 70 { // Mutate an existing element
@@ -191,9 +190,9 @@ impl EvmMutator {
                     } else if choice < 85 && elements.len() > 1 { // Remove an element
                         let idx = rand.below(elements.len() as u64) as usize;
                         elements.remove(idx);
-                    } else { // Add a new element (requires a default value for the type)
-                        // This is complex without knowing the element's DynSolType
-                        // For a real fuzzer, you'd have a `DynSolType::default_value()` method
+                    } else { 
+                        // Add another element of the same type
+                        elements.push(self.generate_default_sol_value(ty, rand));
                     }
                 }
             }
@@ -241,6 +240,23 @@ impl EvmMutator {
                 }
             }
             _ => {} // Extend for arrays, bools, etc.
+        }
+    }
+
+    /// Generates a sensible default value for a given Solidity type to aid in sequence growth.
+    fn generate_default_sol_value<R: Rand>(&self, ty: &DynSolType, rand: &mut R) -> DynSolValue {
+        match ty {
+            DynSolType::Uint(size) => DynSolValue::Uint(U256::ZERO, *size),
+            DynSolType::Int(size) => DynSolValue::Int(alloy_dyn_abi::I256::ZERO, *size),
+            DynSolType::Address => DynSolValue::Address(Address::ZERO),
+            DynSolType::Bool => DynSolValue::Bool(false),
+            DynSolType::Bytes => DynSolValue::Bytes(vec![0u8; 32]),
+            DynSolType::String => DynSolValue::String(String::from("RustyFuzz")),
+            DynSolType::Tuple(inner_types) => {
+                let vals = inner_types.iter().map(|t| self.generate_default_sol_value(t, rand)).collect();
+                DynSolValue::Tuple(vals)
+            }
+            _ => DynSolValue::Uint(U256::ZERO, 256),
         }
     }
 }

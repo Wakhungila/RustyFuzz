@@ -1,6 +1,7 @@
 use crate::common::types::{Snapshot, ChainState, Waypoint};
 use revm::primitives::{Address, U256, keccak256, B256, b256};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub trait VulnerabilityOracle {
     fn check(&self, before: &Snapshot, after: &Snapshot) -> Option<VulnType>;
@@ -19,6 +20,15 @@ pub enum VulnType {
     UnintendedPanic(u64), // Catching specific EVM Panic codes
     DifferentialDivergence(String),
     Other(String),
+}
+
+/// CustomInvariant trait: Allows researchers to define their own protocol-specific
+/// economic or logical invariants.
+pub trait CustomInvariant: Send + Sync + 'static {
+    /// A unique name for this invariant.
+    fn name(&self) -> &str;
+    /// Checks if the invariant is violated between two snapshots.
+    fn check_invariant(&self, before: &Snapshot, after: &Snapshot) -> Option<VulnType>;
 }
 
 /// StaleViewOracle: Detects Read-only Reentrancy by identifying cases where 
@@ -89,7 +99,7 @@ impl VulnerabilityOracle for UniswapV3InvariantOracle {
             let slot0 = pool.storage.get(&U256::ZERO).cloned().unwrap_or(U256::ZERO);
             let current_tick = self.extract_tick_from_slot0(slot0);
 
-            // In a production environment, we would iterate through all initialized ticks
+            // In a production environment, we would iterate through all initialized ticks (from the DataflowRegistry)
             // stored in the DB. If the sum does not match global liquidity, a P0 is found.
             // This detects bugs where liquidity is added/removed but the global tracker
             // desynchronizes due to precision loss or overflow.
@@ -121,7 +131,7 @@ impl UniswapV3InvariantOracle {
 
     fn is_tick_mapping_slot(&self, _slot: &U256) -> bool {
         // In a research-grade tool, we compare the slot against 
-        // keccak256(preimage, 5) from the DataflowRegistry.
+        // keccak256(preimage, 5) from the DataflowRegistry to confirm it's a tick mapping.
         true 
     }
 }
@@ -302,25 +312,35 @@ impl VulnerabilityOracle for SolvencyOracle {
     }
 }
 
-/// Invariant Oracle: Checks for business logic violations (e.g., Solvency)
-pub struct InvariantOracle {
-    pub target_account: alloy::primitives::Address,
+/// PropertyOracle: A generic oracle that allows dynamic definition of custom invariants.
+/// This is the framework for "Invariant Mining" and "Property-Based Fuzzing."
+pub struct PropertyOracle {
+    pub custom_invariants: Vec<Arc<dyn CustomInvariant>>,
 }
 
-impl VulnerabilityOracle for InvariantOracle {
-    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
-        let state = after.state.read();
-        if let ChainState::Evm(db) = &*state {
-            // Example: "Contract balance must never drop below X during fuzzing"
-            if let Some(acc) = db.accounts.get(&Address::from_slice(self.target_account.as_slice())) {
-                if acc.info.balance < U256::from(1) {
-                    return Some(VulnType::InvariantViolation("Solvency broken".to_string()));
-                }
+impl PropertyOracle {
+    pub fn new() -> Self {
+        Self { custom_invariants: Vec::new() }
+    }
+
+    /// Registers a new custom invariant to be checked during fuzzing.
+    pub fn register_invariant(&mut self, invariant: Arc<dyn CustomInvariant>) {
+        log::info!("Registered custom invariant: {}", invariant.name());
+        self.custom_invariants.push(invariant);
+    }
+}
+
+impl VulnerabilityOracle for PropertyOracle {
+    fn check(&self, before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        for invariant in &self.custom_invariants {
+            if let Some(vuln) = invariant.check_invariant(before, after) {
+                return Some(vuln);
             }
         }
         None
     }
 }
+
 
 /// Differential Oracle: Compares execution outcomes between two different snapshots
 /// (e.g., Mainnet state vs. Local Upgrade state).
@@ -332,28 +352,66 @@ impl DifferentialOracle {
         snap_v1: &Snapshot,
         snap_v2: &Snapshot,
     ) -> Option<VulnType> {
-        // 1. Check for Divergence in balance changes
-        // This is a high-level heuristic for "broken" upgrades
-        
-        // 2. Detailed comparison of storage slots
-        // We look for cases where the same TX resulted in different storage roots.
         let state_v1 = snap_v1.state.read();
         let state_v2 = snap_v2.state.read();
 
         match (&*state_v1, &*state_v2) {
             (ChainState::Evm(db_v1), ChainState::Evm(db_v2)) => {
-                // Compare the number of touched accounts as a proxy for divergence
-                if db_v1.accounts.len() != db_v2.accounts.len() {
+                // Structural Diff: Compare every account touched in either implementation
+                let all_addresses: std::collections::HashSet<_> = db_v1.accounts.keys().chain(db_v2.accounts.keys()).collect();
+
+                for addr in all_addresses {
+                    let acc_v1 = db_v1.accounts.get(addr);
+                    let acc_v2 = db_v2.accounts.get(addr);
+
+                    match (acc_v1, acc_v2) {
+                        (Some(a1), Some(a2)) => {
+                            // Check for balance divergence (Economic Divergence)
+                            if a1.info.balance != a2.info.balance {
+                                return Some(VulnType::DifferentialDivergence(format!(
+                                    "Balance mismatch at {}: V1={} V2={}",
+                                    addr, a1.info.balance, a2.info.balance
+                                )));
+                            }
+
+                            // Check for storage divergence (Logic/State Divergence)
+                            // This identifies if an upgrade modified storage layouts or calculation logic
+                            for (slot, val1) in &a1.storage {
+                                let val2 = a2.storage.get(slot).unwrap_or(&U256::ZERO);
+                                if val1 != val2 {
+                                    return Some(VulnType::DifferentialDivergence(format!(
+                                        "Storage mismatch at {}/slot {}: V1={} V2={}",
+                                        addr, slot, val1, val2
+                                    )));
+                                }
+                            }
+                        },
+                        (None, Some(_)) | (Some(_), None) => {
+                            return Some(VulnType::DifferentialDivergence(format!(
+                                "Account existence divergence at {}", addr
+                            )));
+                        }
+                    }
+                }
+
+                // 3. Gas Divergence: Identify potential DoS or gas-griefing vectors.
+                // Significant differences in gas usage for the same input sequence
+                // suggest implementation inconsistencies or algorithmic complexity attacks.
+                let gas_diff = if snap_v1.gas_used > snap_v2.gas_used {
+                    snap_v1.gas_used - snap_v2.gas_used
+                } else {
+                    snap_v2.gas_used - snap_v1.gas_used
+                };
+
+                // Threshold: If gas usage diverges by more than 20% or 100k gas
+                if gas_diff > 100_000 || (snap_v1.gas_used > 0 && (gas_diff as f64 / snap_v1.gas_used as f64) > 0.2) {
                     return Some(VulnType::DifferentialDivergence(format!(
-                        "Account count mismatch: {} vs {}",
-                        db_v1.accounts.len(),
-                        db_v2.accounts.len()
+                        "Gas Divergence detected: V1 used {} vs V2 used {} (diff: {})",
+                        snap_v1.gas_used, snap_v2.gas_used, gas_diff
                     )));
                 }
-                
-                // In a production-grade fuzzer, we would iterate through changed slots 
-                // and compare values, effectively diffing the state trie.
             }
+            _ => {}
         }
 
         None

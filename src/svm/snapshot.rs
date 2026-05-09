@@ -10,5 +10,6 @@ pub fn new_svm_snapshot(id: u64, initial_state: SvmState) -> Snapshot {
         coverage: bitvec![0; 1024 * 64], // example bitmap
         waypoints: vec![],
         depth: 0,
+        gas_used: 0,
     }
 }

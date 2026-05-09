@@ -2,7 +2,7 @@ use crate::common::types::{Snapshot, ChainState, SingletonTx, Waypoint};
 use crate::config::Config;
 use crate::evm::fork::{create_fork_db, create_fork_block_env};
 use crate::evm::executor::EvmExecutor;
-use crate::common::oracle::{VulnerabilityOracle, ReentrancyOracle, ProfitOracle, SolvencyOracle};
+use crate::common::oracle::{VulnerabilityOracle, ReentrancyOracle, ProfitOracle, SolvencyOracle, PropertyOracle, CustomInvariant, UniswapV3InvariantOracle};
 use crate::engine::exploit_synthesizer::synthesize_poc;
 use crate::evm::fuzz::{EvmInput, EvmMutator, AbiRegistry};
 use crate::evm::sgx_executor::SgxExecutor;
@@ -10,6 +10,7 @@ use crate::evm::corpus::SnapshotCorpus;
 use crate::evm::registry::GlobalAccountRegistry;
 use crate::evm::dataflow::DataflowRegistry;
 use crate::engine::corpus_minimizer::CorpusMinimizer;
+use revm::primitives::B256;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use bitvec::prelude::*;
@@ -50,7 +51,27 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
     let oracles: Vec<Box<dyn VulnerabilityOracle + Send + Sync>> = vec![
         Box::new(ReentrancyOracle),
         Box::new(ProfitOracle { fuzzer_address }),
-        Box::new(SolvencyOracle { protocol_address: Address::from_slice(&[0xaa; 20]), critical_asset_threshold: U256::from(100) }), // Example protocol address and threshold
+        Box::new(SolvencyOracle { 
+            protocol_address: Address::from_slice(&[0xaa; 20]), 
+            critical_asset_threshold: U256::from(100) 
+        }),
+    ];
+
+    // Initialize and register custom invariants with the PropertyOracle
+    let mut property_oracle = PropertyOracle::new();
+    // Example: Uniswap V3 Liquidity Asymmetry
+    property_oracle.register_invariant(Arc::new(UniswapV3InvariantOracle {
+        pool_address: Address::from_slice(&[0xc0; 20]), // Example Uniswap V3 Pool Address
+    }));
+    // Example: Custom Token Supply Invariant (Total supply of Token X must never exceed 1M)
+    // property_oracle.register_invariant(Arc::new(TokenSupplyInvariant {
+    //     token_address: Address::from_slice(&[0xbb; 20]), max_supply: U256::from(1_000_000)
+    // }));
+    let oracles: Vec<Box<dyn VulnerabilityOracle + Send + Sync>> = vec![
+        Box::new(ReentrancyOracle),
+        Box::new(ProfitOracle { fuzzer_address }),
+        Box::new(SolvencyOracle { protocol_address: Address::from_slice(&[0xaa; 20]), critical_asset_threshold: U256::from(100) }),
+        Box::new(property_oracle), // Add the generic property oracle
     ];
 
     for i in 0..1000 {
@@ -88,7 +109,7 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
             let mut tx_coverage = last_snapshot.coverage.clone();
             let mut tx_waypoints = Vec::new();
             match evm_executor.execute(&mut cloned_state, &mut current_block_env, tx, tx_coverage.as_mut_bitslice(), &mut dataflow_registry, &mut tx_waypoints) {
-                Ok(_) => {
+                Ok(gas_used) => {
                     let after_snapshot = Snapshot {
                         id: last_snapshot.id + 1,
                         producing_input: Some(input.clone()), // Store the input that led to this state
@@ -96,6 +117,7 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
                         coverage: tx_coverage,
                         waypoints: tx_waypoints,
                         depth: last_snapshot.depth + 1,
+                        gas_used,
                     };
 
                     // Discover new contracts from the resulting state

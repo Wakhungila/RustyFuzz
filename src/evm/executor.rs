@@ -3,6 +3,7 @@ use revm::primitives::SpecId;
 use revm::inspector_handle_register;
 use crate::evm::inspector::CoverageInspector;
 use bitvec::prelude::*;
+use revm::DatabaseCommit;
 
 pub struct EvmExecutor {}
 
@@ -16,7 +17,7 @@ impl EvmExecutor {
         coverage: &mut BitSlice<u8, Lsb0>,
         dataflow: &mut crate::evm::dataflow::DataflowRegistry,
         waypoints: &mut Vec<crate::common::types::Waypoint>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
         let revm_state = match chain_state {
             ChainState::Evm(state) => state,
         };
@@ -31,8 +32,11 @@ impl EvmExecutor {
             .append_handler_register(inspector_handle_register)
             .build();
 
-        evm.transact_commit()?;
+        let result = evm.transact()?;
+        evm.context.evm.db.commit(result.state);
+        
+        let gas_used = result.result.gas_used();
 
-        Ok(())
+        Ok(gas_used)
     }
 }
