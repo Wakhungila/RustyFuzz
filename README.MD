@@ -5,18 +5,18 @@ description: High-Performance Hybrid Fuzzer for EVM Smart Contracts
 
 # RustyFuzz: High-Performance Hybrid Fuzzer for EVM Smart Contracts
 
-![Rust](https://github.com/rust-fuzz/rusty-fuzz/actions/workflows/rust.yml/badge.svg)
+![Rust](https://sl1nk.com/wj1wwg8)
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
 
 RustyFuzz is a cutting-edge, coverage-guided fuzzer designed to uncover vulnerabilities in Ethereum Virtual Machine (EVM) smart contracts. Built entirely in Rust, it leverages the `revm` execution engine for unparalleled performance and aims to integrate `LibAFL` for advanced fuzzing strategies.
 
-## 🌟 Introduction
+## Introduction
 
 Smart contracts are immutable once deployed, making their security paramount. Traditional testing often falls short in exploring the vast state space of complex contracts. RustyFuzz addresses this by employing a hybrid approach: combining the speed and control of an in-process EVM executor with sophisticated fuzzing techniques to systematically explore contract behavior and identify subtle bugs.
 
 Our goal is to provide a robust, extensible, and high-performance fuzzer that can be adapted for various smart contract platforms, starting with EVM and with future plans for SVM (Solana Virtual Machine).
 
-## ✨ Features
+## Features
 
 *   **High-Performance EVM Execution**: Utilizes `revm`, a blazing-fast EVM interpreter written in Rust, for efficient transaction execution and state manipulation.
 *   **Coverage-Guided Fuzzing**: Employs a custom `revm::Inspector` to collect fine-grained code coverage (Program Counter and Opcode hits), guiding the fuzzer towards unexplored code paths.
@@ -27,7 +27,7 @@ Our goal is to provide a robust, extensible, and high-performance fuzzer that ca
 *   **Extensible Architecture**: Designed with `LibAFL` integration in mind, allowing for easy adoption of advanced fuzzing techniques, schedulers, and mutators.
 *   **Rust-Native**: Benefits from Rust's memory safety, performance, and robust ecosystem.
 
-## 🚀 Setup & Installation
+## Setup & Installation
 
 ### Prerequisites
 
@@ -74,7 +74,7 @@ To enable optional features like `z3` (for symbolic execution/constraint solving
 cargo build --release --features "z3 llm"
 ```
 
-## 💡 Usage
+## Usage
 
 RustyFuzz is designed to be integrated into a larger fuzzing harness. The primary entry point for a fuzzing campaign is the `run_fuzz_campaign` function.
 
@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-## 🛠️ Key Concepts
+## Key Concepts
 
 *   **`EvmExecutor`**: The core component responsible for executing `SingletonTx` instances using `revm`. It integrates the `CoverageInspector` to gather execution traces.
 *   **`CoverageInspector`**: A custom `revm::Inspector` that records which EVM opcodes and program counters are hit during transaction execution, storing this information in a `bitvec` for efficient comparison.
@@ -117,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
 *   **`EvmCoverageFeedback`**: A `LibAFL` feedback mechanism (currently a stub) that will compare the coverage of a new execution against the global coverage map to determine if the input is "interesting."
 *   **`mutate_tx`**: A custom mutator function that applies various transformations to a `SingletonTx` to generate new inputs for the fuzzer.
 
-## 🗺️ Roadmap & Future Enhancements
+## Roadmap & Future Enhancements
 
 *   **Full LibAFL Integration**: Implement a complete `LibAFL` harness, including `Fuzzer`, `Executor`, `Scheduler`, `Observers`, and `Feedback` mechanisms.
 *   **Advanced Mutators**: Develop more sophisticated mutators for EVM-specific data structures (e.g., ABI-aware calldata mutation, storage slot manipulation).
@@ -129,7 +129,3 @@ async fn main() -> anyhow::Result<()> {
 ## 🤝 Contributing
 
 Contributions are welcome! Feel free to open issues for bug reports or feature requests, and submit pull requests.
-
-## 📄 License
-
-This project is licensed under the MIT License. See the `LICENSE` file for details.
