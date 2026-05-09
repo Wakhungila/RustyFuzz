@@ -1,7 +1,3 @@
----
-name: RustyFuzz
-description: High-performance causal state-tree fuzzer for the Ethereum Virtual Machine
----
 # RustyFuzz
 
 RustyFuzz is a state-of-the-art, coverage-guided fuzzer optimized for deep-state exploration of the Ethereum Virtual Machine (EVM) and the Solana Virtual Machine (SVM). Built on the `revm` and `mollusk-svm` engines, it implements causal scheduling and taint-guided concolic execution to identify complex logical and economic vulnerabilities.
@@ -70,7 +66,7 @@ RustyFuzz implements high-fidelity oracles for detecting sophisticated DeFi expl
 
 ### Installation
 ```bash
-git clone https://github.com/your-repo/RustyFuzz.git
+git clone git@github.com:Wakhungila/RustyFuzz.git
 cd RustyFuzz
 ```
 
