@@ -1,5 +1,5 @@
 use crate::common::types::{Snapshot, ChainState, Waypoint};
-use revm::primitives::{Address, U256, keccak256, B256, b256};
+use revm::primitives::{Address, U256, keccak256, B256, b256, FixedBytes};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -323,11 +323,17 @@ impl VulnerabilityOracle for AccessControlOracle {
     fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         let state = after.state.read();
         let fuzzer_bytes = B256::from_slice(&self.address_to_32bytes(self.fuzzer_address));
+        
+        // EIP-1967 Admin Slot: keccak-256('eip1967.proxy.admin') - 1
+        let eip1967_admin_slot = b256!("b53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103");
 
         if let ChainState::Evm(db) = &*state {
             for (_addr, acc) in &db.accounts {
                 for (slot, value) in &acc.storage {
-                    if B256::from(value.to_be_bytes::<32>()) == fuzzer_bytes {
+                    let value_b256 = B256::from(value.to_be_bytes::<32>());
+                    
+                    // Check for general ownership takeover or EIP-1967 Admin hijacking
+                    if value_b256 == fuzzer_bytes || (*slot == U256::from_be_bytes(eip1967_admin_slot.0) && value_b256 == fuzzer_bytes) {
                         // Verify if the write to this specific slot was influenced by user-controlled input (tainted)
                         let slot_bytes = slot.to_be_bytes::<32>();
                         if after.waypoints.iter().any(|w| {
@@ -337,7 +343,7 @@ impl VulnerabilityOracle for AccessControlOracle {
                                 false
                             }
                         }) {
-                            log::error!("CRITICAL: Privilege Escalation detected at address {}/slot {}", _addr, slot);
+                            log::error!("CRITICAL: Privilege Escalation/Proxy Hijack detected at address {}/slot {}", _addr, slot);
                             return Some(VulnType::PrivilegeEscalation);
                         }
                     }
@@ -353,6 +359,48 @@ impl AccessControlOracle {
         let mut b = [0u8; 32];
         b[12..32].copy_from_slice(addr.as_slice());
         b
+    }
+}
+
+/// ERC20TotalSupplyInvariant: Monitors that sum(balances) <= totalSupply.
+/// This detects arbitrary minting or internal accounting failures.
+pub struct ERC20TotalSupplyInvariant {
+    pub token_address: Address,
+}
+
+impl CustomInvariant for ERC20TotalSupplyInvariant {
+    fn name(&self) -> &str { "ERC20 Total Supply Invariant" }
+
+    fn check_invariant(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+        let state = after.state.read();
+        if let ChainState::Evm(db) = &*state {
+            if let Some(token_acc) = db.accounts.get(&self.token_address) {
+                // Slot 1: Usually totalSupply in standard ERC20s
+                let total_supply = token_acc.storage.get(&U256::from(1)).cloned().unwrap_or(U256::ZERO);
+                
+                let mut sum_balances = U256::ZERO;
+                // In production, we'd use the DataflowRegistry to identify all addresses
+                // whose balances changed, but for the fuzzer, we check the db accounts.
+                for (addr, acc) in &db.accounts {
+                    if addr == &self.token_address { continue; }
+                    
+                    // Mapping key for balances[addr]
+                    // Mapping slot for 'balances' is usually 0
+                    let mut buf = [0u8; 64];
+                    buf[12..32].copy_from_slice(addr.as_slice());
+                    buf[60..64].copy_from_slice(&0u32.to_be_bytes());
+                    let balance_slot = U256::from_be_bytes(keccak256(&buf).0);
+                    
+                    let bal = token_acc.storage.get(&balance_slot).cloned().unwrap_or(U256::ZERO);
+                    sum_balances = sum_balances.saturating_add(bal);
+                }
+
+                if sum_balances > total_supply {
+                    return Some(VulnType::InvariantViolation("Token inflation detected".to_string()));
+                }
+            }
+        }
+        None
     }
 }
 

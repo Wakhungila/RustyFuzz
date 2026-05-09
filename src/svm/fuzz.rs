@@ -158,19 +158,35 @@ where
             }
             61..=70 => {
                 // Account Substitution: Replace the program ID of a random instruction 
-                // with a unique Pubkey (simulating a fuzzer-controlled malicious program).
-                // This targets bugs like "Arbitrary CPI" or "Wormhole guardian spoofing".
+                // with a malicious or unexpected Pubkey.
                 let idx = rand.below(input.instructions.len() as u64) as usize;
-                input.instructions[idx].program_id = Pubkey::new_unique();
+                
+                // Research-Grade approach: instead of a totally random Pubkey,
+                // use a Pubkey from the account overrides (controlled state)
+                // or a known system program to trigger logic errors in CPI handling.
+                if !input.account_overrides.is_empty() && rand.below(2) == 0 {
+                    let keys: Vec<Pubkey> = input.account_overrides.keys().cloned().collect();
+                    input.instructions[idx].program_id = keys[rand.below(keys.len() as u64) as usize];
+                } else {
+                    // Fallback to a fuzzer-controlled unique Pubkey
+                    input.instructions[idx].program_id = Pubkey::new_unique();
+                }
+                
                 Ok(MutationResult::Mutated)
             }
             _ => {
-                // Data Layout: Mutate instruction data (opcodes, discriminators, and parameters)
+                // Account Confusion: Swap a target instruction account with another 
+                // account found in the snapshot state.
                 let idx = rand.below(input.instructions.len() as u64) as usize;
-                let data = &mut input.instructions[idx].data;
-                if !data.is_empty() {
-                    let offset = rand.below(data.len() as u64) as usize;
-                    data[offset] = rand.next() as u8;
+                let instruction = &mut input.instructions[idx];
+                
+                if !instruction.accounts.is_empty() && !input.account_overrides.is_empty() {
+                    let account_idx = rand.below(instruction.accounts.len() as u64) as usize;
+                    let keys: Vec<Pubkey> = input.account_overrides.keys().cloned().collect();
+                    
+                    // Target P1: Provide a valid account but of the wrong "type"
+                    // (e.g., using a metadata account where a vault was expected)
+                    instruction.accounts[account_idx].pubkey = keys[rand.below(keys.len() as u64) as usize];
                     Ok(MutationResult::Mutated)
                 } else {
                     Ok(MutationResult::Skipped)

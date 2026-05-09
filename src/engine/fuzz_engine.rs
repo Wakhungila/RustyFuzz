@@ -11,6 +11,8 @@ use crate::evm::corpus::SnapshotCorpus;
 use crate::evm::registry::GlobalAccountRegistry;
 use crate::evm::dataflow::DataflowRegistry;
 use crate::engine::corpus_minimizer::CorpusMinimizer;
+use crate::engine::scoring::{ScoringEngine, SeverityScore};
+use crate::evm::economic::EconomicState;
 use revm::primitives::B256;
 use std::sync::Arc;
 use parking_lot::RwLock;
