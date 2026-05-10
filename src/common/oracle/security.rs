@@ -145,7 +145,7 @@ pub struct AccessControlOracle {
 }
 
 impl VulnerabilityOracle for AccessControlOracle {
-    fn check(&self, before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
+    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         let state = after.state.read();
         // EIP-1967 admin slot: keccak256("eip1967.proxy.admin") - 1
         let eip1967_admin_slot: B256 = hex::decode("b53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103")

@@ -260,7 +260,7 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
                         if let Ok(val) = interp.stack.peek(2) {
                             third = Some(val);
                             // If third operand is tainted, it becomes the primary taint source
-                            let third_taint = self.taint_stack.iter().rev().nth(2).cloned().flatten();
+                            let _third_taint = self.taint_stack.iter().rev().nth(2).cloned().flatten();
                             // taint_source = taint_source.or(third_taint); // More complex merge
                         }
                     }
@@ -282,7 +282,7 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
         // Symbolic Path Exploration: Monitor JUMPI (0x57)
         // We record the 'Path Not Taken' as a symbolic target for the solver.
         if opcode == 0x57 {
-            if let (Ok(dest), Ok(condition)) = (interp.stack.peek(0), interp.stack.peek(1)) {
+            if let (Ok(_dest), Ok(condition)) = (interp.stack.peek(0), interp.stack.peek(1)) {
                 let branch_taken = !condition.is_zero();
                 let taint = self.taint_stack.iter().rev().nth(1).cloned().flatten();
                 

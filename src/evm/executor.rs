@@ -17,14 +17,14 @@ impl EvmExecutor {
     pub fn execute(
         &self,
         chain_state: &mut ChainState,
-        block_env: &mut BlockEnv,
+        _block_env: &mut BlockEnv,
         tx: &SingletonTx,
-        coverage: &mut [u8],
-        dataflow: &mut DataflowRegistry,
-        waypoints: &mut Vec<Waypoint>,
-        tx_idx: usize,
+        _coverage: &mut [u8],
+        _dataflow: &mut DataflowRegistry,
+        _waypoints: &mut Vec<Waypoint>,
+        _tx_idx: usize,
     ) -> Result<u64> {
-        let ChainState::Evm(db) = chain_state;
+        let ChainState::Evm(_db) = chain_state;
 
         // 1. Setup Transaction Environment
         let mut tx_env = TxEnv::default();

@@ -96,7 +96,7 @@ where
         &mut self,
         _fuzzer: &mut Z,
         _executor: &mut EvmInput,
-        state: &mut S,
+        _state: &mut S,
         _manager: &mut EM,
     ) -> Result<(), libafl::Error> {
         self.exec_count += 1;
