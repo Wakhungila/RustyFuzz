@@ -1,4 +1,4 @@
-use alloy::primitives::Address;
+use revm::primitives::Address;
 use alloy_json_abi::JsonAbi;
 use anyhow::{anyhow, Result};
 use reqwest::Client;

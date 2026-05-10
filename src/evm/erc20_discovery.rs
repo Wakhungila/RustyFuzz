@@ -1,5 +1,5 @@
-use alloy::primitives::{Address, U256, keccak256};
-use revm::db::{CacheDB, EmptyDB};
+use revm::primitives::{Address, U256, keccak256, BlockEnv};
+use revm::database::{CacheDB, EmptyDB};
 use crate::common::types::{ChainState, SingletonTx};
 use crate::evm::executor::EvmExecutor;
 use crate::evm::fuzz::AbiRegistry;

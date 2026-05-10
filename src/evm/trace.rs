@@ -8,7 +8,7 @@
 
 use revm::{
     interpreter::{CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter},
-    Database, Inspector, EvmContext,
+    Database, Inspector,
     primitives::{Address, Log, U256, Bytes},
 };
 use std::collections::HashMap;
@@ -279,7 +279,7 @@ impl<'a> TraceInspector<'a> {
 }
 
 impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
-    fn step(&mut self, interp: &mut Interpreter, context: &mut EvmContext) {
+    fn step(&mut self, interp: &mut Interpreter, _context: &mut DB) {
         if !self.capture_steps || self.trace.steps.len() >= self.max_steps {
             return;
         }
@@ -290,7 +290,7 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
             gas_remaining: interp.gas.remaining(),
             stack_depth: interp.stack.len(),
             memory_size: interp.shared_memory.len(),
-            contract_address: context.evm.env.tx.caller, // Approximate
+            contract_address: interp.contract.address,
         };
         
         self.trace.steps.push(step);
@@ -298,7 +298,7 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
     
     fn call(
         &mut self,
-        context: &mut EvmContext,
+        _context: &mut DB,
         inputs: &mut CallInputs,
     ) -> Option<CallOutcome> {
         self.current_depth += 1;
@@ -310,7 +310,7 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
         
         // Record call (will be updated with outcome later)
         self.trace.calls.push(CallTrace {
-            caller: inputs.context.caller,
+            caller: inputs.caller,
             target: inputs.target_address,
             input: inputs.input.clone(),
             output: None,
@@ -327,25 +327,23 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
     
     fn call_end(
         &mut self,
-        _context: &mut EvmContext,
-        _inputs: &CallInputs,
-        outcome: CallOutcome,
-    ) -> CallOutcome {
+        _context: &mut DB,
+        inputs: &CallInputs,
+        outcome: &mut CallOutcome,
+    ) {
         if let Some(last_call) = self.trace.calls.last_mut() {
             last_call.output = Some(outcome.result.output.clone());
             last_call.success = outcome.result.is_success();
-            last_call.gas_used = _inputs.gas_limit - outcome.result.gas_used();
+            last_call.gas_used = inputs.gas_limit - outcome.result.gas_used();
         }
         
         self.call_stack.pop();
         self.current_depth = self.current_depth.saturating_sub(1);
-        
-        outcome
     }
     
     fn create(
         &mut self,
-        _context: &mut EvmContext,
+        _context: &mut DB,
         inputs: &mut CreateInputs,
     ) -> Option<CreateOutcome> {
         self.current_depth += 1;
@@ -365,23 +363,21 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
     
     fn create_end(
         &mut self,
-        _context: &mut EvmContext,
-        _inputs: &CreateInputs,
-        outcome: CreateOutcome,
-    ) -> CreateOutcome {
+        _context: &mut DB,
+        inputs: &CreateInputs,
+        outcome: &mut CreateOutcome,
+    ) {
         if let Some(last_create) = self.trace.creates.last_mut() {
             last_create.deployed_address = outcome.address;
             last_create.deployed_code = outcome.result.output.clone().into();
             last_create.success = outcome.result.is_success();
-            last_create.gas_used = _inputs.gas_limit - outcome.result.gas_used();
+            last_create.gas_used = inputs.gas_limit - outcome.result.gas_used();
         }
         
         self.current_depth = self.current_depth.saturating_sub(1);
-        
-        outcome
     }
     
-    fn log(&mut self, _interp: &mut Interpreter, _context: &mut EvmContext, log: &Log) {
+    fn log(&mut self, _context: &mut DB, log: Log) {
         self.trace.logs.push(ParsedLog {
             address: log.address,
             topics: log.topics().iter().map(|t| U256::from_be_bytes(t.0)).collect(),
@@ -389,12 +385,12 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
             depth: self.current_depth,
         });
         
-        self.logs_buffer.push(log.clone());
+        self.logs_buffer.push(log);
     }
     
     fn sstore(
         &mut self,
-        _context: &mut EvmContext,
+        _context: &mut DB,
         address: Address,
         index: U256,
         value: U256,

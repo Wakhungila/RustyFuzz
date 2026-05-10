@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256};
+use revm::primitives::{Address, B256};
 use std::collections::{HashMap, HashSet};
 use serde::{Serialize, Deserialize};
 

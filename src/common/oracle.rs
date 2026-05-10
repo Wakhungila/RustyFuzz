@@ -1,5 +1,5 @@
 use crate::common::types::{Snapshot, ChainState, Waypoint};
-use revm::primitives::{Address, U256, B256};
+use revm::primitives::{Address, U256, B256, BlockEnv};
 use std::collections::{HashMap, HashSet};
 use crate::evm::registry::GlobalAccountRegistry;
 use std::sync::Arc;

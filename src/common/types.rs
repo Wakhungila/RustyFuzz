@@ -1,28 +1,19 @@
-use revm::primitives::{Address, U256, TxEnv, TransactTo, B256};
-use revm::db::{CacheDB, EmptyDB};
-use std::{sync::Arc, collections::HashMap};
-use std::ops::Range;
+use revm::primitives::{
+    Address, U256, B256, 
+    TxEnv, TransactTo, 
+    Bytes, 
+};
+use revm::database::{CacheDB, EmptyDB}; 
+use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::{Serialize, Deserialize};
 use bitvec::prelude::{BitVec, Lsb0};
-use crate::evm::fuzz::EvmInput;
 
-#[derive(Clone, Debug)]
-pub enum ChainId {
-    Evm(u64),
-    Svm,
-}
+pub use crate::evm::fuzz::EvmInput;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 pub enum ChainState {
     Evm(CacheDB<EmptyDB>),
-    // Svm(SvmState), // Disabled to avoid Solana conflicts
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct SvmState {
-    // pub accounts: HashMap<[u8; 32], SvmAccount>,
-    pub influenced_data_regions: HashMap<[u8; 32], Vec<Range<usize>>>, // simplified
 }
 
 #[derive(Clone)]
@@ -44,24 +35,18 @@ pub enum TaintSource {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Waypoint {
-    Dataflow {
-        address: Address,
-        slot: Vec<u8>,
-        influenced: bool,
-    },
+    Dataflow { address: Address, slot: Vec<u8>, influenced: bool },
     Comparison {
         op: u8,
         lhs: U256,
         rhs: U256,
         pc: usize,
+        calldata_offset: usize,
+        condition: bool,
+        hit: bool,
         taint_source: Option<TaintSource>,
     },
-    StaticCall {
-        caller: Address,
-        target: Address,
-        data: Vec<u8>,
-        output: Vec<u8>,
-    },
+    StaticCall { caller: Address, target: Address, data: Vec<u8>, output: Vec<u8> },
     Arithmetic {
         op: u8,
         lhs: U256,
@@ -86,40 +71,12 @@ pub enum Waypoint {
         tx_idx: usize,
         taint_source_of_value: Option<TaintSource>,
     },
-    TransientStorageRead {
-        address: Address,
-        slot: B256,
-        value: U256,
-        pc: usize,
-    },
-    TransientStorageWrite {
-        address: Address,
-        slot: B256,
-        value: U256,
-        pc: usize,
-    },
-    MappingDerivation {
-        base_slot: U256,
-        key: U256,
-        derived_slot: B256,
-    },
-    FlashloanExecution {
-        lender: Address,
-        token: Address,
-        amount: U256,
-        fee: U256,
-        is_repaid: bool,
-    },
-    GovernanceAction {
-        target: Address,
-        selector: [u8; 4],
-        caller: Address,
-    },
-    TokenCallback {
-        target: Address,
-        selector: [u8; 4],
-        data: Vec<u8>,
-    },
+    TransientStorageRead { address: Address, slot: B256, value: U256, pc: usize },
+    TransientStorageWrite { address: Address, slot: B256, value: U256, pc: usize },
+    MappingDerivation { base_slot: U256, key: U256, derived_slot: B256 },
+    FlashloanExecution { lender: Address, token: Address, amount: U256, fee: U256, is_repaid: bool },
+    GovernanceAction { target: Address, selector: [u8; 4], caller: Address },
+    TokenCallback { target: Address, selector: [u8; 4], data: Vec<u8> },
     SvmCpiCall {
         caller_program: [u8; 32],
         callee_program: [u8; 32],
@@ -127,16 +84,8 @@ pub enum Waypoint {
         accounts: Vec<[u8; 32]>,
         signers: Vec<[u8; 32]>,
     },
-    BranchPath {
-        pc: usize,
-        taken: bool,
-        constraint: Box<Waypoint>,
-    },
-    MevSignal {
-        victim_caller: Address,
-        slippage_harvested: U256,
-        is_sandwich: bool,
-    },
+    BranchPath { pc: usize, taken: bool, constraint: Box<Waypoint> },
+    MevSignal { victim_caller: Address, slippage_harvested: U256, is_sandwich: bool },
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -150,14 +99,24 @@ pub struct SingletonTx {
 
 impl SingletonTx {
     pub fn to_revm_tx_env(&self) -> TxEnv {
-        TxEnv {
-            caller: self.caller,
-            transact_to: TransactTo::Call(self.to),
-            gas_limit: 21_000_000,
-            gas_price: 0.into(),
-            value: self.value,
-            data: self.input.clone().into(),
-            ..Default::default()
-        }
+        let mut env = TxEnv::default();
+        
+        env.caller = self.caller;
+        env.transact_to = TransactTo::Call(self.to);
+        
+        env.gas_limit = 30_000_000; 
+        env.gas_price = U256::ZERO;
+        env.value = self.value;
+
+        env.data = Bytes::copy_from_slice(&self.input);
+        
+        env.gas_priority_fee = Some(U256::ZERO); 
+        env.access_list = Vec::new();
+        
+        // Blob transactions (EIP-4844) support - default to None
+        env.blob_hashes = Vec::new();
+        env.max_fee_per_blob_gas = None;
+
+        env
     }
 }
