@@ -65,15 +65,15 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
             // CALLDATALOAD: Mark the top of the stack as tainted with the offset
             0x35 => {
                 if let Ok(offset_val) = interp.stack.peek(0) {
-                    let offset = offset_val.saturating_to();
+                    let offset: usize = offset_val.saturating_to();
                     self.taint_stack.push(Some(TaintSource::Calldata(offset)));
                 }
             }
             0x3C => {
                 if let (Ok(dest), Ok(src), Ok(len)) = (interp.stack.peek(0), interp.stack.peek(1), interp.stack.peek(2)) {
-                    let dest = dest.saturating_to();
-                    let src = src.saturating_to();
-                    let len = len.saturating_to();
+                    let dest: usize = dest.saturating_to();
+                    let src: usize = src.saturating_to();
+                    let len: usize = len.saturating_to();
                     // Propagate taint from calldata to memory
                     for i in 0..len {
                         self.memory_taint.insert(dest + i, TaintSource::Calldata(src + i));
@@ -82,7 +82,7 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
             }
             0x51 => {
                 if let Ok(offset_val) = interp.stack.peek(0) {
-                    let offset = offset_val.saturating_to();
+                    let offset: usize = offset_val.saturating_to();
                     let taint = self.memory_taint.get(&offset).cloned();
                     self.taint_stack.push(taint);
                     return;
@@ -91,7 +91,7 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
             }
             0x52 | 0x53 => {
                 if let (Ok(offset_val), Some(taint)) = (interp.stack.peek(0), self.taint_stack.last().cloned().flatten()) {
-                    let offset = offset_val.saturating_to();
+                    let offset: usize = offset_val.saturating_to();
                     let size = if opcode == 0x52 { 32 } else { 1 };
                     for i in 0..size {
                         self.memory_taint.insert(offset + i, taint.clone());
@@ -124,7 +124,7 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
                             if written_tx_idx < self.current_tx_idx {
                                 self.waypoints.push(Waypoint::StorageRead {
                                     address: addr, slot, value: U256::ZERO, // Value will be known after SLOAD
-                                    pc, read_tx_idx: self.current_tx_idx, taint_source: Some(taint_source_of_value),
+                                    pc, read_tx_idx: self.current_tx_idx, taint_source: Some(taint_source_of_value.clone()),
                                 });
                                 self.taint_stack.push(Some(taint_source_of_value)); // Propagate taint from storage read
                                 return; // Skip default taint propagation
@@ -168,7 +168,7 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
         // Causal Tracking: Monitor SLOAD (0x54) and SSTORE (0x55)
         if opcode == 0x54 || opcode == 0x55 {
             if let Ok(slot_val) = interp.stack.peek(0) {
-                let addr = interp.input.bytecode_address();
+                let addr = interp.input.bytecode_address().copied().unwrap_or(Address::ZERO);
                 let slot = B256::from(slot_val);
 
                 // Logic Sanitizer: Detect Uninitialized Storage Reads
@@ -196,7 +196,7 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
 
             // Slot is the first item on the stack for SSTORE
             if let Ok(slot_val) = interp.stack.peek(0) {
-                let address = interp.input.bytecode_address();
+                let address = interp.input.bytecode_address().copied().unwrap_or(Address::ZERO);
                 let slot = B256::from(slot_val);
 
                 self.dataflow.mark_influenced(address, slot);
@@ -229,7 +229,7 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
         if opcode == 0x5D {
             let value_taint_source = self.taint_stack.last().cloned().flatten();
             if let Ok(slot_val) = interp.stack.peek(0) {
-                let address = interp.input.bytecode_address();
+                let address = interp.input.bytecode_address().copied().unwrap_or(Address::ZERO);
                 let slot = B256::from(slot_val);
                 
                 if let Some(ts) = value_taint_source {
@@ -331,8 +331,8 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
         // Capture Mapping Derivations for high-fidelity Oracle reasoning
         if opcode == 0x20 {
             if let (Ok(offset), Ok(size)) = (interp.stack.peek(0), interp.stack.peek(1)) {
-                let offset = offset.saturating_to();
-                let size = size.saturating_to();
+                let offset: usize = offset.saturating_to();
+                let size: usize = size.saturating_to();
                 
                 // Industry standard: mappings usually involve 64 bytes (key + base_slot)
                 if size == 64 {
@@ -371,7 +371,7 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
                 self.waypoints.push(Waypoint::TokenCallback {
                     target: inputs.target_address,
                     selector: selector.try_into().unwrap(),
-                    data: input_bytes.clone(),
+                    data: input_bytes.to_vec(),
                 });
             }
         }
@@ -441,7 +441,7 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
             self.waypoints.push(Waypoint::StaticCall {
                 caller: inputs.caller,
                 target: inputs.target_address,
-                data: input_bytes,
+                data: input_bytes.to_vec(),
                 output: outcome.result.output.to_vec(),
             });
         }

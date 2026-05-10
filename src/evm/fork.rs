@@ -39,7 +39,7 @@ pub async fn create_fork_block_env(rpc_url: &str, block_number: u64) -> anyhow::
         gas_limit: header.gas_limit,
         basefee: header.base_fee_per_gas.unwrap_or_default(),
         difficulty: header.difficulty,
-        prevrandao: header.mix_hash,
+        prevrandao: Some(header.mix_hash),
         blob_excess_gas_and_price: None, // Update if fuzzing EIP-4844
         slot_num: 0, // Placeholder - needs actual calculation
     })

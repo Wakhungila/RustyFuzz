@@ -26,6 +26,16 @@ pub struct EtherscanAbiFetcher {
     cache: Arc<RwLock<HashMap<Address, JsonAbi>>>,
 }
 
+impl std::fmt::Debug for EtherscanAbiFetcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EtherscanAbiFetcher")
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("cache_size", &self.cache.read().len())
+            .finish()
+    }
+}
+
 impl EtherscanAbiFetcher {
     pub fn new(api_key: String, base_url: String) -> Self {
         Self {

@@ -335,7 +335,7 @@ impl<'a, DB: Database> Inspector<DB> for TaintInspector<'a> {
                     if let Some(top_state) = self.tracker.get_stack_taint(stack_len - 1) {
                         if top_state.is_tainted() {
                             // Record potential access control check
-                            let marks: Vec<_> = top_state.marks.clone();
+                            let marks: Vec<_> = top_state.marks.iter().cloned().collect();
                             for mark in marks {
                                 self.tracker.record_flow(
                                     mark.source.clone(),
@@ -513,7 +513,7 @@ impl<'a, DB: Database> Inspector<DB> for TaintInspector<'a> {
                         TaintSink::CallTarget
                     };
                     
-                    let marks: Vec<_> = target_state.marks.clone();
+                    let marks: Vec<_> = target_state.marks.iter().cloned().collect();
                     for mark in marks {
                         self.tracker.record_flow(
                             mark.source.clone(),

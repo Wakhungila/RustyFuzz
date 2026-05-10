@@ -30,38 +30,33 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let start_time = Instant::now();
 
-    // 1. Monitor Setup
     let monitor = SimpleMonitor::new(|s| {
         log::info!("Stats: {} | Duration: {:?}", s, start_time.elapsed());
     });
 
-    // 2. Shared Memory Provider
     let shmem_provider = StdShMemProvider::new()?;
 
     log::info!("Initializing RustyFuzz v0.15.4 Campaign...");
 
-    // 3. Launcher with LibAFL 0.15 syntax
     Launcher::builder()
         .shmem_provider(shmem_provider)
         .monitor(monitor)
         .configuration(EventConfig::AlwaysUnique)
-        .run_client(|state: Option<_>, mut manager, core_id| {
+        // FIX 1: Explicitly type 'core_id' and 'state' to satisfy type inference
+        .run_client(|state: Option<StdState<_, _, _, _>>, mut manager, core_id: CoreId| {
             
-            // --- Resources (Arc for thread safety across stages) ---
             let snapshot_corpus = Arc::new(RwLock::new(SnapshotCorpus::new()));
             let dataflow_registry = Arc::new(RwLock::new(DataflowRegistry::new()));
             let evm_executor = Arc::new(EvmExecutor::new());
             let account_registry = Arc::new(RwLock::new(GlobalAccountRegistry::default()));
             let abi_registry = Arc::new(AbiRegistry::default());
 
-            // Initialize Forking via tokio handle
             let (initial_db, initial_env) = tokio::runtime::Handle::current().block_on(async {
                 let db = crate::evm::fork::create_fork_db(&config.rpc_url, config.fork_block).await.unwrap();
                 let env = crate::evm::fork::create_fork_block_env(&config.rpc_url, config.fork_block).await.unwrap();
                 (db, env)
             });
 
-            // --- Feedback & State ---
             let mut feedback = crate::evm::feedback::EvmCoverageFeedback::new();
             let mut objective = (); 
 
@@ -75,7 +70,8 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 ).expect("Failed to initialize State")
             });
 
-            // --- Mutator & Stages ---
+            // FIX 2: Ensure your EvmMutator has a 'new' method or use struct initialization
+            // If EvmMutator doesn't have ::new(), use: EvmMutator { abi_registry, ... }
             let mutator = EvmMutator::new(abi_registry, account_registry.clone());
             
             let mut stages = tuple_list!(
@@ -91,19 +87,20 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
             let mut fuzzer = StdFuzzer::new(StdScheduler::new(), feedback, objective);
 
-            // --- Observer Setup ---
+            // FIX 3: Shared map must be accessible. Using a static mut is common for speed.
             static mut COVERAGE_MAP: [u8; MAP_SIZE] = [0u8; MAP_SIZE];
             let observer = unsafe { 
                 StdMapObserver::from_mut_ptr("edges", COVERAGE_MAP.as_mut_ptr(), MAP_SIZE) 
             };
             
-            // --- InProcessExecutor (0.15.4 API) ---
-            // Observers are passed as part of the tuple_list in the new() constructor
+            // FIX 4: Corrected InProcessExecutor constructor
+            // The signature is: InProcessExecutor::new(observers, harness, state, manager, fuzzer)
             let mut executor = InProcessExecutor::new(
-                &mut observer,
-                |input: &EvmInput, _state, _manager| {
+                tuple_list!(observer), // Observers MUST be a tuple_list
+                |input: &EvmInput| {   // Harness closure: only takes input in newer LibAFL
                     let snap_id = input.base_snapshot_id;
-                    let base_snap_arc = snapshot_corpus.read().get_snapshot(snap_id).unwrap();
+                    let snapshot_corpus_guard = snapshot_corpus.read();
+                    let base_snap_arc = snapshot_corpus_guard.get_snapshot(snap_id).unwrap();
                     
                     let mut current_state = base_snap_arc.read().state.read().clone();
                     let mut current_env = initial_env.clone();
@@ -112,7 +109,6 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                         let mut waypoints = Vec::new();
                         let mut df = dataflow_registry.write();
                         
-                        // Execute using the revm v38 refactored logic
                         let _ = evm_executor.execute(
                             &mut current_state,
                             &mut current_env,
@@ -127,15 +123,15 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 },
                 &mut state,
                 &mut manager,
+                &mut fuzzer, // Missing 5th argument in your previous version
             )?;
 
-            // --- Fuzz Loop ---
-            // In 0.15, Fuzzer::fuzz_loop is a trait method
             fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
             
             Ok(())
         })
-        .cores(CoreId::all()?) // CoreId::all() returns Vec in 0.15
+        // FIX 5: Use Cores::from() for the cores iterator
+        .cores(Cores::from(CoreId::all()?)) 
         .build()
         .launch()?;
 

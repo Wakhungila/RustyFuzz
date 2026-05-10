@@ -1,5 +1,6 @@
 use alloy::providers::Provider;
 use alloy::rpc::types::eth::BlockTransactions;
+use alloy::consensus::Transaction;
 use crate::common::types::{SingletonTx, EvmInput};
 use revm::primitives::Address;
 use std::sync::Arc;
@@ -48,14 +49,17 @@ impl<P: Provider> SeedIngester<P> {
                     BlockTransactions::Full(txs) => {
                         for t in txs {
                             // Check if the transaction was directed at our target contract
-                            if t.inner.to() == Some(target) {
+                            // Dereference Recovered to get the envelope
+                            let envelope = &*t.inner;
+                            let tx_to = envelope.to();
+                            if tx_to == Some(target) {
                                 let input = EvmInput {
                                     txs: vec![SingletonTx {
                                         // Conversion to revm::primitives::Bytes
-                                        input: t.inner.input().to_vec(), 
-                                        caller: t.inner.from(),
+                                        input: envelope.input().to_vec(), 
+                                        caller: Address::from(*t.inner.signer()),
                                         to: target,
-                                        value: t.inner.value(),
+                                        value: envelope.value(),
                                         is_victim: false, // Default for seeds
                                     }],
                                     base_snapshot_id: 0, // Root snapshot

@@ -273,7 +273,8 @@ impl EvmMutator {
 
         let token = Address::new([0x17; 20]);
         let amount = U256::from(10u128.pow(21));
-        let sequence_data = bincode::encode_to_vec(&input.txs, bincode::config::standard()).unwrap_or_else(|_| vec![]);
+        // TODO: SingletonTx needs to implement bincode::Encode trait
+        let sequence_data: Vec<u8> = vec![]; // bincode::encode_to_vec(&input.txs, bincode::config::standard()).unwrap_or_else(|_| vec![]);
 
         let mut call_data = vec![0x5c, 0x19, 0xe9, 0x51];
         call_data.extend_from_slice(&[0u8; 12]);
