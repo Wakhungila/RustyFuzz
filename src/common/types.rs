@@ -2,7 +2,6 @@ use revm::primitives::{
     Address, U256, B256, 
     Bytes, 
 };
-use bincode::{Encode, Decode};
 
 use revm::context::TxEnv;
 use revm::database::{CacheDB, EmptyDB}; 
@@ -13,7 +12,7 @@ use bitvec::prelude::{BitVec, Lsb0};
 
 pub use crate::evm::fuzz::EvmInput; 
 
-#[derive(Clone, Debug, Encode, Decode)] // Add these
+#[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 pub struct SingletonTx {
     pub input: Vec<u8>,
     pub caller: Address,

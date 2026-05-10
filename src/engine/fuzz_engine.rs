@@ -11,10 +11,11 @@ use parking_lot::RwLock;
 
 // LibAFL 0.15.4 Imports
 use libafl::prelude::{
-    SimpleMonitor, EventConfig, Launcher, StdState, InMemoryCorpus, 
-    StdFuzzer, StdScheduler, InProcessExecutor, StdMapObserver, 
+    SimpleMonitor, EventConfig, Launcher, StdState, InMemoryCorpus,
+    StdFuzzer, StdScheduler, InProcessExecutor, StdMapObserver,
     StdMutationalStage, ExitKind, Feedback, HasCorpus, Fuzzer,
 };
+use libafl::events::ClientDescription;
 use libafl_bolts::prelude::*;
 use libafl_bolts::shmem::{StdShMemProvider, ShMemProvider};
 use libafl_bolts::tuples::{tuple_list, Handled};
@@ -43,7 +44,7 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
         .monitor(monitor)
         .configuration(EventConfig::AlwaysUnique)
         // FIX 1: Explicitly type 'core_id' and 'state' to satisfy type inference
-        .run_client(|state: Option<StdState<_, _, _, _>>, mut manager, core_id: CoreId| {
+        .run_client(|state: Option<StdState<_, _, _, _>>, mut manager, description: ClientDescription| {
             
             let snapshot_corpus = Arc::new(RwLock::new(SnapshotCorpus::new()));
             let dataflow_registry = Arc::new(RwLock::new(DataflowRegistry::new()));
@@ -56,6 +57,8 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 let env = crate::evm::fork::create_fork_block_env(&config.rpc_url, config.fork_block).await.unwrap();
                 (db, env)
             });
+
+            let core_id = description.core_id();
 
             let mut feedback = crate::evm::feedback::EvmCoverageFeedback::new();
             let mut objective = (); 
@@ -76,13 +79,6 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
             
             let mut stages = tuple_list!(
                 StdMutationalStage::new(mutator),
-                CorpusMinimizationStage::new(
-                    snapshot_corpus.clone(),
-                    evm_executor.clone(),
-                    initial_db.clone(),
-                    initial_env.clone(),
-                    1000
-                ),
             );
 
             let mut fuzzer = StdFuzzer::new(StdScheduler::new(), feedback, objective);
@@ -94,44 +90,45 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
             };
             
             // FIX 4: Corrected InProcessExecutor constructor
-            // The signature is: InProcessExecutor::new(observers, harness, state, manager, fuzzer)
+            // The signature is: InProcessExecutor::new(harness, observers, fuzzer, state, event_manager)
+            let mut harness = |input: &EvmInput| {   // Harness closure: only takes input in newer LibAFL
+                let snap_id = input.base_snapshot_id;
+                let snapshot_corpus_guard = snapshot_corpus.read();
+                let base_snap_arc = snapshot_corpus_guard.get_snapshot(snap_id).unwrap();
+
+                let mut current_state = base_snap_arc.read().state.read().clone();
+                let mut current_env = initial_env.clone();
+
+                for (tx_idx, tx) in input.txs.iter().enumerate() {
+                    let mut waypoints = Vec::new();
+                    let mut df = dataflow_registry.write();
+
+                    let _ = evm_executor.execute(
+                        &mut current_state,
+                        &mut current_env,
+                        tx,
+                        unsafe { &mut COVERAGE_MAP },
+                        &mut df,
+                        &mut waypoints,
+                        tx_idx
+                    );
+                }
+                ExitKind::Ok
+            };
             let mut executor = InProcessExecutor::new(
+                &mut harness,
                 tuple_list!(observer), // Observers MUST be a tuple_list
-                |input: &EvmInput| {   // Harness closure: only takes input in newer LibAFL
-                    let snap_id = input.base_snapshot_id;
-                    let snapshot_corpus_guard = snapshot_corpus.read();
-                    let base_snap_arc = snapshot_corpus_guard.get_snapshot(snap_id).unwrap();
-                    
-                    let mut current_state = base_snap_arc.read().state.read().clone();
-                    let mut current_env = initial_env.clone();
-                    
-                    for (tx_idx, tx) in input.txs.iter().enumerate() {
-                        let mut waypoints = Vec::new();
-                        let mut df = dataflow_registry.write();
-                        
-                        let _ = evm_executor.execute(
-                            &mut current_state,
-                            &mut current_env,
-                            tx,
-                            unsafe { &mut COVERAGE_MAP },
-                            &mut df,
-                            &mut waypoints,
-                            tx_idx
-                        );
-                    }
-                    ExitKind::Ok
-                },
+                &mut fuzzer,
                 &mut state,
                 &mut manager,
-                &mut fuzzer, // Missing 5th argument in your previous version
             )?;
 
             fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
             
             Ok(())
         })
-        // FIX 5: Use Cores::from() for the cores iterator
-        .cores(Cores::from(CoreId::all()?)) 
+        // FIX 5: Use Cores::from_cmdline for the cores iterator
+        .cores(&Cores::from_cmdline("all")?) 
         .build()
         .launch()?;
 

@@ -98,6 +98,18 @@ where
 }
 
 impl EvmMutator {
+    pub fn new(
+        abi_registry: Arc<AbiRegistry>,
+        account_registry: Arc<RwLock<GlobalAccountRegistry>>,
+    ) -> Self {
+        Self {
+            abi_registry,
+            account_registry,
+            type_cache: RwLock::new(HashMap::new()),
+            decode_cache: RwLock::new(LruCache::new(MAX_DECODE_CACHE_SIZE)),
+        }
+    }
+
     #[cfg(feature = "z3")]
     fn concolic_mutation<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
         if input.waypoints.is_empty() {
@@ -273,7 +285,7 @@ impl EvmMutator {
 
         let token = Address::new([0x17; 20]);
         let amount = U256::from(10u128.pow(21));
-        let sequence_data = bincode::encode_to_vec(&input.txs, bincode::config::standard()).unwrap_or_else(|_| vec![]);
+        let sequence_data = bincode::serde::encode_to_vec(&input.txs, bincode::config::standard()).unwrap_or_else(|_| vec![]);
 
         let mut call_data = vec![0x5c, 0x19, 0xe9, 0x51];
         call_data.extend_from_slice(&[0u8; 12]);
