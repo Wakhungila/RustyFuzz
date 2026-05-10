@@ -2,6 +2,8 @@ use revm::primitives::{
     Address, U256, B256, 
     Bytes, 
 };
+use bincode::{Encode, Decode};
+
 use revm::context::TxEnv;
 use revm::database::{CacheDB, EmptyDB}; 
 use std::sync::Arc;
@@ -9,7 +11,16 @@ use parking_lot::RwLock;
 use serde::{Serialize, Deserialize};
 use bitvec::prelude::{BitVec, Lsb0};
 
-pub use crate::evm::fuzz::EvmInput;
+pub use crate::evm::fuzz::EvmInput; 
+
+#[derive(Clone, Debug, Encode, Decode)] // Add these
+pub struct SingletonTx {
+    pub input: Vec<u8>,
+    pub caller: Address,
+    pub to: Address,
+    pub value: U256,
+    pub is_victim: bool,
+}
 
 #[derive(Clone, Serialize)]
 pub enum ChainState {
@@ -86,15 +97,6 @@ pub enum Waypoint {
     },
     BranchPath { pc: usize, taken: bool, constraint: Box<Waypoint> },
     MevSignal { victim_caller: Address, slippage_harvested: U256, is_sandwich: bool },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Hash)]
-pub struct SingletonTx {
-    pub input: Vec<u8>,
-    pub caller: Address,
-    pub to: Address,
-    pub value: U256,
-    pub is_victim: bool,
 }
 
 impl SingletonTx {

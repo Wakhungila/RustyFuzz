@@ -60,11 +60,13 @@ impl Erc20Discovery {
             slot_key_bytes[32..64].copy_from_slice(&U256::from(slot_idx).to_be_bytes::<32>()); // Base slot
             let derived_slot = U256::from_be_bytes(keccak256(&slot_key_bytes).0);
 
-            if let Some(token_acc) = initial_db.cache.accounts.get(&token_address) {
-                if let Some(stored_balance) = token_acc.storage.get(&derived_slot) {
-                    if *stored_balance == actual_balance {
-                        log::info!("Discovered balance slot for Token {} at {}", token_address, derived_slot);
-                        return Some(derived_slot);
+            if let ChainState::Evm(db) = initial_db {
+                if let Some(token_acc) = db.cache.accounts.get(&token_address) {
+                    if let Some(stored_balance) = token_acc.storage.get(&derived_slot) {
+                        if *stored_balance == actual_balance {
+                            log::info!("Discovered balance slot for Token {} at {}", token_address, derived_slot);
+                            return Some(derived_slot);
+                        }
                     }
                 }
             }
