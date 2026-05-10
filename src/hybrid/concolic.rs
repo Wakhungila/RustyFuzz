@@ -1,7 +1,7 @@
 #[cfg(feature = "z3")]
 use z3::{Config, Context, Solver, ast::BV, ast::Ast};
 use crate::common::types::Waypoint;
-use revm::primitives::U256;
+// use revm::primitives::U256; // Unused
 
 pub fn generate_hints(waypoints: &[Waypoint]) -> Vec<Vec<u8>> {
     #[cfg(feature = "z3")]

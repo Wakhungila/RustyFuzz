@@ -1,7 +1,8 @@
 use revm::primitives::Address;
 use alloy_json_abi::JsonAbi;
 use anyhow::{anyhow, Result};
-use reqwest::Client;
+// TODO: reqwest dependency needs to be added to Cargo.toml
+// use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,8 +18,9 @@ struct EtherscanResponse {
 
 /// EtherscanAbiFetcher: Dynamically pulls and caches contract ABIs from Etherscan.
 /// This eliminates manual ABI input and enables the fuzzer to understand new contracts.
+#[derive(Clone)]
 pub struct EtherscanAbiFetcher {
-    client: Client,
+    client: reqwest::Client,
     api_key: String,
     base_url: String,
     cache: Arc<RwLock<HashMap<Address, JsonAbi>>>,
@@ -27,7 +29,7 @@ pub struct EtherscanAbiFetcher {
 impl EtherscanAbiFetcher {
     pub fn new(api_key: String, base_url: String) -> Self {
         Self {
-            client: Client::new(),
+            client: reqwest::Client::new(),
             api_key,
             base_url,
             cache: Arc::new(RwLock::new(HashMap::new())),

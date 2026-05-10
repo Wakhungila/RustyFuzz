@@ -8,11 +8,15 @@
 //! - Access control bypasses with tainted caller checks
 
 use revm::{
-    interpreter::{Interpreter, OpCode},
-    interpreter::stack::Stack,
-    Database, Inspector, Context,
-    primitives::{Address, U256, Bytes},
+    Database, Inspector,
+    interpreter::{Interpreter, Stack, CallInputs, CallOutcome, CallScheme},
+    interpreter::interpreter_types::Jumps,
+    primitives::{Address, U256},
 };
+// v38: OpCode is now in the bytecode module
+// use revm::bytecode::Bytecode; // Unused
+// Context and Bytes unused
+// Context, Bytes,
 use std::collections::{HashMap, HashSet};
 use crate::common::types::SingletonTx;
 
@@ -278,9 +282,11 @@ impl<'a> TaintInspector<'a> {
         result_state.merge(&second_state);
         
         // Add operation to propagation path
-        for mark in result_state.marks.iter_mut() {
+        let mut marks: Vec<_> = result_state.marks.drain().collect();
+        for mark in &mut marks {
             mark.propagation_path.push(op.clone());
         }
+        result_state.marks = marks.into_iter().collect();
         
         // Pop two values, push result
         if stack_len >= 2 {
@@ -298,16 +304,18 @@ impl<'a> TaintInspector<'a> {
         
         let top_state = self.tracker.get_stack_taint_mut(stack_len - 1);
         if let Some(state) = top_state {
-            for mark in state.marks.iter_mut() {
+            let mut marks: Vec<_> = state.marks.drain().collect();
+            for mark in &mut marks {
                 mark.propagation_path.push(op.clone());
             }
+            state.marks = marks.into_iter().collect();
         }
     }
 }
 
 impl<'a, DB: Database> Inspector<DB> for TaintInspector<'a> {
     fn step(&mut self, interp: &mut Interpreter, _context: &mut DB) {
-        let opcode = interp.current_opcode();
+        let opcode = interp.bytecode.opcode();
         let stack = &mut interp.stack;
         let stack_len = stack.len();
         
@@ -327,7 +335,8 @@ impl<'a, DB: Database> Inspector<DB> for TaintInspector<'a> {
                     if let Some(top_state) = self.tracker.get_stack_taint(stack_len - 1) {
                         if top_state.is_tainted() {
                             // Record potential access control check
-                            for mark in &top_state.marks {
+                            let marks: Vec<_> = top_state.marks.clone();
+                            for mark in marks {
                                 self.tracker.record_flow(
                                     mark.source.clone(),
                                     TaintSink::AccessControlCheck,
@@ -425,14 +434,16 @@ impl<'a, DB: Database> Inspector<DB> for TaintInspector<'a> {
                 if stack_len >= 1 {
                     let key_state = self.tracker.stack_taint.pop().unwrap_or_default();
                     
-                    // If key is tainted, record storage key flow
-                    if key_state.is_tainted() {
-                        for mark in &key_state.marks {
-                            self.tracker.record_flow(
-                                mark.source.clone(),
-                                TaintSink::StorageKey,
-                                mark.propagation_path.clone(),
-                            );
+                    if let Some(target_state) = self.tracker.get_stack_taint(stack_len - 1) {
+                        if target_state.is_tainted() {
+                            let marks = target_state.marks.clone();
+                            for mark in &marks {
+                                self.tracker.record_flow(
+                                    mark.source.clone(),
+                                    TaintSink::StorageKey,
+                                    mark.propagation_path.clone(),
+                                );
+                            }
                         }
                     }
                     
@@ -502,7 +513,8 @@ impl<'a, DB: Database> Inspector<DB> for TaintInspector<'a> {
                         TaintSink::CallTarget
                     };
                     
-                    for mark in &target_state.marks {
+                    let marks: Vec<_> = target_state.marks.clone();
+                    for mark in marks {
                         self.tracker.record_flow(
                             mark.source.clone(),
                             sink.clone(),

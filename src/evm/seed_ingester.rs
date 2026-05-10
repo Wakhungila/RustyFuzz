@@ -1,7 +1,7 @@
 use alloy::providers::Provider;
 use alloy::rpc::types::eth::BlockTransactions;
 use crate::common::types::{SingletonTx, EvmInput};
-use revm::primitives::{Address, Bytes};
+use revm::primitives::Address;
 use std::sync::Arc;
 use anyhow::Context;
 
@@ -40,7 +40,7 @@ impl<P: Provider> SeedIngester<P> {
             
             // Alloy 0.2: get_block_by_number returns an Option<Block>
             // We use 'true' to get full transaction objects rather than just hashes
-            let block = self.provider.get_block_by_number(block_num.into(), true).await
+            let block = self.provider.get_block_by_number(block_num.into()).await
                 .context(format!("Failed to fetch block {}", block_num))?;
             
             if let Some(b) = block {
@@ -48,17 +48,18 @@ impl<P: Provider> SeedIngester<P> {
                     BlockTransactions::Full(txs) => {
                         for t in txs {
                             // Check if the transaction was directed at our target contract
-                            if t.to == Some(target) {
+                            if t.inner.to() == Some(target) {
                                 let input = EvmInput {
                                     txs: vec![SingletonTx {
                                         // Conversion to revm::primitives::Bytes
-                                        input: t.input.to_vec(), 
-                                        caller: t.from,
+                                        input: t.inner.input().to_vec(), 
+                                        caller: t.inner.from(),
                                         to: target,
-                                        value: t.value,
+                                        value: t.inner.value(),
                                         is_victim: false, // Default for seeds
                                     }],
                                     base_snapshot_id: 0, // Root snapshot
+                                    waypoints: Vec::new(), // No waypoints for seeds
                                 };
                                 seeds.push(input);
                             }

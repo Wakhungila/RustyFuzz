@@ -1,8 +1,8 @@
 use revm::primitives::{
     Address, U256, B256, 
-    TxEnv, TransactTo, 
     Bytes, 
 };
+use revm::context::TxEnv;
 use revm::database::{CacheDB, EmptyDB}; 
 use std::sync::Arc;
 use parking_lot::RwLock;
@@ -33,7 +33,7 @@ pub enum TaintSource {
     Storage(usize, usize),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 pub enum Waypoint {
     Dataflow { address: Address, slot: Vec<u8>, influenced: bool },
     Comparison {
@@ -41,7 +41,7 @@ pub enum Waypoint {
         lhs: U256,
         rhs: U256,
         pc: usize,
-        calldata_offset: usize,
+        calldata_offset: Option<usize>,
         condition: bool,
         hit: bool,
         taint_source: Option<TaintSource>,
@@ -88,7 +88,7 @@ pub enum Waypoint {
     MevSignal { victim_caller: Address, slippage_harvested: U256, is_sandwich: bool },
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 pub struct SingletonTx {
     pub input: Vec<u8>,
     pub caller: Address,
@@ -102,20 +102,20 @@ impl SingletonTx {
         let mut env = TxEnv::default();
         
         env.caller = self.caller;
-        env.transact_to = TransactTo::Call(self.to);
+        env.kind = revm::primitives::TxKind::Call(self.to);
         
         env.gas_limit = 30_000_000; 
-        env.gas_price = U256::ZERO;
+        env.gas_price = 0;
         env.value = self.value;
 
         env.data = Bytes::copy_from_slice(&self.input);
         
-        env.gas_priority_fee = Some(U256::ZERO); 
-        env.access_list = Vec::new();
+        env.gas_priority_fee = Some(0); 
+        env.access_list = Default::default();
         
-        // Blob transactions (EIP-4844) support - default to None
+        // Blob transactions (EIP-4844) support - default to 0
         env.blob_hashes = Vec::new();
-        env.max_fee_per_blob_gas = None;
+        env.max_fee_per_blob_gas = 0;
 
         env
     }

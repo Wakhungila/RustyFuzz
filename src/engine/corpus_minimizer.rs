@@ -1,12 +1,14 @@
 use revm::{
     database::{CacheDB, EmptyDB},
-    primitives::BlockEnv,
 };
+use revm::context::BlockEnv;
 use libafl::{
     prelude::*,
     stages::Stage,
-    state::{HasCorpus, UsesInput},
-    executors::UsesState,
+    state::HasCorpus,
+    // TODO: These traits moved in libafl
+    // state::UsesInput,
+    // executors::hooks::UsesState,
 };
 use libafl_bolts::prelude::*;
 use std::sync::Arc;
@@ -36,7 +38,7 @@ pub struct CorpusMinimizationStage<S> {
 impl<S> CorpusMinimizationStage<S> 
 where
     S: HasCorpus<EvmInput>,
-    S: UsesInput<Input = EvmInput>, 
+    // S: UsesInput<Input = EvmInput>, // TODO: UsesInput trait moved in libafl 
 {
     pub fn new(
         corpus: Arc<RwLock<SnapshotCorpus>>,
@@ -71,7 +73,7 @@ where
                 &mut chain_state, 
                 &mut current_env, 
                 tx, 
-                total_coverage.as_mut_bitslice(), 
+                total_coverage.as_raw_mut_slice(), 
                 &mut dataflow, 
                 &mut waypoints, 
                 idx
@@ -87,19 +89,18 @@ where
     }
 }
 
-impl<S, EM, Z> Stage<S, EM, Z> for CorpusMinimizationStage<S>
+impl<S, EM, Z> Stage<EvmInput, EM, S, Z> for CorpusMinimizationStage<S>
 where
-    S: HasCorpus<EvmInput> + UsesInput<Input = EvmInput>,
-    EM: UsesState<State = S>,
-    Z: UsesState<State = S>,
+    S: HasCorpus<EvmInput> /* + UsesInput<Input = EvmInput> */, // TODO: UsesInput trait moved in libafl
+    // EM: UsesState<State = S>, // TODO: UsesState trait moved in libafl
+    // Z: UsesState<State = S>, // TODO: UsesState trait moved in libafl
 {
     fn perform(
         &mut self,
         _fuzzer: &mut Z,
-        _executor: &mut EM,
+        _executor: &mut EvmInput,
         state: &mut S,
         _manager: &mut EM,
-        _corpus_idx: CorpusId,
     ) -> Result<(), libafl::Error> {
         self.exec_count += 1;
         if self.exec_count % self.interval != 0 { return Ok(()); }

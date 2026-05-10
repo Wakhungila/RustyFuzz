@@ -7,7 +7,7 @@
 //! - Gas usage profiling per operation
 
 use revm::{
-    interpreter::{CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter},
+    interpreter::{CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter, interpreter_types::{Jumps, InputsTr}},
     Database, Inspector,
     primitives::{Address, Log, U256, Bytes},
 };
@@ -167,7 +167,7 @@ impl CallGraph {
             }
         }
         
-        let edges = edge_map.into_iter().collect();
+        let edges = edge_map.into_iter().map(|((caller, callee), info)| (caller, callee, info)).collect();
         
         Self { nodes, edges }
     }
@@ -285,12 +285,12 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
         }
         
         let step = TraceStep {
-            pc: interp.program_counter(),
-            opcode: interp.current_opcode(),
+            pc: interp.bytecode.pc(),
+            opcode: interp.bytecode.opcode(),
             gas_remaining: interp.gas.remaining(),
             stack_depth: interp.stack.len(),
-            memory_size: interp.shared_memory.len(),
-            contract_address: interp.contract.address,
+            memory_size: interp.memory.len(),
+            contract_address: interp.input.bytecode_address().copied().unwrap_or(Address::ZERO),
         };
         
         self.trace.steps.push(step);
@@ -309,12 +309,20 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
         });
         
         // Record call (will be updated with outcome later)
+        let input_bytes = match &inputs.input {
+            revm::interpreter::CallInput::Bytes(b) => b.clone(),
+            revm::interpreter::CallInput::SharedBuffer(_) => {
+                // Can't access without context, use empty
+                revm::primitives::Bytes::new()
+            }
+        };
+        
         self.trace.calls.push(CallTrace {
             caller: inputs.caller,
             target: inputs.target_address,
-            input: inputs.input.clone(),
+            input: input_bytes,
             output: None,
-            value: inputs.transfer.value,
+            value: inputs.call_value(),
             gas_used: 0,
             success: true,
             depth: self.current_depth,
@@ -333,8 +341,8 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
     ) {
         if let Some(last_call) = self.trace.calls.last_mut() {
             last_call.output = Some(outcome.result.output.clone());
-            last_call.success = outcome.result.is_success();
-            last_call.gas_used = inputs.gas_limit - outcome.result.gas_used();
+            last_call.success = outcome.result.result.is_ok();
+            last_call.gas_used = inputs.gas_limit.saturating_sub(outcome.result.gas.remaining());
         }
         
         self.call_stack.pop();
@@ -349,8 +357,8 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
         self.current_depth += 1;
         
         self.trace.creates.push(CreateTrace {
-            creator: inputs.caller,
-            init_code: inputs.init_code.clone(),
+            creator: inputs.caller(),
+            init_code: inputs.init_code().clone(),
             deployed_address: None,
             deployed_code: None,
             gas_used: 0,
@@ -370,8 +378,8 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
         if let Some(last_create) = self.trace.creates.last_mut() {
             last_create.deployed_address = outcome.address;
             last_create.deployed_code = outcome.result.output.clone().into();
-            last_create.success = outcome.result.is_success();
-            last_create.gas_used = inputs.gas_limit - outcome.result.gas_used();
+            last_create.success = outcome.result.result.is_ok();
+            last_create.gas_used = inputs.gas_limit().saturating_sub(outcome.result.gas.remaining());
         }
         
         self.current_depth = self.current_depth.saturating_sub(1);
@@ -386,24 +394,6 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
         });
         
         self.logs_buffer.push(log);
-    }
-    
-    fn sstore(
-        &mut self,
-        _context: &mut DB,
-        address: Address,
-        index: U256,
-        value: U256,
-        old_value: U256,
-    ) {
-        self.trace.state_changes.push(StateChange {
-            contract: address,
-            slot: index,
-            previous_value: old_value,
-            new_value: value,
-            depth: self.current_depth,
-            pc: 0, // Would need step tracking for exact PC
-        });
     }
 }
 

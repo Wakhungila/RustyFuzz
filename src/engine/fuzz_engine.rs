@@ -1,16 +1,19 @@
 use crate::common::types::EvmInput;
-use crate::engine::config::Config;
+// TODO: Missing module - stub or implement
+// use crate::engine::config::Config;
+#[cfg(feature = "z3")]
 use crate::engine::concolic::ConcolicSolver;
 use crate::engine::corpus_minimizer::CorpusMinimizationStage;
 use crate::evm::executor::EvmExecutor;
 use crate::evm::corpus::SnapshotCorpus;
 use crate::evm::fuzz::{EvmMutator, AbiRegistry};
 use crate::evm::registry::GlobalAccountRegistry;
-use crate::evm::feedback::EvmCoverageFeedback;
-use crate::evm::inspector::CoverageInspector;
+// use crate::evm::feedback::EvmCoverageFeedback; // Unused
+// use crate::evm::inspector::CoverageInspector; // Unused
 use crate::evm::dataflow::DataflowRegistry;
 use crate::common::oracle::{VulnerabilityOracle, VulnType};
-use evm::economic::ProfitReport;
+// TODO: Missing module - stub or implement
+// use crate::evm::economic::ProfitReport;
 use crate::engine::exploit_synthesizer::synthesize_foundry_poc;
 use std::{sync::Arc, collections::HashMap, time::Instant};
 use parking_lot::RwLock;
@@ -20,12 +23,22 @@ use bitvec::prelude::*;
 use libafl::prelude::{
     SimpleMonitor, EventConfig, Launcher, StdState, InMemoryCorpus, 
     StdFuzzer, StdScheduler, InProcessExecutor, StdMapObserver, 
-    StdMutationalStage, ExitKind, Feedback, tuple_list, HasCorpus,
+    StdMutationalStage, ExitKind, Feedback, HasCorpus,
 };
+// TODO: tuple_list might have moved or been renamed in libafl
+// use libafl::prelude::tuple_list;
 use libafl_bolts::prelude::*;
 use libafl_bolts::shmem::StdShMemProvider;
 
 const MAP_SIZE: usize = 65536;
+
+// TODO: Config struct needs to be defined in engine::config module
+// For now, using a placeholder
+#[allow(dead_code)]
+struct Config {
+    rpc_url: String,
+    fork_block: u64,
+}
 
 pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -84,7 +97,7 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
                 decode_cache: RwLock::new(hashlink::LruCache::new(1000)),
             };
 
-            let mut stages = tuple_list!(
+            let mut stages = (
                 StdMutationalStage::new(mutator),
                 CorpusMinimizationStage::new(
                     snapshot_corpus.clone(),
@@ -92,7 +105,7 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
                     initial_db.clone(),
                     initial_env.clone(),
                     1000
-                )
+                ),
             );
 
             let mut fuzzer = StdFuzzer::new(StdScheduler::new(), feedback, objective);
@@ -129,7 +142,7 @@ pub async fn run_fuzz_campaign(config: &Config) -> anyhow::Result<()> {
                     }
                     ExitKind::Ok
                 },
-                tuple_list!(observer),
+                (observer,),
                 &mut state,
                 &mut manager,
             )?;

@@ -7,11 +7,12 @@ use libafl::{
     Error,
 };
 use libafl_bolts::{rands::Rand, HasLen, Named};
-use crate::common::types::{SingletonTx, Waypoint, TaintSource};
+use std::num::NonZero;
+use crate::common::types::{SingletonTx, Waypoint};
 use revm::primitives::{Address, U256};
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc}; // Cow unused
 use crate::evm::registry::GlobalAccountRegistry;
 use parking_lot::RwLock;
 #[cfg(feature = "z3")]
@@ -22,7 +23,7 @@ use hashlink::LruCache;
 const MAX_DECODE_CACHE_SIZE: usize = 10000;
 
 /// Registry of known function selectors and their input types.
-#[derive(Default, Serialize, Deserialize, Clone, Debug)]
+#[derive(Default, Clone, Debug)]
 pub struct AbiRegistry {
     pub functions: HashMap<[u8; 4], Vec<DynSolType>>,
 }
@@ -73,7 +74,7 @@ where
         input: &mut EvmInput,
     ) -> Result<MutationResult, Error> {
         let rand = state.rand_mut();
-        let bucket = rand.below(100);
+        let bucket = rand.below(NonZero::new(100).unwrap());
 
         let result = match bucket {
             0..=14 => self.concolic_mutation(rand, input),
@@ -171,7 +172,8 @@ impl EvmMutator {
             return MutationResult::Skipped;
         }
 
-        let target = downstream[rand.below(downstream.len() as u64) as usize];
+        let target_idx = rand.below(NonZero::new(downstream.len()).unwrap());
+        let target = downstream[target_idx];
         let selector = self.random_selector(rand);
 
         let new_tx = SingletonTx {
@@ -239,7 +241,7 @@ impl EvmMutator {
         let mut cache = self.decode_cache.write();
         let mut decoded = cache.get(calldata).cloned();
         if decoded.is_none() {
-            if let Ok(value) = tuple_type.decode(calldata) {
+            if let Ok(value) = tuple_type.abi_decode(calldata) {
                 cache.insert(calldata.to_vec(), value.clone());
                 decoded = Some(value);
             }
@@ -249,7 +251,8 @@ impl EvmMutator {
         if let Some(mut value) = decoded {
             self.mutate_sol_value(&mut value, rand);
             let mut new_input = selector.to_vec();
-            new_input.extend(value.encode());
+            let encoded = value.abi_encode();
+            new_input.extend_from_slice(&encoded);
             tx.input = new_input;
             MutationResult::Mutated
         } else {
@@ -270,7 +273,7 @@ impl EvmMutator {
 
         let token = Address::new([0x17; 20]);
         let amount = U256::from(10u128.pow(21));
-        let sequence_data = bincode::serialize(&input.txs).unwrap_or_else(|_| vec![]);
+        let sequence_data = bincode::encode_to_vec(&input.txs, bincode::config::standard()).unwrap_or_else(|_| vec![]);
 
         let mut call_data = vec![0x5c, 0x19, 0xe9, 0x51];
         call_data.extend_from_slice(&[0u8; 12]);
@@ -280,7 +283,7 @@ impl EvmMutator {
         call_data.extend_from_slice(&amount.to_be_bytes::<32>());
         call_data.extend_from_slice(&U256::from(128).to_be_bytes::<32>());
         call_data.extend_from_slice(&U256::from(sequence_data.len()).to_be_bytes::<32>());
-        call_data.extend(sequence_data);
+        std::iter::Extend::extend(&mut call_data, sequence_data);
 
         input.txs = vec![SingletonTx {
             input: call_data,
@@ -356,7 +359,7 @@ impl EvmMutator {
         };
 
         let choices = [U256::ZERO, U256::MAX, U256::from(10u128.pow(18))];
-        let choice = rand.below(choices.len() as u64) as usize;
+        let choice = rand.below(NonZero::new(choices.len()).unwrap());
         input.txs[idx].value = choices[choice];
         MutationResult::Mutated
     }
@@ -365,7 +368,7 @@ impl EvmMutator {
         if len == 0 {
             None
         } else {
-            Some(rand.below(len as u64) as usize)
+            Some(rand.below(NonZero::new(len).unwrap()))
         }
     }
 
@@ -373,7 +376,7 @@ impl EvmMutator {
         if items.is_empty() {
             None
         } else {
-            Some(&items[rand.below(items.len() as u64) as usize])
+            Some(&items[rand.below(NonZero::new(items.len()).unwrap())])
         }
     }
 
@@ -381,7 +384,7 @@ impl EvmMutator {
         if self.abi_registry.functions.is_empty() {
             [0u8; 4]
         } else {
-            let idx = rand.below(self.abi_registry.functions.len() as u64) as usize;
+            let idx = rand.below(NonZero::new(self.abi_registry.functions.len()).unwrap());
             *self.abi_registry
                 .functions
                 .keys()
@@ -392,37 +395,37 @@ impl EvmMutator {
 
     fn mutate_sol_value<R: Rand>(&self, value: &mut DynSolValue, rand: &mut R) {
         match value {
-            DynSolValue::Array(ref mut elements, ty) => {
+            DynSolValue::Array(elements) => {
                 if elements.is_empty() {
-                    // Grow the array by generating a default value for the inner type
-                    elements.push(self.generate_default_sol_value(ty, rand));
+                    // Without type info, default to zeroed uints
+                    elements.push(DynSolValue::Uint(U256::ZERO, 256));
                 } else {
-                    let choice = rand.below(100);
+                    let choice = rand.below(NonZero::new(100).unwrap());
                     if choice < 70 { // Mutate an existing element
-                        let idx = rand.below(elements.len() as u64) as usize;
+                        let idx = rand.below(NonZero::new(elements.len()).unwrap());
                         self.mutate_sol_value(&mut elements[idx], rand);
                     } else if choice < 85 && elements.len() > 1 { // Remove an element
-                        let idx = rand.below(elements.len() as u64) as usize;
+                        let idx = rand.below(NonZero::new(elements.len()).unwrap());
                         elements.remove(idx);
                     } else { 
                         // Add another element of the same type
-                        elements.push(self.generate_default_sol_value(ty, rand));
+                        elements.push(elements.last().cloned().unwrap_or(DynSolValue::Uint(U256::ZERO, 256)));
                     }
                 }
             }
-            DynSolValue::FixedArray(ref mut elements, _) => {
+            DynSolValue::FixedArray(elements) => {
                 if !elements.is_empty() {
-                    let idx = rand.below(elements.len() as u64) as usize;
+                    let idx = rand.below(NonZero::new(elements.len()).unwrap());
                     self.mutate_sol_value(&mut elements[idx], rand);
                 }
             }
-            DynSolValue::Tuple(ref mut vals) => {
+            DynSolValue::Tuple(vals) => {
                 if !vals.is_empty() {
-                    let idx = rand.below(vals.len() as u64) as usize;
+                    let idx = rand.below(NonZero::new(vals.len()).unwrap());
                     self.mutate_sol_value(&mut vals[idx], rand);
                 }
             }
-            DynSolValue::Uint(ref mut val, _) => {
+            DynSolValue::Uint(val, _) => {
                 // High-fidelity boundary constants for DeFi logic
                 let choices = [
                     U256::MAX, 
@@ -433,23 +436,23 @@ impl EvmMutator {
                     val.wrapping_add(U256::from(1)),
                     val.wrapping_sub(U256::from(1)),
                 ];
-                *val = choices[rand.below(choices.len() as u64) as usize];
+                *val = choices[rand.below(NonZero::new(choices.len()).unwrap())];
             }
-            DynSolValue::Address(ref mut addr) => {
+            DynSolValue::Address(addr) => {
                 *addr = Address::new([0x1a; 20]);
             }
-            DynSolValue::Bool(ref mut b) => {
+            DynSolValue::Bool(b) => {
                 *b = !*b;
             }
-            DynSolValue::Bytes(ref mut b) => {
+            DynSolValue::Bytes(b) => {
                 if !b.is_empty() {
-                    let idx = rand.below(b.len() as u64) as usize;
+                    let idx = rand.below(NonZero::new(b.len()).unwrap());
                     b[idx] = rand.next() as u8;
                 }
             }
-            DynSolValue::String(ref mut s) => {
+            DynSolValue::String(s) => {
                 if !s.is_empty() {
-                    let idx = rand.below(s.len() as u64) as usize;
+                    let idx = rand.below(NonZero::new(s.len()).unwrap());
                     s.replace_range(idx..idx + 1, &((rand.next() as u8) as char).to_string());
                 }
             }
@@ -461,7 +464,7 @@ impl EvmMutator {
     fn generate_default_sol_value<R: Rand>(&self, ty: &DynSolType, rand: &mut R) -> DynSolValue {
         match ty {
             DynSolType::Uint(size) => DynSolValue::Uint(U256::ZERO, *size),
-            DynSolType::Int(size) => DynSolValue::Int(alloy_dyn_abi::I256::ZERO, *size),
+            DynSolType::Int(size) => DynSolValue::Int(alloy_primitives::I256::ZERO, *size),
             DynSolType::Address => DynSolValue::Address(Address::ZERO),
             DynSolType::Bool => DynSolValue::Bool(false),
             DynSolType::Bytes => DynSolValue::Bytes(vec![0u8; 32]),

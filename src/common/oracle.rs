@@ -1,6 +1,8 @@
 use crate::common::types::{Snapshot, ChainState, Waypoint};
-use revm::primitives::{Address, U256, B256, BlockEnv};
+use revm::primitives::{Address, U256, B256};
+// use revm::context::BlockEnv; // Unused
 use std::collections::{HashMap, HashSet};
+use serde::{Serialize, Deserialize};
 use crate::evm::registry::GlobalAccountRegistry;
 use std::sync::Arc;
 use parking_lot::RwLock;
@@ -9,7 +11,7 @@ pub trait VulnerabilityOracle {
     fn check(&self, before: &Snapshot, after: &Snapshot) -> Option<VulnType>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum VulnType {
     Reentrancy,
     FlashLoanProfit,
@@ -40,6 +42,12 @@ pub enum VulnType {
     SvmPdaCollision,
     DifferentialDivergence(String),
     Other(String),
+}
+
+impl std::fmt::Display for VulnType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 /// CustomInvariant trait: Allows researchers to define their own protocol-specific
@@ -117,11 +125,11 @@ impl VulnerabilityOracle for CrossContractConsistencyOracle {
     fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         let state = after.state.read();
         if let ChainState::Evm(db) = &*state {
-            let val_a = db.accounts.get(&self.contract_a)
+            let val_a = db.cache.accounts.get(&self.contract_a)
                 .and_then(|a| a.storage.get(&self.slot_a))
                 .cloned()
                 .unwrap_or(U256::ZERO);
-            let val_b = db.accounts.get(&self.contract_b)
+            let val_b = db.cache.accounts.get(&self.contract_b)
                 .and_then(|a| a.storage.get(&self.slot_b))
                 .cloned()
                 .unwrap_or(U256::ZERO);
@@ -153,14 +161,14 @@ impl VulnerabilityOracle for AccountingDeltaOracle {
             let balance_slot = registry.erc20_balance_slots.get(&self.external_token)?;
 
             let ext_before = db_before
-                .accounts
+                .cache.accounts
                 .get(&self.external_token)?
                 .storage
                 .get(balance_slot)
                 .cloned()
                 .unwrap_or(U256::ZERO);
             let ext_after = db_after
-                .accounts
+                .cache.accounts
                 .get(&self.external_token)?
                 .storage
                 .get(balance_slot)
@@ -173,14 +181,14 @@ impl VulnerabilityOracle for AccountingDeltaOracle {
             };
 
             let int_before = db_before
-                .accounts
+                .cache.accounts
                 .get(&self.target_contract)?
                 .storage
                 .get(&self.internal_accounting_slot)
                 .cloned()
                 .unwrap_or(U256::ZERO);
             let int_after = db_after
-                .accounts
+                .cache.accounts
                 .get(&self.target_contract)?
                 .storage
                 .get(&self.internal_accounting_slot)
@@ -234,7 +242,7 @@ impl VulnerabilityOracle for StatePersistenceOracle {
     fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         let state = after.state.read();
         if let ChainState::Evm(db) = &*state {
-            if let Some(acc) = db.accounts.get(&self.target_contract) {
+            if let Some(acc) = db.cache.accounts.get(&self.target_contract) {
                 let actual = acc
                     .storage
                     .get(&self.critical_slot)
@@ -267,12 +275,12 @@ impl VulnerabilityOracle for MEVOracle {
                 (&*state_before, &*state_after)
             {
                 let bal_before = db_before
-                    .accounts
+                    .cache.accounts
                     .get(&self.fuzzer_address)
                     .map(|a| a.info.balance)
                     .unwrap_or(U256::ZERO);
                 let bal_after = db_after
-                    .accounts
+                    .cache.accounts
                     .get(&self.fuzzer_address)
                     .map(|a| a.info.balance)
                     .unwrap_or(U256::ZERO);
@@ -329,7 +337,7 @@ impl VulnerabilityOracle for FlashLoanAttackOracle {
             if let Waypoint::FlashloanExecution { lender, amount, fee, .. } = waypoint {
                 let state = after.state.read();
                 if let ChainState::Evm(db) = &*state {
-                    if let Some(acc) = db.accounts.get(&self.fuzzer_address) {
+                    if let Some(acc) = db.cache.accounts.get(&self.fuzzer_address) {
                         let profit = acc.info.balance;
                         if profit > *fee {
                             log::info!(
@@ -488,8 +496,8 @@ impl VulnerabilityOracle for ERC4626InflationOracle {
         if let (ChainState::Evm(db_before), ChainState::Evm(db_after)) =
             (&*state_before, &*state_after)
         {
-            let vault_before = db_before.accounts.get(&self.vault)?;
-            let vault_after = db_after.accounts.get(&self.vault)?;
+            let vault_before = db_before.cache.accounts.get(&self.vault)?;
+            let vault_after = db_after.cache.accounts.get(&self.vault)?;
 
             let supply_before = vault_before
                 .storage
@@ -586,7 +594,7 @@ impl VulnerabilityOracle for UniswapV3InvariantOracle {
     fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         let state = after.state.read();
         if let ChainState::Evm(db) = &*state {
-            let pool = match db.accounts.get(&self.pool_address) {
+            let pool = match db.cache.accounts.get(&self.pool_address) {
                 Some(p) => p,
                 None => return None,
             };
@@ -638,7 +646,7 @@ impl VulnerabilityOracle for UniswapV3InvariantOracle {
 
 impl UniswapV3InvariantOracle {
     fn extract_tick_from_slot0(&self, slot0: U256) -> i32 {
-        let tick_bits = (slot0 >> 160) & U256::from(0xFFFFFF);
+        let tick_bits: U256 = (slot0 >> 160) & U256::from(0xFFFFFF);
         tick_bits.to::<i32>()
     }
 
@@ -700,8 +708,8 @@ impl VulnerabilityOracle for ReentrancyOracle {
                 }
             }
 
-            for (addr, acc_after) in &db_after.accounts {
-                if let Some(acc_before) = db_before.accounts.get(addr) {
+            for (addr, acc_after) in &db_after.cache.accounts {
+                if let Some(acc_before) = db_before.cache.accounts.get(addr) {
                     if acc_after.storage != acc_before.storage && after.depth > 1 {
                         return Some(VulnType::Reentrancy);
                     }
@@ -724,17 +732,17 @@ impl VulnerabilityOracle for StateRootOracle {
             (&*state_before, &*state_after)
         {
             let changed_accounts = db_after
-                .accounts
+                .cache.accounts
                 .iter()
                 .filter(|(addr, acc)| {
                     db_before
-                        .accounts
+                        .cache.accounts
                         .get(*addr)
                         .map_or(true, |prev| prev.info != acc.info)
                 })
                 .count();
 
-            if changed_accounts > 50 && db_before.accounts.len() > 10 {
+            if changed_accounts > 50 && db_before.cache.accounts.len() > 10 {
                 return Some(VulnType::SystemicStateCorruption);
             }
         }
@@ -757,12 +765,12 @@ impl VulnerabilityOracle for ProfitOracle {
             (&*state_before, &*state_after)
         {
             let bal_before = db_before
-                .accounts
+                .cache.accounts
                 .get(&self.fuzzer_address)
                 .map(|a| a.info.balance)
                 .unwrap_or(U256::ZERO);
             let bal_after = db_after
-                .accounts
+                .cache.accounts
                 .get(&self.fuzzer_address)
                 .map(|a| a.info.balance)
                 .unwrap_or(U256::ZERO);
@@ -773,8 +781,8 @@ impl VulnerabilityOracle for ProfitOracle {
 
             let registry = self.account_registry.read();
             for (token_addr, balance_slot) in &registry.erc20_balance_slots {
-                if let Some(token_acc_after) = db_after.accounts.get(token_addr) {
-                    if let Some(token_acc_before) = db_before.accounts.get(token_addr) {
+                if let Some(token_acc_after) = db_after.cache.accounts.get(token_addr) {
+                    if let Some(token_acc_before) = db_before.cache.accounts.get(token_addr) {
                         let erc20_bal_after = token_acc_after
                             .storage
                             .get(balance_slot)
@@ -808,7 +816,7 @@ impl VulnerabilityOracle for SolvencyOracle {
         let state_after = after.state.read();
 
         if let ChainState::Evm(db_after) = &*state_after {
-            if let Some(acc) = db_after.accounts.get(&self.protocol_address) {
+            if let Some(acc) = db_after.cache.accounts.get(&self.protocol_address) {
                 let eth_threshold = self
                     .token_thresholds
                     .get(&Address::ZERO)
@@ -825,7 +833,7 @@ impl VulnerabilityOracle for SolvencyOracle {
                 if *token_addr == Address::ZERO {
                     continue;
                 }
-                if let Some(token_acc) = db_after.accounts.get(token_addr) {
+                if let Some(token_acc) = db_after.cache.accounts.get(token_addr) {
                     let registry = self.account_registry.read();
                     if let Some(slot) = registry.erc20_balance_slots.get(token_addr) {
                         let balance = token_acc
@@ -856,17 +864,15 @@ impl VulnerabilityOracle for AccessControlOracle {
     fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         let state = after.state.read();
         // EIP-1967 admin slot: keccak256("eip1967.proxy.admin") - 1
-        let eip1967_admin_slot = B256::from(
-            hex::decode("b53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103")
+        let eip1967_admin_slot: B256 = hex::decode("b53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103")
                 .unwrap()
                 .as_slice()
                 .try_into()
-                .unwrap(),
-        );
+                .unwrap();
         let fuzzer_bytes = B256::from(self.address_to_32bytes(self.fuzzer_address));
 
         if let ChainState::Evm(db) = &*state {
-            for (_addr, acc) in &db.accounts {
+            for (_addr, acc) in &db.cache.accounts {
                 for (slot, value) in &acc.storage {
                     let value_b256 = B256::from(value.to_be_bytes::<32>());
                     let slot_matches_eip1967 =
@@ -918,7 +924,7 @@ impl VulnerabilityOracle for FoundryInvariantOracle {
         if let ChainState::Evm(db) = &*state {
             for selector in &self.invariant_selectors {
                 let mut cloned_state = ChainState::Evm(db.clone());
-                let mut current_block_env = revm::primitives::BlockEnv::default();
+                let mut current_block_env = revm::context::BlockEnv::default();
                 let mut dummy_coverage =
                     bitvec![u8, Lsb0; 0; crate::evm::inspector::MAP_SIZE];
                 let mut dummy_dataflow = crate::evm::dataflow::DataflowRegistry::new();
@@ -929,6 +935,7 @@ impl VulnerabilityOracle for FoundryInvariantOracle {
                     caller: Address::ZERO,
                     to: self.test_contract,
                     value: U256::ZERO,
+                    is_victim: false,
                 };
 
                 if self
@@ -937,7 +944,7 @@ impl VulnerabilityOracle for FoundryInvariantOracle {
                         &mut cloned_state,
                         &mut current_block_env,
                         &tx,
-                        dummy_coverage.as_mut_bitslice(),
+                        dummy_coverage.as_raw_mut_slice(),
                         &mut dummy_dataflow,
                         &mut dummy_waypoints,
                         0,
@@ -1092,7 +1099,7 @@ impl CustomInvariant for ERC20TotalSupplyInvariant {
             if let Some(total_supply_slot) =
                 registry.erc20_total_supply_slots.get(&self.token_address)
             {
-                if let Some(token_acc) = db.accounts.get(&self.token_address) {
+                if let Some(token_acc) = db.cache.accounts.get(&self.token_address) {
                     let total_supply = token_acc
                         .storage
                         .get(total_supply_slot)
@@ -1104,7 +1111,7 @@ impl CustomInvariant for ERC20TotalSupplyInvariant {
                         if holder_addr == &self.token_address {
                             continue;
                         }
-                        if let Some(holder_acc) = db.accounts.get(holder_addr) {
+                        if let Some(holder_acc) = db.cache.accounts.get(holder_addr) {
                             let bal = holder_acc
                                 .storage
                                 .get(balance_slot)
@@ -1169,11 +1176,11 @@ impl DifferentialOracle {
         match (&*state_v1, &*state_v2) {
             (ChainState::Evm(db_v1), ChainState::Evm(db_v2)) => {
                 let all_addresses: std::collections::HashSet<_> =
-                    db_v1.accounts.keys().chain(db_v2.accounts.keys()).collect();
+                    db_v1.cache.accounts.keys().chain(db_v2.cache.accounts.keys()).collect();
 
                 for addr in all_addresses {
-                    let acc_v1 = db_v1.accounts.get(addr);
-                    let acc_v2 = db_v2.accounts.get(addr);
+                    let acc_v1 = db_v1.cache.accounts.get(addr);
+                    let acc_v2 = db_v2.cache.accounts.get(addr);
 
                     match (acc_v1, acc_v2) {
                         (Some(a1), Some(a2)) => {

@@ -1,10 +1,11 @@
 use crate::common::types::Snapshot;
 use revm::primitives::{Address, B256};
 use libafl_bolts::rands::Rand;
+use std::num::NonZero;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use parking_lot::RwLock;
-use bitvec::bitvec;
+// use bitvec::bitvec; // Unused
 use bitvec::prelude::{BitVec, Lsb0};
 
 /// A specialized corpus for managing EVM state snapshots.
@@ -41,6 +42,7 @@ impl SnapshotCorpus {
 
     pub fn add_snapshot(&mut self, id: u64, parent_id: u64, snapshot: Snapshot) {
         let depth = snapshot.depth;
+        let coverage_score = snapshot.coverage.count_ones();
         self.snapshots.insert(id, Arc::new(RwLock::new(snapshot)));
         self.parent_map.insert(id, parent_id);
         if id != parent_id {
@@ -50,7 +52,7 @@ impl SnapshotCorpus {
             visits: 0,
             last_coverage_gain: 0,
             depth,
-            coverage_score: snapshot.coverage.count_ones(),
+            coverage_score,
             read_set: HashSet::new(), // Populated after execution
             write_set: HashSet::new(),
         });
@@ -80,10 +82,10 @@ impl SnapshotCorpus {
         if total_energy == 0 {
             // Fallback to random if no coverage yet
             let keys: Vec<u64> = self.snapshots.keys().cloned().collect();
-            return Some(keys[rand.below(keys.len() as u64) as usize]);
+            return Some(keys[rand.below(NonZero::new(keys.len()).unwrap())]);
         }
 
-        let mut p = rand.below(total_energy as u64) as usize;
+        let mut p = rand.below(NonZero::new(total_energy).unwrap());
         for (id, energy) in weighted_ids {
             if p < energy {
                 return Some(id);
