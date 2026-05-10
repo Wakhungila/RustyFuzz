@@ -17,7 +17,8 @@ evm      = [
     "dep:alloy",
     "dep:alloy-dyn-abi",
     "dep:alloy-primitives",
-    "dep:alloy-json-abi"
+    "dep:alloy-json-abi",
+    "dep:reqwest"
 ]
 svm      = ["dep:solana-sdk", "dep:solana-client", "dep:solana-rpc-client-api",
              "dep:mollusk-svm", "dep:borsh"]
