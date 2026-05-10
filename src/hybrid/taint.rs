@@ -9,7 +9,7 @@
 
 use revm::{
     Database, Inspector,
-    interpreter::{Interpreter, Stack, CallInputs, CallOutcome, CallScheme},
+    interpreter::{Interpreter, Stack},
     interpreter::interpreter_types::Jumps,
     primitives::{Address, U256},
 };
@@ -419,7 +419,7 @@ impl<'a, DB: Database> Inspector<DB> for TaintInspector<'a> {
             0x52 => {
                 if stack_len >= 2 {
                     let value_state = self.tracker.stack_taint.pop().unwrap_or_default();
-                    let offset_state = self.tracker.stack_taint.pop().unwrap_or_default();
+                    let _offset_state = self.tracker.stack_taint.pop().unwrap_or_default();
                     
                     // Store taint at memory location (simplified)
                     // Real impl would track exact offsets
@@ -532,7 +532,7 @@ impl<'a, DB: Database> Inspector<DB> for TaintInspector<'a> {
         &mut self,
         _context: &mut DB,
         _inputs: &revm::interpreter::CallInputs,
-        outcome: &mut revm::interpreter::CallOutcome,
+        _outcome: &mut revm::interpreter::CallOutcome,
     ) {
         self.current_depth = self.current_depth.saturating_sub(1);
         
@@ -546,7 +546,7 @@ pub struct TaintAnalyzer;
 
 impl TaintAnalyzer {
     pub fn analyze(tracker: &TaintTracker) -> TaintReport {
-        let critical_flows = tracker.get_critical_flows();
+        let _critical_flows = tracker.get_critical_flows();
         
         let mut report = TaintReport {
             total_flows: tracker.detected_flows.len(),

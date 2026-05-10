@@ -1,5 +1,5 @@
 use revm::{
-    interpreter::{CallInputs, CallOutcome, CallScheme, Interpreter, interpreter_types::{Jumps, InputsTr, MemoryTr}},
+    interpreter::{CallInputs, CallOutcome, CallScheme, Interpreter, interpreter_types::{Jumps, InputsTr}},
     Database, Inspector,
 };
 // v38: OpCode is now in the bytecode module or directly available

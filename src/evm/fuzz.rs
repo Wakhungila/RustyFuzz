@@ -2,7 +2,6 @@ use libafl::{
     corpus::CorpusId,
     inputs::Input,
     mutators::{Mutator, MutationResult},
-    prelude::*,
     state::HasRand,
     Error,
 };
@@ -12,7 +11,7 @@ use crate::common::types::{SingletonTx, Waypoint};
 use revm::primitives::{Address, U256};
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc}; // Cow unused
+use std::{collections::HashMap, sync::Arc}; 
 use crate::evm::registry::GlobalAccountRegistry;
 use parking_lot::RwLock;
 #[cfg(feature = "z3")]

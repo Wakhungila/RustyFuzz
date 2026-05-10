@@ -46,9 +46,8 @@ impl Erc20Discovery {
         };
 
         let actual_balance = if let Ok(_gas) = self.executor.execute(&mut temp_state, &mut dummy_block_env, &tx, dummy_coverage.as_raw_mut_slice(), &mut dummy_dataflow, &mut dummy_waypoints, 0) {
-            if let ChainState::Evm(db) = &temp_state {
-                db.cache.accounts.get(&token_address).map(|acc| acc.info.balance).unwrap_or(U256::ZERO)
-            } else { U256::ZERO }
+            let ChainState::Evm(db) = &temp_state;
+            db.cache.accounts.get(&token_address).map(|acc| acc.info.balance).unwrap_or(U256::ZERO)
         } else { U256::ZERO };
 
         if actual_balance.is_zero() { return None; } // Cannot verify if balance is zero

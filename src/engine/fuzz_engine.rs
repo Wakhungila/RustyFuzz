@@ -1,24 +1,28 @@
 use crate::common::types::EvmInput;
-use crate::engine::corpus_minimizer::CorpusMinimizationStage;
 use crate::evm::executor::EvmExecutor;
 use crate::evm::corpus::SnapshotCorpus;
 use crate::evm::fuzz::{EvmMutator, AbiRegistry};
 use crate::evm::registry::GlobalAccountRegistry;
 use crate::evm::dataflow::DataflowRegistry;
 
-use std::{sync::Arc, collections::HashMap, time::Instant};
+use std::{sync::Arc, time::Instant};
+use std::cell::UnsafeCell;
 use parking_lot::RwLock;
+
+// Sync wrapper for UnsafeCell to allow thread-safe static usage
+struct SyncUnsafeCell<T>(UnsafeCell<T>);
+unsafe impl<T: Send> Sync for SyncUnsafeCell<T> {}
 
 // LibAFL 0.15.4 Imports
 use libafl::prelude::{
     SimpleMonitor, EventConfig, Launcher, StdState, InMemoryCorpus,
     StdFuzzer, StdScheduler, InProcessExecutor, StdMapObserver,
-    StdMutationalStage, ExitKind, Feedback, HasCorpus, Fuzzer,
+    StdMutationalStage, ExitKind, Fuzzer,
 };
 use libafl::events::ClientDescription;
 use libafl_bolts::prelude::*;
 use libafl_bolts::shmem::{StdShMemProvider, ShMemProvider};
-use libafl_bolts::tuples::{tuple_list, Handled};
+use libafl_bolts::tuples::tuple_list;
 
 const MAP_SIZE: usize = 65536;
 
@@ -52,7 +56,7 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
             let account_registry = Arc::new(RwLock::new(GlobalAccountRegistry::default()));
             let abi_registry = Arc::new(AbiRegistry::default());
 
-            let (initial_db, initial_env) = tokio::runtime::Handle::current().block_on(async {
+            let (_initial_db, initial_env) = tokio::runtime::Handle::current().block_on(async {
                 let db = crate::evm::fork::create_fork_db(&config.rpc_url, config.fork_block).await.unwrap();
                 let env = crate::evm::fork::create_fork_block_env(&config.rpc_url, config.fork_block).await.unwrap();
                 (db, env)
@@ -83,10 +87,10 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
             let mut fuzzer = StdFuzzer::new(StdScheduler::new(), feedback, objective);
 
-            // FIX 3: Shared map must be accessible. Using a static mut is common for speed.
-            static mut COVERAGE_MAP: [u8; MAP_SIZE] = [0u8; MAP_SIZE];
-            let observer = unsafe { 
-                StdMapObserver::from_mut_ptr("edges", COVERAGE_MAP.as_mut_ptr(), MAP_SIZE) 
+            // FIX 3: Shared map must be accessible. Using SyncUnsafeCell for Rust 2024 compatibility.
+            static COVERAGE_MAP: SyncUnsafeCell<[u8; MAP_SIZE]> = SyncUnsafeCell(UnsafeCell::new([0u8; MAP_SIZE]));
+            let observer = unsafe {
+                StdMapObserver::from_mut_ptr("edges", (COVERAGE_MAP.0).get() as *mut u8, MAP_SIZE)
             };
             
             // FIX 4: Corrected InProcessExecutor constructor
@@ -102,16 +106,19 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 for (tx_idx, tx) in input.txs.iter().enumerate() {
                     let mut waypoints = Vec::new();
                     let mut df = dataflow_registry.write();
-
-                    let _ = evm_executor.execute(
-                        &mut current_state,
-                        &mut current_env,
-                        tx,
-                        unsafe { &mut COVERAGE_MAP },
-                        &mut df,
-                        &mut waypoints,
-                        tx_idx
-                    );
+                    let _ = unsafe {
+                        let map_ptr = (COVERAGE_MAP.0).get() as *mut u8;
+                        let map_slice = std::slice::from_raw_parts_mut(map_ptr, MAP_SIZE);
+                        evm_executor.execute(
+                            &mut current_state,
+                            &mut current_env,
+                            tx,
+                            map_slice,
+                            &mut df,
+                            &mut waypoints,
+                            tx_idx
+                        )
+                    };
                 }
                 ExitKind::Ok
             };

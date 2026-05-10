@@ -10,19 +10,17 @@ use libafl::{
     // state::UsesInput,
     // executors::hooks::UsesState,
 };
-use libafl_bolts::prelude::*;
 use std::sync::Arc;
 use parking_lot::RwLock;
-use bitvec::prelude::{BitVec, BitSlice, Lsb0};
+use bitvec::prelude::{BitSlice, Lsb0};
 use bitvec::bitvec;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-// Fixed crate import based on your project structure
-use crate::evm::corpus::SnapshotCorpus; 
-use crate::evm::fuzz::EvmInput;
-use crate::common::types::{ChainState, Waypoint};
+use crate::common::types::ChainState;
 use crate::evm::executor::EvmExecutor;
 use crate::evm::dataflow::DataflowRegistry;
+use crate::evm::corpus::SnapshotCorpus;
+use crate::evm::fuzz::EvmInput;
 use crate::evm::inspector::MAP_SIZE;
 
 pub struct CorpusMinimizationStage<S> {
@@ -81,9 +79,8 @@ where
                 return false;
             }
             
-            if let ChainState::Evm(new_db) = chain_state { 
-                current_db = new_db; 
-            }
+            let ChainState::Evm(new_db) = chain_state;
+            current_db = new_db;
         }
         target.iter_ones().all(|i| total_coverage[i])
     }
