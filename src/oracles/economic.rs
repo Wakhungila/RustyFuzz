@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, U256, Bytes};
+use alloy_primitives::{Address, U256};
 use std::collections::{HashMap, HashSet};
 use crate::common::oracle::{VulnerabilityOracle, VulnType};
 use crate::common::types::Snapshot;

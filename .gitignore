@@ -1,7 +1,7 @@
-```
 # Dependencies
 target/
 .cargo/
+.cargo.lock
 
 # Compiled and build artifacts
 *.o
@@ -37,4 +37,3 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
-```

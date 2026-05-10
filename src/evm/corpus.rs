@@ -4,6 +4,8 @@ use libafl_bolts::rands::Rand;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use parking_lot::RwLock;
+use bitvec::bitvec;
+use bitvec::prelude::{BitVec, Lsb0};
 
 /// A specialized corpus for managing EVM state snapshots.
 /// Industry-grade fuzzers like ItyFuzz use a tree-based approach to explore deep states.
@@ -33,7 +35,7 @@ impl SnapshotCorpus {
             children_map: HashMap::new(),
             metadata: HashMap::new(),
             global_read_hotspots: HashMap::new(),
-            priority_gap_map: bitvec![u8, Lsb0; 0; 65536],
+            priority_gap_map: bitvec::bitvec![u8, Lsb0; 0; 65536],
         }
     }
 

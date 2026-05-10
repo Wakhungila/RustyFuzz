@@ -8,8 +8,9 @@
 //! - Access control bypasses with tainted caller checks
 
 use revm::{
-    interpreter::{Interpreter, Stack, OpCode},
-    Database, Inspector, EvmContext,
+    interpreter::{Interpreter, OpCode},
+    interpreter::stack::Stack,
+    Database, Inspector, Context,
     primitives::{Address, U256, Bytes},
 };
 use std::collections::{HashMap, HashSet};
@@ -35,13 +36,13 @@ pub enum TaintSource {
 }
 
 /// A taint mark attached to a value
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct TaintMark {
     pub source: TaintSource,
     pub propagation_path: Vec<TaintOperation>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub enum TaintOperation {
     Add,
     Sub,
@@ -305,7 +306,7 @@ impl<'a> TaintInspector<'a> {
 }
 
 impl<'a, DB: Database> Inspector<DB> for TaintInspector<'a> {
-    fn step(&mut self, interp: &mut Interpreter, _context: &mut EvmContext) {
+    fn step(&mut self, interp: &mut Interpreter, _context: &mut DB) {
         let opcode = interp.current_opcode();
         let stack = &mut interp.stack;
         let stack_len = stack.len();
@@ -484,7 +485,7 @@ impl<'a, DB: Database> Inspector<DB> for TaintInspector<'a> {
     
     fn call(
         &mut self,
-        _context: &mut EvmContext,
+        _context: &mut DB,
         inputs: &mut revm::interpreter::CallInputs,
     ) -> Option<revm::interpreter::CallOutcome> {
         self.current_depth += 1;
@@ -517,16 +518,14 @@ impl<'a, DB: Database> Inspector<DB> for TaintInspector<'a> {
     
     fn call_end(
         &mut self,
-        _context: &mut EvmContext,
+        _context: &mut DB,
         _inputs: &revm::interpreter::CallInputs,
-        outcome: revm::interpreter::CallOutcome,
-    ) -> revm::interpreter::CallOutcome {
+        outcome: &mut revm::interpreter::CallOutcome,
+    ) {
         self.current_depth = self.current_depth.saturating_sub(1);
         
         // Return data from external calls may be tainted
         // In a full implementation, we'd mark the return buffer as tainted
-        
-        outcome
     }
 }
 

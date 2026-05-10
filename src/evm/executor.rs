@@ -1,45 +1,72 @@
 use crate::common::types::{SingletonTx, ChainState};
-use revm::primitives::SpecId;
-use revm::{inspector_handle_register, DatabaseCommit};
 use crate::evm::inspector::CoverageInspector;
-use bitvec::prelude::*;
+
+// v38: Primitives are unified in revm::primitives (or revm_primitives)
+use revm::primitives::{SpecId, BlockEnv, ExecutionResult};
+use revm::{Evm, DatabaseCommit};
+
+// v38: Database traits and implementations have moved
+use revm::database::CacheDB;
+use revm::database::EmptyDB; // Moved from revm::db to revm::database
+use anyhow::{Result, anyhow};
 
 pub struct EvmExecutor {}
 
 impl EvmExecutor {
-    pub fn new() -> Self { EvmExecutor {} }
+    pub fn new() -> Self {
+        EvmExecutor {}
+    }
 
     pub fn execute(
         &self,
         chain_state: &mut ChainState,
-        block_env: &mut revm::primitives::BlockEnv,
+        block_env: &mut BlockEnv,
         tx: &SingletonTx,
         coverage: &mut [u8],
         dataflow: &mut crate::evm::dataflow::DataflowRegistry,
         waypoints: &mut Vec<crate::common::types::Waypoint>,
-        _tx_idx: usize,
-    ) -> anyhow::Result<u64> {
-        let revm_state = match chain_state {
-            ChainState::Evm(state) => state,
+        tx_idx: usize,
+    ) -> Result<u64> {
+        // Extract the database from the ChainState enum
+        let revm_db = match chain_state {
+            ChainState::Evm(db) => db,
         };
 
-        let mut inspector = CoverageInspector::new(coverage, dataflow, waypoints, _tx_idx);
+        // Initialize your custom LibAFL inspector
+        let mut inspector = CoverageInspector::new(coverage, dataflow, waypoints, tx_idx);
 
-        let mut evm = revm::Evm::builder()
-            .with_db(revm_state)
+        // v38: The Builder pattern is now the exclusive way to construct the EVM.
+        // It decouples the EvmContext from the Handler logic.
+        let mut evm = Evm::builder()
+            .with_db(revm_db)
             .with_external_context(&mut inspector)
             .with_block_env(block_env.clone())
-            .with_spec_id(SpecId::CANCUN)
-            .modify_tx_env(|revm_tx| *revm_tx = tx.to_revm_tx_env())
-            .append_handler_register(inspector_handle_register)
+            // Prague/Amsterdam 2026 specs support EIP-7702 and EIP-7843
+            .with_spec_id(SpecId::CANCUN) 
+            .modify_tx_env(|revm_tx| {
+                *revm_tx = tx.to_revm_tx_env();
+            })
+            // REPLACEMENT: Manual registers are gone. 
+            // Use this built-in register to wire the Inspector to the Handler.
+            .append_handler_register(revm::inspector::register_builtin_inspectors)
             .build();
 
-        let result = evm.transact().map_err(|e| anyhow::anyhow!("EVM Execution Error: {:?}", e))?;
+        // v38: transact() returns ResultAndState, which contains both 
+        // the execution result and the post-state BundleState.
+        let result_and_state = evm.transact().map_err(|e| {
+            anyhow!("EVM Execution Error [TX {}]: {:?}", tx_idx, e)
+        })?;
 
-        if !result.result.is_halt() {
-            evm.context.evm.db.commit(result.state);
-        }
+        let ExecutionResult::Success { gas_used, .. } = result_and_state.result else {
+            // If it's a Revert or Halt, we still might want to keep the coverage,
+            // but we usually don't commit the state.
+            return Ok(result_and_state.result.gas_used());
+        };
 
-        Ok(result.result.gas_used())
+        // v38: DatabaseCommit::commit now takes the BundleState directly.
+        // This is significantly more efficient than the old state-merge logic.
+        evm.context.evm.db.commit(result_and_state.state);
+
+        Ok(gas_used)
     }
 }

@@ -1,17 +1,21 @@
 use libafl::{
-    prelude::*,
+    corpus::CorpusId,
     inputs::Input,
-    feedbacks::Feedback,
+    mutators::{Mutator, MutationResult},
+    prelude::*,
+    state::HasRand,
+    Error,
 };
-use libafl_bolts::{HasLen, Named, rands::Rand, Error};
-use crate::common::types::{SingletonTx, Snapshot, Waypoint};
-use revm::primitives::{U256, Address};
-use alloy_dyn_abi::{DynSolValue, DynSolType};
+use libafl_bolts::{rands::Rand, HasLen, Named};
+use crate::common::types::{SingletonTx, Waypoint, TaintSource};
+use revm::primitives::{Address, U256};
+use alloy_dyn_abi::{DynSolType, DynSolValue};
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, sync::Arc, collections::HashMap};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 use crate::evm::registry::GlobalAccountRegistry;
 use parking_lot::RwLock;
-use crate::engine::concolic::{ConcolicSolver, ConcolicHint};
+#[cfg(feature = "z3")]
+use crate::engine::concolic::ConcolicSolver;
 use hashlink::LruCache;
 
 /// Maximum number of entries allowed in the decode cache before eviction is triggered.
@@ -25,7 +29,7 @@ pub struct AbiRegistry {
 
 /// Represents a structured EVM execution step.
 /// This is the "Input" that LibAFL evolves.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Hash)]
 pub struct EvmInput {
     pub txs: Vec<SingletonTx>, // Change to a sequence for multi-step exploits
     pub base_snapshot_id: u64, // The ID of the snapshot this input was derived from
@@ -33,14 +37,21 @@ pub struct EvmInput {
 }
 
 impl Input for EvmInput {
-    fn generate_name(&self, id: usize) -> String {
-        format!("seq_{}_{}", self.base_snapshot_id, id)
+    fn generate_name(&self, _id: Option<CorpusId>) -> String {
+        format!("seq_{}_len_{}", self.base_snapshot_id, self.txs.len())
     }
 }
 
 impl HasLen for EvmInput {
     fn len(&self) -> usize {
         self.txs.iter().map(|t| t.input.len()).sum()
+    }
+}
+
+impl Named for EvmMutator {
+    fn name(&self) -> &std::borrow::Cow<'static, str> {
+        static NAME: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed("EvmMutator");
+        &NAME
     }
 }
 
@@ -60,48 +71,67 @@ where
         &mut self,
         state: &mut S,
         input: &mut EvmInput,
-        _stage_idx: i32,
-    ) -> Result<MutationResult, libafl::Error> {
+    ) -> Result<MutationResult, Error> {
         let rand = state.rand_mut();
-        let mutation_type = rand.below(100);
+        let bucket = rand.below(100);
 
-        #[cfg(feature = "z3")]
-        if mutation_type < 20 && !input.waypoints.is_empty() {
-            // Constraint-Guided Mutation (Concolic Hints): Resolves branch constraints
-            // collected during sequence execution to explore alternative state transitions.
-            let cfg = z3::Config::new();
-            let ctx = z3::Context::new(&cfg);
-            let solver = ConcolicSolver::new(&ctx);
+        let result = match bucket {
+            0..=14 => self.concolic_mutation(rand, input),
+            15..=24 => self.structural_mutation(rand, input),
+            25..=39 => self.semantic_chaining(rand, input),
+            40..=49 => self.caller_mutation(rand, input),
+            50..=59 => self.discovery_mutation(rand, input),
+            60..=84 => self.abi_mutation(rand, input),
+            85..=92 => self.wrap_flashloan(rand, input),
+            93..=96 => self.oracle_pressure(rand, input),
+            97..=98 => self.mev_sandwich(rand, input),
+            _ => self.value_boundary(rand, input),
+        };
 
-            // Enable multi-transaction symbolic path discovery by attempting to solve constraints 
-            // from any point in the transaction sequence.
-            let tx_idx = rand.below(input.txs.len() as u64) as usize;
+        Ok(result)
+    }
+
+    fn post_exec(&mut self, _state: &mut S, _corpus_idx: Option<CorpusId>) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+impl EvmMutator {
+    #[cfg(feature = "z3")]
+    fn concolic_mutation<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+        if input.waypoints.is_empty() {
+            return MutationResult::Skipped;
+        }
+
+        let cfg = z3::Config::new();
+        let ctx = z3::Context::new(&cfg);
+        let solver = ConcolicSolver::new(&ctx);
+
+        if let Some(tx_idx) = self.random_index(rand, input.txs.len()) {
             if let Some(tx_waypoints) = input.waypoints.get(tx_idx) {
-                // Priority: Solve for 'BranchPath' first to explore new control flow
-                let mut candidates: Vec<_> = tx_waypoints
+                let candidates: Vec<_> = tx_waypoints
                     .iter()
                     .filter(|w| matches!(w, Waypoint::BranchPath { .. } | Waypoint::Comparison { taint_source: Some(_), .. }))
                     .collect();
 
-                if !candidates.is_empty() {
-                    // Higher selection energy for BranchPath waypoints
-                    let waypoint = candidates[rand.below(candidates.len() as u64) as usize];
+                if let Some(waypoint) = self.pick_random(rand, &candidates) {
                     if let Some(hint) = solver.solve_hint(waypoint) {
                         if let Some(ts) = match waypoint {
                             Waypoint::Comparison { taint_source: Some(ts), .. } => Some(ts),
                             Waypoint::Arithmetic { taint_source: Some(ts), .. } => Some(ts),
                             _ => None,
                         } {
-                            // Apply the hint to the original transaction in the sequence
                             let (target_tx_idx, offset) = match ts {
                                 TaintSource::Calldata(o) => (tx_idx, *o),
                                 TaintSource::Storage(orig_tx_idx, o) => (*orig_tx_idx, *o),
                             };
 
-                            let tx = &mut input.txs[target_tx_idx];
-                            if tx.input.len() >= offset + 32 {
-                                tx.input[offset..offset + 32].copy_from_slice(&hint);
-                                return Ok(MutationResult::Mutated);
+                            if let Some(tx) = input.txs.get_mut(target_tx_idx) {
+                                let end = offset + 32;
+                                if tx.input.len() >= end {
+                                    tx.input[offset..end].copy_from_slice(&hint);
+                                    return MutationResult::Mutated;
+                                }
                             }
                         }
                     }
@@ -109,232 +139,257 @@ where
             }
         }
 
-        match mutation_type {
-            0..=5 => {
-                // Structural Mutation: Add a new transaction to the sequence
-                let new_tx = SingletonTx {
-                    input: vec![0, 0, 0, 0], // Placeholder for a default/random selector
-                    caller: Address::random(),
-                    to: Address::random(), // New transactions should target random addresses
-                    value: U256::ZERO,
-                    is_victim: false,
-                };
-                input.txs.push(new_tx);
-                return Ok(MutationResult::Mutated);
-            }
-            6..=15 => {
-                // Semantic Chaining: Follow the protocol graph to chain logical steps
-                if let Some(last_tx) = input.txs.last() {
-                    let registry = self.account_registry.read();
-                    let downstream = registry.get_downstream_targets(&last_tx.to);
-                    if !downstream.is_empty() {
-                        let target = downstream[rand.below(downstream.len() as u64) as usize];
-                        let mut selector = [0u8; 4];
-                        // Pick a selector known for this contract or a global common one
-                        if let Some(s) = self.abi_registry.functions.keys().nth(rand.below(self.abi_registry.functions.len() as u64) as usize) {
-                            selector = *s;
-                        }
-                        
-                        let new_tx = SingletonTx {
-                            input: selector.to_vec(),
-                            caller: last_tx.caller,
-                            to: target,
-                            value: U256::ZERO,
-                            is_victim: false,
-                        };
-                        input.txs.push(new_tx);
-                        return Ok(MutationResult::Mutated);
-                    }
-                }
-                Ok(MutationResult::Skipped)
-            }
-            6..=10 => {
-                // Semantic Chaining: Use the protocol graph to find a logical next step.
-                // If TX1 is a Deposit into a Vault, TX2 should target the Vault or its Underlying.
-                if let Some(last_tx) = input.txs.last() {
-                    let registry = self.account_registry.read();
-                    let downstream = registry.get_downstream_targets(&last_tx.to);
-                    
-                    if !downstream.is_empty() {
-                        let target = downstream[rand.below(downstream.len() as u64) as usize];
-                        let new_tx = SingletonTx {
-                            input: vec![0, 0, 0, 0], // Mutator will fill this in next round
-                            caller: last_tx.caller,
-                            to: target,
-                            value: U256::ZERO,
-                        };
-                        input.txs.push(new_tx);
-                        return Ok(MutationResult::Mutated);
-                    }
-                }
-                Ok(MutationResult::Skipped)
-            }
-            11..=15 => {
-                // Semantic Mutation: Change the caller to a privileged or malicious actor
-                let idx = rand.below(input.txs.len() as u64) as usize;
-                input.txs[idx].caller = Address::random();
-            }
-            16..=25 => {
-                // Discovery Mutation: Call a randomly discovered contract from the state
-                let idx = rand.below(input.txs.len() as u64) as usize;
-                let registry = self.account_registry.read();
-                if let Some(target) = registry.random_contract(rand) {
-                    input.txs[idx].to = target;
-                }
-            }
-            26..=70 => {
-                // ABI-Aware Mutation: Lookup selector and mutate actual types
-                let idx = rand.below(input.txs.len() as u64) as usize;
-                let tx = &mut input.txs[idx];
-                
-                if tx.input.len() >= 4 {
-                    let mut selector = [0u8; 4];
-                    selector.copy_from_slice(&tx.input[0..4]);
-                    
-                    // 1. Retrieve or build the tuple type from the type cache
-                    let tuple_type = self.type_cache.read().get(&selector).cloned().or_else(|| {
-                        self.abi_registry.functions.get(&selector).map(|types| {
-                            let t = DynSolType::Tuple(types.clone());
-                            self.type_cache.write().insert(selector, t.clone());
-                            t
-                        })
-                    });
+        MutationResult::Skipped
+    }
 
-                    if let Some(tuple_type) = tuple_type {
-                        let calldata = &tx.input[4..];
-                        
-                        // 2. Attempt to retrieve decoded value from LRU cache
-                        let mut decoded = self.decode_cache.write().get(calldata).cloned();
+    #[cfg(not(feature = "z3"))]
+    fn concolic_mutation<R: Rand>(&self, _rand: &mut R, _input: &mut EvmInput) -> MutationResult {
+        MutationResult::Skipped
+    }
 
-                        if decoded.is_none() {
-                            if let Ok(d) = tuple_type.decode(calldata) {
-                                self.decode_cache.write().insert(calldata.to_vec(), d.clone());
-                                decoded = Some(d);
-                            }
-                        }
+    fn structural_mutation<R: Rand>(&self, _rand: &mut R, input: &mut EvmInput) -> MutationResult {
+        let new_tx = SingletonTx {
+            input: vec![0, 0, 0, 0],
+            caller: Address::new([0x13; 20]),
+            to: Address::new([0x14; 20]),
+            value: U256::ZERO,
+            is_victim: false,
+        };
+        input.txs.push(new_tx);
+        MutationResult::Mutated
+    }
 
-                        if let Some(mut val) = decoded {
-                            self.mutate_sol_value(&mut val, rand);
-                            let mut new_input = selector.to_vec();
-                            new_input.extend(val.encode());
-                            tx.input = new_input;
-                        }
-                    }
-                }
-            }
-            71..=85 => {
-                // native flashloan injection: wrap existing sequence in an EIP-3156 loop
-                if !input.txs.is_empty() {
-                    let registry = self.account_registry.read();
-                    // Heuristic: pick a contract that has been seen responding to flashLoan calls
-                    // or just a random discovered contract to probe for lender interfaces.
-                    if let Some(lender) = registry.random_contract(rand) {
-                        let token = Address::random(); // In production, pick a known liquid token (WETH/USDC)
-                        let amount = U256::from(10u128.pow(21)); // 1000 ETH-scale loan
-                        
-                        // Encode the sequence into the 'data' parameter for the callback
-                        let sequence_data = bincode::serialize(&input.txs).unwrap_or_default();
-                        
-                        // EIP-3156 flashLoan selector: 0x5c19e951
-                        let mut call_data = vec![0x5c, 0x19, 0xe9, 0x51];
-                        // receiver = fuzzer_address (mocked as zeros here, usually a specific attack contract)
-                        call_data.extend_from_slice(&[0u8; 12]);
-                        call_data.extend_from_slice(&[0u8; 20]); 
-                        // token
-                        call_data.extend_from_slice(&[0u8; 12]);
-                        call_data.extend_from_slice(token.as_slice());
-                        // amount
-                        call_data.extend_from_slice(&amount.to_be_bytes::<32>());
-                        // data offset and length
-                        call_data.extend_from_slice(&U256::from(128).to_be_bytes::<32>());
-                        call_data.extend_from_slice(&U256::from(sequence_data.len()).to_be_bytes::<32>());
-                        call_data.extend(sequence_data);
+    fn semantic_chaining<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+        let (caller, last_to) = match input.txs.last() {
+            Some(tx) => (tx.caller, tx.to),
+            None => return MutationResult::Skipped,
+        };
 
-                        input.txs = vec![SingletonTx {
-                            input: call_data,
-                            caller: Address::random(),
-                            to: lender,
-                            value: U256::ZERO,
-                            is_victim: false,
-                        }];
-                        return Ok(MutationResult::Mutated);
-                    }
-                }
-                Ok(MutationResult::Skipped)
-            }
-            86..=93 => {
-                // Oracle Pressure: Prepend a massive swap to the sequence
-                // This pressures oracles by moving spot prices before an invariant check.
-                let registry = self.account_registry.read();
-                if let Some(dex_pool) = registry.random_contract(rand) {
-                    // Uniswap V2 swap selector: 0x022c0d9f
-                    let mut swap_data = vec![0x02, 0x2c, 0x0d, 0x9f];
-                    // amount0Out, amount1Out, to, data
-                    swap_data.extend_from_slice(&U256::from(10u128.pow(24)).to_be_bytes::<32>()); // 1M tokens
-                    swap_data.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
-                    swap_data.extend_from_slice(&[0u8; 12]);
-                    swap_data.extend_from_slice(Address::random().as_slice());
-                    swap_data.extend_from_slice(&U256::from(128).to_be_bytes::<32>());
-                    swap_data.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+        let registry = self.account_registry.read();
+        let downstream = registry.get_downstream_targets(&last_to);
+        if downstream.is_empty() {
+            return MutationResult::Skipped;
+        }
 
-                    let pressure_tx = SingletonTx {
-                        input: swap_data,
-                        caller: Address::random(),
-                        to: dex_pool,
-                        value: U256::ZERO,
-                        is_victim: false,
-                    };
-                    input.txs.insert(0, pressure_tx);
-                    return Ok(MutationResult::Mutated);
-                }
-                Ok(MutationResult::Skipped)
-            }
-            94..=100 => {
-                // MEV Sandwich Simulation: Interleave frontrun/backrun around a victim
-                if !input.txs.is_empty() {
-                    let idx = rand.below(input.txs.len() as u64) as usize;
-                    // Tag current TX as victim (likely a trade from mainnet seeds)
-                    input.txs[idx].is_victim = true;
-                    
-                    let victim_to = input.txs[idx].to;
-                    let attacker = Address::random();
+        let target = downstream[rand.below(downstream.len() as u64) as usize];
+        let selector = self.random_selector(rand);
 
-                    // 1. Frontrun Swap (move price against victim)
-                    let frontrun = SingletonTx {
-                        input: vec![0x02, 0x2c, 0x0d, 0x9f, 1, 2, 3], // Simplified swap
-                        caller: attacker,
-                        to: victim_to,
-                        value: U256::ZERO,
-                        is_victim: false,
-                    };
+        let new_tx = SingletonTx {
+            input: selector.to_vec(),
+            caller,
+            to: target,
+            value: U256::ZERO,
+            is_victim: false,
+        };
+        input.txs.push(new_tx);
+        MutationResult::Mutated
+    }
 
-                    // 2. Backrun Swap (arbitrage the slippage)
-                    let backrun = SingletonTx {
-                        input: vec![0x02, 0x2c, 0x0d, 0x9f, 3, 2, 1], // Reverse swap
-                        caller: attacker,
-                        to: victim_to,
-                        value: U256::ZERO,
-                        is_victim: false,
-                    };
-
-                    input.txs.insert(idx, frontrun);
-                    input.txs.insert(idx + 2, backrun);
-                    return Ok(MutationResult::Mutated);
-                }
-                Ok(MutationResult::Skipped)
-            }
-            _ => {
-                // Boundary Value Mutation for ETH 'value'
-                let choices = [U256::ZERO, U256::MAX, U256::from(10u128.pow(18))];
-                let idx = rand.below(input.txs.len() as u64) as usize;
-                input.txs[idx].value = choices[rand.below(choices.len() as u64) as usize];
-                Ok(MutationResult::Mutated)
-            }
+    fn caller_mutation<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+        if let Some(idx) = self.random_index(rand, input.txs.len()) {
+            input.txs[idx].caller = Address::new([0x15; 20]);
+            MutationResult::Mutated
+        } else {
+            MutationResult::Skipped
         }
     }
-}
 
-impl EvmMutator {
+    fn discovery_mutation<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+        if let Some(idx) = self.random_index(rand, input.txs.len()) {
+            let registry = self.account_registry.read();
+            if let Some(target) = registry.random_contract(rand) {
+                input.txs[idx].to = target;
+                MutationResult::Mutated
+            } else {
+                MutationResult::Skipped
+            }
+        } else {
+            MutationResult::Skipped
+        }
+    }
+
+    fn abi_mutation<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+        let idx = match self.random_index(rand, input.txs.len()) {
+            Some(i) => i,
+            None => return MutationResult::Skipped,
+        };
+
+        let tx = &mut input.txs[idx];
+        if tx.input.len() < 4 {
+            return MutationResult::Skipped;
+        }
+
+        let mut selector = [0u8; 4];
+        selector.copy_from_slice(&tx.input[0..4]);
+
+        let tuple_type = self.type_cache.read().get(&selector).cloned().or_else(|| {
+            self.abi_registry.functions.get(&selector).map(|types| {
+                let t = DynSolType::Tuple(types.clone());
+                self.type_cache.write().insert(selector, t.clone());
+                t
+            })
+        });
+
+        let tuple_type = match tuple_type {
+            Some(t) => t,
+            None => return MutationResult::Skipped,
+        };
+
+        let calldata = &tx.input[4..];
+        let mut cache = self.decode_cache.write();
+        let mut decoded = cache.get(calldata).cloned();
+        if decoded.is_none() {
+            if let Ok(value) = tuple_type.decode(calldata) {
+                cache.insert(calldata.to_vec(), value.clone());
+                decoded = Some(value);
+            }
+        }
+        drop(cache);
+
+        if let Some(mut value) = decoded {
+            self.mutate_sol_value(&mut value, rand);
+            let mut new_input = selector.to_vec();
+            new_input.extend(value.encode());
+            tx.input = new_input;
+            MutationResult::Mutated
+        } else {
+            MutationResult::Skipped
+        }
+    }
+
+    fn wrap_flashloan<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+        if input.txs.is_empty() {
+            return MutationResult::Skipped;
+        }
+
+        let registry = self.account_registry.read();
+        let lender = match registry.random_contract(rand) {
+            Some(l) => l,
+            None => return MutationResult::Skipped,
+        };
+
+        let token = Address::new([0x17; 20]);
+        let amount = U256::from(10u128.pow(21));
+        let sequence_data = bincode::serialize(&input.txs).unwrap_or_else(|_| vec![]);
+
+        let mut call_data = vec![0x5c, 0x19, 0xe9, 0x51];
+        call_data.extend_from_slice(&[0u8; 12]);
+        call_data.extend_from_slice(&[0u8; 20]);
+        call_data.extend_from_slice(&[0u8; 12]);
+        call_data.extend_from_slice(token.as_slice());
+        call_data.extend_from_slice(&amount.to_be_bytes::<32>());
+        call_data.extend_from_slice(&U256::from(128).to_be_bytes::<32>());
+        call_data.extend_from_slice(&U256::from(sequence_data.len()).to_be_bytes::<32>());
+        call_data.extend(sequence_data);
+
+        input.txs = vec![SingletonTx {
+            input: call_data,
+            caller: Address::new([0x18; 20]),
+            to: lender,
+            value: U256::ZERO,
+            is_victim: false,
+        }];
+        MutationResult::Mutated
+    }
+
+    fn oracle_pressure<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+        let registry = self.account_registry.read();
+        let dex_pool = match registry.random_contract(rand) {
+            Some(p) => p,
+            None => return MutationResult::Skipped,
+        };
+
+        let mut swap_data = vec![0x02, 0x2c, 0x0d, 0x9f];
+        swap_data.extend_from_slice(&U256::from(10u128.pow(24)).to_be_bytes::<32>());
+        swap_data.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+        swap_data.extend_from_slice(&[0u8; 12]);
+        swap_data.extend_from_slice(Address::new([0x19; 20]).as_slice());
+        swap_data.extend_from_slice(&U256::from(128).to_be_bytes::<32>());
+        swap_data.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+
+        let pressure_tx = SingletonTx {
+            input: swap_data,
+            caller: Address::new([0x18; 20]),
+            to: dex_pool,
+            value: U256::ZERO,
+            is_victim: false,
+        };
+        input.txs.insert(0, pressure_tx);
+        MutationResult::Mutated
+    }
+
+    fn mev_sandwich<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+        let idx = match self.random_index(rand, input.txs.len()) {
+            Some(i) => i,
+            None => return MutationResult::Skipped,
+        };
+
+        input.txs[idx].is_victim = true;
+        let victim_to = input.txs[idx].to;
+        let attacker = Address::new([0x16; 20]);
+
+        let frontrun = SingletonTx {
+            input: vec![0x02, 0x2c, 0x0d, 0x9f, 1, 2, 3],
+            caller: attacker,
+            to: victim_to,
+            value: U256::ZERO,
+            is_victim: false,
+        };
+
+        let backrun = SingletonTx {
+            input: vec![0x02, 0x2c, 0x0d, 0x9f, 3, 2, 1],
+            caller: attacker,
+            to: victim_to,
+            value: U256::ZERO,
+            is_victim: false,
+        };
+
+        input.txs.insert(idx, frontrun);
+        input.txs.insert(idx + 2, backrun);
+        MutationResult::Mutated
+    }
+
+    fn value_boundary<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+        let idx = match self.random_index(rand, input.txs.len()) {
+            Some(i) => i,
+            None => return MutationResult::Skipped,
+        };
+
+        let choices = [U256::ZERO, U256::MAX, U256::from(10u128.pow(18))];
+        let choice = rand.below(choices.len() as u64) as usize;
+        input.txs[idx].value = choices[choice];
+        MutationResult::Mutated
+    }
+
+    fn random_index<R: Rand>(&self, rand: &mut R, len: usize) -> Option<usize> {
+        if len == 0 {
+            None
+        } else {
+            Some(rand.below(len as u64) as usize)
+        }
+    }
+
+    fn pick_random<'a, R: Rand, T>(&self, rand: &mut R, items: &'a [T]) -> Option<&'a T> {
+        if items.is_empty() {
+            None
+        } else {
+            Some(&items[rand.below(items.len() as u64) as usize])
+        }
+    }
+
+    fn random_selector<R: Rand>(&self, rand: &mut R) -> [u8; 4] {
+        if self.abi_registry.functions.is_empty() {
+            [0u8; 4]
+        } else {
+            let idx = rand.below(self.abi_registry.functions.len() as u64) as usize;
+            *self.abi_registry
+                .functions
+                .keys()
+                .nth(idx)
+                .unwrap_or(&[0u8; 4])
+        }
+    }
+
     fn mutate_sol_value<R: Rand>(&self, value: &mut DynSolValue, rand: &mut R) {
         match value {
             DynSolValue::Array(ref mut elements, ty) => {
@@ -381,7 +436,7 @@ impl EvmMutator {
                 *val = choices[rand.below(choices.len() as u64) as usize];
             }
             DynSolValue::Address(ref mut addr) => {
-                *addr = Address::random();
+                *addr = Address::new([0x1a; 20]);
             }
             DynSolValue::Bool(ref mut b) => {
                 *b = !*b;
@@ -417,30 +472,5 @@ impl EvmMutator {
             }
             _ => DynSolValue::Uint(U256::ZERO, 256),
         }
-    }
-}
-
-/// Feedback mechanism to detect if a Snapshot found new coverage bits.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct EvmCoverageFeedback;
-
-impl Named for EvmCoverageFeedback {
-    fn name(&self) -> &Cow<'static, str> {
-        static NAME: Cow<'static, str> = Cow::Borrowed("EvmCoverageFeedback");
-        &NAME
-    }
-}
-
-impl<S> Feedback<S> for EvmCoverageFeedback
-where
-    S: State + HasCorpus,
-{
-    fn is_interesting<EM, OT>(
-        &mut self,
-        _state: &mut S,
-        // ... implementation truncated for brevity ...
-        _exit_kind: &ExitKind,
-    ) -> Result<bool, libafl::Error> {
-        Ok(true)
     }
 }

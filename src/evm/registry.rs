@@ -1,4 +1,4 @@
-use alloy::primitives::Address;
+use revm::primitives::{Address, U256};
 use std::collections::{HashMap, HashSet, BTreeMap, VecDeque};
 use crate::common::types::ChainState;
 use libafl_bolts::rands::Rand;
