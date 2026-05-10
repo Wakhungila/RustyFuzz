@@ -1,7 +1,8 @@
 use revm::primitives::{Address, U256};
-use std::collections::{HashMap, HashSet, BTreeMap, VecDeque};
+use std::collections::{HashMap, HashSet, BTreeMap};
 use crate::common::types::ChainState;
 use libafl_bolts::rands::Rand;
+use std::num::NonZero;
 use crate::evm::trace::ExecutionTrace;
 use crate::evm::etherscan_abi_fetcher::EtherscanAbiFetcher;
 use crate::evm::fuzz::AbiRegistry;
@@ -20,13 +21,12 @@ pub struct GlobalAccountRegistry {
 impl GlobalAccountRegistry {
     /// Scans the EVM state for accounts with code and adds them to the registry.
     pub fn discover_from_state(&mut self, state: &ChainState) {
-        if let ChainState::Evm(db) = state {
-            for (addr, acc) in &db.accounts {
-                // Heuristic: If it has code, it's a potential fuzzing target
-                if acc.info.code.as_ref().map_or(false, |c| !c.is_empty()) {
-                    let alloy_addr = Address::from_slice(addr.as_slice());
-                    self.contracts.insert(alloy_addr);
-                }
+        let ChainState::Evm(db) = state;
+        for (addr, acc) in &db.cache.accounts {
+            // Heuristic: If it has code, it's a potential fuzzing target
+            if acc.info.code.as_ref().map_or(false, |c| !c.is_empty()) {
+                let alloy_addr = Address::from_slice(addr.as_slice());
+                self.contracts.insert(alloy_addr);
             }
         }
     }
@@ -83,7 +83,7 @@ impl GlobalAccountRegistry {
         if let Some(fetcher) = &self.etherscan_abi_fetcher {
             let abi = fetcher.fetch_abi(address).await?;
             for func in abi.functions() {
-                abi_registry.functions.insert(func.selector(), func.inputs().iter().map(|p| DynSolType::parse(&p.ty).unwrap()).collect());
+                abi_registry.functions.insert(func.selector().0, func.inputs.iter().map(|p| DynSolType::parse(&p.ty).unwrap()).collect());
             }
             log::info!("Fetched ABI for {} from Etherscan.", address);
         }
@@ -97,7 +97,7 @@ impl GlobalAccountRegistry {
 
     pub fn random_contract<R: Rand>(&self, rand: &mut R) -> Option<Address> {
         if self.contracts.is_empty() { return None; }
-        let idx = rand.below(self.contracts.len() as u64) as usize;
+        let idx = rand.below(NonZero::new(self.contracts.len()).unwrap());
         self.contracts.iter().nth(idx).cloned()
     }
 }

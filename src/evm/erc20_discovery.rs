@@ -1,4 +1,4 @@
-use revm::primitives::{Address, U256, keccak256, BlockEnv};
+use revm::primitives::{Address, U256, keccak256};
 use revm::database::{CacheDB, EmptyDB};
 use crate::common::types::{ChainState, SingletonTx};
 use crate::evm::executor::EvmExecutor;
@@ -35,22 +35,19 @@ impl Erc20Discovery {
         let mut dummy_coverage = bitvec::bitvec![u8, bitvec::prelude::Lsb0; 0; crate::evm::inspector::MAP_SIZE];
         let mut dummy_dataflow = crate::evm::dataflow::DataflowRegistry::new();
         let mut dummy_waypoints = Vec::new();
-        let mut dummy_block_env = revm::primitives::BlockEnv::default();
+        let mut dummy_block_env = revm::context::BlockEnv::default();
 
         let tx = SingletonTx {
             input: call_data,
             caller: Address::ZERO, // Neutral caller
             to: token_address,
             value: U256::ZERO,
+            is_victim: false,
         };
 
-        let actual_balance = if let Ok(_gas) = self.executor.execute(&mut temp_state, &mut dummy_block_env, &tx, dummy_coverage.as_mut_bitslice(), &mut dummy_dataflow, &mut dummy_waypoints, 0) {
-            if let ChainState::Evm(db) = temp_state {
-                // This is a simplified way to get the return value from a static call.
-                // In a real scenario, we'd parse the output from the Waypoints or the ExecutionResult.
-                // For now, we assume the balance is directly readable from the DB after the call.
-                db.accounts.get(&token_address).and_then(|acc| acc.info.balance).unwrap_or(U256::ZERO)
-            } else { U256::ZERO }
+        let actual_balance = if let Ok(_gas) = self.executor.execute(&mut temp_state, &mut dummy_block_env, &tx, dummy_coverage.as_raw_mut_slice(), &mut dummy_dataflow, &mut dummy_waypoints, 0) {
+            let ChainState::Evm(db) = &temp_state;
+            db.cache.accounts.get(&token_address).map(|acc| acc.info.balance).unwrap_or(U256::ZERO)
         } else { U256::ZERO };
 
         if actual_balance.is_zero() { return None; } // Cannot verify if balance is zero
@@ -62,13 +59,11 @@ impl Erc20Discovery {
             slot_key_bytes[32..64].copy_from_slice(&U256::from(slot_idx).to_be_bytes::<32>()); // Base slot
             let derived_slot = U256::from_be_bytes(keccak256(&slot_key_bytes).0);
 
-            if let ChainState::Evm(db) = initial_db {
-                if let Some(token_acc) = db.accounts.get(&token_address) {
-                    if let Some(stored_balance) = token_acc.storage.get(&derived_slot) {
-                        if *stored_balance == actual_balance {
-                            log::info!("Discovered balance slot for Token {} at {}", token_address, derived_slot);
-                            return Some(derived_slot);
-                        }
+            if let Some(token_acc) = initial_db.cache.accounts.get(&token_address) {
+                if let Some(stored_balance) = token_acc.storage.get(&derived_slot) {
+                    if *stored_balance == actual_balance {
+                        log::info!("Discovered balance slot for Token {} at {}", token_address, derived_slot);
+                        return Some(derived_slot);
                     }
                 }
             }
@@ -81,11 +76,9 @@ impl Erc20Discovery {
         // This is a simpler heuristic: totalSupply is often at slot 0 or 1.
         // In production, we'd call totalSupply() and compare against probed slots.
         // For now, we assume slot 0 or 1.
-        if let ChainState::Evm(db) = initial_db {
-            if let Some(token_acc) = db.accounts.get(&token_address) {
-                if token_acc.storage.contains_key(&U256::ZERO) { return Some(U256::ZERO); }
-                if token_acc.storage.contains_key(&U256::from(1)) { return Some(U256::from(1)); }
-            }
+        if let Some(token_acc) = initial_db.cache.accounts.get(&token_address) {
+            if token_acc.storage.contains_key(&U256::ZERO) { return Some(U256::ZERO); }
+            if token_acc.storage.contains_key(&U256::from(1)) { return Some(U256::from(1)); }
         }
         None
     }

@@ -1,26 +1,26 @@
 use revm::{
     database::{CacheDB, EmptyDB},
-    primitives::BlockEnv,
 };
+use revm::context::BlockEnv;
 use libafl::{
     prelude::*,
     stages::Stage,
-    state::{HasCorpus, UsesInput},
-    executors::UsesState,
+    state::HasCorpus,
+    // TODO: These traits moved in libafl
+    // state::UsesInput,
+    // executors::hooks::UsesState,
 };
-use libafl_bolts::prelude::*;
 use std::sync::Arc;
 use parking_lot::RwLock;
-use bitvec::prelude::{BitVec, BitSlice, Lsb0};
+use bitvec::prelude::{BitSlice, Lsb0};
 use bitvec::bitvec;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-// Fixed crate import based on your project structure
-use crate::evm::corpus::SnapshotCorpus; 
-use crate::evm::fuzz::EvmInput;
-use crate::common::types::{ChainState, Waypoint};
+use crate::common::types::ChainState;
 use crate::evm::executor::EvmExecutor;
 use crate::evm::dataflow::DataflowRegistry;
+use crate::evm::corpus::SnapshotCorpus;
+use crate::evm::fuzz::EvmInput;
 use crate::evm::inspector::MAP_SIZE;
 
 pub struct CorpusMinimizationStage<S> {
@@ -36,7 +36,7 @@ pub struct CorpusMinimizationStage<S> {
 impl<S> CorpusMinimizationStage<S> 
 where
     S: HasCorpus<EvmInput>,
-    S: UsesInput<Input = EvmInput>, 
+    // S: UsesInput<Input = EvmInput>, // TODO: UsesInput trait moved in libafl 
 {
     pub fn new(
         corpus: Arc<RwLock<SnapshotCorpus>>,
@@ -71,7 +71,7 @@ where
                 &mut chain_state, 
                 &mut current_env, 
                 tx, 
-                total_coverage.as_mut_bitslice(), 
+                total_coverage.as_raw_mut_slice(), 
                 &mut dataflow, 
                 &mut waypoints, 
                 idx
@@ -79,27 +79,25 @@ where
                 return false;
             }
             
-            if let ChainState::Evm(new_db) = chain_state { 
-                current_db = new_db; 
-            }
+            let ChainState::Evm(new_db) = chain_state;
+            current_db = new_db;
         }
         target.iter_ones().all(|i| total_coverage[i])
     }
 }
 
-impl<S, EM, Z> Stage<S, EM, Z> for CorpusMinimizationStage<S>
+impl<S, EM, Z> Stage<EvmInput, EM, S, Z> for CorpusMinimizationStage<S>
 where
-    S: HasCorpus<EvmInput> + UsesInput<Input = EvmInput>,
-    EM: UsesState<State = S>,
-    Z: UsesState<State = S>,
+    S: HasCorpus<EvmInput> /* + UsesInput<Input = EvmInput> */, // TODO: UsesInput trait moved in libafl
+    // EM: UsesState<State = S>, // TODO: UsesState trait moved in libafl
+    // Z: UsesState<State = S>, // TODO: UsesState trait moved in libafl
 {
     fn perform(
         &mut self,
         _fuzzer: &mut Z,
-        _executor: &mut EM,
-        state: &mut S,
+        _executor: &mut EvmInput,
+        _state: &mut S,
         _manager: &mut EM,
-        _corpus_idx: CorpusId,
     ) -> Result<(), libafl::Error> {
         self.exec_count += 1;
         if self.exec_count % self.interval != 0 { return Ok(()); }

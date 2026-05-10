@@ -1,9 +1,32 @@
 use crate::common::oracle::VulnType;
 use crate::evm::trace::ExecutionTrace;
-use crate::evm::economic::ProfitReport;
 use revm::primitives::U256;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+// TODO: Missing module - stub or implement
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfitReport {
+    pub profit: U256,
+    pub loss: U256,
+}
+
+impl Default for ProfitReport {
+    fn default() -> Self {
+        Self {
+            profit: U256::ZERO,
+            loss: U256::ZERO,
+        }
+    }
+}
+
+impl ProfitReport {
+    pub fn is_significant(&self, _threshold: u64) -> bool {
+        self.profit > U256::ZERO
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeverityScore {
     pub total: u32,            // 0-10000 (scaled by 100)
     pub reachability: u32,     // 0-100
@@ -43,7 +66,7 @@ impl ScoringEngine {
         };
 
         // C. Economic Impact (0-100): funds_drained / TVL
-        let total_profit_eth = profit.eth_profit; // Simplified for demo
+        let total_profit_eth = profit.profit; // Simplified for demo
         let economic_impact = if self.protocol_tvl > U256::ZERO {
             let ratio = (total_profit_eth * U256::from(100)) / self.protocol_tvl;
             ratio.to::<u64>() as u32
@@ -89,11 +112,11 @@ impl ScoringEngine {
     }
 
     pub fn get_label(&self, score: &SeverityScore) -> &'static str {
-        if score.total >= 80.0 && score.confidence > 0.8 {
+        if score.total >= 8000 && score.confidence > 80 {
             "P0 / CRITICAL"
-        } else if score.total >= 60.0 {
+        } else if score.total >= 6000 {
             "HIGH"
-        } else if score.total >= 30.0 {
+        } else if score.total >= 3000 {
             "MEDIUM"
         } else {
             "LOW"

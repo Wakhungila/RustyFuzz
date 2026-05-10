@@ -31,7 +31,11 @@ async fn main() -> anyhow::Result<()> {
     match args.command {
         Command::Fuzz { chain, contract } => {
             println!("Starting fuzz campaign on {:?} for contract {:?}", chain, contract);
-            rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(&config).await?;
+            let fuzz_config = rusty_fuzz::engine::fuzz_engine::Config {
+                rpc_url: config.rpc_url.clone(),
+                fork_block: config.fork_block.unwrap_or(0),
+            };
+            rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config)?;
         }
         Command::ScanMempool => {
             println!("Starting mempool scanner for chain: {}", config.chain);

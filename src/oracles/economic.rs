@@ -2,7 +2,47 @@ use alloy_primitives::{Address, U256};
 use std::collections::{HashMap, HashSet};
 use crate::common::oracle::{VulnerabilityOracle, VulnType};
 use crate::common::types::Snapshot;
-use super::economic::{EconomicState, PriceAnalyzer};
+// TODO: Missing module - stub or implement
+// use super::economic::{EconomicState, PriceAnalyzer};
+
+// Stub types for missing economic module
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct EconomicState {
+    // token_address -> borrower_address -> balance
+    pub balances: HashMap<Address, HashMap<Address, U256>>,
+}
+
+impl Default for EconomicState {
+    fn default() -> Self {
+        Self {
+            balances: HashMap::new(),
+        }
+    }
+}
+
+impl EconomicState {
+    pub fn calculate_profit(&self, _attacker: Address, _initial: &EconomicState) -> crate::engine::scoring::ProfitReport {
+        crate::engine::scoring::ProfitReport::default()
+    }
+}
+
+#[allow(dead_code)]
+pub struct PriceAnalyzer;
+
+impl PriceAnalyzer {
+    pub fn new() -> Self {
+        Self
+    }
+    
+    pub fn record_initial_price(&mut self, _oracle: Address, _price: U256) {
+        // Stub
+    }
+    
+    pub fn check_manipulation(&self, _oracle: Address, _current_price: U256, _threshold_bps: u64) -> bool {
+        false
+    }
+}
 
 /// Detects flashloan attacks by analyzing profitability without collateral
 pub struct FlashLoanOracle {
@@ -24,8 +64,8 @@ impl FlashLoanOracle {
         
         Self {
             providers,
-            initial_state,
-            current_state: initial_state.clone(),
+            initial_state: initial_state.clone(),
+            current_state: initial_state,
         }
     }
 
@@ -51,7 +91,7 @@ impl FlashLoanOracle {
         // Threshold: 0.1 ETH profit (adjustable)
         let threshold = U256::from(100_000_000_000_000_000u128);
         
-        if report.is_significant(threshold) {
+        if report.is_significant(threshold.to::<u64>()) {
             return Some(VulnType::FlashLoanProfit);
         }
         None

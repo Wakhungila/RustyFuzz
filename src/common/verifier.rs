@@ -1,7 +1,6 @@
 use crate::evm::fuzz::EvmInput;
-use crate::common::oracle::VulnerabilityOracle; 
 use async_trait::async_trait;
-use std::process::Command;
+use anyhow::Result;
 
 /// Abstract interface for a symbolic execution verifier.
 /// This allows RustyFuzz to integrate with various formal verification tools.

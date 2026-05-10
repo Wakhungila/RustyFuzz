@@ -89,8 +89,8 @@ fn calculate_storage_diff(before: &Snapshot, after: &Snapshot) -> Vec<StorageDif
     let state_after = after.state.read();
 
     if let (ChainState::Evm(db_before), ChainState::Evm(db_after)) = (&*state_before, &*state_after) {
-        for (addr, acc_after) in &db_after.accounts {
-            let acc_before = db_before.accounts.get(addr);
+        for (addr, acc_after) in &db_after.cache.accounts {
+            let acc_before = db_before.cache.accounts.get(addr);
             for (slot, val_after) in &acc_after.storage {
                 let val_before = acc_before
                     .and_then(|a| a.storage.get(slot))
@@ -125,7 +125,7 @@ fn generate_markdown_report(evidence: &EvidenceChain, label: &str) -> String {
 
     md.push_str("## 🛠 Reproducibility\n");
     md.push_str(&format!("- **Foundry PoC:** `{}`\n", evidence.poc_file));
-    md.push_str("To verify, run: `forge test --match-path {}`\n\n", &evidence.poc_file);
+    md.push_str(&format!("To verify, run: `forge test --match-path {}`\n\n", evidence.poc_file));
 
     md.push_str("## 📦 Minimal Call Sequence\n");
     md.push_str("| Step | Caller | Target | Value | Data |\n");

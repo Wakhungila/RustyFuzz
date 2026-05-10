@@ -6,7 +6,7 @@ use crate::evm::dataflow::DataflowRegistry;
 use bitvec::prelude::*;
 // v38: Database types moved to revm::database
 use revm::database::{CacheDB, EmptyDB};
-use revm::primitives::BlockEnv;
+use revm::context::BlockEnv;
 use std::sync::Arc;
 use parking_lot::RwLock;
 

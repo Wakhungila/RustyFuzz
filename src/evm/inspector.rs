@@ -1,8 +1,10 @@
 use revm::{
-    interpreter::{CallInputs, CallOutcome, CallScheme, Interpreter, OpCode},
-    Database, Inspector, Context,
+    interpreter::{CallInputs, CallOutcome, CallScheme, Interpreter, interpreter_types::{Jumps, InputsTr}},
+    Database, Inspector,
 };
-use bitvec::prelude::{BitSlice, Lsb0};
+// v38: OpCode is now in the bytecode module or directly available
+// use revm::bytecode::Bytecode; // Unused
+// use bitvec::prelude::{BitSlice, Lsb0}; // Unused
 use crate::common::types::{TaintSource, Waypoint};
 use crate::evm::dataflow::DataflowRegistry;
 use revm::primitives::{keccak256, Address, B256, U256};
@@ -54,66 +56,66 @@ impl<'a> CoverageInspector<'a> {
 }
 
 impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
-    fn step(&mut self, interp: &mut Interpreter, _context: &mut Context<'_, DB>) {
-        let pc = interp.program_counter();
-        let opcode = interp.current_opcode();
+    fn step(&mut self, interp: &mut Interpreter, _context: &mut DB) {
+        let pc = interp.bytecode.pc();
+        let opcode = interp.bytecode.opcode();
 
         // --- Taint Propagation ---
         match opcode {
             // CALLDATALOAD: Mark the top of the stack as tainted with the offset
-            OpCode::CALLDATALOAD => {
+            0x35 => {
                 if let Ok(offset_val) = interp.stack.peek(0) {
-                    let offset = offset_val.saturating_to();
+                    let offset: usize = offset_val.saturating_to();
                     self.taint_stack.push(Some(TaintSource::Calldata(offset)));
                 }
             }
-            OpCode::CALLDATACOPY => {
+            0x3C => {
                 if let (Ok(dest), Ok(src), Ok(len)) = (interp.stack.peek(0), interp.stack.peek(1), interp.stack.peek(2)) {
-                    let dest = dest.saturating_to();
-                    let src = src.saturating_to();
-                    let len = len.saturating_to();
+                    let dest: usize = dest.saturating_to();
+                    let src: usize = src.saturating_to();
+                    let len: usize = len.saturating_to();
                     // Propagate taint from calldata to memory
                     for i in 0..len {
                         self.memory_taint.insert(dest + i, TaintSource::Calldata(src + i));
                     }
                 }
             }
-            OpCode::MLOAD => {
+            0x51 => {
                 if let Ok(offset_val) = interp.stack.peek(0) {
-                    let offset = offset_val.saturating_to();
+                    let offset: usize = offset_val.saturating_to();
                     let taint = self.memory_taint.get(&offset).cloned();
                     self.taint_stack.push(taint);
                     return;
                 }
                 self.taint_stack.push(None);
             }
-            OpCode::MSTORE | OpCode::MSTORE8 => {
+            0x52 | 0x53 => {
                 if let (Ok(offset_val), Some(taint)) = (interp.stack.peek(0), self.taint_stack.last().cloned().flatten()) {
-                    let offset = offset_val.saturating_to();
-                    let size = if opcode == OpCode::MSTORE { 32 } else { 1 };
+                    let offset: usize = offset_val.saturating_to();
+                    let size = if opcode == 0x52 { 32 } else { 1 };
                     for i in 0..size {
                         self.memory_taint.insert(offset + i, taint.clone());
                     }
                 }
             }
             // Propagation for stack operations
-            OpCode::PUSH1..=OpCode::PUSH32 => self.taint_stack.push(None),
-            OpCode::DUP1..=OpCode::DUP16 => {
-                let idx = (opcode as u8 - OpCode::DUP1 as u8) as usize;
+            0x60..=0x7F => self.taint_stack.push(None),
+            0x80..=0x8F => {
+                let idx = (opcode - 0x80) as usize;
                 let taint = self.taint_stack.iter().rev().nth(idx).cloned().flatten(); // Get taint from duplicated item
                 self.taint_stack.push(taint);
             }
-            OpCode::SWAP1..=OpCode::SWAP16 => {
-                let idx = (opcode as u8 - OpCode::SWAP1 as u8 + 1) as usize;
+            0x90..=0x9F => {
+                let idx = (opcode - 0x90 + 1) as usize;
                 let len = self.taint_stack.len();
                 if len > idx {
                     self.taint_stack.swap(len - 1, len - 1 - idx);
                 }
             }
-            OpCode::POP => { self.taint_stack.pop(); } // Remove taint for popped item
-            OpCode::SLOAD => {
+            0x50 => { self.taint_stack.pop(); } // Remove taint for popped item
+            0x54 => {
                 if let Ok(slot_val) = interp.stack.peek(0) {
-                    let addr = interp.contract.address;
+                    let addr = interp.input.bytecode_address().copied().unwrap_or(Address::ZERO);
                     let slot = B256::from(slot_val);
                     
                     // If this slot was written by a previous transaction in the sequence
@@ -122,7 +124,7 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
                             if written_tx_idx < self.current_tx_idx {
                                 self.waypoints.push(Waypoint::StorageRead {
                                     address: addr, slot, value: U256::ZERO, // Value will be known after SLOAD
-                                    pc, read_tx_idx: self.current_tx_idx, taint_source: Some(taint_source_of_value),
+                                    pc, read_tx_idx: self.current_tx_idx, taint_source: Some(taint_source_of_value.clone()),
                                 });
                                 self.taint_stack.push(Some(taint_source_of_value)); // Propagate taint from storage read
                                 return; // Skip default taint propagation
@@ -132,9 +134,9 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
                 }
                 self.taint_stack.push(None); // SLOAD result is untainted by default unless explicitly tracked
             }
-            OpCode::TLOAD => {
+            0x5C => {
                 if let Ok(slot_val) = interp.stack.peek(0) {
-                    let addr = interp.contract.address;
+                    let addr = interp.input.bytecode_address().copied().unwrap_or(Address::ZERO);
                     let slot = B256::from(slot_val);
                     
                     if let Some(ts) = self.transient_taint_map.get(&(addr, slot)).cloned() {
@@ -154,8 +156,8 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
         }
 
         // Precision Edge Hashing: mimicking hardware-level branch tracking
-        if opcode == OpCode::JUMP || opcode == OpCode::JUMPI {
-            let edge_hash = (pc ^ (self.last_pc.wrapping_rotate_left(1))) % MAP_SIZE;
+        if opcode == 0xF1 || opcode == 0xF2 || opcode == 0xF4 || opcode == 0xFA {
+            let edge_hash = (pc ^ (self.last_pc.rotate_left(1))) % MAP_SIZE;
             self.coverage[edge_hash] = self.coverage[edge_hash].saturating_add(1);
         }
 
@@ -166,7 +168,7 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
         // Causal Tracking: Monitor SLOAD (0x54) and SSTORE (0x55)
         if opcode == 0x54 || opcode == 0x55 {
             if let Ok(slot_val) = interp.stack.peek(0) {
-                let addr = interp.contract.address;
+                let addr = interp.input.bytecode_address().copied().unwrap_or(Address::ZERO);
                 let slot = B256::from(slot_val);
 
                 // Logic Sanitizer: Detect Uninitialized Storage Reads
@@ -194,7 +196,7 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
 
             // Slot is the first item on the stack for SSTORE
             if let Ok(slot_val) = interp.stack.peek(0) {
-                let address = interp.contract.address;
+                let address = interp.input.bytecode_address().copied().unwrap_or(Address::ZERO);
                 let slot = B256::from(slot_val);
 
                 self.dataflow.mark_influenced(address, slot);
@@ -224,10 +226,10 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
         }
 
         // Cancun Spec: Transient Storage (EIP-1153)
-        if opcode == OpCode::TSTORE {
+        if opcode == 0x5D {
             let value_taint_source = self.taint_stack.last().cloned().flatten();
             if let Ok(slot_val) = interp.stack.peek(0) {
-                let address = interp.contract.address;
+                let address = interp.input.bytecode_address().copied().unwrap_or(Address::ZERO);
                 let slot = B256::from(slot_val);
                 
                 if let Some(ts) = value_taint_source {
@@ -258,7 +260,7 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
                         if let Ok(val) = interp.stack.peek(2) {
                             third = Some(val);
                             // If third operand is tainted, it becomes the primary taint source
-                            let third_taint = self.taint_stack.iter().rev().nth(2).cloned().flatten();
+                            let _third_taint = self.taint_stack.iter().rev().nth(2).cloned().flatten();
                             // taint_source = taint_source.or(third_taint); // More complex merge
                         }
                     }
@@ -280,7 +282,7 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
         // Symbolic Path Exploration: Monitor JUMPI (0x57)
         // We record the 'Path Not Taken' as a symbolic target for the solver.
         if opcode == 0x57 {
-            if let (Ok(dest), Ok(condition)) = (interp.stack.peek(0), interp.stack.peek(1)) {
+            if let (Ok(_dest), Ok(condition)) = (interp.stack.peek(0), interp.stack.peek(1)) {
                 let branch_taken = !condition.is_zero();
                 let taint = self.taint_stack.iter().rev().nth(1).cloned().flatten();
                 
@@ -289,13 +291,16 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
                     self.waypoints.push(Waypoint::BranchPath {
                         pc,
                         taken: branch_taken,
-                        constraint: Waypoint::Comparison {
+                        constraint: Box::new(Waypoint::Comparison {
                             op: 0x14, // Force equality check logic in solver
                             lhs: condition,
                             rhs: if branch_taken { U256::ZERO } else { U256::from(1) },
                             pc,
                             taint_source: Some(ts),
-                        },
+                            calldata_offset: None,
+                            condition: false,
+                            hit: false,
+                        }),
                     });
                 }
             }
@@ -316,26 +321,29 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
                     rhs,
                     pc,
                     taint_source,
+                    calldata_offset: None,
+                    condition: false,
+                    hit: false,
                 });
             }
         }
 
         // Capture Mapping Derivations for high-fidelity Oracle reasoning
-        if opcode == OpCode::SHA3 {
+        if opcode == 0x20 {
             if let (Ok(offset), Ok(size)) = (interp.stack.peek(0), interp.stack.peek(1)) {
-                let offset = offset.saturating_to();
-                let size = size.saturating_to();
+                let offset: usize = offset.saturating_to();
+                let size: usize = size.saturating_to();
                 
                 // Industry standard: mappings usually involve 64 bytes (key + base_slot)
                 if size == 64 {
-                    let data = interp.shared_memory.slice(offset, size);
+                    let data = interp.memory.slice_len(offset, size);
                     let key = U256::from_be_slice(&data[0..32]);
                     let base_slot = U256::from_be_slice(&data[32..64]);
                     
                     self.waypoints.push(Waypoint::MappingDerivation {
                         base_slot,
                         key,
-                        derived_slot: keccak256(data),
+                        derived_slot: keccak256(&*data),
                     });
                 }
             }
@@ -344,46 +352,55 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
         self.last_pc = pc;
     }
 
-    fn call(&mut self, _context: &mut Context<'_, DB>, inputs: &mut CallInputs) -> Option<CallOutcome> {
+    fn call(&mut self, _context: &mut DB, inputs: &mut CallInputs) -> Option<CallOutcome> {
+        // Extract input bytes once for all checks
+        let input_bytes = match &inputs.input {
+            revm::interpreter::CallInput::Bytes(b) => b.clone(),
+            revm::interpreter::CallInput::SharedBuffer(_) => {
+                // Can't access shared buffer without context, skip for now
+                return None;
+            }
+        };
+        
         // Detect Token Callbacks (ERC777 / ERC1363)
-        if inputs.input.len() >= 4 {
-            let selector = &inputs.input[0..4];
+        if input_bytes.len() >= 4 {
+            let selector = &input_bytes[0..4];
             // 0x97135039: tokensReceived (ERC777)
             // 0x88a7ca5c: onTransferReceived (ERC1363)
             if selector == [0x97, 0x13, 0x50, 0x39] || selector == [0x88, 0xa7, 0xca, 0x5c] {
                 self.waypoints.push(Waypoint::TokenCallback {
                     target: inputs.target_address,
                     selector: selector.try_into().unwrap(),
-                    data: inputs.input.to_vec(),
+                    data: input_bytes.to_vec(),
                 });
             }
         }
 
         // EIP-3156: flashLoan(receiver, token, amount, data) -> 0x5c19e951
-        if inputs.input.len() >= 4 && inputs.input[0..4] == [0x5c, 0x19, 0xe9, 0x51] {
+        if input_bytes.len() >= 4 && &input_bytes[0..4] == &[0x5c, 0x19, 0xe9, 0x51] {
              // Potential flashloan initiation detected.
         }
 
         // EIP-3156: onFlashLoan(initiator, token, amount, fee, data) -> 0x2393069c
-        if inputs.input.len() >= 4 && inputs.input[0..4] == [0x23, 0x93, 0x06, 0x9c] {
+        if input_bytes.len() >= 4 && &input_bytes[0..4] == &[0x23, 0x93, 0x06, 0x9c] {
             // The lender is calling back the fuzzer. 
             // This is the "manipulate" phase of the attack.
-            if let Ok(amount) = U256::abi_decode(&inputs.input[68..100], true) {
-                if let Ok(fee) = U256::abi_decode(&inputs.input[100..132], true) {
-                    self.waypoints.push(Waypoint::FlashloanExecution {
-                        lender: inputs.caller,
-                        token: Address::from_slice(&inputs.input[16..36]),
-                        amount,
-                        fee,
-                        is_repaid: false, // Will be verified in call_end or by Oracle
-                    });
-                }
+            if input_bytes.len() >= 132 {
+                let amount = U256::from_be_slice(&input_bytes[68..100]);
+                let fee = U256::from_be_slice(&input_bytes[100..132]);
+                self.waypoints.push(Waypoint::FlashloanExecution {
+                    lender: inputs.caller,
+                    token: Address::from_slice(&input_bytes[16..36]),
+                    amount,
+                    fee,
+                    is_repaid: false, // Will be verified in call_end or by Oracle
+                });
             }
         }
 
         // Governance detection (GovernorBravo/Alpha style)
-        if inputs.input.len() >= 4 {
-            let selector = &inputs.input[0..4];
+        if input_bytes.len() >= 4 {
+            let selector = &input_bytes[0..4];
             // da95691a: propose, 56781388: castVote, fe0d94c1: execute
             if selector == [0xda, 0x95, 0x69, 0x1a] || 
                selector == [0x56, 0x78, 0x13, 0x88] || 
@@ -409,18 +426,24 @@ impl<'a, DB: Database> Inspector<DB> for CoverageInspector<'a> {
 
     fn call_end(
         &mut self,
-        _context: &mut Context<'_, DB>,
+        _context: &mut DB,
         inputs: &CallInputs,
-        outcome: CallOutcome,
-    ) -> CallOutcome {
+        outcome: &mut CallOutcome,
+    ) {
         if inputs.scheme == CallScheme::StaticCall {
+            let input_bytes = match &inputs.input {
+                revm::interpreter::CallInput::Bytes(b) => b.clone(),
+                revm::interpreter::CallInput::SharedBuffer(_) => {
+                    // Can't access without context
+                    return;
+                }
+            };
             self.waypoints.push(Waypoint::StaticCall {
                 caller: inputs.caller,
                 target: inputs.target_address,
-                data: inputs.input.to_vec(),
+                data: input_bytes.to_vec(),
                 output: outcome.result.output.to_vec(),
             });
         }
-        outcome
     }
 }
