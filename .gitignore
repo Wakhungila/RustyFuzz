@@ -2,6 +2,10 @@
 target/
 .cargo/
 .cargo.lock
+.cargo.toml
+node_modules/
+vendor/
+config.toml
 
 # Compiled and build artifacts
 *.o

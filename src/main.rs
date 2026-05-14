@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
                 rpc_url: config.rpc_url.clone(),
                 fork_block: config.fork_block.unwrap_or(0),
             };
-            rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config)?;
+            rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await?;
         }
         Command::ScanMempool => {
             println!("Starting mempool scanner for chain: {}", config.chain);

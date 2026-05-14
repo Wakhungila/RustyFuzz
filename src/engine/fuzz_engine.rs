@@ -31,7 +31,7 @@ pub struct Config {
     pub fork_block: u64,
 }
 
-pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
+pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let start_time = Instant::now();
 
@@ -43,11 +43,16 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
     log::info!("Initializing RustyFuzz v0.15.4 Campaign...");
 
+    let (_initial_db, initial_env) = {
+        let db = crate::evm::fork::create_fork_db(&config.rpc_url, config.fork_block).await?;
+        let env = crate::evm::fork::create_fork_block_env(&config.rpc_url, config.fork_block).await?;
+        (db, env)
+    };
+
     Launcher::builder()
         .shmem_provider(shmem_provider)
         .monitor(monitor)
         .configuration(EventConfig::AlwaysUnique)
-        // FIX 1: Explicitly type 'core_id' and 'state' to satisfy type inference
         .run_client(|state: Option<StdState<_, _, _, _>>, mut manager, description: ClientDescription| {
             
             let snapshot_corpus = Arc::new(RwLock::new(SnapshotCorpus::new()));
@@ -55,12 +60,6 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
             let evm_executor = Arc::new(EvmExecutor::new());
             let account_registry = Arc::new(RwLock::new(GlobalAccountRegistry::default()));
             let abi_registry = Arc::new(AbiRegistry::default());
-
-            let (_initial_db, initial_env) = tokio::runtime::Handle::current().block_on(async {
-                let db = crate::evm::fork::create_fork_db(&config.rpc_url, config.fork_block).await.unwrap();
-                let env = crate::evm::fork::create_fork_block_env(&config.rpc_url, config.fork_block).await.unwrap();
-                (db, env)
-            });
 
             let core_id = description.core_id();
 
@@ -77,8 +76,6 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 ).expect("Failed to initialize State")
             });
 
-            // FIX 2: Ensure your EvmMutator has a 'new' method or use struct initialization
-            // If EvmMutator doesn't have ::new(), use: EvmMutator { abi_registry, ... }
             let mutator = EvmMutator::new(abi_registry, account_registry.clone());
             
             let mut stages = tuple_list!(
@@ -87,15 +84,12 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
             let mut fuzzer = StdFuzzer::new(StdScheduler::new(), feedback, objective);
 
-            // FIX 3: Shared map must be accessible. Using SyncUnsafeCell for Rust 2024 compatibility.
             static COVERAGE_MAP: SyncUnsafeCell<[u8; MAP_SIZE]> = SyncUnsafeCell(UnsafeCell::new([0u8; MAP_SIZE]));
             let observer = unsafe {
                 StdMapObserver::from_mut_ptr("edges", (COVERAGE_MAP.0).get() as *mut u8, MAP_SIZE)
             };
             
-            // FIX 4: Corrected InProcessExecutor constructor
-            // The signature is: InProcessExecutor::new(harness, observers, fuzzer, state, event_manager)
-            let mut harness = |input: &EvmInput| {   // Harness closure: only takes input in newer LibAFL
+            let mut harness = |input: &EvmInput| {
                 let snap_id = input.base_snapshot_id;
                 let snapshot_corpus_guard = snapshot_corpus.read();
                 let base_snap_arc = snapshot_corpus_guard.get_snapshot(snap_id).unwrap();
@@ -122,9 +116,10 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 }
                 ExitKind::Ok
             };
+
             let mut executor = InProcessExecutor::new(
                 &mut harness,
-                tuple_list!(observer), // Observers MUST be a tuple_list
+                tuple_list!(observer),
                 &mut fuzzer,
                 &mut state,
                 &mut manager,
@@ -134,7 +129,6 @@ pub fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
             
             Ok(())
         })
-        // FIX 5: Use Cores::from_cmdline for the cores iterator
         .cores(&Cores::from_cmdline("all")?) 
         .build()
         .launch()?;
