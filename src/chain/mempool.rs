@@ -1,5 +1,5 @@
-use crate::common::types::SingletonTx;
 use crate::chain::interface::ChainInterface;
+use crate::common::types::SingletonTx;
 use async_trait::async_trait;
 
 // A dummy implementation of ChainInterface for demonstration
@@ -10,7 +10,10 @@ pub struct DummyChainInterface {
 #[async_trait]
 impl ChainInterface for DummyChainInterface {
     async fn get_mempool_txs(&self) -> Vec<SingletonTx> {
-        println!("DummyChainInterface: Fetching mempool transactions from {}", self.rpc_url);
+        println!(
+            "DummyChainInterface: Fetching mempool transactions from {}",
+            self.rpc_url
+        );
         // In a real scenario, this would connect to an RPC endpoint and fetch pending transactions.
         vec![] // Return empty for now
     }
@@ -27,7 +30,9 @@ pub struct MempoolScanner {
 
 impl MempoolScanner {
     pub fn new(rpc_url: String) -> Self {
-        MempoolScanner { chain_interface: DummyChainInterface { rpc_url } }
+        MempoolScanner {
+            chain_interface: DummyChainInterface { rpc_url },
+        }
     }
 
     pub async fn scan_mempool(&self) -> anyhow::Result<()> {

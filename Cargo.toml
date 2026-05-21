@@ -1,7 +1,7 @@
 [package]
 name = "rusty-fuzz"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FEATURES
@@ -25,6 +25,7 @@ svm      = ["dep:solana-sdk", "dep:solana-client", "dep:solana-rpc-client-api",
 z3       = ["dep:z3"]
 llm      = ["dep:reqwest"]
 notifier = ["dep:reqwest"]
+sgx      = []
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FUZZING CORE
@@ -139,7 +140,7 @@ version  = "1.1.3"
 features = ["use-std"]
 
 [dependencies.toml]
-version = "1.1.2+spec-1.1.0"
+version = "1.1.2"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CORE UTILITIES
@@ -202,5 +203,5 @@ optional = true
 # ─────────────────────────────────────────────────────────────────────────────
 [dependencies.reqwest]
 version  = "0.13.3"
-features = ["json"]
+features = ["json", "blocking"]
 optional = true

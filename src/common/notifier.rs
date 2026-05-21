@@ -1,9 +1,9 @@
-use serde_json::json;
-use chrono::Utc;
 use crate::common::oracle::VulnType;
 use crate::common::types::Snapshot;
 use alloy::hex;
+use chrono::Utc;
 use parking_lot::Mutex;
+use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,9 +30,9 @@ impl DiscordNotifier {
 
     /// Dispatches a formatted alert to Discord.
     pub async fn notify_discovery(
-        &self, 
-        vuln_type: &VulnType, 
-        snapshot: &Snapshot, 
+        &self,
+        vuln_type: &VulnType,
+        snapshot: &Snapshot,
         mrenclave: Option<&[u8]>,
         poc: Option<String>,
     ) -> anyhow::Result<()> {
@@ -64,7 +64,10 @@ impl DiscordNotifier {
 
         let mut description = "A state-tree branch has violated a protocol invariant. Multi-step transaction sequence verified.".to_string();
         if let Some(poc_content) = poc {
-            description.push_str(&format!("\n\n**Proof of Concept:**\n```rust\n{}\n```", poc_content));
+            description.push_str(&format!(
+                "\n\n**Proof of Concept:**\n```rust\n{}\n```",
+                poc_content
+            ));
         }
 
         let payload = json!({
@@ -81,7 +84,13 @@ impl DiscordNotifier {
         });
 
         // Fallback: Log if transport fails or returns an error status
-        match self.client.post(&self.webhook_url).json(&payload).send().await {
+        match self
+            .client
+            .post(&self.webhook_url)
+            .json(&payload)
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => {
                 log::info!("Discord notification sent successfully for {:?}", vuln_type);
             }
@@ -89,7 +98,12 @@ impl DiscordNotifier {
                 log::error!("Discord notification failed (status: {}). Fallback log: Found {:?} in Snapshot {}", resp.status(), vuln_type, snapshot.id);
             }
             Err(e) => {
-                log::error!("Discord transport error: {}. Fallback log: Found {:?} in Snapshot {}", e, vuln_type, snapshot.id);
+                log::error!(
+                    "Discord transport error: {}. Fallback log: Found {:?} in Snapshot {}",
+                    e,
+                    vuln_type,
+                    snapshot.id
+                );
             }
         }
         Ok(())

@@ -1,9 +1,9 @@
+pub mod chain;
 pub mod common;
+pub mod config;
+pub mod engine;
 pub mod evm;
 pub mod hybrid;
-pub mod engine;
-pub mod chain;
-pub mod config;
 pub mod oracles;
 
 // SVM is disabled by default due to version conflicts with Solana 2.0.18

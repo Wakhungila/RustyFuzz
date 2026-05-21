@@ -55,14 +55,26 @@ impl ScoringEngine {
         seq_len: usize,
     ) -> SeverityScore {
         // A. Reachability (0-100): Based on call depth and sequence complexity
-        let reachability = if seq_len <= 1 { 100 } else if seq_len <= 3 { 80 } else { 50 };
+        let reachability = if seq_len <= 1 {
+            100
+        } else if seq_len <= 3 {
+            80
+        } else {
+            50
+        };
 
         // B. Privilege Escalation (0-100): Weighted heavily for Pashov's triage workflow.
         // Access control bypasses are the highest-priority findings.
         let privilege = match vuln {
             VulnType::PrivilegeEscalation => 100,
             VulnType::GovernanceParameterManipulation => 90,
-            _ => if trace.calls.iter().any(|c| c.is_delegate) { 70 } else { 0 },
+            _ => {
+                if trace.calls.iter().any(|c| c.is_delegate) {
+                    70
+                } else {
+                    0
+                }
+            }
         };
 
         // C. Economic Impact (0-100): funds_drained / TVL
@@ -75,7 +87,11 @@ impl ScoringEngine {
         };
 
         // D. Exploitability (0-100): Shorter sequences are much easier to report.
-        let exploitability = if seq_len <= 2 { 100 } else { 100 / (seq_len as u32) };
+        let exploitability = if seq_len <= 2 {
+            100
+        } else {
+            100 / (seq_len as u32)
+        };
 
         // E. State Corruption (0-100): Intensity of storage modifications
         let state_corruption = ((trace.state_changes.len() as u32 * 100) / 50).min(100);

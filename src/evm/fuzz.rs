@@ -1,22 +1,22 @@
+use crate::common::types::{SingletonTx, Waypoint};
+#[cfg(feature = "z3")]
+use crate::engine::concolic::ConcolicSolver;
+use crate::evm::registry::GlobalAccountRegistry;
+use alloy_dyn_abi::{DynSolType, DynSolValue};
+use hashlink::LruCache;
 use libafl::{
     corpus::CorpusId,
     inputs::Input,
-    mutators::{Mutator, MutationResult},
+    mutators::{MutationResult, Mutator},
     state::HasRand,
     Error,
 };
 use libafl_bolts::{rands::Rand, HasLen, Named};
-use std::num::NonZero;
-use crate::common::types::{SingletonTx, Waypoint};
-use revm::primitives::{Address, U256};
-use alloy_dyn_abi::{DynSolType, DynSolValue};
-use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc}; 
-use crate::evm::registry::GlobalAccountRegistry;
 use parking_lot::RwLock;
-#[cfg(feature = "z3")]
-use crate::engine::concolic::ConcolicSolver;
-use hashlink::LruCache;
+use revm::primitives::{Address, U256};
+use serde::{Deserialize, Serialize};
+use std::num::NonZero;
+use std::{collections::HashMap, sync::Arc};
 
 /// Maximum number of entries allowed in the decode cache before eviction is triggered.
 const MAX_DECODE_CACHE_SIZE: usize = 10000;
@@ -67,11 +67,7 @@ impl<S> Mutator<EvmInput, S> for EvmMutator
 where
     S: HasRand,
 {
-    fn mutate(
-        &mut self,
-        state: &mut S,
-        input: &mut EvmInput,
-    ) -> Result<MutationResult, Error> {
+    fn mutate(&mut self, state: &mut S, input: &mut EvmInput) -> Result<MutationResult, Error> {
         let rand = state.rand_mut();
         let bucket = rand.below(NonZero::new(100).unwrap());
 
@@ -123,14 +119,29 @@ impl EvmMutator {
             if let Some(tx_waypoints) = input.waypoints.get(tx_idx) {
                 let candidates: Vec<_> = tx_waypoints
                     .iter()
-                    .filter(|w| matches!(w, Waypoint::BranchPath { .. } | Waypoint::Comparison { taint_source: Some(_), .. }))
+                    .filter(|w| {
+                        matches!(
+                            w,
+                            Waypoint::BranchPath { .. }
+                                | Waypoint::Comparison {
+                                    taint_source: Some(_),
+                                    ..
+                                }
+                        )
+                    })
                     .collect();
 
                 if let Some(waypoint) = self.pick_random(rand, &candidates) {
                     if let Some(hint) = solver.solve_hint(waypoint) {
                         if let Some(ts) = match waypoint {
-                            Waypoint::Comparison { taint_source: Some(ts), .. } => Some(ts),
-                            Waypoint::Arithmetic { taint_source: Some(ts), .. } => Some(ts),
+                            Waypoint::Comparison {
+                                taint_source: Some(ts),
+                                ..
+                            } => Some(ts),
+                            Waypoint::Arithmetic {
+                                taint_source: Some(ts),
+                                ..
+                            } => Some(ts),
                             _ => None,
                         } {
                             let (target_tx_idx, offset) = match ts {
@@ -284,7 +295,8 @@ impl EvmMutator {
 
         let token = Address::new([0x17; 20]);
         let amount = U256::from(10u128.pow(21));
-        let sequence_data = bincode::serde::encode_to_vec(&input.txs, bincode::config::standard()).unwrap_or_else(|_| vec![]);
+        let sequence_data = bincode::serde::encode_to_vec(&input.txs, bincode::config::standard())
+            .unwrap_or_else(|_| vec![]);
 
         let mut call_data = vec![0x5c, 0x19, 0xe9, 0x51];
         call_data.extend_from_slice(&[0u8; 12]);
@@ -383,6 +395,7 @@ impl EvmMutator {
         }
     }
 
+    #[cfg(feature = "z3")]
     fn pick_random<'a, R: Rand, T>(&self, rand: &mut R, items: &'a [T]) -> Option<&'a T> {
         if items.is_empty() {
             None
@@ -396,7 +409,8 @@ impl EvmMutator {
             [0u8; 4]
         } else {
             let idx = rand.below(NonZero::new(self.abi_registry.functions.len()).unwrap());
-            *self.abi_registry
+            *self
+                .abi_registry
                 .functions
                 .keys()
                 .nth(idx)
@@ -412,15 +426,22 @@ impl EvmMutator {
                     elements.push(DynSolValue::Uint(U256::ZERO, 256));
                 } else {
                     let choice = rand.below(NonZero::new(100).unwrap());
-                    if choice < 70 { // Mutate an existing element
+                    if choice < 70 {
+                        // Mutate an existing element
                         let idx = rand.below(NonZero::new(elements.len()).unwrap());
                         self.mutate_sol_value(&mut elements[idx], rand);
-                    } else if choice < 85 && elements.len() > 1 { // Remove an element
+                    } else if choice < 85 && elements.len() > 1 {
+                        // Remove an element
                         let idx = rand.below(NonZero::new(elements.len()).unwrap());
                         elements.remove(idx);
-                    } else { 
+                    } else {
                         // Add another element of the same type
-                        elements.push(elements.last().cloned().unwrap_or(DynSolValue::Uint(U256::ZERO, 256)));
+                        elements.push(
+                            elements
+                                .last()
+                                .cloned()
+                                .unwrap_or(DynSolValue::Uint(U256::ZERO, 256)),
+                        );
                     }
                 }
             }
@@ -439,9 +460,9 @@ impl EvmMutator {
             DynSolValue::Uint(val, _) => {
                 // High-fidelity boundary constants for DeFi logic
                 let choices = [
-                    U256::MAX, 
-                    U256::ZERO, 
-                    U256::from(1), 
+                    U256::MAX,
+                    U256::ZERO,
+                    U256::from(1),
                     U256::from(10u128.pow(18)), // 1e18 (Standard WAD)
                     U256::from(10u128.pow(6)),  // 1e6 (Standard USDC)
                     val.wrapping_add(U256::from(1)),
@@ -472,6 +493,7 @@ impl EvmMutator {
     }
 
     /// Generates a sensible default value for a given Solidity type to aid in sequence growth.
+    #[cfg(feature = "z3")]
     fn generate_default_sol_value<R: Rand>(&self, ty: &DynSolType, rand: &mut R) -> DynSolValue {
         match ty {
             DynSolType::Uint(size) => DynSolValue::Uint(U256::ZERO, *size),
@@ -481,7 +503,10 @@ impl EvmMutator {
             DynSolType::Bytes => DynSolValue::Bytes(vec![0u8; 32]),
             DynSolType::String => DynSolValue::String(String::from("RustyFuzz")),
             DynSolType::Tuple(inner_types) => {
-                let vals = inner_types.iter().map(|t| self.generate_default_sol_value(t, rand)).collect();
+                let vals = inner_types
+                    .iter()
+                    .map(|t| self.generate_default_sol_value(t, rand))
+                    .collect();
                 DynSolValue::Tuple(vals)
             }
             _ => DynSolValue::Uint(U256::ZERO, 256),

@@ -1,5 +1,5 @@
 //! Execution trace analysis for extracting events, state changes, and call graphs
-//! 
+//!
 //! This module provides deep inspection of EVM execution traces to enable:
 //! - Event log parsing for vulnerability detection
 //! - State change tracking across calls
@@ -7,9 +7,12 @@
 //! - Gas usage profiling per operation
 
 use revm::{
-    interpreter::{CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter, interpreter_types::{Jumps, InputsTr}},
+    interpreter::{
+        interpreter_types::{InputsTr, Jumps},
+        CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter,
+    },
+    primitives::{Address, Bytes, Log, U256},
     Database, Inspector,
-    primitives::{Address, Log, U256, Bytes},
 };
 use std::collections::HashMap;
 
@@ -92,7 +95,7 @@ impl ExecutionTrace {
             .filter(|c| !c.is_delegate && !c.is_static && c.depth > 0)
             .collect()
     }
-    
+
     /// Get state changes grouped by contract
     pub fn state_changes_by_contract(&self) -> HashMap<Address, Vec<&StateChange>> {
         let mut map = HashMap::new();
@@ -103,20 +106,19 @@ impl ExecutionTrace {
         }
         map
     }
-    
+
     /// Build a call graph from the trace
     pub fn build_call_graph(&self) -> CallGraph {
         CallGraph::from_trace(self)
     }
-    
+
     /// Find all calls to unverified or suspicious addresses
     pub fn find_suspicious_calls(&self, known_contracts: &[Address]) -> Vec<&CallTrace> {
         self.calls
             .iter()
             .filter(|c| {
-                c.depth > 0 && 
-                !known_contracts.contains(&c.target) &&
-                !c.input.is_empty() // Has calldata, likely a function call
+                c.depth > 0 && !known_contracts.contains(&c.target) && !c.input.is_empty()
+                // Has calldata, likely a function call
             })
             .collect()
     }
@@ -140,7 +142,7 @@ impl CallGraph {
     pub fn from_trace(trace: &ExecutionTrace) -> Self {
         let mut nodes = Vec::new();
         let mut edge_map: HashMap<(Address, Address), CallEdgeInfo> = HashMap::new();
-        
+
         for call in &trace.calls {
             if !nodes.contains(&call.caller) {
                 nodes.push(call.caller);
@@ -148,17 +150,17 @@ impl CallGraph {
             if !nodes.contains(&call.target) {
                 nodes.push(call.target);
             }
-            
+
             let key = (call.caller, call.target);
             let edge = edge_map.entry(key).or_insert(CallEdgeInfo {
                 call_count: 0,
                 total_value: U256::ZERO,
                 selectors: Vec::new(),
             });
-            
+
             edge.call_count += 1;
             edge.total_value = edge.total_value.saturating_add(call.value);
-            
+
             if call.input.len() >= 4 {
                 let selector: [u8; 4] = call.input[0..4].try_into().unwrap();
                 if !edge.selectors.contains(&selector) {
@@ -166,27 +168,30 @@ impl CallGraph {
                 }
             }
         }
-        
-        let edges = edge_map.into_iter().map(|((caller, callee), info)| (caller, callee, info)).collect();
-        
+
+        let edges = edge_map
+            .into_iter()
+            .map(|((caller, callee), info)| (caller, callee, info))
+            .collect();
+
         Self { nodes, edges }
     }
-    
+
     /// Find contracts that receive calls from multiple sources (potential attack surfaces)
     pub fn find_high_traffic_targets(&self, threshold: usize) -> Vec<Address> {
         let mut incoming_count: HashMap<Address, usize> = HashMap::new();
-        
+
         for (_, target, info) in &self.edges {
             *incoming_count.entry(*target).or_insert(0) += info.call_count;
         }
-        
+
         incoming_count
             .into_iter()
             .filter(|(_, count)| *count >= threshold)
             .map(|(addr, _)| addr)
             .collect()
     }
-    
+
     /// Find circular call patterns (potential reentrancy vectors)
     pub fn find_cycles(&self) -> Vec<Vec<Address>> {
         // Simple DFS-based cycle detection
@@ -198,19 +203,19 @@ impl CallGraph {
             }
             map
         };
-        
+
         let mut visited = HashMap::new();
         let mut rec_stack = Vec::new();
-        
+
         for &node in &self.nodes {
             if !visited.contains_key(&node) {
                 self.dfs_cycle(node, &adj, &mut visited, &mut rec_stack, &mut cycles);
             }
         }
-        
+
         cycles
     }
-    
+
     fn dfs_cycle(
         &self,
         node: Address,
@@ -221,7 +226,7 @@ impl CallGraph {
     ) {
         visited.insert(node, true);
         rec_stack.push(node);
-        
+
         if let Some(neighbors) = adj.get(&node) {
             for &neighbor in neighbors {
                 if !visited.contains_key(&neighbor) {
@@ -236,7 +241,7 @@ impl CallGraph {
                 }
             }
         }
-        
+
         rec_stack.pop();
     }
 }
@@ -248,6 +253,7 @@ pub struct TraceInspector<'a> {
     pub max_steps: usize,
     current_depth: usize,
     call_stack: Vec<CallContext>,
+    #[allow(dead_code)]
     pending_state_changes: Vec<(U256, U256)>, // (slot, old_value)
     #[allow(dead_code)]
     logs_buffer: &'a mut Vec<Log>,
@@ -255,7 +261,9 @@ pub struct TraceInspector<'a> {
 
 #[derive(Debug, Clone)]
 struct CallContext {
+    #[allow(dead_code)]
     address: Address,
+    #[allow(dead_code)]
     depth: usize,
 }
 
@@ -271,7 +279,7 @@ impl<'a> TraceInspector<'a> {
             logs_buffer,
         }
     }
-    
+
     pub fn with_step_capture(mut self) -> Self {
         self.capture_steps = true;
         self
@@ -283,31 +291,31 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
         if !self.capture_steps || self.trace.steps.len() >= self.max_steps {
             return;
         }
-        
+
         let step = TraceStep {
             pc: interp.bytecode.pc(),
             opcode: interp.bytecode.opcode(),
             gas_remaining: interp.gas.remaining(),
             stack_depth: interp.stack.len(),
             memory_size: interp.memory.len(),
-            contract_address: interp.input.bytecode_address().copied().unwrap_or(Address::ZERO),
+            contract_address: interp
+                .input
+                .bytecode_address()
+                .copied()
+                .unwrap_or(Address::ZERO),
         };
-        
+
         self.trace.steps.push(step);
     }
-    
-    fn call(
-        &mut self,
-        _context: &mut DB,
-        inputs: &mut CallInputs,
-    ) -> Option<CallOutcome> {
+
+    fn call(&mut self, _context: &mut DB, inputs: &mut CallInputs) -> Option<CallOutcome> {
         self.current_depth += 1;
-        
+
         self.call_stack.push(CallContext {
             address: inputs.target_address,
             depth: self.current_depth,
         });
-        
+
         // Record call (will be updated with outcome later)
         let input_bytes = match &inputs.input {
             revm::interpreter::CallInput::Bytes(b) => b.clone(),
@@ -316,7 +324,7 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
                 revm::primitives::Bytes::new()
             }
         };
-        
+
         self.trace.calls.push(CallTrace {
             caller: inputs.caller,
             target: inputs.target_address,
@@ -329,33 +337,26 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
             is_delegate: matches!(inputs.scheme, revm::interpreter::CallScheme::DelegateCall),
             is_static: inputs.is_static,
         });
-        
+
         None
     }
-    
-    fn call_end(
-        &mut self,
-        _context: &mut DB,
-        inputs: &CallInputs,
-        outcome: &mut CallOutcome,
-    ) {
+
+    fn call_end(&mut self, _context: &mut DB, inputs: &CallInputs, outcome: &mut CallOutcome) {
         if let Some(last_call) = self.trace.calls.last_mut() {
             last_call.output = Some(outcome.result.output.clone());
             last_call.success = outcome.result.result.is_ok();
-            last_call.gas_used = inputs.gas_limit.saturating_sub(outcome.result.gas.remaining());
+            last_call.gas_used = inputs
+                .gas_limit
+                .saturating_sub(outcome.result.gas.remaining());
         }
-        
+
         self.call_stack.pop();
         self.current_depth = self.current_depth.saturating_sub(1);
     }
-    
-    fn create(
-        &mut self,
-        _context: &mut DB,
-        inputs: &mut CreateInputs,
-    ) -> Option<CreateOutcome> {
+
+    fn create(&mut self, _context: &mut DB, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
         self.current_depth += 1;
-        
+
         self.trace.creates.push(CreateTrace {
             creator: inputs.caller(),
             init_code: inputs.init_code().clone(),
@@ -365,10 +366,10 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
             success: true,
             depth: self.current_depth,
         });
-        
+
         None
     }
-    
+
     fn create_end(
         &mut self,
         _context: &mut DB,
@@ -379,20 +380,26 @@ impl<'a, DB: Database> Inspector<DB> for TraceInspector<'a> {
             last_create.deployed_address = outcome.address;
             last_create.deployed_code = outcome.result.output.clone().into();
             last_create.success = outcome.result.result.is_ok();
-            last_create.gas_used = inputs.gas_limit().saturating_sub(outcome.result.gas.remaining());
+            last_create.gas_used = inputs
+                .gas_limit()
+                .saturating_sub(outcome.result.gas.remaining());
         }
-        
+
         self.current_depth = self.current_depth.saturating_sub(1);
     }
-    
+
     fn log(&mut self, _context: &mut DB, log: Log) {
         self.trace.logs.push(ParsedLog {
             address: log.address,
-            topics: log.topics().iter().map(|t| U256::from_be_bytes(t.0)).collect(),
+            topics: log
+                .topics()
+                .iter()
+                .map(|t| U256::from_be_bytes(t.0))
+                .collect(),
             data: log.data.data.clone(),
             depth: self.current_depth,
         });
-        
+
         self.logs_buffer.push(log);
     }
 }
@@ -404,29 +411,29 @@ impl TraceAnalyzer {
     /// Analyze a trace for common vulnerability patterns
     pub fn analyze(trace: &ExecutionTrace) -> Vec<TraceFinding> {
         let mut findings = Vec::new();
-        
+
         // Check for suspicious call patterns
         findings.extend(Self::check_reentrancy_patterns(trace));
-        
+
         // Check for dangerous delegate calls
         findings.extend(Self::check_delegate_call_patterns(trace));
-        
+
         // Check for unusual state change patterns
         findings.extend(Self::check_state_change_patterns(trace));
-        
+
         // Check for gas-intensive operations
         findings.extend(Self::check_gas_patterns(trace));
-        
+
         findings
     }
-    
+
     fn check_reentrancy_patterns(trace: &ExecutionTrace) -> Vec<TraceFinding> {
         let mut findings = Vec::new();
-        
+
         // Look for external calls followed by state changes at same depth
         let call_graph = trace.build_call_graph();
         let cycles = call_graph.find_cycles();
-        
+
         if !cycles.is_empty() {
             for cycle in cycles {
                 findings.push(TraceFinding {
@@ -434,17 +441,20 @@ impl TraceAnalyzer {
                     category: "Reentrancy".to_string(),
                     description: format!(
                         "Circular call pattern detected: {}",
-                        cycle.iter()
+                        cycle
+                            .iter()
                             .map(|a| format!("{:?}", a))
                             .collect::<Vec<_>>()
                             .join(" -> ")
                     ),
                     evidence: format!("Cycle length: {}", cycle.len()),
-                    recommendation: "Implement reentrancy guards or use checks-effects-interactions pattern".to_string(),
+                    recommendation:
+                        "Implement reentrancy guards or use checks-effects-interactions pattern"
+                            .to_string(),
                 });
             }
         }
-        
+
         // Check for state changes after external calls
         let mut last_external_call_depth = 0;
         for item in &trace.calls {
@@ -452,7 +462,7 @@ impl TraceAnalyzer {
                 last_external_call_depth = item.depth;
             }
         }
-        
+
         for change in &trace.state_changes {
             if change.depth <= last_external_call_depth && last_external_call_depth > 0 {
                 findings.push(TraceFinding {
@@ -467,67 +477,74 @@ impl TraceAnalyzer {
                 });
             }
         }
-        
+
         findings
     }
-    
+
     fn check_delegate_call_patterns(trace: &ExecutionTrace) -> Vec<TraceFinding> {
         let mut findings = Vec::new();
-        
+
         for call in &trace.calls {
             if call.is_delegate && call.depth > 0 {
                 // Check if target is hardcoded or dynamic
-                let is_dynamic_target = call.input.len() < 4 || 
-                    call.input[0..4] != [0x00, 0x00, 0x00, 0x00]; // Simplified check
-                
+                let is_dynamic_target =
+                    call.input.len() < 4 || call.input[0..4] != [0x00, 0x00, 0x00, 0x00]; // Simplified check
+
                 if is_dynamic_target {
                     findings.push(TraceFinding {
                         severity: FindingSeverity::Critical,
                         category: "Dangerous DelegateCall".to_string(),
                         description: "DELEGATECALL to potentially dynamic target".to_string(),
-                        evidence: format!("Target: {:?}, Input len: {}", call.target, call.input.len()),
-                        recommendation: "Ensure DELEGATECALL targets are immutable and trusted".to_string(),
+                        evidence: format!(
+                            "Target: {:?}, Input len: {}",
+                            call.target,
+                            call.input.len()
+                        ),
+                        recommendation: "Ensure DELEGATECALL targets are immutable and trusted"
+                            .to_string(),
                     });
                 }
             }
         }
-        
+
         findings
     }
-    
+
     fn check_state_change_patterns(trace: &ExecutionTrace) -> Vec<TraceFinding> {
         let mut findings = Vec::new();
-        
+
         // Group state changes by contract
         let changes_by_contract = trace.state_changes_by_contract();
-        
+
         for (contract, changes) in changes_by_contract {
             // Check for balance-like slot changes (common slots: 0, 1, 2)
             let balance_slots: Vec<_> = changes
                 .iter()
                 .filter(|c| c.slot <= U256::from(10))
                 .collect();
-            
+
             if balance_slots.len() > 3 {
                 findings.push(TraceFinding {
                     severity: FindingSeverity::Medium,
                     category: "Frequent Balance Updates".to_string(),
                     description: format!(
                         "Contract {:?} had {} updates to low-index storage slots",
-                        contract, balance_slots.len()
+                        contract,
+                        balance_slots.len()
                     ),
                     evidence: "Multiple updates to potential balance/mapping slots".to_string(),
-                    recommendation: "Review access controls on balance-modifying functions".to_string(),
+                    recommendation: "Review access controls on balance-modifying functions"
+                        .to_string(),
                 });
             }
         }
-        
+
         findings
     }
-    
+
     fn check_gas_patterns(trace: &ExecutionTrace) -> Vec<TraceFinding> {
         let mut findings = Vec::new();
-        
+
         if trace.total_gas_used > 20_000_000 {
             findings.push(TraceFinding {
                 severity: FindingSeverity::Low,
@@ -538,10 +555,11 @@ impl TraceAnalyzer {
                     (trace.total_gas_used as f64 / 30_000_000.0) * 100.0
                 ),
                 evidence: "Gas usage exceeds typical thresholds".to_string(),
-                recommendation: "Consider optimizing hot paths or implementing gas limits".to_string(),
+                recommendation: "Consider optimizing hot paths or implementing gas limits"
+                    .to_string(),
             });
         }
-        
+
         findings
     }
 }

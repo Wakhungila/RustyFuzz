@@ -1,7 +1,8 @@
 use clap::Parser;
-use rusty_fuzz::config::Config;
-use tracing_subscriber;
+use revm::primitives::Address;
 use rusty_fuzz::chain::mempool::MempoolScanner;
+use rusty_fuzz::config::Config;
+use std::str::FromStr;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -30,10 +31,20 @@ async fn main() -> anyhow::Result<()> {
 
     match args.command {
         Command::Fuzz { chain, contract } => {
-            println!("Starting fuzz campaign on {:?} for contract {:?}", chain, contract);
+            println!(
+                "Starting fuzz campaign on {:?} for contract {:?}",
+                chain, contract
+            );
             let fuzz_config = rusty_fuzz::engine::fuzz_engine::Config {
                 rpc_url: config.rpc_url.clone(),
                 fork_block: config.fork_block.unwrap_or(0),
+                target_contract: config
+                    .target_contract
+                    .as_deref()
+                    .map(Address::from_str)
+                    .transpose()?,
+                corpus_dir: config.corpus_dir.clone(),
+                report_dir: config.report_dir.clone(),
             };
             rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await?;
         }

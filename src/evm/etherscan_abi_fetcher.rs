@@ -1,12 +1,12 @@
-use revm::primitives::Address;
 use alloy_json_abi::JsonAbi;
 use anyhow::{anyhow, Result};
+use revm::primitives::Address;
 // TODO: reqwest dependency needs to be added to Cargo.toml
 // use reqwest::Client;
+use parking_lot::RwLock;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 /// Etherscan API response structure for ABI fetching.
 #[derive(Deserialize, Debug)]
@@ -68,7 +68,7 @@ impl EtherscanAbiFetcher {
         }
 
         let abi: JsonAbi = serde_json::from_str(&response.result)?;
-        
+
         // Cache the fetched ABI
         self.cache.write().insert(address, abi.clone());
         Ok(abi)

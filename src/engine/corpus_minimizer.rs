@@ -1,7 +1,5 @@
-use revm::{
-    database::{CacheDB, EmptyDB},
-};
-use revm::context::BlockEnv;
+use bitvec::bitvec;
+use bitvec::prelude::{BitSlice, Lsb0};
 use libafl::{
     prelude::*,
     stages::Stage,
@@ -10,38 +8,38 @@ use libafl::{
     // state::UsesInput,
     // executors::hooks::UsesState,
 };
-use std::sync::Arc;
 use parking_lot::RwLock;
-use bitvec::prelude::{BitSlice, Lsb0};
-use bitvec::bitvec;
+use revm::context::BlockEnv;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::common::types::ChainState;
-use crate::evm::executor::EvmExecutor;
-use crate::evm::dataflow::DataflowRegistry;
 use crate::evm::corpus::SnapshotCorpus;
+use crate::evm::dataflow::DataflowRegistry;
+use crate::evm::executor::EvmExecutor;
+use crate::evm::fork_db::EvmCacheDb;
 use crate::evm::fuzz::EvmInput;
 use crate::evm::inspector::MAP_SIZE;
 
 pub struct CorpusMinimizationStage<S> {
     pub corpus: Arc<RwLock<SnapshotCorpus>>,
     pub executor: Arc<EvmExecutor>,
-    pub initial_db: CacheDB<EmptyDB>,
+    pub initial_db: EvmCacheDb,
     pub initial_env: BlockEnv,
     pub interval: usize,
     pub exec_count: usize,
     _phantom: std::marker::PhantomData<S>,
 }
 
-impl<S> CorpusMinimizationStage<S> 
+impl<S> CorpusMinimizationStage<S>
 where
     S: HasCorpus<EvmInput>,
-    // S: UsesInput<Input = EvmInput>, // TODO: UsesInput trait moved in libafl 
+    // S: UsesInput<Input = EvmInput>, // TODO: UsesInput trait moved in libafl
 {
     pub fn new(
         corpus: Arc<RwLock<SnapshotCorpus>>,
         executor: Arc<EvmExecutor>,
-        initial_db: CacheDB<EmptyDB>,
+        initial_db: EvmCacheDb,
         initial_env: BlockEnv,
         interval: usize,
     ) -> Self {
@@ -65,20 +63,24 @@ where
         for (idx, tx) in input.txs.iter().enumerate() {
             let mut chain_state = ChainState::Evm(current_db.clone());
             let mut waypoints = Vec::new();
-            
+
             // Note: Update execute() to take revm::Context in your implementation
-            if self.executor.execute(
-                &mut chain_state, 
-                &mut current_env, 
-                tx, 
-                total_coverage.as_raw_mut_slice(), 
-                &mut dataflow, 
-                &mut waypoints, 
-                idx
-            ).is_err() {
+            if self
+                .executor
+                .execute(
+                    &mut chain_state,
+                    &mut current_env,
+                    tx,
+                    total_coverage.as_raw_mut_slice(),
+                    &mut dataflow,
+                    &mut waypoints,
+                    idx,
+                )
+                .is_err()
+            {
                 return false;
             }
-            
+
             let ChainState::Evm(new_db) = chain_state;
             current_db = new_db;
         }
@@ -88,9 +90,9 @@ where
 
 impl<S, EM, Z> Stage<EvmInput, EM, S, Z> for CorpusMinimizationStage<S>
 where
-    S: HasCorpus<EvmInput> /* + UsesInput<Input = EvmInput> */, // TODO: UsesInput trait moved in libafl
-    // EM: UsesState<State = S>, // TODO: UsesState trait moved in libafl
-    // Z: UsesState<State = S>, // TODO: UsesState trait moved in libafl
+    S: HasCorpus<EvmInput>,
+    // TODO: Reintroduce UsesInput/UsesState bounds when this stage is wired to the
+    // active LibAFL API.
 {
     fn perform(
         &mut self,
@@ -100,7 +102,9 @@ where
         _manager: &mut EM,
     ) -> Result<(), libafl::Error> {
         self.exec_count += 1;
-        if self.exec_count % self.interval != 0 { return Ok(()); }
+        if !self.exec_count.is_multiple_of(self.interval) {
+            return Ok(());
+        }
 
         log::info!("Starting continuous corpus distillation...");
 
@@ -110,7 +114,9 @@ where
         corpus_lock.retain(&kept_ids);
 
         for id in kept_ids {
-            if id == 0 { continue; }
+            if id == 0 {
+                continue;
+            }
             let snap_arc = corpus_lock.get_snapshot(id).unwrap();
             let (mut evm_input, target_coverage) = {
                 let snap = snap_arc.read();
@@ -164,7 +170,9 @@ impl CorpusMinimizer {
                 while !kept_ids.contains(&current_id) {
                     kept_ids.insert(current_id);
                     if let Some(&parent) = corpus.parent_map.get(&current_id) {
-                        if current_id == parent { break; }
+                        if current_id == parent {
+                            break;
+                        }
                         current_id = parent;
                     } else {
                         break;

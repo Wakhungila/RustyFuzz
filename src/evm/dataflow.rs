@@ -1,6 +1,6 @@
 use revm::primitives::{Address, B256};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use serde::{Serialize, Deserialize};
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct DataflowRegistry {
@@ -15,10 +15,15 @@ impl DataflowRegistry {
     }
 
     pub fn mark_influenced(&mut self, address: Address, slot: B256) {
-        self.influenced_slots.entry(address).or_default().insert(slot);
+        self.influenced_slots
+            .entry(address)
+            .or_default()
+            .insert(slot);
     }
 
     pub fn is_influenced(&self, address: Address, slot: B256) -> bool {
-        self.influenced_slots.get(&address).map_or(false, |slots| slots.contains(&slot))
+        self.influenced_slots
+            .get(&address)
+            .is_some_and(|slots| slots.contains(&slot))
     }
 }

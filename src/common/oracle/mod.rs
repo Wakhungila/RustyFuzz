@@ -1,5 +1,5 @@
 use crate::common::types::Snapshot;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 pub trait VulnerabilityOracle {
     fn check(&self, before: &Snapshot, after: &Snapshot) -> Option<VulnType>;
@@ -53,14 +53,14 @@ pub trait CustomInvariant: Send + Sync + 'static {
 
 // Re-export oracle modules
 pub mod defi;
-pub mod security;
 pub mod governance;
-pub mod svm;
 pub mod mev;
+pub mod security;
+pub mod svm;
 
 // Re-export common oracle implementations
 pub use defi::*;
-pub use security::*;
 pub use governance::*;
-pub use svm::*;
 pub use mev::*;
+pub use security::*;
+pub use svm::*;

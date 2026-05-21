@@ -1,27 +1,27 @@
-use crate::common::types::{SingletonTx, ChainState};
-use crate::evm::inspector::CoverageInspector;
+use crate::common::types::{ChainState, SingletonTx};
 use crate::evm::dataflow::DataflowRegistry;
-use revm::primitives::SpecId;
-use revm::inspector_handle_register;
-use bitvec::prelude::*;
-use aes_gcm_siv::{Aes256GcmSiv, KeyInit, Nonce, aead::Aead};
-use serde::{Serialize, Deserialize};
+use crate::evm::inspector::CoverageInspector;
+use aes_gcm_siv::{aead::Aead, Aes256GcmSiv, KeyInit, Nonce};
 use anyhow::Result;
+use bitvec::prelude::*;
+use revm::inspector_handle_register;
+use revm::primitives::SpecId;
+use serde::{Deserialize, Serialize};
 use sgx_types::*;
 
 /// Hardware-backed proof that a specific execution occurred within an enclave.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SgxAttestationReport {
-    pub raw_report: Vec<u8>, // Serialized sgx_report_t from hardware
+    pub raw_report: Vec<u8>,       // Serialized sgx_report_t from hardware
     pub enclave_identity: Vec<u8>, // MRENCLAVE
     pub timestamp: u64,
 }
 
 /// SgxExecutor runs the EVM within a Trusted Execution Environment (TEE).
-/// This ensures that the state, transactions, and coverage data remain 
+/// This ensures that the state, transactions, and coverage data remain
 /// encrypted in memory, protecting against side-channel leaks on the host.
 pub struct SgxExecutor {
-    // In a production enclave, this might hold sensitive keys for 
+    // In a production enclave, this might hold sensitive keys for
     // decrypting state snapshots or signing PoCs.
     pub enclave_id: u64,
     pub sealing_nonce_counter: std::sync::atomic::AtomicU64,
@@ -29,7 +29,7 @@ pub struct SgxExecutor {
 
 impl SgxExecutor {
     pub fn new(enclave_id: u64) -> Self {
-        Self { 
+        Self {
             enclave_id,
             sealing_nonce_counter: std::sync::atomic::AtomicU64::new(0),
         }
@@ -48,7 +48,7 @@ impl SgxExecutor {
             ChainState::Evm(state) => state,
         };
 
-        // We keep the inspector inside the enclave to ensure coverage 
+        // We keep the inspector inside the enclave to ensure coverage
         // metrics (which can reveal branch behavior) are not leaked.
         let mut inspector = CoverageInspector::new(coverage, dataflow);
 
@@ -74,17 +74,22 @@ impl SgxExecutor {
         // 1. Hardware Key Derivation (EGETKEY)
         let mut key_request = sgx_key_request_t::default();
         key_request.key_name = SGX_KEYSELECT_SEAL as u16;
-        
+
         let mut sealing_key = sgx_key_128bit_t::default();
         unsafe {
             let status = sgx_get_key(&key_request, &mut sealing_key);
             match status {
                 sgx_status_t::SGX_SUCCESS => (),
                 sgx_status_t::SGX_ERROR_INVALID_PARAMETER => {
-                    return Err(anyhow::anyhow!("SGX Key Derivation: Invalid key request parameters"));
+                    return Err(anyhow::anyhow!(
+                        "SGX Key Derivation: Invalid key request parameters"
+                    ));
                 }
                 _ => {
-                    return Err(anyhow::anyhow!("SGX Hardware Error: EGETKEY status {:?}", status));
+                    return Err(anyhow::anyhow!(
+                        "SGX Hardware Error: EGETKEY status {:?}",
+                        status
+                    ));
                 }
             }
         }
@@ -92,19 +97,21 @@ impl SgxExecutor {
         let cipher = Aes256GcmSiv::new_from_slice(&sealing_key)
             .map_err(|_| anyhow::anyhow!("Invalid Key Length"))?;
 
-        // 2. Serialize the state. 
+        // 2. Serialize the state.
         // Note: CacheDB needs to be converted to a serializable format.
         let serialized_state = serde_json::to_vec(state)
             .map_err(|e| anyhow::anyhow!("Serialization failed: {}", e))?;
 
-        // 3. Generate a Nonce. 
+        // 3. Generate a Nonce.
         // High-rigor: Use a 12-byte nonce consisting of a counter and the enclave ID.
         // This ensures no two state snapshots ever share a key/nonce pair.
-        let count = self.sealing_nonce_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let count = self
+            .sealing_nonce_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[0..8].copy_from_slice(&count.to_le_bytes());
         nonce_bytes[8..12].copy_from_slice(&(self.enclave_id as u32).to_le_bytes());
-        
+
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         // 4. Encrypt and Seal
@@ -121,18 +128,23 @@ impl SgxExecutor {
     pub fn generate_attestation_report(&self, exploit_hash: &[u8]) -> Result<SgxAttestationReport> {
         let target_info = sgx_target_info_t::default(); // Usually obtained from the Quoting Enclave via OCALL
         let mut report_data = sgx_report_data_t::default();
-        
+
         // Bind the discovery hash to the hardware report's 64-byte user data field.
         // This ensures the hardware proof is unique to this specific finding.
         let len = exploit_hash.len().min(64);
         report_data.d[..len].copy_from_slice(&exploit_hash[..len]);
 
-        let report = sgx_tstd::sgx_create_report(&target_info, &report_data)
-            .map_err(|e| anyhow::anyhow!("SGX hardware report (EREPORT) generation failed: {:?}", e))?;
+        let report = sgx_tstd::sgx_create_report(&target_info, &report_data).map_err(|e| {
+            anyhow::anyhow!("SGX hardware report (EREPORT) generation failed: {:?}", e)
+        })?;
 
         Ok(SgxAttestationReport {
-            raw_report: unsafe { 
-                std::slice::from_raw_parts(&report as *const _ as *const u8, std::mem::size_of::<sgx_report_t>()).to_vec() 
+            raw_report: unsafe {
+                std::slice::from_raw_parts(
+                    &report as *const _ as *const u8,
+                    std::mem::size_of::<sgx_report_t>(),
+                )
+                .to_vec()
             },
             enclave_identity: report.body.mr_enclave.m.to_vec(),
             timestamp: std::time::SystemTime::now()

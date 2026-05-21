@@ -1,5 +1,5 @@
+use crate::common::oracle::{VulnType, VulnerabilityOracle};
 use crate::common::types::{Snapshot, Waypoint};
-use crate::common::oracle::{VulnerabilityOracle, VulnType};
 use revm::primitives::Address;
 use std::collections::HashSet;
 
@@ -34,7 +34,10 @@ impl VulnerabilityOracle for GovernanceFlashLoanOracle {
             .any(|w| matches!(w, Waypoint::FlashloanExecution { .. }));
 
         for waypoint in &after.waypoints {
-            if let Waypoint::GovernanceAction { selector, caller, .. } = waypoint {
+            if let Waypoint::GovernanceAction {
+                selector, caller, ..
+            } = waypoint
+            {
                 if *selector == [0xfe, 0x0d, 0x94, 0xc1] && *caller == self.fuzzer_address {
                     if has_flashloan {
                         return Some(VulnType::GovernanceTakeover);

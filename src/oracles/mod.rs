@@ -3,8 +3,5 @@
 pub mod economic;
 
 pub use economic::{
-    FlashLoanOracle, 
-    PriceManipulationOracle, 
-    AccessControlOracle, 
-    EconomicOracleBundle,
+    AccessControlOracle, EconomicOracleBundle, FlashLoanOracle, PriceManipulationOracle,
 };

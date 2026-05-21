@@ -1,6 +1,6 @@
-use crate::common::types::{Snapshot, ChainState, Waypoint};
-use crate::common::oracle::{VulnerabilityOracle, VulnType};
-use revm::primitives::{Address, U256, B256};
+use crate::common::oracle::{VulnType, VulnerabilityOracle};
+use crate::common::types::{ChainState, Snapshot, Waypoint};
+use revm::primitives::{Address, B256, U256};
 use std::collections::HashMap;
 
 /// StaleViewOracle: Detects Read-only Reentrancy by identifying cases where
@@ -17,7 +17,12 @@ impl VulnerabilityOracle for StaleViewOracle {
                 Waypoint::StorageWrite { .. } | Waypoint::TransientStorageWrite { .. } => {
                     state_changed = true;
                 }
-                Waypoint::StaticCall { target, data, output, .. } => {
+                Waypoint::StaticCall {
+                    target,
+                    data,
+                    output,
+                    ..
+                } => {
                     let key = (Address::from_slice(target.as_slice()), data.clone());
                     if let Some(previous_output) = observed_outputs.get(&key) {
                         if previous_output != output && state_changed {
@@ -47,28 +52,28 @@ impl VulnerabilityOracle for ReentrancyOracle {
 
         let (ChainState::Evm(db_before), ChainState::Evm(db_after)) =
             (&*state_before, &*state_after);
-            for waypoint in &after.waypoints {
-                if let Waypoint::Arithmetic { op, lhs, rhs, .. } = waypoint {
-                    if after.depth > 1 {
-                        let overflowed = match *op {
-                            0x01 => lhs.overflowing_add(*rhs).1,
-                            0x02 => lhs.overflowing_mul(*rhs).1,
-                            _ => false,
-                        };
-                        if overflowed {
-                            return Some(VulnType::Reentrancy);
-                        }
-                    }
-                }
-            }
-
-            for (addr, acc_after) in &db_after.cache.accounts {
-                if let Some(acc_before) = db_before.cache.accounts.get(addr) {
-                    if acc_after.storage != acc_before.storage && after.depth > 1 {
+        for waypoint in &after.waypoints {
+            if let Waypoint::Arithmetic { op, lhs, rhs, .. } = waypoint {
+                if after.depth > 1 {
+                    let overflowed = match *op {
+                        0x01 => lhs.overflowing_add(*rhs).1,
+                        0x02 => lhs.overflowing_mul(*rhs).1,
+                        _ => false,
+                    };
+                    if overflowed {
                         return Some(VulnType::Reentrancy);
                     }
                 }
             }
+        }
+
+        for (addr, acc_after) in &db_after.cache.accounts {
+            if let Some(acc_before) = db_before.cache.accounts.get(addr) {
+                if acc_after.storage != acc_before.storage && after.depth > 1 {
+                    return Some(VulnType::Reentrancy);
+                }
+            }
+        }
         None
     }
 }
@@ -98,7 +103,14 @@ pub struct PrecisionLossOracle;
 impl VulnerabilityOracle for PrecisionLossOracle {
     fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         for waypoint in &after.waypoints {
-            if let Waypoint::Arithmetic { op, lhs, rhs, taint_source, .. } = waypoint {
+            if let Waypoint::Arithmetic {
+                op,
+                lhs,
+                rhs,
+                taint_source,
+                ..
+            } = waypoint
+            {
                 if (*op == 0x04 || *op == 0x05) && !rhs.is_zero() {
                     let result = lhs.wrapping_div(*rhs);
                     if taint_source.is_some() && result.is_zero() && !lhs.is_zero() {
@@ -121,20 +133,22 @@ impl VulnerabilityOracle for StateRootOracle {
 
         let (ChainState::Evm(db_before), ChainState::Evm(db_after)) =
             (&*state_before, &*state_after);
-            let changed_accounts = db_after
-                .cache.accounts
-                .iter()
-                .filter(|(addr, acc)| {
-                    db_before
-                        .cache.accounts
-                        .get(*addr)
-                        .map_or(true, |prev| prev.info != acc.info)
-                })
-                .count();
+        let changed_accounts = db_after
+            .cache
+            .accounts
+            .iter()
+            .filter(|(addr, acc)| {
+                db_before
+                    .cache
+                    .accounts
+                    .get(*addr)
+                    .is_none_or(|prev| prev.info != acc.info)
+            })
+            .count();
 
-            if changed_accounts > 50 && db_before.cache.accounts.len() > 10 {
-                return Some(VulnType::SystemicStateCorruption);
-            }
+        if changed_accounts > 50 && db_before.cache.accounts.len() > 10 {
+            return Some(VulnType::SystemicStateCorruption);
+        }
         None
     }
 }
@@ -148,7 +162,8 @@ impl VulnerabilityOracle for AccessControlOracle {
     fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         let state = after.state.read();
         // EIP-1967 admin slot: keccak256("eip1967.proxy.admin") - 1
-        let eip1967_admin_slot: B256 = hex::decode("b53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103")
+        let eip1967_admin_slot: B256 =
+            hex::decode("b53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103")
                 .unwrap()
                 .as_slice()
                 .try_into()
@@ -156,19 +171,18 @@ impl VulnerabilityOracle for AccessControlOracle {
         let fuzzer_bytes = B256::from(self.address_to_32bytes(self.fuzzer_address));
 
         let ChainState::Evm(db) = &*state;
-            for (_addr, acc) in &db.cache.accounts {
-                for (slot, value) in &acc.storage {
-                    let value_b256 = B256::from(value.to_be_bytes::<32>());
-                    let slot_matches_eip1967 =
-                        *slot == U256::from_be_bytes(eip1967_admin_slot.0);
+        for (_addr, acc) in &db.cache.accounts {
+            for (slot, value) in &acc.storage {
+                let value_b256 = B256::from(value.to_be_bytes::<32>());
+                let slot_matches_eip1967 = *slot == U256::from_be_bytes(eip1967_admin_slot.0);
 
-                    if value_b256 == fuzzer_bytes
-                        && (slot_matches_eip1967 || self.is_owner_slot(slot, &after.waypoints, _addr))
-                    {
-                        return Some(VulnType::PrivilegeEscalation);
-                    }
+                if value_b256 == fuzzer_bytes
+                    && (slot_matches_eip1967 || self.is_owner_slot(slot, &after.waypoints, _addr))
+                {
+                    return Some(VulnType::PrivilegeEscalation);
                 }
             }
+        }
         None
     }
 }
@@ -181,9 +195,28 @@ impl AccessControlOracle {
     }
 
     fn is_owner_slot(&self, slot: &U256, waypoints: &[Waypoint], _contract_addr: &Address) -> bool {
+        if *slot == U256::ZERO {
+            let slot_bytes = slot.to_be_bytes::<32>().to_vec();
+            return waypoints.iter().any(|waypoint| {
+                matches!(
+                    waypoint,
+                    Waypoint::Dataflow {
+                        address,
+                        slot,
+                        influenced: true,
+                    } if address == _contract_addr && slot == &slot_bytes
+                )
+            });
+        }
+
         let target_slot = B256::from(slot.to_be_bytes::<32>());
         for waypoint in waypoints {
-            if let Waypoint::MappingDerivation { base_slot, derived_slot, .. } = waypoint {
+            if let Waypoint::MappingDerivation {
+                base_slot,
+                derived_slot,
+                ..
+            } = waypoint
+            {
                 if *base_slot == U256::ZERO && *derived_slot == target_slot {
                     return true;
                 }
@@ -192,4 +225,3 @@ impl AccessControlOracle {
         false
     }
 }
-

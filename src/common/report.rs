@@ -1,9 +1,9 @@
-use crate::common::types::{Snapshot, ChainState, SingletonTx};
 use crate::common::oracle::VulnType;
-use crate::engine::scoring::{SeverityScore, ScoringEngine};
-use revm::primitives::{Address, U256, keccak256};
+use crate::common::types::{ChainState, SingletonTx, Snapshot};
+use crate::engine::scoring::{ScoringEngine, SeverityScore};
 use chrono::Utc;
-use serde::{Serialize, Deserialize};
+use revm::primitives::{keccak256, Address, U256};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
@@ -40,16 +40,26 @@ pub fn generate_finding_report(
 ) -> anyhow::Result<()> {
     let timestamp = Utc::now().to_rfc3339();
     let label = scoring_engine.get_label(score);
-    
-    // Generate a dedupe hash based on the vulnerability type and the 
-    // last 5 waypoints (execution context). This ensures unique bugs are 
+
+    // Generate a dedupe hash based on the vulnerability type and the
+    // last 5 waypoints (execution context). This ensures unique bugs are
     // grouped together regardless of the specific input values.
-    let context_data: Vec<u8> = after.waypoints.iter().rev().take(5)
-        .flat_map(|w| postcard::to_allocvec(w).unwrap_or_default()).collect();
-    let dedupe_hash = format!("0x{:x}", keccak256(&[format!("{:?}", vuln).as_bytes(), &context_data].concat()));
+    let context_data: Vec<u8> = after
+        .waypoints
+        .iter()
+        .rev()
+        .take(5)
+        .flat_map(|w| postcard::to_allocvec(w).unwrap_or_default())
+        .collect();
+    let dedupe_hash = format!(
+        "0x{:x}",
+        keccak256([format!("{:?}", vuln).as_bytes(), &context_data].concat())
+    );
 
     // 1. Extract Minimal Transaction Sequence
-    let txs = after.producing_input.as_ref()
+    let txs = after
+        .producing_input
+        .as_ref()
         .map(|i| i.txs.clone())
         .unwrap_or_default();
 
@@ -88,23 +98,22 @@ fn calculate_storage_diff(before: &Snapshot, after: &Snapshot) -> Vec<StorageDif
     let state_before = before.state.read();
     let state_after = after.state.read();
 
-    if let (ChainState::Evm(db_before), ChainState::Evm(db_after)) = (&*state_before, &*state_after) {
-        for (addr, acc_after) in &db_after.cache.accounts {
-            let acc_before = db_before.cache.accounts.get(addr);
-            for (slot, val_after) in &acc_after.storage {
-                let val_before = acc_before
-                    .and_then(|a| a.storage.get(slot))
-                    .cloned()
-                    .unwrap_or(U256::ZERO);
+    let (ChainState::Evm(db_before), ChainState::Evm(db_after)) = (&*state_before, &*state_after);
+    for (addr, acc_after) in &db_after.cache.accounts {
+        let acc_before = db_before.cache.accounts.get(addr);
+        for (slot, val_after) in &acc_after.storage {
+            let val_before = acc_before
+                .and_then(|a| a.storage.get(slot))
+                .cloned()
+                .unwrap_or(U256::ZERO);
 
-                if val_after != &val_before {
-                    diffs.push(StorageDiff {
-                        address: *addr,
-                        slot: *slot,
-                        before: val_before,
-                        after: *val_after,
-                    });
-                }
+            if val_after != &val_before {
+                diffs.push(StorageDiff {
+                    address: *addr,
+                    slot: *slot,
+                    before: val_before,
+                    after: *val_after,
+                });
             }
         }
     }
@@ -112,20 +121,29 @@ fn calculate_storage_diff(before: &Snapshot, after: &Snapshot) -> Vec<StorageDif
 }
 
 fn generate_markdown_report(evidence: &EvidenceChain, label: &str) -> String {
-    let mut md = format!(
-        "# RustyFuzz Finding: {}\n\n",
-        evidence.vuln_type
-    );
+    let mut md = format!("# RustyFuzz Finding: {}\n\n", evidence.vuln_type);
 
     md.push_str(&format!("## 🔴 Severity: {}\n", label));
-    md.push_str(&format!("- **Score:** {:.2}/100\n", evidence.score.total as f32 / 100.0));
-    md.push_str(&format!("- **Confidence:** {}%\n", evidence.score.confidence));
-    md.push_str(&format!("- **Exploit Gas Cost:** {}\n", evidence.gas_estimate));
+    md.push_str(&format!(
+        "- **Score:** {:.2}/100\n",
+        evidence.score.total as f32 / 100.0
+    ));
+    md.push_str(&format!(
+        "- **Confidence:** {}%\n",
+        evidence.score.confidence
+    ));
+    md.push_str(&format!(
+        "- **Exploit Gas Cost:** {}\n",
+        evidence.gas_estimate
+    ));
     md.push_str(&format!("- **Timestamp:** {}\n\n", evidence.timestamp));
 
     md.push_str("## 🛠 Reproducibility\n");
     md.push_str(&format!("- **Foundry PoC:** `{}`\n", evidence.poc_file));
-    md.push_str(&format!("To verify, run: `forge test --match-path {}`\n\n", evidence.poc_file));
+    md.push_str(&format!(
+        "To verify, run: `forge test --match-path {}`\n\n",
+        evidence.poc_file
+    ));
 
     md.push_str("## 📦 Minimal Call Sequence\n");
     md.push_str("| Step | Caller | Target | Value | Data |\n");
@@ -150,10 +168,7 @@ fn generate_markdown_report(evidence: &EvidenceChain, label: &str) -> String {
         for diff in &evidence.storage_diffs {
             md.push_str(&format!(
                 "| `{}` | `{}` | `{}` | `{}` |\n",
-                diff.address,
-                diff.slot,
-                diff.before,
-                diff.after
+                diff.address, diff.slot, diff.before, diff.after
             ));
         }
     }

@@ -1,15 +1,15 @@
 //! Differential fuzzing engine for comparing multiple implementations
-//! 
+//!
 //! This module enables detection of subtle bugs by comparing execution results across:
 //! - Different contract versions (git diff analysis)
 //! - Different DEX implementations (Uniswap vs SushiSwap)
 //! - Forked vs simulated state
 //! - Optimistic vs pessimistic execution paths
 
-use std::collections::HashMap;
-use revm::primitives::{Address, U256, Bytes, Log};
 use crate::common::types::SingletonTx;
 use crate::evm::trace::ExecutionTrace;
+use revm::primitives::{Address, Bytes, Log, U256};
+use std::collections::HashMap;
 
 /// Result from a single implementation execution
 #[derive(Debug, Clone)]
@@ -55,12 +55,12 @@ impl StateDiff {
             .map(|c| c.delta)
             .unwrap_or(0)
     }
-    
+
     /// Get all addresses with balance changes
     pub fn changed_addresses(&self) -> Vec<Address> {
         self.balance_changes.keys().cloned().collect()
     }
-    
+
     /// Check if a specific storage slot changed
     pub fn storage_changed(&self, contract: &Address, slot: &U256) -> bool {
         self.storage_changes
@@ -83,25 +83,23 @@ impl DifferentialFuzzer {
             baseline_idx: 0, // First implementation is baseline
         }
     }
-    
+
     /// Compare results across all implementations
     pub fn compare(&self, results: &[ImplementationResult]) -> DifferentialReport {
         if results.is_empty() {
             return DifferentialReport::new("No results".to_string());
         }
-        
-        let mut report = DifferentialReport::new(format!(
-            "Comparing {} implementations",
-            results.len()
-        ));
-        
+
+        let mut report =
+            DifferentialReport::new(format!("Comparing {} implementations", results.len()));
+
         let baseline = &results[self.baseline_idx];
-        
+
         for (i, result) in results.iter().enumerate() {
             if i == self.baseline_idx {
                 continue;
             }
-            
+
             // Compare success/failure
             if baseline.success != result.success {
                 report.findings.push(DifferentialFinding {
@@ -120,16 +118,17 @@ impl DifferentialFuzzer {
                     recommendation: "Investigate why implementations behave differently. This could indicate a bug in one implementation.".to_string(),
                 });
             }
-            
+
             // Compare gas usage
             let gas_diff = result.gas_used as i64 - baseline.gas_used as i64;
-            if gas_diff.abs() > 1000 { // Threshold: 1000 gas
+            if gas_diff.abs() > 1000 {
+                // Threshold: 1000 gas
                 let severity = if gas_diff.abs() > 100_000 {
                     FindingSeverity::High
                 } else {
                     FindingSeverity::Medium
                 };
-                
+
                 report.findings.push(DifferentialFinding {
                     severity,
                     category: "Gas Usage Divergence".to_string(),
@@ -144,7 +143,7 @@ impl DifferentialFuzzer {
                     recommendation: "Large gas differences may indicate different code paths or optimization opportunities.".to_string(),
                 });
             }
-            
+
             // Compare return data
             if baseline.return_data != result.return_data {
                 report.findings.push(DifferentialFinding {
@@ -157,13 +156,20 @@ impl DifferentialFuzzer {
                         result.name,
                         result.return_data.as_ref().map(|b| b.len())
                     ),
-                    recommendation: "Different return values indicate semantic differences in implementation.".to_string(),
+                    recommendation:
+                        "Different return values indicate semantic differences in implementation."
+                            .to_string(),
                 });
             }
-            
+
             // Compare state diffs
-            self.compare_state_diffs(&baseline.state_diff, &result.state_diff, &result.name, &mut report);
-            
+            self.compare_state_diffs(
+                &baseline.state_diff,
+                &result.state_diff,
+                &result.name,
+                &mut report,
+            );
+
             // Compare logs
             if baseline.logs.len() != result.logs.len() {
                 report.findings.push(DifferentialFinding {
@@ -179,10 +185,10 @@ impl DifferentialFuzzer {
                 });
             }
         }
-        
+
         report
     }
-    
+
     fn compare_state_diffs(
         &self,
         baseline: &StateDiff,
@@ -197,11 +203,11 @@ impl DifferentialFuzzer {
             .chain(other.balance_changes.keys())
             .cloned()
             .collect();
-        
+
         for addr in all_addresses {
             let baseline_change = baseline.balance_changes.get(&addr);
             let other_change = other.balance_changes.get(&addr);
-            
+
             match (baseline_change, other_change) {
                 (Some(b), Some(o)) => {
                     if b.delta != o.delta {
@@ -236,7 +242,7 @@ impl DifferentialFuzzer {
                 (None, None) => {}
             }
         }
-        
+
         // Compare storage changes
         let all_contracts: std::collections::HashSet<_> = baseline
             .storage_changes
@@ -244,21 +250,21 @@ impl DifferentialFuzzer {
             .chain(other.storage_changes.keys())
             .cloned()
             .collect();
-        
+
         for contract in all_contracts {
             let baseline_slots = baseline.storage_changes.get(&contract);
             let other_slots = other.storage_changes.get(&contract);
-            
+
             match (baseline_slots, other_slots) {
                 (Some(b), Some(o)) => {
                     // Find slots that changed differently
-                    let all_slots: std::collections::HashSet<_> = 
+                    let all_slots: std::collections::HashSet<_> =
                         b.keys().chain(o.keys()).cloned().collect();
-                    
+
                     for slot in all_slots {
                         let b_change = b.get(&slot);
                         let o_change = o.get(&slot);
-                        
+
                         match (b_change, o_change) {
                             (Some(bc), Some(oc)) => {
                                 if bc.after != oc.after {
@@ -309,7 +315,7 @@ impl DifferentialFuzzer {
             }
         }
     }
-    
+
     /// Run differential fuzzing on a specific transaction across implementations
     pub async fn run_differential(
         &self,
@@ -319,9 +325,9 @@ impl DifferentialFuzzer {
         if executors.len() != self.implementations.len() {
             anyhow::bail!("Number of executors must match number of implementations");
         }
-        
+
         let mut results = Vec::new();
-        
+
         for (i, executor) in executors.iter().enumerate() {
             let result = executor.execute(tx).await?;
             results.push(ImplementationResult {
@@ -329,7 +335,7 @@ impl DifferentialFuzzer {
                 ..result
             });
         }
-        
+
         Ok(self.compare(&results))
     }
 }
@@ -363,15 +369,15 @@ impl DifferentialReport {
             low_count: 0,
         }
     }
-    
+
     pub fn has_critical_findings(&self) -> bool {
         self.critical_count > 0
     }
-    
+
     pub fn has_high_findings(&self) -> bool {
         self.high_count > 0
     }
-    
+
     pub fn severity_summary(&self) -> String {
         format!(
             "Critical: {}, High: {}, Medium: {}, Low: {}",
@@ -399,7 +405,9 @@ pub enum FindingSeverity {
 
 /// Git diff analyzer for identifying risky code changes
 pub struct DiffAnalyzer {
+    #[allow(dead_code)]
     old_commit: String,
+    #[allow(dead_code)]
     new_commit: String,
 }
 
@@ -410,11 +418,11 @@ impl DiffAnalyzer {
             new_commit: new_commit.to_string(),
         }
     }
-    
+
     /// Analyze git diff to identify security-relevant changes
     pub fn analyze_diff(&self, diff_content: &str) -> Vec<SecurityConcern> {
         let mut concerns = Vec::new();
-        
+
         for line in diff_content.lines() {
             // Look for removed access controls
             if line.starts_with("-") && (line.contains("onlyOwner") || line.contains("onlyRole")) {
@@ -425,26 +433,31 @@ impl DiffAnalyzer {
                     severity: FindingSeverity::Critical,
                 });
             }
-            
+
             // Look for changed arithmetic operations
-            if line.starts_with("-") && line.contains(".sub(") ||
-               line.starts_with("+") && !line.contains(".sub(") && line.contains("-") {
+            if line.starts_with("-") && line.contains(".sub(")
+                || line.starts_with("+") && !line.contains(".sub(") && line.contains("-")
+            {
                 concerns.push(SecurityConcern {
                     concern_type: ConcernType::ArithmeticChange,
-                    description: "Arithmetic operation changed (potential overflow risk)".to_string(),
+                    description: "Arithmetic operation changed (potential overflow risk)"
+                        .to_string(),
                     line: line.to_string(),
                     severity: FindingSeverity::High,
                 });
             }
-            
+
             // Look for modified external calls
-            if line.contains("call(") || line.contains("delegatecall(") || line.contains("staticcall(") {
+            if line.contains("call(")
+                || line.contains("delegatecall(")
+                || line.contains("staticcall(")
+            {
                 let severity = if line.starts_with("+") {
                     FindingSeverity::High
                 } else {
                     FindingSeverity::Medium
                 };
-                
+
                 concerns.push(SecurityConcern {
                     concern_type: ConcernType::ExternalCallModified,
                     description: "External call pattern modified".to_string(),
@@ -452,10 +465,11 @@ impl DiffAnalyzer {
                     severity,
                 });
             }
-            
+
             // Look for visibility changes
-            if (line.starts_with("-") && line.contains("private")) ||
-               (line.starts_with("+") && line.contains("public")) {
+            if (line.starts_with("-") && line.contains("private"))
+                || (line.starts_with("+") && line.contains("public"))
+            {
                 concerns.push(SecurityConcern {
                     concern_type: ConcernType::VisibilityChange,
                     description: "Function/variable visibility changed".to_string(),
@@ -463,7 +477,7 @@ impl DiffAnalyzer {
                     severity: FindingSeverity::Medium,
                 });
             }
-            
+
             // Look for oracle price source changes
             if line.contains("price") || line.contains("oracle") || line.contains("twap") {
                 concerns.push(SecurityConcern {
@@ -474,28 +488,31 @@ impl DiffAnalyzer {
                 });
             }
         }
-        
+
         concerns
     }
-    
+
     /// Generate targeted fuzzing strategies based on diff analysis
     pub fn generate_fuzz_targets(&self, concerns: &[SecurityConcern]) -> Vec<FuzzTarget> {
         let mut targets = Vec::new();
-        
+
         for concern in concerns {
             match concern.concern_type {
                 ConcernType::AccessControlRemoved => {
                     targets.push(FuzzTarget {
                         strategy: FuzzStrategy::AccessControlBypass,
                         priority: 100,
-                        description: "Test calling previously protected functions without authorization".to_string(),
+                        description:
+                            "Test calling previously protected functions without authorization"
+                                .to_string(),
                     });
                 }
                 ConcernType::ArithmeticChange => {
                     targets.push(FuzzTarget {
                         strategy: FuzzStrategy::BoundaryValues,
                         priority: 90,
-                        description: "Test boundary values (0, 1, MAX) for potential overflows".to_string(),
+                        description: "Test boundary values (0, 1, MAX) for potential overflows"
+                            .to_string(),
                     });
                 }
                 ConcernType::ExternalCallModified => {
@@ -516,12 +533,13 @@ impl DiffAnalyzer {
                     targets.push(FuzzTarget {
                         strategy: FuzzStrategy::PriceManipulation,
                         priority: 95,
-                        description: "Test price manipulation attacks on modified oracle".to_string(),
+                        description: "Test price manipulation attacks on modified oracle"
+                            .to_string(),
                     });
                 }
             }
         }
-        
+
         targets
     }
 }

@@ -1,28 +1,24 @@
+use crate::common::oracle::{VulnType, VulnerabilityOracle};
+use crate::common::types::Snapshot;
 use alloy_primitives::{Address, U256};
 use std::collections::{HashMap, HashSet};
-use crate::common::oracle::{VulnerabilityOracle, VulnType};
-use crate::common::types::Snapshot;
 // TODO: Missing module - stub or implement
 // use super::economic::{EconomicState, PriceAnalyzer};
 
 // Stub types for missing economic module
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EconomicState {
     // token_address -> borrower_address -> balance
     pub balances: HashMap<Address, HashMap<Address, U256>>,
 }
 
-impl Default for EconomicState {
-    fn default() -> Self {
-        Self {
-            balances: HashMap::new(),
-        }
-    }
-}
-
 impl EconomicState {
-    pub fn calculate_profit(&self, _attacker: Address, _initial: &EconomicState) -> crate::engine::scoring::ProfitReport {
+    pub fn calculate_profit(
+        &self,
+        _attacker: Address,
+        _initial: &EconomicState,
+    ) -> crate::engine::scoring::ProfitReport {
         crate::engine::scoring::ProfitReport::default()
     }
 }
@@ -34,13 +30,24 @@ impl PriceAnalyzer {
     pub fn new() -> Self {
         Self
     }
-    
+
     pub fn record_initial_price(&mut self, _oracle: Address, _price: U256) {
         // Stub
     }
-    
-    pub fn check_manipulation(&self, _oracle: Address, _current_price: U256, _threshold_bps: u64) -> bool {
+
+    pub fn check_manipulation(
+        &self,
+        _oracle: Address,
+        _current_price: U256,
+        _threshold_bps: u64,
+    ) -> bool {
         false
+    }
+}
+
+impl Default for PriceAnalyzer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -58,10 +65,16 @@ impl FlashLoanOracle {
     pub fn new(initial_state: EconomicState) -> Self {
         let mut providers = HashSet::new();
         // Add known flashloan providers
-        providers.insert(Address::from_slice(&hex::decode("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9").unwrap())); // Aave V2
-        providers.insert(Address::from_slice(&hex::decode("87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2").unwrap())); // Aave V3
-        providers.insert(Address::from_slice(&hex::decode("1C32bE1aC51a437986650e25df6ACcf33C6446e2").unwrap())); // dYdX
-        
+        providers.insert(Address::from_slice(
+            &hex::decode("7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9").unwrap(),
+        )); // Aave V2
+        providers.insert(Address::from_slice(
+            &hex::decode("87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2").unwrap(),
+        )); // Aave V3
+        providers.insert(Address::from_slice(
+            &hex::decode("1C32bE1aC51a437986650e25df6ACcf33C6446e2").unwrap(),
+        )); // dYdX
+
         Self {
             providers,
             initial_state: initial_state.clone(),
@@ -72,25 +85,27 @@ impl FlashLoanOracle {
     /// Record a flashloan borrow event
     pub fn record_borrow(&mut self, token: Address, amount: U256, borrower: Address) {
         // Flashloans increase borrower balance temporarily
-        let entry = self.current_state.balances.entry(token).or_insert_with(HashMap::new);
+        let entry = self.current_state.balances.entry(token).or_default();
         let bal = entry.entry(borrower).or_insert(U256::ZERO);
         *bal = bal.saturating_add(amount);
     }
 
     /// Record a flashloan repay event
     pub fn record_repay(&mut self, token: Address, amount: U256, borrower: Address) {
-        let entry = self.current_state.balances.entry(token).or_insert_with(HashMap::new);
+        let entry = self.current_state.balances.entry(token).or_default();
         let bal = entry.entry(borrower).or_insert(U256::ZERO);
         *bal = bal.saturating_sub(amount);
     }
 
     /// Check if the transaction sequence resulted in profit indicative of flashloan attack
     fn detect_profit(&self, attacker: Address) -> Option<VulnType> {
-        let report = self.current_state.calculate_profit(attacker, &self.initial_state);
-        
+        let report = self
+            .current_state
+            .calculate_profit(attacker, &self.initial_state);
+
         // Threshold: 0.1 ETH profit (adjustable)
         let threshold = U256::from(100_000_000_000_000_000u128);
-        
+
         if report.is_significant(threshold.to::<u64>()) {
             return Some(VulnType::FlashLoanProfit);
         }
@@ -121,8 +136,10 @@ impl PriceManipulationOracle {
     pub fn new(threshold_bps: u64) -> Self {
         let mut oracles = HashSet::new();
         // Add known oracles (Chainlink, Uniswap TWAP, etc.)
-        oracles.insert(Address::from_slice(&hex::decode("5f4eC3Df9cbd43714FE2740f5E3616155c5b8419").unwrap())); // ETH/USD Chainlink
-        
+        oracles.insert(Address::from_slice(
+            &hex::decode("5f4eC3Df9cbd43714FE2740f5E3616155c5b8419").unwrap(),
+        )); // ETH/USD Chainlink
+
         Self {
             analyzer: PriceAnalyzer::new(),
             threshold_bps,
@@ -141,7 +158,10 @@ impl PriceManipulationOracle {
             return None;
         }
 
-        if self.analyzer.check_manipulation(oracle, current_price, self.threshold_bps) {
+        if self
+            .analyzer
+            .check_manipulation(oracle, current_price, self.threshold_bps)
+        {
             Some(VulnType::PriceOracleManipulation)
         } else {
             None
@@ -186,7 +206,12 @@ impl AccessControlOracle {
     }
 
     /// Check if a function call violated access control
-    pub fn check_violation(&self, selector: [u8; 4], caller: Address, succeeded: bool) -> Option<VulnType> {
+    pub fn check_violation(
+        &self,
+        selector: [u8; 4],
+        caller: Address,
+        succeeded: bool,
+    ) -> Option<VulnType> {
         if !succeeded {
             return None; // Reverted calls don't indicate bypass
         }
@@ -195,16 +220,28 @@ impl AccessControlOracle {
             if let Some(caller_roles) = self.caller_roles.get(&caller) {
                 // Check if caller has ANY of the required roles
                 let has_access = required_roles.iter().any(|r| caller_roles.contains(r));
-                
+
                 if !has_access {
-                    return Some(VulnType::Other(format!("AccessControlBypass: selector={:?}", selector)));
+                    return Some(VulnType::Other(format!(
+                        "AccessControlBypass: selector={:?}",
+                        selector
+                    )));
                 }
             } else {
                 // Caller has no recorded roles, assume no access
-                return Some(VulnType::Other(format!("AccessControlBypass: selector={:?}", selector)));
+                return Some(VulnType::Other(format!(
+                    "AccessControlBypass: selector={:?}",
+                    selector
+                )));
             }
         }
         None
+    }
+}
+
+impl Default for AccessControlOracle {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -233,7 +270,7 @@ impl EconomicOracleBundle {
 
     pub fn check_all(&self, before: &Snapshot, after: &Snapshot) -> Vec<VulnType> {
         let mut vulns = Vec::new();
-        
+
         if let Some(v) = self.flashloan.check(before, after) {
             vulns.push(v);
         }
@@ -243,7 +280,7 @@ impl EconomicOracleBundle {
         if let Some(v) = self.access_control.check(before, after) {
             vulns.push(v);
         }
-        
+
         vulns
     }
 }

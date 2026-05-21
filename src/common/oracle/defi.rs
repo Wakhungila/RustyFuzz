@@ -1,10 +1,10 @@
-use crate::common::types::{Snapshot, ChainState, Waypoint};
-use crate::common::oracle::{VulnerabilityOracle, VulnType};
+use crate::common::oracle::{VulnType, VulnerabilityOracle};
+use crate::common::types::{ChainState, Snapshot, Waypoint};
 use crate::evm::registry::GlobalAccountRegistry;
-use revm::primitives::{Address, U256, B256};
+use parking_lot::RwLock;
+use revm::primitives::{Address, B256, U256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 /// CrossContractConsistencyOracle: Detects desynchronization between related protocol components.
 pub struct CrossContractConsistencyOracle {
@@ -18,17 +18,23 @@ impl VulnerabilityOracle for CrossContractConsistencyOracle {
     fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         let state = after.state.read();
         let ChainState::Evm(db) = &*state;
-            let val_a = db.cache.accounts.get(&self.contract_a)
-                .and_then(|a| a.storage.get(&self.slot_a))
-                .cloned()
-                .unwrap_or(U256::ZERO);
-            let val_b = db.cache.accounts.get(&self.contract_b)
-                .and_then(|a| a.storage.get(&self.slot_b))
-                .cloned()
-                .unwrap_or(U256::ZERO);
-            if val_a != val_b {
-                return Some(VulnType::CrossContractDesync);
-            }
+        let val_a = db
+            .cache
+            .accounts
+            .get(&self.contract_a)
+            .and_then(|a| a.storage.get(&self.slot_a))
+            .cloned()
+            .unwrap_or(U256::ZERO);
+        let val_b = db
+            .cache
+            .accounts
+            .get(&self.contract_b)
+            .and_then(|a| a.storage.get(&self.slot_b))
+            .cloned()
+            .unwrap_or(U256::ZERO);
+        if val_a != val_b {
+            return Some(VulnType::CrossContractDesync);
+        }
         None
     }
 }
@@ -48,56 +54,59 @@ impl VulnerabilityOracle for AccountingDeltaOracle {
 
         let (ChainState::Evm(db_before), ChainState::Evm(db_after)) =
             (&*state_before, &*state_after);
-            let registry = self.account_registry.read();
-            let balance_slot = registry.erc20_balance_slots.get(&self.external_token)?;
+        let registry = self.account_registry.read();
+        let balance_slot = registry.erc20_balance_slots.get(&self.external_token)?;
 
-            let ext_before = db_before
-                .cache.accounts
-                .get(&self.external_token)?
-                .storage
-                .get(balance_slot)
-                .cloned()
-                .unwrap_or(U256::ZERO);
-            let ext_after = db_after
-                .cache.accounts
-                .get(&self.external_token)?
-                .storage
-                .get(balance_slot)
-                .cloned()
-                .unwrap_or(U256::ZERO);
-            let ext_delta = if ext_after > ext_before {
-                ext_after - ext_before
-            } else {
-                ext_before - ext_after
-            };
+        let ext_before = db_before
+            .cache
+            .accounts
+            .get(&self.external_token)?
+            .storage
+            .get(balance_slot)
+            .cloned()
+            .unwrap_or(U256::ZERO);
+        let ext_after = db_after
+            .cache
+            .accounts
+            .get(&self.external_token)?
+            .storage
+            .get(balance_slot)
+            .cloned()
+            .unwrap_or(U256::ZERO);
+        let ext_delta = if ext_after > ext_before {
+            ext_after - ext_before
+        } else {
+            ext_before - ext_after
+        };
 
-            let int_before = db_before
-                .cache.accounts
-                .get(&self.target_contract)?
-                .storage
-                .get(&self.internal_accounting_slot)
-                .cloned()
-                .unwrap_or(U256::ZERO);
-            let int_after = db_after
-                .cache.accounts
-                .get(&self.target_contract)?
-                .storage
-                .get(&self.internal_accounting_slot)
-                .cloned()
-                .unwrap_or(U256::ZERO);
-            let int_delta = if int_after > int_before {
-                int_after - int_before
-            } else {
-                int_before - int_after
-            };
+        let int_before = db_before
+            .cache
+            .accounts
+            .get(&self.target_contract)?
+            .storage
+            .get(&self.internal_accounting_slot)
+            .cloned()
+            .unwrap_or(U256::ZERO);
+        let int_after = db_after
+            .cache
+            .accounts
+            .get(&self.target_contract)?
+            .storage
+            .get(&self.internal_accounting_slot)
+            .cloned()
+            .unwrap_or(U256::ZERO);
+        let int_delta = if int_after > int_before {
+            int_after - int_before
+        } else {
+            int_before - int_after
+        };
 
-            if int_delta != ext_delta {
-                if (int_delta > ext_delta && int_delta - ext_delta > U256::from(1))
-                    || (ext_delta > int_delta && ext_delta - int_delta > U256::from(1))
-                {
-                    return Some(VulnType::AccountingDesync);
-                }
-            }
+        if int_delta != ext_delta
+            && ((int_delta > ext_delta && int_delta - ext_delta > U256::from(1))
+                || (ext_delta > int_delta && ext_delta - int_delta > U256::from(1)))
+        {
+            return Some(VulnType::AccountingDesync);
+        }
         None
     }
 }
@@ -113,16 +122,16 @@ impl VulnerabilityOracle for StatePersistenceOracle {
     fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         let state = after.state.read();
         let ChainState::Evm(db) = &*state;
-            if let Some(acc) = db.cache.accounts.get(&self.target_contract) {
-                let actual = acc
-                    .storage
-                    .get(&self.critical_slot)
-                    .cloned()
-                    .unwrap_or(U256::ZERO);
-                if actual != self.expected_persistent_value && after.depth > 1 {
-                    return Some(VulnType::PersistenceFailure);
-                }
+        if let Some(acc) = db.cache.accounts.get(&self.target_contract) {
+            let actual = acc
+                .storage
+                .get(&self.critical_slot)
+                .cloned()
+                .unwrap_or(U256::ZERO);
+            if actual != self.expected_persistent_value && after.depth > 1 {
+                return Some(VulnType::PersistenceFailure);
             }
+        }
         None
     }
 }
@@ -135,22 +144,28 @@ pub struct FlashLoanAttackOracle {
 impl VulnerabilityOracle for FlashLoanAttackOracle {
     fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         for waypoint in &after.waypoints {
-            if let Waypoint::FlashloanExecution { lender, amount: _, fee, .. } = waypoint {
+            if let Waypoint::FlashloanExecution {
+                lender,
+                amount: _,
+                fee,
+                ..
+            } = waypoint
+            {
                 let state = after.state.read();
                 let ChainState::Evm(db) = &*state;
-                    if let Some(acc) = db.cache.accounts.get(&self.fuzzer_address) {
-                        let profit = acc.info.balance;
-                        if profit > *fee {
-                            log::info!(
-                                "FLASHLOAN EXPLOIT: Profit of {} realized via lender {}",
-                                profit,
-                                lender
-                            );
-                            return Some(VulnType::FlashLoanProfit);
-                        }
+                if let Some(acc) = db.cache.accounts.get(&self.fuzzer_address) {
+                    let profit = acc.info.balance;
+                    if profit > *fee {
+                        log::info!(
+                            "FLASHLOAN EXPLOIT: Profit of {} realized via lender {}",
+                            profit,
+                            lender
+                        );
+                        return Some(VulnType::FlashLoanProfit);
                     }
                 }
             }
+        }
         None
     }
 }
@@ -164,7 +179,13 @@ impl VulnerabilityOracle for PriceOracleManipulationOracle {
     fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         let mut observed: HashMap<Address, U256> = HashMap::new();
         for waypoint in &after.waypoints {
-            if let Waypoint::StaticCall { target, data, output, .. } = waypoint {
+            if let Waypoint::StaticCall {
+                target,
+                data,
+                output,
+                ..
+            } = waypoint
+            {
                 if data.len() < 4 || output.len() < 32 {
                     continue;
                 }
@@ -175,10 +196,13 @@ impl VulnerabilityOracle for PriceOracleManipulationOracle {
                 };
                 if let Some(curr) = val {
                     if let Some(prev) = observed.get(target) {
-                        let diff = if curr > *prev { curr - *prev } else { *prev - curr };
+                        let diff = if curr > *prev {
+                            curr - *prev
+                        } else {
+                            *prev - curr
+                        };
                         if !prev.is_zero()
-                            && (diff * U256::from(10000)) / *prev
-                                > U256::from(self.threshold_bps)
+                            && (diff * U256::from(10000)) / *prev > U256::from(self.threshold_bps)
                         {
                             return Some(VulnType::PriceManipulation);
                         }
@@ -202,42 +226,41 @@ impl VulnerabilityOracle for ERC4626InflationOracle {
 
         let (ChainState::Evm(db_before), ChainState::Evm(db_after)) =
             (&*state_before, &*state_after);
-            let vault_before = db_before.cache.accounts.get(&self.vault)?;
-            let vault_after = db_after.cache.accounts.get(&self.vault)?;
+        let vault_before = db_before.cache.accounts.get(&self.vault)?;
+        let vault_after = db_after.cache.accounts.get(&self.vault)?;
 
-            let supply_before = vault_before
-                .storage
-                .get(&U256::ZERO)
-                .cloned()
-                .unwrap_or(U256::ZERO);
-            let assets_before = vault_before
-                .storage
-                .get(&U256::from(1))
-                .cloned()
-                .unwrap_or(U256::ZERO);
-            let supply_after = vault_after
-                .storage
-                .get(&U256::ZERO)
-                .cloned()
-                .unwrap_or(U256::ZERO);
-            let assets_after = vault_after
-                .storage
-                .get(&U256::from(1))
-                .cloned()
-                .unwrap_or(U256::ZERO);
+        let supply_before = vault_before
+            .storage
+            .get(&U256::ZERO)
+            .cloned()
+            .unwrap_or(U256::ZERO);
+        let assets_before = vault_before
+            .storage
+            .get(&U256::from(1))
+            .cloned()
+            .unwrap_or(U256::ZERO);
+        let supply_after = vault_after
+            .storage
+            .get(&U256::ZERO)
+            .cloned()
+            .unwrap_or(U256::ZERO);
+        let assets_after = vault_after
+            .storage
+            .get(&U256::from(1))
+            .cloned()
+            .unwrap_or(U256::ZERO);
 
-            if !supply_after.is_zero() {
-                let price_after =
-                    (assets_after * U256::from(10u128.pow(18))) / supply_after;
-                let price_before = if supply_before.is_zero() {
-                    U256::ZERO
-                } else {
-                    (assets_before * U256::from(10u128.pow(18))) / supply_before
-                };
-                if !price_before.is_zero() && price_after > (price_before * U256::from(2)) {
-                    return Some(VulnType::VaultInflation);
-                }
+        if !supply_after.is_zero() {
+            let price_after = (assets_after * U256::from(10u128.pow(18))) / supply_after;
+            let price_before = if supply_before.is_zero() {
+                U256::ZERO
+            } else {
+                (assets_before * U256::from(10u128.pow(18))) / supply_before
+            };
+            if !price_before.is_zero() && price_after > (price_before * U256::from(2)) {
+                return Some(VulnType::VaultInflation);
             }
+        }
         None
     }
 }
@@ -252,7 +275,13 @@ impl VulnerabilityOracle for PriceManipulationOracle {
         let mut observed_oracle_values: HashMap<Address, U256> = HashMap::new();
 
         for waypoint in &after.waypoints {
-            if let Waypoint::StaticCall { target, data, output, .. } = waypoint {
+            if let Waypoint::StaticCall {
+                target,
+                data,
+                output,
+                ..
+            } = waypoint
+            {
                 if data.len() < 4 || output.len() < 32 {
                     continue;
                 }
@@ -299,51 +328,47 @@ impl VulnerabilityOracle for UniswapV3InvariantOracle {
     fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         let state = after.state.read();
         let ChainState::Evm(db) = &*state;
-            let pool = match db.cache.accounts.get(&self.pool_address) {
-                Some(p) => p,
-                None => return None,
-            };
+        let pool = db.cache.accounts.get(&self.pool_address)?;
 
-            let global_liquidity =
-                pool.storage.get(&U256::from(4)).cloned().unwrap_or(U256::ZERO);
+        let global_liquidity = pool
+            .storage
+            .get(&U256::from(4))
+            .cloned()
+            .unwrap_or(U256::ZERO);
 
-            let ticks_touched: HashSet<i32> = after
-                .waypoints
-                .iter()
-                .filter_map(|w| {
-                    if let Waypoint::MappingDerivation { base_slot, key, .. } = w {
-                        if *base_slot == U256::from(5) {
-                            return Some(key.to::<i32>());
-                        }
-                    }
-                    None
-                })
-                .collect();
-
-            if ticks_touched.is_empty() {
-                return None;
-            }
-
-            let mut calculated_liquidity: i128 = 0;
-            let slot0 = pool.storage.get(&U256::ZERO).cloned().unwrap_or(U256::ZERO);
-            let current_tick = self.extract_tick_from_slot0(slot0);
-
-            for (slot, value) in &pool.storage {
-                if let Some(tick_index) =
-                    self.get_tick_index_for_slot(slot, &after.waypoints)
-                {
-                    let liquidity_net =
-                        (value & U256::from(u128::MAX)).to::<i128>();
-                    if tick_index <= current_tick {
-                        calculated_liquidity =
-                            calculated_liquidity.saturating_add(liquidity_net);
+        let ticks_touched: HashSet<i32> = after
+            .waypoints
+            .iter()
+            .filter_map(|w| {
+                if let Waypoint::MappingDerivation { base_slot, key, .. } = w {
+                    if *base_slot == U256::from(5) {
+                        return Some(key.to::<i32>());
                     }
                 }
-            }
+                None
+            })
+            .collect();
 
-            if U256::from(calculated_liquidity.unsigned_abs()) != global_liquidity {
-                return Some(VulnType::UniswapV3LiquidityAsymmetry);
+        if ticks_touched.is_empty() {
+            return None;
+        }
+
+        let mut calculated_liquidity: i128 = 0;
+        let slot0 = pool.storage.get(&U256::ZERO).cloned().unwrap_or(U256::ZERO);
+        let current_tick = self.extract_tick_from_slot0(slot0);
+
+        for (slot, value) in &pool.storage {
+            if let Some(tick_index) = self.get_tick_index_for_slot(slot, &after.waypoints) {
+                let liquidity_net = (value & U256::from(u128::MAX)).to::<i128>();
+                if tick_index <= current_tick {
+                    calculated_liquidity = calculated_liquidity.saturating_add(liquidity_net);
+                }
             }
+        }
+
+        if U256::from(calculated_liquidity.unsigned_abs()) != global_liquidity {
+            return Some(VulnType::UniswapV3LiquidityAsymmetry);
+        }
         None
     }
 }
@@ -357,7 +382,12 @@ impl UniswapV3InvariantOracle {
     fn get_tick_index_for_slot(&self, slot: &U256, waypoints: &[Waypoint]) -> Option<i32> {
         let target_slot = B256::from(slot.to_be_bytes::<32>());
         for waypoint in waypoints {
-            if let Waypoint::MappingDerivation { base_slot, key, derived_slot } = waypoint {
+            if let Waypoint::MappingDerivation {
+                base_slot,
+                key,
+                derived_slot,
+            } = waypoint
+            {
                 if *base_slot == U256::from(5) && *derived_slot == target_slot {
                     return Some(key.to::<i32>());
                 }
@@ -375,16 +405,23 @@ pub struct PrecisionOracle {
 impl VulnerabilityOracle for PrecisionOracle {
     fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         for waypoint in &after.waypoints {
-            if let Waypoint::Arithmetic { op, lhs, rhs, taint_source, .. } = waypoint {
-                if *op == 0x04 || *op == 0x05 {
-                    if !rhs.is_zero() {
-                        let result = lhs.wrapping_div(*rhs);
-                        let remainder = lhs.wrapping_rem(*rhs);
-                        if taint_source.is_some() && !remainder.is_zero() {
-                            if result.is_zero() && *lhs > U256::ZERO {
-                                return Some(VulnType::RoundingLeakage);
-                            }
-                        }
+            if let Waypoint::Arithmetic {
+                op,
+                lhs,
+                rhs,
+                taint_source,
+                ..
+            } = waypoint
+            {
+                if (*op == 0x04 || *op == 0x05) && !rhs.is_zero() {
+                    let result = lhs.wrapping_div(*rhs);
+                    let remainder = lhs.wrapping_rem(*rhs);
+                    if taint_source.is_some()
+                        && !remainder.is_zero()
+                        && result.is_zero()
+                        && *lhs > U256::ZERO
+                    {
+                        return Some(VulnType::RoundingLeakage);
                     }
                 }
             }
@@ -406,41 +443,43 @@ impl VulnerabilityOracle for ProfitOracle {
 
         let (ChainState::Evm(db_before), ChainState::Evm(db_after)) =
             (&*state_before, &*state_after);
-            let bal_before = db_before
-                .cache.accounts
-                .get(&self.fuzzer_address)
-                .map(|a| a.info.balance)
-                .unwrap_or(U256::ZERO);
-            let bal_after = db_after
-                .cache.accounts
-                .get(&self.fuzzer_address)
-                .map(|a| a.info.balance)
-                .unwrap_or(U256::ZERO);
+        let bal_before = db_before
+            .cache
+            .accounts
+            .get(&self.fuzzer_address)
+            .map(|a| a.info.balance)
+            .unwrap_or(U256::ZERO);
+        let bal_after = db_after
+            .cache
+            .accounts
+            .get(&self.fuzzer_address)
+            .map(|a| a.info.balance)
+            .unwrap_or(U256::ZERO);
 
-            if bal_after > bal_before {
-                return Some(VulnType::FlashLoanProfit);
-            }
+        if bal_after > bal_before {
+            return Some(VulnType::FlashLoanProfit);
+        }
 
-            let registry = self.account_registry.read();
-            for (token_addr, balance_slot) in &registry.erc20_balance_slots {
-                if let Some(token_acc_after) = db_after.cache.accounts.get(token_addr) {
-                    if let Some(token_acc_before) = db_before.cache.accounts.get(token_addr) {
-                        let erc20_bal_after = token_acc_after
-                            .storage
-                            .get(balance_slot)
-                            .cloned()
-                            .unwrap_or(U256::ZERO);
-                        let erc20_bal_before = token_acc_before
-                            .storage
-                            .get(balance_slot)
-                            .cloned()
-                            .unwrap_or(U256::ZERO);
-                        if erc20_bal_after > erc20_bal_before {
-                            return Some(VulnType::FlashLoanProfit);
-                        }
+        let registry = self.account_registry.read();
+        for (token_addr, balance_slot) in &registry.erc20_balance_slots {
+            if let Some(token_acc_after) = db_after.cache.accounts.get(token_addr) {
+                if let Some(token_acc_before) = db_before.cache.accounts.get(token_addr) {
+                    let erc20_bal_after = token_acc_after
+                        .storage
+                        .get(balance_slot)
+                        .cloned()
+                        .unwrap_or(U256::ZERO);
+                    let erc20_bal_before = token_acc_before
+                        .storage
+                        .get(balance_slot)
+                        .cloned()
+                        .unwrap_or(U256::ZERO);
+                    if erc20_bal_after > erc20_bal_before {
+                        return Some(VulnType::FlashLoanProfit);
                     }
                 }
             }
+        }
         None
     }
 }
@@ -457,40 +496,36 @@ impl VulnerabilityOracle for SolvencyOracle {
         let state_after = after.state.read();
 
         let ChainState::Evm(db_after) = &*state_after;
-            if let Some(acc) = db_after.cache.accounts.get(&self.protocol_address) {
-                let eth_threshold = self
-                    .token_thresholds
-                    .get(&Address::ZERO)
-                    .cloned()
-                    .unwrap_or(U256::ZERO);
-                if acc.info.balance < eth_threshold {
-                    return Some(VulnType::InvariantViolation(
-                        "Protocol ETH Insolvency".into(),
-                    ));
-                }
+        if let Some(acc) = db_after.cache.accounts.get(&self.protocol_address) {
+            let eth_threshold = self
+                .token_thresholds
+                .get(&Address::ZERO)
+                .cloned()
+                .unwrap_or(U256::ZERO);
+            if acc.info.balance < eth_threshold {
+                return Some(VulnType::InvariantViolation(
+                    "Protocol ETH Insolvency".into(),
+                ));
             }
+        }
 
-            for (token_addr, threshold) in &self.token_thresholds {
-                if *token_addr == Address::ZERO {
-                    continue;
-                }
-                if let Some(token_acc) = db_after.cache.accounts.get(token_addr) {
-                    let registry = self.account_registry.read();
-                    if let Some(slot) = registry.erc20_balance_slots.get(token_addr) {
-                        let balance = token_acc
-                            .storage
-                            .get(slot)
-                            .cloned()
-                            .unwrap_or(U256::ZERO);
-                        if balance < *threshold {
-                            return Some(VulnType::InvariantViolation(format!(
-                                "Insolvent in token {}",
-                                token_addr
-                            )));
-                        }
+        for (token_addr, threshold) in &self.token_thresholds {
+            if *token_addr == Address::ZERO {
+                continue;
+            }
+            if let Some(token_acc) = db_after.cache.accounts.get(token_addr) {
+                let registry = self.account_registry.read();
+                if let Some(slot) = registry.erc20_balance_slots.get(token_addr) {
+                    let balance = token_acc.storage.get(slot).cloned().unwrap_or(U256::ZERO);
+                    if balance < *threshold {
+                        return Some(VulnType::InvariantViolation(format!(
+                            "Insolvent in token {}",
+                            token_addr
+                        )));
                     }
                 }
             }
+        }
         None
     }
 }
@@ -508,26 +543,27 @@ impl VulnerabilityOracle for RebalanceDeltaOracle {
 
         let (ChainState::Evm(db_before), ChainState::Evm(db_after)) =
             (&*state_before, &*state_after);
-            let val_before = db_before
-                .cache.accounts
-                .get(&self.target_contract)
-                .and_then(|a| a.storage.get(&self.rebalance_slot))
-                .cloned()
-                .unwrap_or(U256::ZERO);
-            let val_after = db_after
-                .cache.accounts
-                .get(&self.target_contract)
-                .and_then(|a| a.storage.get(&self.rebalance_slot))
-                .cloned()
-                .unwrap_or(U256::ZERO);
+        let val_before = db_before
+            .cache
+            .accounts
+            .get(&self.target_contract)
+            .and_then(|a| a.storage.get(&self.rebalance_slot))
+            .cloned()
+            .unwrap_or(U256::ZERO);
+        let val_after = db_after
+            .cache
+            .accounts
+            .get(&self.target_contract)
+            .and_then(|a| a.storage.get(&self.rebalance_slot))
+            .cloned()
+            .unwrap_or(U256::ZERO);
 
-            if val_after < val_before {
-                let loss = val_before - val_after;
-                if loss > U256::from(10u128.pow(18)) {
-                    return Some(VulnType::RebalanceValueLoss);
-                }
+        if val_after < val_before {
+            let loss = val_before - val_after;
+            if loss > U256::from(10u128.pow(18)) {
+                return Some(VulnType::RebalanceValueLoss);
             }
+        }
         None
     }
 }
-
