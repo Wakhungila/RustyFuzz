@@ -1,14 +1,15 @@
 use revm::{
+    context_interface::{ContextTr, CreateScheme},
     interpreter::{
         interpreter_types::{InputsTr, Jumps},
-        CallInputs, CallOutcome, CallScheme, Interpreter,
+        CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, Interpreter,
     },
     Inspector,
 };
 // v38: OpCode is now in the bytecode module or directly available
 // use revm::bytecode::Bytecode; // Unused
 // use bitvec::prelude::{BitSlice, Lsb0}; // Unused
-use crate::common::types::{TaintSource, Waypoint};
+use crate::common::types::{CallKind, CallPhase, ComparisonOperand, TaintSource, Waypoint};
 use crate::evm::dataflow::DataflowRegistry;
 use revm::primitives::{keccak256, Address, B256, U256};
 use std::collections::{HashMap, HashSet};
@@ -33,6 +34,17 @@ pub struct CoverageInspector<'a> {
     pub transient_taint_map: HashMap<(Address, B256), TaintSource>,  // EIP-1153 support
     pub memory_taint: HashMap<usize, TaintSource>,                   // offset -> TaintSource
     pub known_initialized_slots: HashSet<(Address, B256)>, // Track slots written in current or previous TXs
+    pub call_depth: usize,
+    pending_sload: Option<PendingStorageRead>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingStorageRead {
+    address: Address,
+    slot: B256,
+    pc: usize,
+    tx_idx: usize,
+    taint_source: Option<TaintSource>,
 }
 
 impl<'a> CoverageInspector<'a> {
@@ -57,11 +69,44 @@ impl<'a> CoverageInspector<'a> {
             transient_taint_map: HashMap::new(),
             memory_taint: HashMap::new(),
             known_initialized_slots: HashSet::new(),
+            call_depth: 0,
+            pending_sload: None,
         }
     }
 }
 
-impl<'a, CTX> Inspector<CTX> for CoverageInspector<'a> {
+fn compare_condition(opcode: u8, lhs: U256, rhs: U256) -> bool {
+    match opcode {
+        0x10 => lhs < rhs,
+        0x11 => lhs > rhs,
+        0x12 => signed_less_than(lhs, rhs),
+        0x13 => signed_greater_than(lhs, rhs),
+        0x14 => lhs == rhs,
+        _ => false,
+    }
+}
+
+fn signed_less_than(lhs: U256, rhs: U256) -> bool {
+    let lhs_negative = lhs.bit(255);
+    let rhs_negative = rhs.bit(255);
+    match (lhs_negative, rhs_negative) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => lhs < rhs,
+    }
+}
+
+fn signed_greater_than(lhs: U256, rhs: U256) -> bool {
+    let lhs_negative = lhs.bit(255);
+    let rhs_negative = rhs.bit(255);
+    match (lhs_negative, rhs_negative) {
+        (true, false) => false,
+        (false, true) => true,
+        _ => lhs > rhs,
+    }
+}
+
+impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
     fn step(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
         let pc = interp.bytecode.pc();
         let opcode = interp.bytecode.opcode();
@@ -144,12 +189,11 @@ impl<'a, CTX> Inspector<CTX> for CoverageInspector<'a> {
                     {
                         if let TaintSource::Storage(written_tx_idx, _) = taint_source_of_value {
                             if written_tx_idx < self.current_tx_idx {
-                                self.waypoints.push(Waypoint::StorageRead {
+                                self.pending_sload = Some(PendingStorageRead {
                                     address: addr,
                                     slot,
-                                    value: U256::ZERO, // Value will be known after SLOAD
                                     pc,
-                                    read_tx_idx: self.current_tx_idx,
+                                    tx_idx: self.current_tx_idx,
                                     taint_source: Some(taint_source_of_value.clone()),
                                 });
                                 self.taint_stack.push(Some(taint_source_of_value)); // Propagate taint from storage read
@@ -213,6 +257,16 @@ impl<'a, CTX> Inspector<CTX> for CoverageInspector<'a> {
                     .copied()
                     .unwrap_or(Address::ZERO);
                 let slot = B256::from(slot_val);
+
+                if opcode == 0x54 && self.pending_sload.is_none() {
+                    self.pending_sload = Some(PendingStorageRead {
+                        address: addr,
+                        slot,
+                        pc,
+                        tx_idx: self.current_tx_idx,
+                        taint_source: None,
+                    });
+                }
 
                 // Logic Sanitizer: Detect Uninitialized Storage Reads
                 // If a slot is read before being written to in the protocol lifecycle,
@@ -367,6 +421,7 @@ impl<'a, CTX> Inspector<CTX> for CoverageInspector<'a> {
                             calldata_offset: None,
                             condition: false,
                             hit: false,
+                            tainted_operand: ComparisonOperand::Lhs,
                         }),
                     });
                 }
@@ -380,7 +435,13 @@ impl<'a, CTX> Inspector<CTX> for CoverageInspector<'a> {
                 // Get taint source for LHS and RHS
                 let lhs_taint = self.taint_stack.iter().rev().nth(0).cloned().flatten();
                 let rhs_taint = self.taint_stack.iter().rev().nth(1).cloned().flatten();
-                let taint_source = lhs_taint.or(rhs_taint); // Combine taints (heuristic)
+                let (taint_source, tainted_operand) = match (lhs_taint, rhs_taint) {
+                    (Some(lhs), Some(_)) => (Some(lhs), ComparisonOperand::Unknown),
+                    (Some(lhs), None) => (Some(lhs), ComparisonOperand::Lhs),
+                    (None, Some(rhs)) => (Some(rhs), ComparisonOperand::Rhs),
+                    (None, None) => (None, ComparisonOperand::Unknown),
+                };
+                let condition = compare_condition(opcode, lhs, rhs);
 
                 self.waypoints.push(Waypoint::Comparison {
                     op: opcode,
@@ -389,8 +450,9 @@ impl<'a, CTX> Inspector<CTX> for CoverageInspector<'a> {
                     pc,
                     taint_source,
                     calldata_offset: None,
-                    condition: false,
-                    hit: false,
+                    condition,
+                    hit: condition,
+                    tainted_operand,
                 });
             }
         }
@@ -419,15 +481,40 @@ impl<'a, CTX> Inspector<CTX> for CoverageInspector<'a> {
         self.last_pc = pc;
     }
 
+    fn step_end(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
+        if let Some(read) = self.pending_sload.take() {
+            if let Ok(value) = interp.stack.peek(0) {
+                self.waypoints.push(Waypoint::StorageRead {
+                    address: read.address,
+                    slot: read.slot,
+                    value,
+                    pc: read.pc,
+                    read_tx_idx: read.tx_idx,
+                    taint_source: read.taint_source,
+                });
+            }
+        }
+    }
+
     fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
         // Extract input bytes once for all checks
-        let input_bytes = match &inputs.input {
-            revm::interpreter::CallInput::Bytes(b) => b.clone(),
-            revm::interpreter::CallInput::SharedBuffer(_) => {
-                // Can't access shared buffer without context, skip for now
-                return None;
-            }
-        };
+        let input_bytes = inputs.input.bytes(_context);
+        self.waypoints.push(Waypoint::CallTrace {
+            tx_idx: self.current_tx_idx,
+            depth: self.call_depth + 1,
+            caller: inputs.caller,
+            target: inputs.target_address,
+            value: inputs.call_value(),
+            input: input_bytes.to_vec(),
+            output: Vec::new(),
+            gas_limit: inputs.gas_limit,
+            gas_used: 0,
+            success: false,
+            kind: call_kind(inputs.scheme),
+            phase: CallPhase::Start,
+            result: None,
+        });
+        self.call_depth += 1;
 
         // Detect Token Callbacks (ERC777 / ERC1363)
         if input_bytes.len() >= 4 {
@@ -499,14 +586,24 @@ impl<'a, CTX> Inspector<CTX> for CoverageInspector<'a> {
     }
 
     fn call_end(&mut self, _context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
+        self.call_depth = self.call_depth.saturating_sub(1);
+        let input_bytes = inputs.input.bytes(_context);
+        self.waypoints.push(Waypoint::CallTrace {
+            tx_idx: self.current_tx_idx,
+            depth: self.call_depth + 1,
+            caller: inputs.caller,
+            target: inputs.target_address,
+            value: inputs.call_value(),
+            input: input_bytes.to_vec(),
+            output: outcome.result.output.to_vec(),
+            gas_limit: inputs.gas_limit,
+            gas_used: outcome.result.gas.used(),
+            success: outcome.result.result.is_ok(),
+            kind: call_kind(inputs.scheme),
+            phase: CallPhase::End,
+            result: Some(format!("{:?}", outcome.result.result)),
+        });
         if inputs.scheme == CallScheme::StaticCall {
-            let input_bytes = match &inputs.input {
-                revm::interpreter::CallInput::Bytes(b) => b.clone(),
-                revm::interpreter::CallInput::SharedBuffer(_) => {
-                    // Can't access without context
-                    return;
-                }
-            };
             self.waypoints.push(Waypoint::StaticCall {
                 caller: inputs.caller,
                 target: inputs.target_address,
@@ -514,5 +611,66 @@ impl<'a, CTX> Inspector<CTX> for CoverageInspector<'a> {
                 output: outcome.result.output.to_vec(),
             });
         }
+    }
+
+    fn create(&mut self, _context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
+        self.waypoints.push(Waypoint::CreateTrace {
+            tx_idx: self.current_tx_idx,
+            depth: self.call_depth + 1,
+            creator: inputs.caller(),
+            created_address: None,
+            value: inputs.value(),
+            init_code: inputs.init_code().to_vec(),
+            deployed_code: Vec::new(),
+            gas_limit: inputs.gas_limit(),
+            gas_used: 0,
+            success: false,
+            kind: create_kind(inputs.scheme()),
+            phase: CallPhase::Start,
+            result: None,
+        });
+        self.call_depth += 1;
+        None
+    }
+
+    fn create_end(
+        &mut self,
+        _context: &mut CTX,
+        inputs: &CreateInputs,
+        outcome: &mut CreateOutcome,
+    ) {
+        self.call_depth = self.call_depth.saturating_sub(1);
+        self.waypoints.push(Waypoint::CreateTrace {
+            tx_idx: self.current_tx_idx,
+            depth: self.call_depth + 1,
+            creator: inputs.caller(),
+            created_address: outcome.address,
+            value: inputs.value(),
+            init_code: inputs.init_code().to_vec(),
+            deployed_code: outcome.result.output.to_vec(),
+            gas_limit: inputs.gas_limit(),
+            gas_used: outcome.result.gas.used(),
+            success: outcome.result.result.is_ok(),
+            kind: create_kind(inputs.scheme()),
+            phase: CallPhase::End,
+            result: Some(format!("{:?}", outcome.result.result)),
+        });
+    }
+}
+
+fn call_kind(scheme: CallScheme) -> CallKind {
+    match scheme {
+        CallScheme::Call => CallKind::Call,
+        CallScheme::CallCode => CallKind::CallCode,
+        CallScheme::DelegateCall => CallKind::DelegateCall,
+        CallScheme::StaticCall => CallKind::StaticCall,
+    }
+}
+
+fn create_kind(scheme: CreateScheme) -> CallKind {
+    match scheme {
+        CreateScheme::Create => CallKind::Create,
+        CreateScheme::Create2 { .. } => CallKind::Create2,
+        CreateScheme::Custom { .. } => CallKind::Create,
     }
 }

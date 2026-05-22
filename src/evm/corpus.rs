@@ -1,6 +1,8 @@
 use crate::common::types::{ChainState, SequenceExecutionResult, Snapshot};
 use crate::evm::feedback::EvmCoverageFeedback;
+use crate::evm::fork_db::{ForkDb, ForkDbCacheSnapshot};
 use crate::evm::fuzz::EvmInput;
+use crate::evm::seed_ingester::MainnetSeedBundle;
 use libafl_bolts::rands::Rand;
 use parking_lot::RwLock;
 use revm::primitives::{Address, B256};
@@ -18,6 +20,10 @@ pub struct CorpusEntryMetadata {
     pub id: String,
     pub input_hash: String,
     pub path_hash: u64,
+    #[serde(default)]
+    pub state_hash: u64,
+    #[serde(default)]
+    pub state_novelty_score: u64,
     pub coverage_edges: usize,
     pub gas_used: u64,
     pub crash_fingerprint: Option<String>,
@@ -50,6 +56,8 @@ impl PersistentCorpus {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("inputs"))?;
         fs::create_dir_all(root.join("crashes"))?;
+        fs::create_dir_all(root.join("fork_cache"))?;
+        fs::create_dir_all(root.join("mainnet_seeds"))?;
         Ok(Self { root })
     }
 
@@ -66,6 +74,8 @@ impl PersistentCorpus {
             id: id.clone(),
             input_hash,
             path_hash: EvmCoverageFeedback::stable_path_hash(coverage),
+            state_hash: 0,
+            state_novelty_score: 0,
             coverage_edges: coverage.iter().filter(|&&hit| hit != 0).count(),
             gas_used,
             crash_fingerprint: None,
@@ -78,8 +88,93 @@ impl PersistentCorpus {
         Ok(metadata)
     }
 
+    pub fn persist_execution_input(
+        &self,
+        input: &EvmInput,
+        execution: &SequenceExecutionResult,
+        coverage: &[u8],
+        state_novelty_score: u64,
+    ) -> anyhow::Result<CorpusEntryMetadata> {
+        let encoded = serde_json::to_vec(input)?;
+        let input_hash = format!("0x{}", hex::encode(revm::primitives::keccak256(&encoded)));
+        let id = input_hash.trim_start_matches("0x")[..16].to_string();
+        let metadata = CorpusEntryMetadata {
+            id: id.clone(),
+            input_hash,
+            path_hash: EvmCoverageFeedback::stable_path_hash(coverage),
+            state_hash: crate::evm::feedback::stable_execution_state_hash(execution),
+            state_novelty_score,
+            coverage_edges: coverage.iter().filter(|&&hit| hit != 0).count(),
+            gas_used: execution.total_gas_used,
+            crash_fingerprint: None,
+        };
+
+        let input_path = self.root.join("inputs").join(format!("{id}.json"));
+        let meta_path = self.root.join("inputs").join(format!("{id}.meta.json"));
+        fs::write(input_path, serde_json::to_vec_pretty(input)?)?;
+        fs::write(meta_path, serde_json::to_vec_pretty(&metadata)?)?;
+        Ok(metadata)
+    }
+
     pub fn load_input(&self, id: &str) -> anyhow::Result<EvmInput> {
         let bytes = fs::read(self.root.join("inputs").join(format!("{id}.json")))?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    pub fn persist_fork_cache(
+        &self,
+        id: &str,
+        fork_db: &ForkDb,
+    ) -> anyhow::Result<ForkDbCacheSnapshot> {
+        let snapshot = fork_db.cache_snapshot();
+        let path = self.root.join("fork_cache").join(format!("{id}.json"));
+        fs::write(path, serde_json::to_vec_pretty(&snapshot)?)?;
+        Ok(snapshot)
+    }
+
+    pub fn load_fork_cache(&self, id: &str) -> anyhow::Result<ForkDbCacheSnapshot> {
+        let bytes = fs::read(self.root.join("fork_cache").join(format!("{id}.json")))?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    pub fn load_offline_fork_db(&self, id: &str) -> anyhow::Result<ForkDb> {
+        Ok(ForkDb::from_cache_snapshot(self.load_fork_cache(id)?))
+    }
+
+    pub fn persist_mainnet_seed_bundle(
+        &self,
+        id: &str,
+        bundle: &MainnetSeedBundle,
+    ) -> anyhow::Result<()> {
+        let bundle_dir = self.root.join("mainnet_seeds").join(id);
+        fs::create_dir_all(bundle_dir.join("inputs"))?;
+
+        fs::write(
+            bundle_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(bundle)?,
+        )?;
+        fs::write(
+            bundle_dir.join("fork_cache.json"),
+            serde_json::to_vec_pretty(&bundle.fork_cache)?,
+        )?;
+
+        for seed in &bundle.seeds {
+            fs::write(
+                bundle_dir.join("inputs").join(format!("{}.json", seed.id)),
+                serde_json::to_vec_pretty(&seed.input)?,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    pub fn load_mainnet_seed_bundle(&self, id: &str) -> anyhow::Result<MainnetSeedBundle> {
+        let bytes = fs::read(
+            self.root
+                .join("mainnet_seeds")
+                .join(id)
+                .join("manifest.json"),
+        )?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 

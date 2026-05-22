@@ -55,6 +55,7 @@ pub trait CustomInvariant: Send + Sync + 'static {
 pub mod defi;
 pub mod governance;
 pub mod mev;
+pub mod packs;
 pub mod security;
 pub mod svm;
 
@@ -62,5 +63,6 @@ pub mod svm;
 pub use defi::*;
 pub use governance::*;
 pub use mev::*;
+pub use packs::*;
 pub use security::*;
 pub use svm::*;

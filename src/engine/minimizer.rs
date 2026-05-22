@@ -1,12 +1,17 @@
-use crate::common::oracle::VulnerabilityOracle;
-use crate::common::types::{ChainState, SingletonTx, Snapshot};
+use crate::common::oracle::{ProtocolFinding, ProtocolOraclePack, VulnType, VulnerabilityOracle};
+use crate::common::types::{ChainState, SequenceExecutionResult, SingletonTx, Snapshot};
+use crate::engine::exploit_synthesizer::synthesize_foundry_poc_with_findings;
+use crate::evm::corpus::{CorpusEntryMetadata, CrashRecord, PersistentCorpus};
 use crate::evm::dataflow::DataflowRegistry;
 use crate::evm::executor::EvmExecutor;
+use crate::evm::feedback::EvmStateNoveltyFeedback;
 use crate::evm::fork_db::EvmCacheDb;
+use crate::evm::fuzz::EvmInput;
 use crate::evm::snapshot::new_evm_snapshot;
 use bitvec::prelude::*;
 use parking_lot::RwLock;
 use revm::context::BlockEnv;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub struct Minimizer<'a> {
@@ -29,6 +34,228 @@ impl<'a> Minimizer<'a> {
             initial_db,
             initial_block_env,
         }
+    }
+
+    pub fn minimize_crash<F>(&self, original: &EvmInput, preserves_crash: F) -> Option<EvmInput>
+    where
+        F: Fn(&SequenceExecutionResult) -> bool,
+    {
+        if !self
+            .replay_input(original)
+            .ok()
+            .as_ref()
+            .is_some_and(&preserves_crash)
+        {
+            return None;
+        }
+
+        let mut minimized = original.clone();
+        self.minimize_sequence(&mut minimized, &preserves_crash);
+        self.minimize_values(&mut minimized, &preserves_crash);
+        self.minimize_calldata(&mut minimized, &preserves_crash);
+        Some(minimized)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn minimize_crash_to_foundry_poc<F>(
+        &self,
+        original: &EvmInput,
+        corpus: &PersistentCorpus,
+        report_dir: &Path,
+        vuln: &VulnType,
+        rpc_url: &str,
+        fork_block: u64,
+        reason: &str,
+        preserves_crash: F,
+    ) -> anyhow::Result<MinimizedCrashArtifact>
+    where
+        F: Fn(&SequenceExecutionResult) -> bool,
+    {
+        let minimized = self
+            .minimize_crash(original, &preserves_crash)
+            .ok_or_else(|| anyhow::anyhow!("original input does not reproduce crash predicate"))?;
+        let execution = self.replay_input(&minimized)?;
+        anyhow::ensure!(
+            preserves_crash(&execution),
+            "minimized input failed crash predicate after replay"
+        );
+
+        let mut state_feedback = EvmStateNoveltyFeedback::new();
+        let novelty = state_feedback.observe_execution(&execution);
+        let coverage = execution_coverage_material(&execution);
+        let metadata = corpus.persist_execution_input(
+            &minimized,
+            &execution,
+            &coverage,
+            novelty.novelty_score(),
+        )?;
+        let crash = corpus.persist_crash(&metadata, reason)?;
+        let reproduction_report =
+            corpus.write_reproduction_report(&minimized, &execution, Some(&crash))?;
+        let protocol_findings = ProtocolOraclePack::default().evaluate(&execution);
+        let foundry_poc = PathBuf::from(synthesize_foundry_poc_with_findings(
+            &minimized,
+            vuln,
+            Some(&execution),
+            &protocol_findings,
+            report_dir,
+            rpc_url,
+            fork_block,
+        )?);
+
+        Ok(MinimizedCrashArtifact {
+            original_tx_count: original.txs.len(),
+            minimized_tx_count: minimized.txs.len(),
+            minimized_input: minimized,
+            execution,
+            metadata,
+            crash,
+            protocol_findings,
+            reproduction_report,
+            foundry_poc,
+        })
+    }
+
+    pub fn replay_input(&self, input: &EvmInput) -> anyhow::Result<SequenceExecutionResult> {
+        let mut current_db = self.initial_db.clone();
+        let mut block_env = self.initial_block_env.clone();
+        let mut dataflow = DataflowRegistry::new();
+        let mut coverage = vec![0u8; 65_536];
+        let mut tx_results = Vec::with_capacity(input.txs.len());
+
+        for (idx, tx) in input.txs.iter().enumerate() {
+            let mut chain_state = ChainState::Evm(current_db.clone());
+            let mut waypoints = Vec::new();
+            let result = self.executor.execute_with_result(
+                &mut chain_state,
+                &mut block_env,
+                tx,
+                &mut coverage,
+                &mut dataflow,
+                &mut waypoints,
+                idx,
+            )?;
+            let ChainState::Evm(new_db) = chain_state;
+            current_db = new_db;
+            tx_results.push(result);
+        }
+
+        Ok(sequence_result_from_tx_results(tx_results))
+    }
+
+    fn minimize_sequence<F>(&self, input: &mut EvmInput, preserves_crash: &F)
+    where
+        F: Fn(&SequenceExecutionResult) -> bool,
+    {
+        let mut idx = 0;
+        while idx < input.txs.len() {
+            if input.txs.len() == 1 {
+                break;
+            }
+            let mut candidate = input.clone();
+            candidate.txs.remove(idx);
+            if self.input_preserves(&candidate, preserves_crash) {
+                *input = candidate;
+            } else {
+                idx += 1;
+            }
+        }
+    }
+
+    fn minimize_values<F>(&self, input: &mut EvmInput, preserves_crash: &F)
+    where
+        F: Fn(&SequenceExecutionResult) -> bool,
+    {
+        for idx in 0..input.txs.len() {
+            if input.txs[idx].value.is_zero() {
+                continue;
+            }
+            let mut candidate = input.clone();
+            candidate.txs[idx].value = revm::primitives::U256::ZERO;
+            if self.input_preserves(&candidate, preserves_crash) {
+                *input = candidate;
+            }
+        }
+    }
+
+    fn minimize_calldata<F>(&self, input: &mut EvmInput, preserves_crash: &F)
+    where
+        F: Fn(&SequenceExecutionResult) -> bool,
+    {
+        for tx_idx in 0..input.txs.len() {
+            self.truncate_calldata(input, tx_idx, preserves_crash);
+            self.zero_abi_words(input, tx_idx, preserves_crash);
+            self.remove_abi_words(input, tx_idx, preserves_crash);
+        }
+    }
+
+    fn truncate_calldata<F>(&self, input: &mut EvmInput, tx_idx: usize, preserves_crash: &F)
+    where
+        F: Fn(&SequenceExecutionResult) -> bool,
+    {
+        let min_len = if input.txs[tx_idx].input.len() >= 4 {
+            4
+        } else {
+            0
+        };
+        let mut target_len = input.txs[tx_idx].input.len();
+        while target_len > min_len {
+            target_len = min_len + ((target_len - min_len) / 2);
+            let mut candidate = input.clone();
+            candidate.txs[tx_idx].input.truncate(target_len);
+            if self.input_preserves(&candidate, preserves_crash) {
+                *input = candidate;
+            } else if target_len == min_len {
+                break;
+            }
+        }
+    }
+
+    fn zero_abi_words<F>(&self, input: &mut EvmInput, tx_idx: usize, preserves_crash: &F)
+    where
+        F: Fn(&SequenceExecutionResult) -> bool,
+    {
+        let len = input.txs[tx_idx].input.len();
+        if len <= 4 {
+            return;
+        }
+        let mut offset = 4;
+        while offset < len {
+            let end = (offset + 32).min(len);
+            let mut candidate = input.clone();
+            candidate.txs[tx_idx].input[offset..end].fill(0);
+            if self.input_preserves(&candidate, preserves_crash) {
+                *input = candidate;
+            }
+            offset += 32;
+        }
+    }
+
+    fn remove_abi_words<F>(&self, input: &mut EvmInput, tx_idx: usize, preserves_crash: &F)
+    where
+        F: Fn(&SequenceExecutionResult) -> bool,
+    {
+        let mut offset = 4;
+        while offset < input.txs[tx_idx].input.len() {
+            let end = (offset + 32).min(input.txs[tx_idx].input.len());
+            let mut candidate = input.clone();
+            candidate.txs[tx_idx].input.drain(offset..end);
+            if self.input_preserves(&candidate, preserves_crash) {
+                *input = candidate;
+            } else {
+                offset += 32;
+            }
+        }
+    }
+
+    fn input_preserves<F>(&self, input: &EvmInput, preserves_crash: &F) -> bool
+    where
+        F: Fn(&SequenceExecutionResult) -> bool,
+    {
+        self.replay_input(input)
+            .ok()
+            .as_ref()
+            .is_some_and(preserves_crash)
     }
 
     /// Reduces a sequence of transactions to the smallest possible subset
@@ -116,4 +343,60 @@ impl<'a> Minimizer<'a> {
 
         false
     }
+}
+
+#[derive(Debug)]
+pub struct MinimizedCrashArtifact {
+    pub original_tx_count: usize,
+    pub minimized_tx_count: usize,
+    pub minimized_input: EvmInput,
+    pub execution: SequenceExecutionResult,
+    pub metadata: CorpusEntryMetadata,
+    pub crash: CrashRecord,
+    pub protocol_findings: Vec<ProtocolFinding>,
+    pub reproduction_report: PathBuf,
+    pub foundry_poc: PathBuf,
+}
+
+fn sequence_result_from_tx_results(
+    tx_results: Vec<crate::common::types::TxExecutionResult>,
+) -> SequenceExecutionResult {
+    let total_gas_used = tx_results.iter().map(|result| result.gas_used).sum();
+    let final_coverage_hash = tx_results
+        .last()
+        .map(|result| result.coverage_hash)
+        .unwrap_or_default();
+    SequenceExecutionResult {
+        total_gas_used,
+        final_coverage_hash,
+        storage_reads: tx_results
+            .iter()
+            .flat_map(|result| result.storage_reads.clone())
+            .collect(),
+        storage_writes: tx_results
+            .iter()
+            .flat_map(|result| result.storage_writes.clone())
+            .collect(),
+        storage_diffs: tx_results
+            .iter()
+            .flat_map(|result| result.storage_diffs.clone())
+            .collect(),
+        call_trace: tx_results
+            .iter()
+            .flat_map(|result| result.call_trace.clone())
+            .collect(),
+        oracle_observations: Vec::new(),
+        tx_results,
+    }
+}
+
+fn execution_coverage_material(execution: &SequenceExecutionResult) -> Vec<u8> {
+    let mut material = Vec::with_capacity(execution.tx_results.len() * 8);
+    for result in &execution.tx_results {
+        material.extend_from_slice(&result.coverage_hash.to_be_bytes());
+    }
+    if material.is_empty() {
+        material.extend_from_slice(&execution.final_coverage_hash.to_be_bytes());
+    }
+    material
 }

@@ -11,6 +11,7 @@ pub struct Config {
     pub corpus_dir: String,
     pub report_dir: String,
     pub llm_enabled: bool,
+    pub foundry_project: Option<String>,
 }
 
 impl Config {

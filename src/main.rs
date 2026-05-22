@@ -2,6 +2,7 @@ use clap::Parser;
 use revm::primitives::Address;
 use rusty_fuzz::chain::mempool::MempoolScanner;
 use rusty_fuzz::config::Config;
+use rusty_fuzz::engine::foundry_ingest::FoundryHarnessManifest;
 use std::str::FromStr;
 
 #[derive(Parser, Debug)]
@@ -45,6 +46,11 @@ async fn main() -> anyhow::Result<()> {
                     .transpose()?,
                 corpus_dir: config.corpus_dir.clone(),
                 report_dir: config.report_dir.clone(),
+                foundry_harness: config
+                    .foundry_project
+                    .as_deref()
+                    .map(FoundryHarnessManifest::ingest)
+                    .transpose()?,
             };
             rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await?;
         }

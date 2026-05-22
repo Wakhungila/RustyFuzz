@@ -1,11 +1,15 @@
-use crate::common::types::{ChainState, SequenceExecutionResult};
+use crate::common::oracle::{VulnType, VulnerabilityOracle};
+use crate::common::types::{ChainState, OracleObservation, SequenceExecutionResult, Snapshot};
+use crate::evm::corpus::PersistentCorpus;
 use crate::evm::dataflow::DataflowRegistry;
 use crate::evm::executor::EvmExecutor;
 use crate::evm::feedback::EvmCoverageFeedback;
+use crate::evm::fork_db::EvmCacheDb;
 use crate::evm::fuzz::EvmInput;
 use anyhow::Result;
 use async_trait::async_trait;
 use revm::context::BlockEnv;
+use revm::database::CacheDB;
 
 pub struct ReplayVerifier {
     executor: EvmExecutor,
@@ -49,6 +53,23 @@ impl ReplayVerifier {
         Ok(SequenceExecutionResult {
             total_gas_used: tx_results.iter().map(|result| result.gas_used).sum(),
             final_coverage_hash: EvmCoverageFeedback::stable_path_hash(&coverage),
+            storage_reads: tx_results
+                .iter()
+                .flat_map(|result| result.storage_reads.clone())
+                .collect(),
+            storage_writes: tx_results
+                .iter()
+                .flat_map(|result| result.storage_writes.clone())
+                .collect(),
+            storage_diffs: tx_results
+                .iter()
+                .flat_map(|result| result.storage_diffs.clone())
+                .collect(),
+            call_trace: tx_results
+                .iter()
+                .flat_map(|result| result.call_trace.clone())
+                .collect(),
+            oracle_observations: Vec::new(),
             tx_results,
         })
     }
@@ -66,6 +87,42 @@ impl ReplayVerifier {
             "deterministic replay mismatch: first={first:?}, second={second:?}"
         );
         Ok(first)
+    }
+
+    pub fn verify_persisted_input(
+        &self,
+        corpus: &PersistentCorpus,
+        input_id: &str,
+        fork_cache_id: &str,
+        block_env: &BlockEnv,
+    ) -> Result<SequenceExecutionResult> {
+        let input = corpus.load_input(input_id)?;
+        let fork_db = corpus.load_offline_fork_db(fork_cache_id)?;
+        let base_db: EvmCacheDb = CacheDB::new(fork_db);
+        self.verify_deterministic(&ChainState::Evm(base_db), block_env, &input)
+    }
+
+    pub fn evaluate_oracle(
+        &self,
+        execution: &mut SequenceExecutionResult,
+        oracle_name: impl Into<String>,
+        oracle: &dyn VulnerabilityOracle,
+        before: &Snapshot,
+        after: &Snapshot,
+    ) -> Option<VulnType> {
+        let finding = oracle.check(before, after)?;
+        execution.oracle_observations.push(OracleObservation {
+            oracle: oracle_name.into(),
+            finding: finding.to_string(),
+            tx_index: execution.tx_results.last().map(|result| result.tx_index),
+            evidence: format!(
+                "storage_diffs={}, calls={}, coverage_hash={}",
+                execution.storage_diffs.len(),
+                execution.call_trace.len(),
+                execution.final_coverage_hash
+            ),
+        });
+        Some(finding)
     }
 }
 

@@ -1,7 +1,12 @@
-use crate::common::types::{ChainState, EvmInput, SingletonTx};
+use crate::common::oracle::ProtocolOraclePack;
+use crate::common::types::{ChainState, EvmInput, SequenceExecutionResult, SingletonTx};
+use crate::engine::foundry_ingest::FoundryHarnessManifest;
+use crate::engine::scheduler::RustyFuzzScheduler;
+use crate::engine::scoring::{CampaignScore, CampaignScorer};
 use crate::evm::corpus::SnapshotCorpus;
 use crate::evm::dataflow::DataflowRegistry;
 use crate::evm::executor::EvmExecutor;
+use crate::evm::feedback::{EvmCoverageFeedback, EvmStateNoveltyFeedback, StateNoveltyReport};
 use crate::evm::fuzz::{AbiRegistry, EvmMutator};
 use crate::evm::registry::GlobalAccountRegistry;
 use crate::evm::snapshot::new_evm_snapshot;
@@ -22,13 +27,15 @@ unsafe impl<T: Send> Sync for SyncUnsafeCell<T> {}
 use libafl::events::ClientDescription;
 use libafl::prelude::{
     EventConfig, ExitKind, Fuzzer, InMemoryCorpus, InProcessExecutor, Launcher, SimpleMonitor,
-    StdFuzzer, StdMapObserver, StdMutationalStage, StdScheduler, StdState,
+    StdFuzzer, StdMapObserver, StdMutationalStage, StdState,
 };
 use libafl_bolts::prelude::*;
 use libafl_bolts::shmem::{ShMemProvider, StdShMemProvider};
 use libafl_bolts::tuples::tuple_list;
 
 const MAP_SIZE: usize = 65536;
+const STATE_NOVELTY_MAP_SLOTS: usize = 2048;
+const CAMPAIGN_SCORE_MAP_SLOTS: usize = 1024;
 
 pub struct Config {
     pub rpc_url: String,
@@ -36,6 +43,7 @@ pub struct Config {
     pub target_contract: Option<Address>,
     pub corpus_dir: String,
     pub report_dir: String,
+    pub foundry_harness: Option<FoundryHarnessManifest>,
 }
 
 pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
@@ -91,15 +99,30 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 initial_snapshot_corpus.add_snapshot(0, 0, new_evm_snapshot(0, initial_db.clone()));
                 let snapshot_corpus = Arc::new(RwLock::new(initial_snapshot_corpus));
                 let dataflow_registry = Arc::new(RwLock::new(DataflowRegistry::new()));
+                let state_novelty_feedback =
+                    Arc::new(RwLock::new(EvmStateNoveltyFeedback::new()));
+                let pending_campaign_score = Arc::new(RwLock::new(None));
+                let campaign_scorer = Arc::new(CampaignScorer::default());
+                let protocol_oracles = Arc::new(ProtocolOraclePack::default());
                 let evm_executor = Arc::new(EvmExecutor::new());
                 let account_registry = Arc::new(RwLock::new(initial_registry));
                 let mut initial_abi = AbiRegistry::default();
                 account_registry.read().auto_populate_abi(&mut initial_abi);
+                if let Some(harness) = &config.foundry_harness {
+                    log::info!(
+                        "Loaded Foundry harness: {} files, {} invariants, {} target selectors, {} handlers",
+                        harness.files_scanned.len(),
+                        harness.invariant_functions.len(),
+                        harness.target_selectors.len(),
+                        harness.handler_contracts.len()
+                    );
+                    populate_abi_from_foundry_harness(harness, &mut initial_abi);
+                }
                 let abi_registry = Arc::new(initial_abi);
 
                 let core_id = description.core_id();
 
-                let mut feedback = crate::evm::feedback::EvmCoverageFeedback::new();
+                let mut feedback = EvmCoverageFeedback::new();
                 let mut objective = ();
 
                 let mut state = state.unwrap_or_else(|| {
@@ -123,7 +146,11 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
                 let mut stages = tuple_list!(StdMutationalStage::new(mutator),);
 
-                let mut fuzzer = StdFuzzer::new(StdScheduler::new(), feedback, objective);
+                let mut fuzzer = StdFuzzer::new(
+                    RustyFuzzScheduler::with_pending_score(pending_campaign_score.clone()),
+                    feedback,
+                    objective,
+                );
 
                 static COVERAGE_MAP: SyncUnsafeCell<[u8; MAP_SIZE]> =
                     SyncUnsafeCell(UnsafeCell::new([0u8; MAP_SIZE]));
@@ -145,6 +172,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
                     let mut current_state = base_snap_arc.read().state.read().clone();
                     let mut current_env = initial_env.clone();
+                    let mut tx_results = Vec::with_capacity(input.txs.len());
 
                     for (tx_idx, tx) in input.txs.iter().enumerate() {
                         let mut waypoints = Vec::new();
@@ -152,7 +180,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                         let exec_result = unsafe {
                             let map_ptr = (COVERAGE_MAP.0).get() as *mut u8;
                             let map_slice = std::slice::from_raw_parts_mut(map_ptr, MAP_SIZE);
-                            evm_executor.execute(
+                            evm_executor.execute_with_result(
                                 &mut current_state,
                                 &mut current_env,
                                 tx,
@@ -162,11 +190,57 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                                 tx_idx,
                             )
                         };
-                        if let Err(err) = exec_result {
-                            log::error!("EVM execution failed for tx {}: {err:#}", tx_idx);
-                            return ExitKind::Crash;
-                        }
+                        let result = match exec_result {
+                            Ok(result) => result,
+                            Err(err) => {
+                                log::error!("EVM execution failed for tx {}: {err:#}", tx_idx);
+                                return ExitKind::Crash;
+                            }
+                        };
+                        tx_results.push(result);
                     }
+
+                    let execution = sequence_result_from_tx_results(tx_results);
+                    let report = state_novelty_feedback
+                        .write()
+                        .observe_execution(&execution);
+                    let findings = protocol_oracles.evaluate(&execution);
+                    let campaign_score =
+                        campaign_scorer.score(input, &execution, &report, &findings);
+                    if report.interesting {
+                        unsafe {
+                            let map_ptr = (COVERAGE_MAP.0).get() as *mut u8;
+                            let map_slice = std::slice::from_raw_parts_mut(map_ptr, MAP_SIZE);
+                            reward_state_novelty(map_slice, &report);
+                        }
+                        log::debug!(
+                            "State novelty: score={}, transitions={}, slots={}, reads={}, call_edges={}, contracts={}",
+                            report.novelty_score(),
+                            report.new_transition_hashes.len(),
+                            report.new_slot_hashes.len(),
+                            report.new_read_hashes.len(),
+                            report.new_call_edge_hashes.len(),
+                            report.new_contracts.len()
+                        );
+                    }
+                    if campaign_score.is_interesting() {
+                        unsafe {
+                            let map_ptr = (COVERAGE_MAP.0).get() as *mut u8;
+                            let map_slice = std::slice::from_raw_parts_mut(map_ptr, MAP_SIZE);
+                            reward_campaign_score(map_slice, &campaign_score);
+                        }
+                        log::debug!(
+                            "Campaign score: total={}, economic={}, invariant={}, oracle={}, state={}, exploration={}, reasons={}",
+                            campaign_score.total,
+                            campaign_score.economic_pressure,
+                            campaign_score.invariant_pressure,
+                            campaign_score.oracle_pressure,
+                            campaign_score.state_pressure,
+                            campaign_score.exploration_pressure,
+                            campaign_score.explanation.join("; ")
+                        );
+                    }
+                    *pending_campaign_score.write() = Some(campaign_score);
                     ExitKind::Ok
                 };
 
@@ -190,6 +264,88 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn sequence_result_from_tx_results(
+    tx_results: Vec<crate::common::types::TxExecutionResult>,
+) -> SequenceExecutionResult {
+    let total_gas_used = tx_results.iter().map(|result| result.gas_used).sum();
+    let final_coverage_hash = tx_results
+        .last()
+        .map(|result| result.coverage_hash)
+        .unwrap_or_default();
+    SequenceExecutionResult {
+        total_gas_used,
+        final_coverage_hash,
+        storage_reads: tx_results
+            .iter()
+            .flat_map(|result| result.storage_reads.clone())
+            .collect(),
+        storage_writes: tx_results
+            .iter()
+            .flat_map(|result| result.storage_writes.clone())
+            .collect(),
+        storage_diffs: tx_results
+            .iter()
+            .flat_map(|result| result.storage_diffs.clone())
+            .collect(),
+        call_trace: tx_results
+            .iter()
+            .flat_map(|result| result.call_trace.clone())
+            .collect(),
+        oracle_observations: Vec::new(),
+        tx_results,
+    }
+}
+
+fn reward_state_novelty(coverage: &mut [u8], report: &StateNoveltyReport) {
+    if coverage.is_empty() {
+        return;
+    }
+    let novelty_slots = STATE_NOVELTY_MAP_SLOTS.min(coverage.len());
+    let offset = coverage.len() - novelty_slots;
+
+    for hash in report
+        .new_transition_hashes
+        .iter()
+        .chain(report.new_slot_hashes.iter())
+        .chain(report.new_read_hashes.iter())
+        .chain(report.new_call_edge_hashes.iter())
+    {
+        let idx = offset + ((*hash as usize) % novelty_slots);
+        coverage[idx] = coverage[idx].saturating_add(1);
+    }
+
+    for contract in &report.new_contracts {
+        let mut material = [0u8; 8];
+        material.copy_from_slice(&contract.as_slice()[..8]);
+        let idx = offset + ((u64::from_be_bytes(material) as usize) % novelty_slots);
+        coverage[idx] = coverage[idx].saturating_add(1);
+    }
+}
+
+fn reward_campaign_score(coverage: &mut [u8], score: &CampaignScore) {
+    if coverage.is_empty() || score.total == 0 {
+        return;
+    }
+    let score_slots = CAMPAIGN_SCORE_MAP_SLOTS.min(coverage.len());
+    let offset = coverage.len() - score_slots;
+    let components = [
+        score.total,
+        score.economic_pressure,
+        score.invariant_pressure,
+        score.oracle_pressure,
+        score.state_pressure,
+        score.exploration_pressure,
+    ];
+    for (component_idx, value) in components.into_iter().enumerate() {
+        if value == 0 {
+            continue;
+        }
+        let bucket = value.next_power_of_two().min(128) as u8;
+        let idx = offset + ((component_idx * 131 + value as usize) % score_slots);
+        coverage[idx] = coverage[idx].saturating_add(bucket.max(1));
+    }
+}
+
 fn choose_target_contract(
     configured: Option<Address>,
     registry: &GlobalAccountRegistry,
@@ -199,6 +355,19 @@ fn choose_target_contract(
         contracts.sort_by_key(|address| *address);
         contracts.into_iter().next()
     })
+}
+
+fn populate_abi_from_foundry_harness(
+    harness: &FoundryHarnessManifest,
+    abi_registry: &mut AbiRegistry,
+) {
+    for target in &harness.target_selectors {
+        for selector in &target.selectors {
+            if let Some(selector_hex) = selector.selector_hex {
+                abi_registry.functions.entry(selector_hex).or_default();
+            }
+        }
+    }
 }
 
 fn seed_input(target_contract: Address, fuzzer_address: Address) -> EvmInput {
@@ -212,5 +381,52 @@ fn seed_input(target_contract: Address, fuzzer_address: Address) -> EvmInput {
         }],
         base_snapshot_id: 0,
         waypoints: Vec::new(),
+        mutation_provenance: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_novelty_projection_rewards_reserved_coverage_slots() {
+        let mut coverage = vec![0u8; 64];
+        let report = StateNoveltyReport {
+            interesting: true,
+            new_transition_hashes: vec![1, 65],
+            new_slot_hashes: vec![2],
+            new_read_hashes: vec![3],
+            new_call_edge_hashes: vec![4],
+            new_contracts: vec![Address::repeat_byte(0x99)],
+            state_hash: 10,
+            write_set_hash: 11,
+            read_set_hash: 12,
+            call_graph_hash: 13,
+        };
+
+        reward_state_novelty(&mut coverage, &report);
+
+        assert!(coverage.iter().any(|hit| *hit > 0));
+        assert_eq!(coverage.iter().filter(|hit| **hit > 0).count(), 5);
+    }
+
+    #[test]
+    fn campaign_score_projection_rewards_reserved_coverage_slots() {
+        let mut coverage = vec![0u8; 128];
+        let score = CampaignScore {
+            total: 1000,
+            economic_pressure: 600,
+            invariant_pressure: 0,
+            oracle_pressure: 350,
+            state_pressure: 20,
+            exploration_pressure: 30,
+            explanation: vec!["test".to_string()],
+        };
+
+        reward_campaign_score(&mut coverage, &score);
+
+        assert!(coverage.iter().any(|hit| *hit > 0));
+        assert!(coverage.iter().filter(|hit| **hit > 0).count() >= 4);
     }
 }

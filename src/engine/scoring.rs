@@ -1,4 +1,7 @@
-use crate::common::oracle::VulnType;
+use crate::common::oracle::{ProtocolFinding, ProtocolSeverity, VulnType};
+use crate::common::types::SequenceExecutionResult;
+use crate::evm::feedback::StateNoveltyReport;
+use crate::evm::fuzz::EvmInput;
 use crate::evm::trace::ExecutionTrace;
 use revm::primitives::U256;
 use serde::{Deserialize, Serialize};
@@ -9,6 +12,220 @@ use serde::{Deserialize, Serialize};
 pub struct ProfitReport {
     pub profit: U256,
     pub loss: U256,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CampaignScore {
+    pub total: u64,
+    pub economic_pressure: u64,
+    pub invariant_pressure: u64,
+    pub oracle_pressure: u64,
+    pub state_pressure: u64,
+    pub exploration_pressure: u64,
+    pub explanation: Vec<String>,
+}
+
+impl CampaignScore {
+    pub fn is_interesting(&self) -> bool {
+        self.total > 0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CampaignScoringConfig {
+    pub large_storage_delta: U256,
+    pub max_score: u64,
+}
+
+impl Default for CampaignScoringConfig {
+    fn default() -> Self {
+        Self {
+            large_storage_delta: U256::from(10u128.pow(18)),
+            max_score: 10_000,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct CampaignScorer {
+    pub config: CampaignScoringConfig,
+}
+
+impl CampaignScorer {
+    pub fn new(config: CampaignScoringConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn score(
+        &self,
+        input: &EvmInput,
+        execution: &SequenceExecutionResult,
+        state_novelty: &StateNoveltyReport,
+        findings: &[ProtocolFinding],
+    ) -> CampaignScore {
+        let mut explanation = Vec::new();
+        let economic_pressure = self.economic_pressure(execution, findings, &mut explanation);
+        let invariant_pressure = self.invariant_pressure(findings, input, &mut explanation);
+        let oracle_pressure = self.oracle_pressure(findings, &mut explanation);
+        let state_pressure = state_novelty.novelty_score();
+        if state_pressure > 0 {
+            explanation.push(format!("state_novelty={state_pressure}"));
+        }
+        let exploration_pressure = self.exploration_pressure(input, execution, &mut explanation);
+
+        let total = economic_pressure
+            .saturating_add(invariant_pressure)
+            .saturating_add(oracle_pressure)
+            .saturating_add(state_pressure)
+            .saturating_add(exploration_pressure)
+            .min(self.config.max_score);
+
+        CampaignScore {
+            total,
+            economic_pressure,
+            invariant_pressure,
+            oracle_pressure,
+            state_pressure,
+            exploration_pressure,
+            explanation,
+        }
+    }
+
+    fn economic_pressure(
+        &self,
+        execution: &SequenceExecutionResult,
+        findings: &[ProtocolFinding],
+        explanation: &mut Vec<String>,
+    ) -> u64 {
+        let large_deltas = execution
+            .storage_diffs
+            .iter()
+            .filter(|diff| {
+                let delta = if diff.new_value > diff.old_value {
+                    diff.new_value - diff.old_value
+                } else {
+                    diff.old_value - diff.new_value
+                };
+                delta >= self.config.large_storage_delta
+            })
+            .count() as u64;
+        let economic_findings = findings
+            .iter()
+            .filter(|finding| {
+                matches!(
+                    finding.vuln,
+                    VulnType::FlashLoanProfit
+                        | VulnType::FlashLoanAttack
+                        | VulnType::PriceManipulation
+                        | VulnType::PriceOracleManipulation
+                        | VulnType::VaultDonationAttack
+                        | VulnType::VaultInflation
+                        | VulnType::MevSandwichExploit
+                        | VulnType::UniswapV3LiquidityAsymmetry
+                        | VulnType::AccountingDesync
+                        | VulnType::RebalanceValueLoss
+                )
+            })
+            .count() as u64;
+        let score = large_deltas * 40 + economic_findings * 600;
+        if score > 0 {
+            explanation.push(format!(
+                "economic_pressure: large_deltas={large_deltas}, economic_findings={economic_findings}"
+            ));
+        }
+        score
+    }
+
+    fn invariant_pressure(
+        &self,
+        findings: &[ProtocolFinding],
+        input: &EvmInput,
+        explanation: &mut Vec<String>,
+    ) -> u64 {
+        let invariant_findings = findings
+            .iter()
+            .filter(|finding| matches!(finding.vuln, VulnType::InvariantViolation(_)))
+            .count() as u64;
+        let governance_or_critical = findings
+            .iter()
+            .filter(|finding| {
+                matches!(
+                    finding.vuln,
+                    VulnType::GovernanceTakeover
+                        | VulnType::GovernanceParameterManipulation
+                        | VulnType::PrivilegeEscalation
+                        | VulnType::SystemicStateCorruption
+                ) || finding.severity == ProtocolSeverity::Critical
+            })
+            .count() as u64;
+        let oracle_guided_mutations = input
+            .mutation_provenance
+            .iter()
+            .filter(|mutation| {
+                matches!(
+                    mutation.strategy.as_str(),
+                    "oracle_pressure" | "mev_sandwich" | "flashloan_wrap"
+                )
+            })
+            .count() as u64;
+        let score =
+            invariant_findings * 700 + governance_or_critical * 900 + oracle_guided_mutations * 50;
+        if score > 0 {
+            explanation.push(format!(
+                "invariant_pressure: invariant_findings={invariant_findings}, critical={governance_or_critical}, guided_mutations={oracle_guided_mutations}"
+            ));
+        }
+        score
+    }
+
+    fn oracle_pressure(&self, findings: &[ProtocolFinding], explanation: &mut Vec<String>) -> u64 {
+        let score: u64 = findings
+            .iter()
+            .map(|finding| match finding.severity {
+                ProtocolSeverity::Info => 5,
+                ProtocolSeverity::Low => 25,
+                ProtocolSeverity::Medium => 100,
+                ProtocolSeverity::High => 350,
+                ProtocolSeverity::Critical => 900,
+            })
+            .sum();
+        if score > 0 {
+            explanation.push(format!("oracle_pressure: findings={}", findings.len()));
+        }
+        score
+    }
+
+    fn exploration_pressure(
+        &self,
+        input: &EvmInput,
+        execution: &SequenceExecutionResult,
+        explanation: &mut Vec<String>,
+    ) -> u64 {
+        let successful_txs = execution
+            .tx_results
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result.status,
+                    crate::common::types::ExecutionStatus::Success
+                )
+            })
+            .count() as u64;
+        let call_depth = execution
+            .call_trace
+            .iter()
+            .map(|call| call.depth)
+            .max()
+            .unwrap_or_default() as u64;
+        let sequence_depth = input.txs.len() as u64;
+        let score = successful_txs * 5 + call_depth * 10 + sequence_depth.saturating_sub(1) * 15;
+        if score > 0 {
+            explanation.push(format!(
+                "exploration_pressure: successful_txs={successful_txs}, call_depth={call_depth}, sequence_depth={sequence_depth}"
+            ));
+        }
+        score
+    }
 }
 
 impl Default for ProfitReport {

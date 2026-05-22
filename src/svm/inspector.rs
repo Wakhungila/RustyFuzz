@@ -3,7 +3,7 @@ use solana_sdk::instruction::Instruction;
 use bitvec::prelude::*;
 use solana_sdk::instruction::AccountMeta;
 use solana_sdk::hash::Hash as SolanaHash; // Use Solana's Hash for instruction hashing
-use crate::common::types::Waypoint;
+use crate::common::types::{ComparisonOperand, Waypoint};
 use crate::common::oracle::VulnType;
 use revm::primitives::U256;
 use std::hash::{Hash, Hasher};
@@ -50,6 +50,10 @@ impl<'a> SvmCoverageInspector<'a> {
             rhs: U256::ZERO,
             pc: 0,
             calldata_offset: None,
+            condition: result.result.is_ok(),
+            hit: result.result.is_ok(),
+            taint_source: None,
+            tainted_operand: ComparisonOperand::Unknown,
         });
         
         // P0 Discovery: Missing Signer Check Detection
@@ -64,6 +68,10 @@ impl<'a> SvmCoverageInspector<'a> {
                         rhs: U256::ZERO,
                         pc: 0,
                         calldata_offset: None,
+                        condition: true,
+                        hit: true,
+                        taint_source: None,
+                        tainted_operand: ComparisonOperand::Unknown,
                     });
                 }
             }

@@ -1,132 +1,252 @@
-#[cfg(feature = "z3")]
-use crate::common::types::{TaintSource, Waypoint};
-#[cfg(feature = "z3")]
+use crate::common::types::{ComparisonOperand, TaintSource, Waypoint};
 use revm::primitives::U256;
-#[cfg(feature = "z3")]
-use z3::ast::{Ast, BV};
-#[cfg(feature = "z3")]
-use z3::{Context, SatResult, Solver};
 
-#[cfg(feature = "z3")]
-pub struct ConcolicSolver<'a> {
-    ctx: &'a Context,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConcolicHint {
+    pub source: TaintSource,
+    pub tx_index: usize,
+    pub calldata_offset: usize,
+    pub word: [u8; 32],
+    pub pc: usize,
+    pub strategy: ConcolicStrategy,
 }
 
-#[cfg(feature = "z3")]
-impl<'a> ConcolicSolver<'a> {
-    pub fn new(ctx: &'a Context) -> Self {
-        Self { ctx }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcolicStrategy {
+    FlipComparison { opcode: u8, target_true: bool },
+    FlipBranch { taken: bool },
+    ArithmeticBoundary { opcode: u8 },
+}
+
+#[derive(Debug, Default)]
+pub struct ConcolicSolver;
+
+impl ConcolicSolver {
+    pub fn new() -> Self {
+        Self
     }
 
-    /// Generates a "hint" (a 32-byte value) that satisfies the alternative
-    /// path of a comparison or an arithmetic edge case.
-    pub fn solve_hint(&self, waypoint: &Waypoint) -> Option<[u8; 32]> {
+    pub fn solve_hint(&self, tx_index: usize, waypoint: &Waypoint) -> Option<ConcolicHint> {
         match waypoint {
+            Waypoint::BranchPath {
+                taken, constraint, ..
+            } => {
+                let mut hint = self.solve_hint(tx_index, constraint)?;
+                hint.strategy = ConcolicStrategy::FlipBranch { taken: *taken };
+                Some(hint)
+            }
             Waypoint::Comparison {
                 op,
-                lhs: _,
+                lhs,
                 rhs,
-                taint_source: Some(taint_source),
+                pc,
+                condition,
+                taint_source: Some(source),
+                tainted_operand,
                 ..
             } => {
-                let solver = Solver::new(self.ctx);
-                let input_var = self.create_symbolic_var(taint_source)?;
-                let rhs_bv = self.u256_to_bv(rhs)?;
-
-                // EVM Opcode Mapping to Z3 BitVector operations
-                let constraint = match *op {
-                    0x10 => input_var.bvult(&rhs_bv), // LT
-                    0x11 => input_var.bvugt(&rhs_bv), // GT
-                    0x14 => input_var._eq(&rhs_bv),   // EQ
-                    0x12 => input_var.bvslt(&rhs_bv), // SLT
-                    0x13 => input_var.bvsgt(&rhs_bv), // SGT
-                    _ => return None,
+                let target_true = !*condition;
+                let operand = match tainted_operand {
+                    ComparisonOperand::Unknown => {
+                        infer_tainted_operand(*op, *lhs, *rhs, target_true)
+                    }
+                    known => known.clone(),
                 };
-
-                solver.assert(&constraint);
-                self.get_solution(solver, input_var)
+                let solved = solve_comparison_word(*op, *lhs, *rhs, &operand, target_true)?;
+                Some(hint_from_source(
+                    source,
+                    tx_index,
+                    *pc,
+                    solved,
+                    ConcolicStrategy::FlipComparison {
+                        opcode: *op,
+                        target_true,
+                    },
+                ))
             }
-
             Waypoint::Arithmetic {
                 op,
-                lhs: _,
+                lhs,
                 rhs,
                 third,
-                taint_source: Some(taint_source),
-                ..
+                pc,
+                taint_source: Some(source),
             } => {
-                let solver = Solver::new(self.ctx);
-                let input_var = self.create_symbolic_var(taint_source)?;
-                let rhs_bv = self.u256_to_bv(rhs)?;
-                let zero_bv = self.u256_to_bv(&U256::ZERO)?;
-                let max_bv = self.u256_to_bv(&U256::MAX)?;
-
-                let constraint = match *op {
-                    0x01 => input_var.bvadd(&rhs_bv).bvugt(&max_bv), // ADD: Overflow
-                    0x02 => input_var.bvmul(&rhs_bv).bvugt(&max_bv), // MUL: Overflow
-                    0x03 => input_var.bvult(&rhs_bv),                // SUB: Underflow
-                    0x04 | 0x05 => input_var.bvurem(&rhs_bv)._ne(&zero_bv), // DIV: Force rounding
-                    0x08 | 0x09 => {
-                        // ADDMOD / MULMOD
-                        if let Some(n) = third {
-                            let n_bv = self.u256_to_bv(n)?;
-                            let res = if *op == 0x08 {
-                                input_var.bvadd(&rhs_bv)
-                            } else {
-                                input_var.bvmul(&rhs_bv)
-                            };
-                            res.bvurem(&n_bv)._eq(&zero_bv)
-                        } else {
-                            return None;
-                        }
-                    }
-                    _ => return None,
-                };
-
-                solver.assert(&constraint);
-                self.get_solution(solver, input_var)
+                let solved = solve_arithmetic_boundary(*op, *lhs, *rhs, *third)?;
+                Some(hint_from_source(
+                    source,
+                    tx_index,
+                    *pc,
+                    solved,
+                    ConcolicStrategy::ArithmeticBoundary { opcode: *op },
+                ))
             }
             _ => None,
         }
     }
 
-    fn create_symbolic_var(&self, taint_source: &TaintSource) -> Option<BV<'a>> {
-        match taint_source {
-            TaintSource::Calldata(offset) => {
-                if *offset >= 1024 * 1024 {
-                    return None;
-                }
-                Some(BV::new_const(self.ctx, format!("calldata_{}", offset), 256))
-            }
-            TaintSource::Storage(tx_idx, offset) => Some(BV::new_const(
-                self.ctx,
-                format!("tx{}_storage_at_{}", tx_idx, offset),
-                256,
-            )),
-        }
+    pub fn solve_hints<'a>(
+        &self,
+        tx_waypoints: impl Iterator<Item = (usize, &'a Waypoint)>,
+    ) -> Vec<ConcolicHint> {
+        let mut hints: Vec<_> = tx_waypoints
+            .filter_map(|(tx_index, waypoint)| self.solve_hint(tx_index, waypoint))
+            .collect();
+        hints.sort_by_key(|hint| {
+            (
+                hint.tx_index,
+                hint.calldata_offset,
+                hint.pc,
+                strategy_rank(&hint.strategy),
+            )
+        });
+        hints.dedup_by_key(|hint| (hint.tx_index, hint.calldata_offset, hint.word));
+        hints
+    }
+}
+
+fn hint_from_source(
+    source: &TaintSource,
+    fallback_tx_index: usize,
+    pc: usize,
+    value: U256,
+    strategy: ConcolicStrategy,
+) -> ConcolicHint {
+    let (tx_index, calldata_offset) = match source {
+        TaintSource::Calldata(offset) => (fallback_tx_index, *offset),
+        TaintSource::Storage(origin_tx, offset) => (*origin_tx, *offset),
+    };
+    ConcolicHint {
+        source: source.clone(),
+        tx_index,
+        calldata_offset,
+        word: value.to_be_bytes::<32>(),
+        pc,
+        strategy,
+    }
+}
+
+fn infer_tainted_operand(op: u8, lhs: U256, rhs: U256, target_true: bool) -> ComparisonOperand {
+    let lhs_candidate = solve_comparison_word(op, lhs, rhs, &ComparisonOperand::Lhs, target_true);
+    let rhs_candidate = solve_comparison_word(op, lhs, rhs, &ComparisonOperand::Rhs, target_true);
+    match (lhs_candidate, rhs_candidate) {
+        (Some(_), None) => ComparisonOperand::Lhs,
+        (None, Some(_)) => ComparisonOperand::Rhs,
+        _ => ComparisonOperand::Lhs,
+    }
+}
+
+fn solve_comparison_word(
+    op: u8,
+    lhs: U256,
+    rhs: U256,
+    tainted_operand: &ComparisonOperand,
+    target_true: bool,
+) -> Option<U256> {
+    match tainted_operand {
+        ComparisonOperand::Lhs => solve_lhs_comparison(op, rhs, target_true),
+        ComparisonOperand::Rhs => solve_rhs_comparison(op, lhs, target_true),
+        ComparisonOperand::Unknown => None,
+    }
+}
+
+fn solve_lhs_comparison(op: u8, rhs: U256, target_true: bool) -> Option<U256> {
+    match (op, target_true) {
+        (0x10 | 0x12, true) => rhs.checked_sub(U256::from(1)),
+        (0x10 | 0x12, false) => Some(rhs),
+        (0x11 | 0x13, true) => rhs.checked_add(U256::from(1)),
+        (0x11 | 0x13, false) => Some(rhs),
+        (0x14, true) => Some(rhs),
+        (0x14, false) => perturb(rhs),
+        _ => None,
+    }
+}
+
+fn solve_rhs_comparison(op: u8, lhs: U256, target_true: bool) -> Option<U256> {
+    match (op, target_true) {
+        (0x10 | 0x12, true) => lhs.checked_add(U256::from(1)),
+        (0x10 | 0x12, false) => Some(lhs),
+        (0x11 | 0x13, true) => lhs.checked_sub(U256::from(1)),
+        (0x11 | 0x13, false) => Some(lhs),
+        (0x14, true) => Some(lhs),
+        (0x14, false) => perturb(lhs),
+        _ => None,
+    }
+}
+
+fn perturb(value: U256) -> Option<U256> {
+    value
+        .checked_add(U256::from(1))
+        .or_else(|| value.checked_sub(U256::from(1)))
+}
+
+fn solve_arithmetic_boundary(op: u8, lhs: U256, rhs: U256, third: Option<U256>) -> Option<U256> {
+    match op {
+        0x01 => U256::MAX.checked_sub(rhs).and_then(perturb),
+        0x02 if rhs > U256::from(1) => Some(U256::MAX / rhs + U256::from(1)),
+        0x03 => Some(rhs.checked_sub(U256::from(1)).unwrap_or(U256::ZERO)),
+        0x04 | 0x05 => Some(
+            rhs.saturating_mul(U256::from(2))
+                .saturating_add(U256::from(1)),
+        ),
+        0x08 | 0x09 => third.filter(|n| !n.is_zero()),
+        _ => Some(lhs),
+    }
+}
+
+fn strategy_rank(strategy: &ConcolicStrategy) -> u8 {
+    match strategy {
+        ConcolicStrategy::FlipBranch { .. } => 0,
+        ConcolicStrategy::FlipComparison { .. } => 1,
+        ConcolicStrategy::ArithmeticBoundary { .. } => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn solves_false_eq_into_matching_calldata_word() {
+        let waypoint = Waypoint::Comparison {
+            op: 0x14,
+            lhs: U256::from(7),
+            rhs: U256::from(42),
+            pc: 11,
+            calldata_offset: None,
+            condition: false,
+            hit: false,
+            taint_source: Some(TaintSource::Calldata(4)),
+            tainted_operand: ComparisonOperand::Lhs,
+        };
+
+        let hint = ConcolicSolver::new()
+            .solve_hint(0, &waypoint)
+            .expect("hint");
+        assert_eq!(hint.tx_index, 0);
+        assert_eq!(hint.calldata_offset, 4);
+        assert_eq!(U256::from_be_bytes(hint.word), U256::from(42));
     }
 
-    fn u256_to_bv(&self, val: &U256) -> Option<BV<'a>> {
-        let hex_str = format!("0x{:x}", val);
-        BV::from_str(self.ctx, 256, &hex_str)
-    }
+    #[test]
+    fn storage_taint_targets_originating_transaction() {
+        let waypoint = Waypoint::Comparison {
+            op: 0x10,
+            lhs: U256::from(100),
+            rhs: U256::from(10),
+            pc: 99,
+            calldata_offset: None,
+            condition: false,
+            hit: false,
+            taint_source: Some(TaintSource::Storage(1, 36)),
+            tainted_operand: ComparisonOperand::Lhs,
+        };
 
-    fn get_solution(&self, solver: Solver<'a>, var: BV<'a>) -> Option<[u8; 32]> {
-        if solver.check() == SatResult::Sat {
-            let model = solver.get_model()?;
-            let solution = model.eval(&var, true)?;
-
-            // Format to 64-char hex string (32 bytes)
-            let bit_string = format!("{:x}", solution);
-            let stripped = bit_string.trim_start_matches("0x");
-            let mut decoded = hex::decode(format!("{:0>64}", stripped)).ok()?;
-
-            if decoded.len() == 32 {
-                let mut res = [0u8; 32];
-                res.copy_from_slice(&decoded);
-                return Some(res);
-            }
-        }
-        None
+        let hint = ConcolicSolver::new()
+            .solve_hint(3, &waypoint)
+            .expect("hint");
+        assert_eq!(hint.tx_index, 1);
+        assert_eq!(hint.calldata_offset, 36);
+        assert_eq!(U256::from_be_bytes(hint.word), U256::from(9));
     }
 }

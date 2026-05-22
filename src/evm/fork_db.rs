@@ -3,13 +3,55 @@ use revm::database::CacheDB;
 use revm::database_interface::{DBErrorMarker, DatabaseRef};
 use revm::primitives::{Address, StorageKey, StorageValue, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
 pub type EvmCacheDb = CacheDB<ForkDb>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForkDbCacheSnapshot {
+    pub block_tag: String,
+    pub accounts: Vec<ForkAccountCacheEntry>,
+    pub code_by_hash: Vec<ForkCodeCacheEntry>,
+    pub storage: Vec<ForkStorageCacheEntry>,
+    pub block_hashes: Vec<ForkBlockHashCacheEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForkAccountCacheEntry {
+    pub address: Address,
+    pub info: Option<ForkAccountInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForkAccountInfo {
+    pub balance: U256,
+    pub nonce: u64,
+    pub code_hash: B256,
+    pub code: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForkCodeCacheEntry {
+    pub code_hash: B256,
+    pub code: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForkStorageCacheEntry {
+    pub address: Address,
+    pub slot: StorageKey,
+    pub value: StorageValue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForkBlockHashCacheEntry {
+    pub number: u64,
+    pub hash: B256,
+}
 
 #[derive(Debug)]
 pub enum ForkDbError {
@@ -81,6 +123,100 @@ impl ForkDb {
         }
     }
 
+    pub fn from_cache_snapshot(snapshot: ForkDbCacheSnapshot) -> Self {
+        let db = Self::new_offline(snapshot.block_tag);
+
+        {
+            let mut accounts = db.inner.accounts.lock();
+            for entry in snapshot.accounts {
+                let info = entry.info.map(ForkAccountInfo::into_account_info);
+                accounts.insert(entry.address, info);
+            }
+        }
+
+        {
+            let mut code_by_hash = db.inner.code_by_hash.lock();
+            for entry in snapshot.code_by_hash {
+                code_by_hash.insert(entry.code_hash, Bytecode::new_raw(entry.code.into()));
+            }
+        }
+
+        {
+            let mut storage = db.inner.storage.lock();
+            for entry in snapshot.storage {
+                storage.insert((entry.address, entry.slot), entry.value);
+            }
+        }
+
+        {
+            let mut block_hashes = db.inner.block_hashes.lock();
+            for entry in snapshot.block_hashes {
+                block_hashes.insert(entry.number, entry.hash);
+            }
+        }
+
+        db
+    }
+
+    pub fn cache_snapshot(&self) -> ForkDbCacheSnapshot {
+        let mut accounts: Vec<_> = self
+            .inner
+            .accounts
+            .lock()
+            .iter()
+            .map(|(address, info)| ForkAccountCacheEntry {
+                address: *address,
+                info: info.as_ref().map(ForkAccountInfo::from_account_info),
+            })
+            .collect();
+        accounts.sort_by_key(|entry| entry.address);
+
+        let mut code_by_hash: Vec<_> = self
+            .inner
+            .code_by_hash
+            .lock()
+            .iter()
+            .map(|(code_hash, code)| ForkCodeCacheEntry {
+                code_hash: *code_hash,
+                code: code.original_byte_slice().to_vec(),
+            })
+            .collect();
+        code_by_hash.sort_by_key(|entry| entry.code_hash);
+
+        let mut storage: Vec<_> = self
+            .inner
+            .storage
+            .lock()
+            .iter()
+            .map(|((address, slot), value)| ForkStorageCacheEntry {
+                address: *address,
+                slot: *slot,
+                value: *value,
+            })
+            .collect();
+        storage.sort_by_key(|entry| (entry.address, entry.slot));
+
+        let mut block_hashes: Vec<_> = self
+            .inner
+            .block_hashes
+            .lock()
+            .iter()
+            .map(|(number, hash)| ForkBlockHashCacheEntry {
+                number: *number,
+                hash: *hash,
+            })
+            .collect();
+        block_hashes.sort_by_key(|entry| entry.number);
+
+        ForkDbCacheSnapshot {
+            block_tag: self.inner.block_tag.clone(),
+            accounts,
+            code_by_hash,
+            storage,
+            block_hashes,
+        }
+    }
+
     pub fn cache_account(&self, address: Address, info: AccountInfo) {
         if let Some(code) = &info.code {
             self.inner
@@ -132,6 +268,30 @@ impl ForkDb {
     fn blocking_client(&self) -> &'static reqwest::blocking::Client {
         static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
         CLIENT.get_or_init(reqwest::blocking::Client::new)
+    }
+}
+
+impl ForkAccountInfo {
+    fn from_account_info(info: &AccountInfo) -> Self {
+        Self {
+            balance: info.balance,
+            nonce: info.nonce,
+            code_hash: info.code_hash,
+            code: info
+                .code
+                .as_ref()
+                .map(|code| code.original_byte_slice().to_vec())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn into_account_info(self) -> AccountInfo {
+        AccountInfo::new(
+            self.balance,
+            self.nonce,
+            self.code_hash,
+            Bytecode::new_raw(self.code.into()),
+        )
     }
 }
 

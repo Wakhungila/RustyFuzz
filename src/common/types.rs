@@ -38,6 +38,10 @@ pub struct TxExecutionResult {
     pub output: Vec<u8>,
     pub coverage_hash: u64,
     pub coverage_edges: usize,
+    pub storage_reads: Vec<StorageAccess>,
+    pub storage_writes: Vec<StorageAccess>,
+    pub storage_diffs: Vec<StorageDiff>,
+    pub call_trace: Vec<CallObservation>,
     pub waypoints: Vec<Waypoint>,
 }
 
@@ -46,6 +50,73 @@ pub struct SequenceExecutionResult {
     pub tx_results: Vec<TxExecutionResult>,
     pub total_gas_used: u64,
     pub final_coverage_hash: u64,
+    pub storage_reads: Vec<StorageAccess>,
+    pub storage_writes: Vec<StorageAccess>,
+    pub storage_diffs: Vec<StorageDiff>,
+    pub call_trace: Vec<CallObservation>,
+    pub oracle_observations: Vec<OracleObservation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct StorageAccess {
+    pub tx_index: usize,
+    pub address: Address,
+    pub slot: B256,
+    pub value: Option<U256>,
+    pub pc: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct StorageDiff {
+    pub tx_index: usize,
+    pub address: Address,
+    pub slot: B256,
+    pub old_value: U256,
+    pub new_value: U256,
+    pub pc: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct CallObservation {
+    pub tx_index: usize,
+    pub depth: usize,
+    pub caller: Address,
+    pub target: Address,
+    pub value: U256,
+    pub input: Vec<u8>,
+    pub output: Vec<u8>,
+    pub gas_limit: u64,
+    pub gas_used: u64,
+    pub success: bool,
+    pub kind: CallKind,
+    pub phase: CallPhase,
+    pub created_address: Option<Address>,
+    pub result: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum CallKind {
+    Transaction,
+    Call,
+    CallCode,
+    DelegateCall,
+    StaticCall,
+    Create,
+    Create2,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum CallPhase {
+    Start,
+    End,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct OracleObservation {
+    pub oracle: String,
+    pub finding: String,
+    pub tx_index: Option<usize>,
+    pub evidence: String,
 }
 
 #[derive(Clone)]
@@ -66,6 +137,13 @@ pub enum TaintSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum ComparisonOperand {
+    Lhs,
+    Rhs,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Waypoint {
     Dataflow {
         address: Address,
@@ -81,12 +159,43 @@ pub enum Waypoint {
         condition: bool,
         hit: bool,
         taint_source: Option<TaintSource>,
+        tainted_operand: ComparisonOperand,
     },
     StaticCall {
         caller: Address,
         target: Address,
         data: Vec<u8>,
         output: Vec<u8>,
+    },
+    CallTrace {
+        tx_idx: usize,
+        depth: usize,
+        caller: Address,
+        target: Address,
+        value: U256,
+        input: Vec<u8>,
+        output: Vec<u8>,
+        gas_limit: u64,
+        gas_used: u64,
+        success: bool,
+        kind: CallKind,
+        phase: CallPhase,
+        result: Option<String>,
+    },
+    CreateTrace {
+        tx_idx: usize,
+        depth: usize,
+        creator: Address,
+        created_address: Option<Address>,
+        value: U256,
+        init_code: Vec<u8>,
+        deployed_code: Vec<u8>,
+        gas_limit: u64,
+        gas_used: u64,
+        success: bool,
+        kind: CallKind,
+        phase: CallPhase,
+        result: Option<String>,
     },
     Arithmetic {
         op: u8,
