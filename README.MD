@@ -1,105 +1,314 @@
 # RustyFuzz
 
-RustyFuzz is a state-of-the-art, coverage-guided fuzzer optimized for deep-state exploration of the Ethereum Virtual Machine (EVM) and the Solana Virtual Machine (SVM). Built on the `revm` and `mollusk-svm` engines, it implements causal scheduling and taint-guided concolic execution to identify complex logical and economic vulnerabilities.
+RustyFuzz is a stateful EVM fuzzing foundation for protocol-security research. It is built around deterministic transaction-sequence execution, fork-aware state replay, real coverage feedback, protocol oracle evidence, and reproducible crash reporting.
 
-## Technical Architecture
+The current priority is not breadth of speculative features. The core path is:
 
-### Core Engine
-The engine utilizes a custom implementation of `revm::Inspector` for real-time trace analysis.
-*   **Execution**: Leverages `revm` for high-throughput transaction processing.
-*   **Coverage**: Implements edge hashing (prev_pc XOR curr_pc) via a 64KB bit-vector to track unique execution paths.
-*   **Causal Tracking**: Monitors SLOAD/SSTORE operations to establish dataflow dependencies between storage slots and transaction inputs.
+```text
+EvmInput
+  -> ABI/sequence mutator
+  -> deterministic revm executor
+  -> canonical SequenceExecutionResult
+  -> coverage + state novelty + protocol oracles + concolic hints
+  -> campaign scorer
+  -> custom LibAFL scheduler
+  -> persistent corpus / replay / minimization / Foundry PoC
+```
 
-### Causal State Management
-Unlike linear fuzzers, RustyFuzz maintains a non-linear state tree.
-*   **Snapshot Corpus**: Stores complete EVM state snapshots (including `CacheDB`) as nodes in a tree, allowing the fuzzer to branch from any historical state.
-*   **Power Scheduling**: Selects snapshots for mutation based on a coverage-weighted algorithm, prioritizing branches that exhibit high code coverage or frequent interaction with "hot" storage slots.
-*   **Minimization**: Features a dual-stage minimizer that reduces transaction sequences to the minimal set required to trigger a specific vulnerability (delta debugging) and prunes the corpus of redundant coverage bits.
+## Current Capabilities
 
-### Advanced Mutation Strategies
-The `EvmMutator` implements several high-fidelity mutation types:
-*   **Structural**: Appends or modifies transaction sequences to explore multi-step exploit vectors.
-*   **ABI-Aware**: Decodes calldata using provided function selectors and applies type-specific mutations (e.g., boundary values for `uint256`, address randomization, array resizing).
-*   **Anchor-Aware (SVM)**: Identifies and mutates 8-byte instruction discriminators and Borsh-serialized account data.
-*   **Semantic**: Randomizes callers and account signers to discover unauthorized access vulnerabilities.
-*   **Discovery**: Automatically targets contracts discovered within the EVM state during execution.
+### EVM Execution
 
-### Taint-Guided Concolic Solving
-Integrated Z3 support enables solving for complex branch constraints.
-*   **Taint Propagation**: Tracks calldata provenance through the EVM stack during execution.
-*   **Waypoint Capture**: Records comparison operations (LT, GT, EQ) and their symbolic counterparts.
-*   **Hint Generation**: Utilizes the Z3 SMT solver to generate precise calldata bytes that satisfy branch conditions, bypassing "magic number" checks.
+- Uses one coherent `revm` stack.
+- Executes real EVM transactions against mutable `CacheDB` state.
+- Supports multi-transaction sequences.
+- Tracks gas, status, output, coverage, storage reads/writes, storage diffs, and nested call/create traces.
+- Separates runtime state from serialized corpus metadata.
 
-### Hardware-Backed Security (SGX)
-RustyFuzz supports execution within Intel SGX enclaves using `sgx_tstd`.
-*   **Confidential Execution**: Keeps the execution state, inspector logic, and discovered coverage data encrypted in memory to prevent leakage on host systems.
-*   **Attestation**: Generates hardware-backed reports (EREPORT) that bind a discovered exploit to the enclave's MRENCLAVE identity, providing cryptographic proof of a vulnerability finding.
+### Canonical Execution Artifact
 
-## Vulnerability Oracles
+Execution produces `SequenceExecutionResult`, which is the shared artifact between executor, feedback, corpus, minimizer, oracles, reporting, and PoC generation.
 
-RustyFuzz implements high-fidelity oracles for detecting sophisticated DeFi exploits:
-*   **Read-Only Reentrancy**: Detects temporal inconsistencies by monitoring `STATICCALL` output changes within a single execution sequence.
-*   **Economic Profit Oracle**: Tracks fuzzer-controlled balance mappings (ETH and ERC20 storage slots) to identify unauthorized value extraction.
-*   **Reentrancy Oracle**: Identifies state-change violations where storage is modified at call depths greater than the entry point.
-*   **Systemic State Corruption**: Heuristic detection of "god-mode" exploits that modify a disproportionate amount of contract state.
-*   **Solvency and Invariants**: Pluggable modules for monitoring protocol-specific invariants like total assets vs. liabilities.
+It contains:
 
-## Implementation Status
+- per-transaction execution results,
+- total gas and coverage hash,
+- storage read/write sets,
+- storage diffs,
+- nested call/create trace,
+- oracle observations,
+- waypoint evidence for concolic and dataflow use.
 
-| Component | Status | Description |
-| :--- | :--- | :--- |
-| EVM Execution | Production | Full Cancun spec support via `revm`. |
-| Causal Inspector | Production | Taint tracking and storage read/write sets. |
-| Snapshot Corpus | Production | Tree-based state exploration with power scheduling. |
-| ABI Mutator | Production | Support for `alloy-dyn-abi` types. |
-| Concolic Solver | Beta | Z3 integration (requires `z3` feature). |
-| SGX Executor | Alpha | Hardware-backed execution and sealing. |
-| SVM Support | Beta | Integration with `mollusk-svm` for Solana. |
-| SVM Differential | Beta | Parallel comparison of Mollusk execution with live RPC simulation. |
+### Fork State and Replay
 
-## Setup and Build
+RustyFuzz has a fork database layer with lazy RPC-backed account, code, balance, nonce, storage, and block-hash loading. Loaded fork state can be cached and persisted so replay can use deterministic cached state rather than live RPC.
 
-### Prerequisites
-*   **Rust**: Stable toolchain (1.75+).
-*   **Z3**: Required for concolic solver features (`libz3-dev` on Linux).
-*   **SGX SDK**: Required for hardware-backed execution features.
+Persistent corpus support includes:
 
-### Installation
+- replayable input JSON,
+- deterministic input IDs,
+- crash metadata,
+- fork cache manifests,
+- reproduction reports,
+- replay verifier integration.
+
+### Coverage and Feedback
+
+The EVM feedback path is no longer fake-positive.
+
+Current feedback signals include:
+
+- AFL-style edge coverage with hitcount bucketing,
+- stable path hashing,
+- state novelty over storage transitions, slots, reads, call edges, and contracts,
+- protocol-oracle findings,
+- expression-backed branch frontier pressure,
+- economic and invariant pressure.
+
+### Campaign Scheduling
+
+RustyFuzz uses a custom LibAFL scheduler instead of relying only on bitmap-side reward projection.
+
+Corpus entries are prioritized by `CampaignScore`, including:
+
+- economic pressure,
+- invariant pressure,
+- oracle severity,
+- state novelty,
+- exploration depth,
+- branch-frontier pressure,
+- scheduling decay after repeated selection.
+
+The bitmap bridge still exists as a secondary signal, but campaign economics now live in the scheduler where they belong.
+
+### ABI-Aware Mutation
+
+The mutator supports:
+
+- ABI-valid sequence insertion,
+- ABI argument mutation through `alloy-dyn-abi`,
+- target discovery mutation,
+- caller mutation,
+- semantic sequence chaining,
+- value-boundary mutation,
+- flashloan-style wrapping,
+- MEV sandwich pressure,
+- oracle-pressure calls,
+- mutation provenance tracking.
+
+Concolic hints are applied as ABI words when possible and can extend short calldata instead of dropping solvable sequence constraints.
+
+### Concolic and Expression Solving
+
+RustyFuzz now has deterministic taint-guided expression solving without requiring the core build to depend on Z3.
+
+The engine tracks symbolic expressions through:
+
+- calldata,
+- memory,
+- arithmetic,
+- bitwise operations,
+- storage writes,
+- storage reads across transaction sequences,
+- SHA3/mapping derivations.
+
+Supported expression inversion currently covers practical single-source forms:
+
+- `arg + c`,
+- `arg - c`,
+- `arg * c` when divisible,
+- `arg / c`,
+- `arg % c` when satisfiable,
+- `arg ^ c`,
+- direct calldata/storage comparisons,
+- branch-path inversion.
+
+This is not full symbolic execution. It is a bounded, deterministic concolic assist designed to feed the mutator with high-value calldata words.
+
+### Foundry Harness and PoC Support
+
+RustyFuzz can ingest Foundry invariant harness metadata and use it to populate selectors and campaign context.
+
+Crash minimization can emit Foundry PoC scaffolds that:
+
+- replay exact transaction sequences,
+- select the requested fork block,
+- embed calldata and callers,
+- assert replay status,
+- assert protocol evidence where available,
+- assert storage diffs from oracle evidence,
+- expose an `assertRustyFuzzInvariant` extension point.
+
+### Protocol Oracle Packs
+
+Protocol oracle packs currently cover evidence patterns for:
+
+- ERC20 accounting and allowance behavior,
+- ERC4626 inflation and rounding behavior,
+- AMM reserve/asymmetry behavior,
+- lending accounting desynchronization and liquidation paths,
+- governance/timelock takeover patterns.
+
+These are evidence-driven oracle packs, not replacements for protocol-specific human invariants. They are intended to focus campaigns and generate reproducible triage artifacts.
+
+## Experimental or Limited Areas
+
+These areas compile or have scaffolding, but should not be treated as equivalent to the EVM core:
+
+- SVM support is separate and not part of the hardened EVM campaign path.
+- SGX support is feature-gated and experimental.
+- LLM guidance is intentionally inert unless a real integration is added.
+- Z3 remains optional; the current core concolic path is deterministic and internal.
+- Full symbolic execution, dynamic-array constraint solving, keccak preimage solving, and protocol-specific exploit synthesis remain future work.
+
+## Build
+
+Default EVM build:
+
 ```bash
-git clone git@github.com:Wakhungila/RustyFuzz.git
-cd RustyFuzz
+cargo build
 ```
 
-### Compilation
-Standard build:
+Run the full validation set:
+
 ```bash
-cargo build --release
+cargo fmt
+cargo check
+cargo build
+cargo test
+cargo clippy -- -D warnings
 ```
 
-Build with concolic solving and AI-guidance:
+Optional Z3 feature check:
+
 ```bash
-cargo build --release --features "z3 llm"
+cargo check --features z3
 ```
 
-## Usage
+SVM is intentionally separate:
 
-RustyFuzz expects a configuration specifying the target environment and initial state forking.
-
-```rust
-use rusty_fuzz::config::Config;
-use rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let config = Config {
-        rpc_url: "https://eth-mainnet.g.alchemy.com/v2/...".to_string(),
-        fork_block: Some(19000000),
-        ..Default::default()
-    };
-
-    run_fuzz_campaign(&config).await
-}
+```bash
+cargo build --features svm --no-default-features
 ```
+
+## Configuration
+
+The binary expects `config.toml` in the project root.
+
+Minimal EVM configuration:
+
+```toml
+rpc_url = "http://localhost:8545"
+fork_block = 19000000
+chain = "evm"
+target_contract = "0x0000000000000000000000000000000000000000"
+timeout_secs = 3600
+corpus_dir = "corpus"
+report_dir = "reports"
+llm_enabled = false
+foundry_project = "."
+```
+
+Run a fuzz campaign:
+
+```bash
+cargo run -- fuzz --chain evm --contract 0xTarget
+```
+
+Seed a campaign from mainnet fork history:
+
+```bash
+cargo run -- seed --target 0xTarget --max-seeds 32 --bundle-id target-mainnet
+```
+
+Replay a persisted input against cached fork state:
+
+```bash
+cargo run -- replay --input-id <input-id> --fork-cache-id <cache-id>
+```
+
+Compare cached replay against live RPC-backed fork reads:
+
+```bash
+cargo run -- replay --input-id <input-id> --fork-cache-id <cache-id> --live
+```
+
+Minimize a persisted crashing/finding input and emit a Foundry PoC:
+
+```bash
+cargo run -- minimize --input-id <input-id> --fork-cache-id <cache-id> --reason protocol-finding
+```
+
+Write a reproduction report for a persisted input:
+
+```bash
+cargo run -- report --input-id <input-id> --fork-cache-id <cache-id>
+```
+
+Scan mempool:
+
+```bash
+cargo run -- scan-mempool
+```
+
+## Repository Map
+
+```text
+src/common/types.rs              canonical input, execution, trace, symbolic, and oracle types
+src/common/oracle/               legacy and protocol oracle logic
+src/common/oracle/packs.rs       ERC20/ERC4626/AMM/lending/governance oracle packs
+src/common/verifier.rs           deterministic replay verification
+src/engine/fuzz_engine.rs        main LibAFL campaign orchestration
+src/engine/scheduler.rs          campaign-aware LibAFL scheduler
+src/engine/scoring.rs            economic/invariant/state/frontier campaign scoring
+src/engine/concolic.rs           deterministic expression hint solver
+src/engine/minimizer.rs          sequence minimization and crash artifact generation
+src/engine/exploit_synthesizer.rs Foundry PoC generation
+src/engine/foundry_ingest.rs     Foundry invariant harness ingestion
+src/evm/executor.rs              deterministic revm execution
+src/evm/inspector.rs             unified coverage/dataflow/trace/concolic instrumentation
+src/evm/feedback.rs              coverage and state novelty feedback
+src/evm/fork_db.rs               lazy RPC fork database and cache persistence
+src/evm/corpus.rs                persistent corpus, crash metadata, replay artifacts
+src/evm/fuzz.rs                  structured EVM input and mutation engine
+src/evm/seed_ingester.rs         mainnet seed normalization and discovery
+src/svm/                         separated SVM surface
+tests/benchmarks.rs              regression and integration coverage
+```
+
+## What To Do Next
+
+The next highest-impact engineering work is:
+
+1. Promote CLI campaign commands into a polished operator workflow.
+   - Add structured output, dry-run modes, explicit fork-cache IDs, and CI-friendly exit codes.
+
+2. Deepen solver-backed sequence synthesis.
+   - Move beyond cloning patched transactions and synthesize setup/action/assertion sequences from branch-frontier evidence.
+
+3. Expand ABI-aware dynamic type placement.
+   - Fully repair offset tables for dynamic arrays, bytes, strings, and nested tuples when applying concolic hints.
+
+4. Generate stronger protocol-specific invariants.
+   - Convert ERC4626, AMM, lending, and governance oracle evidence into replay assertions that verify semantic deltas, not only storage reproduction.
+
+5. Use persisted frontier metadata in scheduling and minimization.
+   - Corpus entries now store branch-distance, expression, mapping, and oracle-frontier summaries; the next step is to consume them for energy assignment and crash shrinking.
+
+6. Harden cached-vs-live differential replay.
+   - Add richer diff reports for gas, output, storage diffs, call traces, and fork-cache misses.
+
+7. Keep SVM separate.
+   - Stabilize it as its own execution target after the EVM campaign loop is complete.
+
+## Engineering Position
+
+RustyFuzz is now a coherent EVM fuzzing foundation with real execution, coverage, state novelty, fork caching, protocol evidence, concolic assists, custom scheduling, replay, minimization, and Foundry PoC generation.
+
+It is not honest to claim a fixed success rate against hardened protocols. Finding high-impact bugs in mature systems still depends on target modeling, harness quality, seed quality, invariants, fork state, oracle precision, and researcher judgment.
+
+The goal of this codebase is to make those inputs compound instead of fighting a broken runtime.
 
 ## License
-Distributed under the MIT License.
+
+MIT.

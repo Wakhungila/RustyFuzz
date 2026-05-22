@@ -1,8 +1,18 @@
+use alloy::providers::ProviderBuilder;
 use clap::Parser;
+use revm::database::CacheDB;
 use revm::primitives::Address;
 use rusty_fuzz::chain::mempool::MempoolScanner;
+use rusty_fuzz::common::oracle::{ProtocolOraclePack, ReentrancyOracle, VulnType};
+use rusty_fuzz::common::verifier::ReplayVerifier;
 use rusty_fuzz::config::Config;
 use rusty_fuzz::engine::foundry_ingest::FoundryHarnessManifest;
+use rusty_fuzz::engine::minimizer::Minimizer;
+use rusty_fuzz::evm::corpus::PersistentCorpus;
+use rusty_fuzz::evm::executor::EvmExecutor;
+use rusty_fuzz::evm::fork::create_fork_block_env;
+use rusty_fuzz::evm::fork_db::ForkDb;
+use rusty_fuzz::evm::seed_ingester::{MainnetSeedConfig, SeedIngester};
 use std::str::FromStr;
 
 #[derive(Parser, Debug)]
@@ -19,6 +29,38 @@ enum Command {
         chain: Option<String>,
         #[arg(long)]
         contract: Option<String>,
+    },
+    Seed {
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, default_value_t = 32)]
+        max_seeds: usize,
+        #[arg(long, default_value = "default")]
+        bundle_id: String,
+    },
+    Replay {
+        #[arg(long)]
+        input_id: String,
+        #[arg(long)]
+        fork_cache_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        live: bool,
+    },
+    Minimize {
+        #[arg(long)]
+        input_id: String,
+        #[arg(long)]
+        fork_cache_id: Option<String>,
+        #[arg(long, default_value = "cli-minimize")]
+        reason: String,
+    },
+    Report {
+        #[arg(long)]
+        input_id: String,
+        #[arg(long)]
+        fork_cache_id: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
     },
     ScanMempool,
 }
@@ -54,6 +96,133 @@ async fn main() -> anyhow::Result<()> {
             };
             rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await?;
         }
+        Command::Seed {
+            target,
+            max_seeds,
+            bundle_id,
+        } => {
+            ensure_evm_chain(&config)?;
+            let target = target_address(target.as_deref(), &config)?;
+            let fork_block = config.fork_block.unwrap_or(0);
+            let url: reqwest::Url = config.rpc_url.parse()?;
+            let provider = ProviderBuilder::new().connect_http(url);
+            let fork_db = ForkDb::new(config.rpc_url.clone(), fork_block);
+            let ingester = SeedIngester::new(provider);
+            let bundle = ingester
+                .ingest_bundle_from_target(
+                    &MainnetSeedConfig::new(fork_block, target, max_seeds),
+                    &fork_db,
+                )
+                .await?;
+            let corpus = PersistentCorpus::new(&config.corpus_dir)?;
+            corpus.persist_mainnet_seed_bundle(&bundle_id, &bundle)?;
+            println!(
+                "Persisted seed bundle `{}`: {} seeds, {} discovered accounts",
+                bundle_id,
+                bundle.seeds.len(),
+                bundle.discovered_accounts.len()
+            );
+        }
+        Command::Replay {
+            input_id,
+            fork_cache_id,
+            live,
+        } => {
+            ensure_evm_chain(&config)?;
+            let fork_cache_id = fork_cache_id.unwrap_or_else(|| input_id.clone());
+            let corpus = PersistentCorpus::new(&config.corpus_dir)?;
+            let block_env = campaign_block_env(&config).await?;
+            let verifier = ReplayVerifier::new(65_536);
+            let execution = if live {
+                let input = corpus.load_input(&input_id)?;
+                let (execution, report) = verifier.compare_cached_vs_live(
+                    corpus.load_offline_fork_db(&fork_cache_id)?,
+                    ForkDb::new(config.rpc_url.clone(), config.fork_block.unwrap_or(0)),
+                    &block_env,
+                    &input,
+                )?;
+                println!("Differential replay report: {report:?}");
+                anyhow::ensure!(report.equivalent, "cached-vs-live replay mismatch");
+                execution
+            } else {
+                verifier.verify_persisted_input(&corpus, &input_id, &fork_cache_id, &block_env)?
+            };
+            println!(
+                "Replay ok: txs={}, gas={}, coverage_hash={}",
+                execution.tx_results.len(),
+                execution.total_gas_used,
+                execution.final_coverage_hash
+            );
+        }
+        Command::Minimize {
+            input_id,
+            fork_cache_id,
+            reason,
+        } => {
+            ensure_evm_chain(&config)?;
+            let fork_cache_id = fork_cache_id.unwrap_or_else(|| input_id.clone());
+            let corpus = PersistentCorpus::new(&config.corpus_dir)?;
+            let input = corpus.load_input(&input_id)?;
+            let block_env = campaign_block_env(&config).await?;
+            let db = CacheDB::new(corpus.load_offline_fork_db(&fork_cache_id)?);
+            let executor = EvmExecutor::new();
+            let oracle = ReentrancyOracle;
+            let minimizer = Minimizer::new(&executor, &oracle, db, block_env);
+            let artifact = minimizer.minimize_crash_to_foundry_poc(
+                &input,
+                &corpus,
+                std::path::Path::new(&config.report_dir),
+                &VulnType::Other(reason.clone()),
+                &config.rpc_url,
+                config.fork_block.unwrap_or(0),
+                &reason,
+                |execution| {
+                    !ProtocolOraclePack::default().evaluate(execution).is_empty()
+                        || execution.tx_results.iter().any(|result| {
+                            !matches!(
+                                result.status,
+                                rusty_fuzz::common::types::ExecutionStatus::Success
+                            )
+                        })
+                },
+            )?;
+            println!(
+                "Minimized {} -> {} txs; report={}, foundry_poc={}",
+                artifact.original_tx_count,
+                artifact.minimized_tx_count,
+                artifact.reproduction_report.display(),
+                artifact.foundry_poc.display()
+            );
+        }
+        Command::Report {
+            input_id,
+            fork_cache_id,
+            reason,
+        } => {
+            ensure_evm_chain(&config)?;
+            let fork_cache_id = fork_cache_id.unwrap_or_else(|| input_id.clone());
+            let corpus = PersistentCorpus::new(&config.corpus_dir)?;
+            let input = corpus.load_input(&input_id)?;
+            let block_env = campaign_block_env(&config).await?;
+            let execution = ReplayVerifier::new(65_536).verify_persisted_input(
+                &corpus,
+                &input_id,
+                &fork_cache_id,
+                &block_env,
+            )?;
+            let metadata = corpus.persist_execution_input(
+                &input,
+                &execution,
+                &execution_coverage_material(&execution),
+                0,
+            )?;
+            let crash = match reason {
+                Some(reason) => Some(corpus.persist_crash(&metadata, &reason)?),
+                None => None,
+            };
+            let report = corpus.write_reproduction_report(&input, &execution, crash.as_ref())?;
+            println!("Report written: {}", report.display());
+        }
         Command::ScanMempool => {
             println!("Starting mempool scanner for chain: {}", config.chain);
             let scanner = MempoolScanner::new(config.rpc_url.clone());
@@ -62,4 +231,42 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn ensure_evm_chain(config: &Config) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        config.chain == "evm",
+        "this command targets the EVM campaign path; configured chain is `{}`",
+        config.chain
+    );
+    Ok(())
+}
+
+fn target_address(cli_target: Option<&str>, config: &Config) -> anyhow::Result<Address> {
+    cli_target
+        .or(config.target_contract.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("target contract is required"))
+        .and_then(|target| Address::from_str(target).map_err(Into::into))
+}
+
+async fn campaign_block_env(config: &Config) -> anyhow::Result<revm::context::BlockEnv> {
+    let Some(fork_block) = config.fork_block else {
+        return Ok(Default::default());
+    };
+    create_fork_block_env(&config.rpc_url, fork_block)
+        .await
+        .or_else(|_| Ok(Default::default()))
+}
+
+fn execution_coverage_material(
+    execution: &rusty_fuzz::common::types::SequenceExecutionResult,
+) -> Vec<u8> {
+    let mut material = Vec::with_capacity(execution.tx_results.len() * 8);
+    for result in &execution.tx_results {
+        material.extend_from_slice(&result.coverage_hash.to_be_bytes());
+    }
+    if material.is_empty() {
+        material.extend_from_slice(&execution.final_coverage_hash.to_be_bytes());
+    }
+    material
 }

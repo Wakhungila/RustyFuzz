@@ -5,25 +5,27 @@ use revm::primitives::{Address, U256};
 use revm::state::{AccountInfo, Bytecode};
 use rusty_fuzz::common::oracle::{
     AccessControlOracle, ERC4626InflationOracle, ProtocolOraclePack, ProtocolOraclePackKind,
-    ReentrancyOracle, VulnType, VulnerabilityOracle,
+    ProtocolSeverity, ReentrancyOracle, VulnType, VulnerabilityOracle,
 };
 use rusty_fuzz::common::types::{
     CallKind, CallObservation, CallPhase, ChainState, EvmInput, SequenceExecutionResult,
-    SingletonTx, StorageDiff, Waypoint,
+    SingletonTx, StorageDiff, SymbolicExpression, TaintSource, Waypoint,
 };
 use rusty_fuzz::common::verifier::ReplayVerifier;
+use rusty_fuzz::engine::concolic::ConcolicSolver;
 use rusty_fuzz::engine::exploit_synthesizer::{
     synthesize_foundry_poc, synthesize_foundry_poc_with_findings,
 };
 use rusty_fuzz::engine::minimizer::Minimizer;
-use rusty_fuzz::engine::scoring::CampaignScorer;
-use rusty_fuzz::evm::corpus::PersistentCorpus;
+use rusty_fuzz::engine::scoring::{CampaignScore, CampaignScorer, CampaignScoringConfig};
+use rusty_fuzz::evm::corpus::{CampaignArtifactRequest, PersistentCorpus};
 use rusty_fuzz::evm::dataflow::DataflowRegistry;
 use rusty_fuzz::evm::executor::EvmExecutor;
 use rusty_fuzz::evm::feedback::{
     stable_execution_state_hash, EvmCoverageFeedback, EvmStateNoveltyFeedback,
 };
 use rusty_fuzz::evm::fork_db::ForkDb;
+use rusty_fuzz::evm::registry::GlobalAccountRegistry;
 use rusty_fuzz::evm::seed_ingester::{
     discover_accounts_from_seeds, extract_address_hints, normalize_seeds, MainnetSeed,
     MainnetSeedBundle, SeedMetadata,
@@ -217,6 +219,132 @@ fn storage_read_evidence_contains_exact_sload_value() {
 }
 
 #[test]
+fn concolic_solver_inverts_arithmetic_expression_before_comparison() {
+    let caller = addr(0xa3);
+    let target = addr(0xb3);
+    let mut db = test_db();
+    db.insert_account_info(
+        caller,
+        AccountInfo {
+            balance: U256::from(10u128.pow(30)),
+            ..AccountInfo::default()
+        },
+    );
+    db.insert_account_info(
+        target,
+        AccountInfo::default().with_code(Bytecode::new_raw(
+            vec![
+                0x60, 0x04, // PUSH1 4
+                0x35, // CALLDATALOAD
+                0x60, 0x05, // PUSH1 5
+                0x01, // ADD
+                0x60, 0x2a, // PUSH1 42
+                0x14, // EQ
+                0x00, // STOP
+            ]
+            .into(),
+        )),
+    );
+
+    let mut chain_state = ChainState::Evm(db);
+    let mut block = BlockEnv::default();
+    let tx = SingletonTx {
+        input: vec![0u8; 36],
+        caller,
+        to: target,
+        value: U256::ZERO,
+        is_victim: false,
+    };
+    let mut coverage = vec![0u8; 1024];
+    let mut dataflow = DataflowRegistry::new();
+    let mut waypoints = Vec::new();
+
+    let result = EvmExecutor::new()
+        .execute_with_result(
+            &mut chain_state,
+            &mut block,
+            &tx,
+            &mut coverage,
+            &mut dataflow,
+            &mut waypoints,
+            0,
+        )
+        .expect("execution should succeed");
+
+    let hints = ConcolicSolver::new().solve_hints(result.waypoints.iter().map(|w| (0, w)));
+    assert!(hints
+        .iter()
+        .any(|hint| hint.calldata_offset == 4 && U256::from_be_bytes(hint.word) == U256::from(37)));
+}
+
+#[test]
+fn inspector_captures_mapping_key_expression_from_sha3_memory() {
+    let caller = addr(0xa4);
+    let target = addr(0xb4);
+    let mut db = test_db();
+    db.insert_account_info(
+        caller,
+        AccountInfo {
+            balance: U256::from(10u128.pow(30)),
+            ..AccountInfo::default()
+        },
+    );
+    db.insert_account_info(
+        target,
+        AccountInfo::default().with_code(Bytecode::new_raw(
+            vec![
+                0x60, 0x04, // PUSH1 4
+                0x35, // CALLDATALOAD
+                0x60, 0x00, // PUSH1 0
+                0x52, // MSTORE key at memory[0]
+                0x60, 0x05, // PUSH1 5
+                0x60, 0x20, // PUSH1 32
+                0x52, // MSTORE base slot at memory[32]
+                0x60, 0x40, // PUSH1 64
+                0x60, 0x00, // PUSH1 0
+                0x20, // SHA3
+                0x00, // STOP
+            ]
+            .into(),
+        )),
+    );
+
+    let mut chain_state = ChainState::Evm(db);
+    let mut block = BlockEnv::default();
+    let tx = SingletonTx {
+        input: vec![0u8; 36],
+        caller,
+        to: target,
+        value: U256::ZERO,
+        is_victim: false,
+    };
+    let mut coverage = vec![0u8; 1024];
+    let mut dataflow = DataflowRegistry::new();
+    let mut waypoints = Vec::new();
+
+    let result = EvmExecutor::new()
+        .execute_with_result(
+            &mut chain_state,
+            &mut block,
+            &tx,
+            &mut coverage,
+            &mut dataflow,
+            &mut waypoints,
+            0,
+        )
+        .expect("execution should succeed");
+
+    assert!(result.waypoints.iter().any(|waypoint| matches!(
+        waypoint,
+        Waypoint::MappingDerivation {
+            key_expression: Some(SymbolicExpression::Source(TaintSource::Calldata(4))),
+            base_slot_expression: Some(SymbolicExpression::Constant(value)),
+            ..
+        } if *value == U256::from(5)
+    )));
+}
+
+#[test]
 fn coverage_feedback_tracks_bucketed_novelty() {
     let mut feedback = EvmCoverageFeedback::with_map_size(8);
     assert!(!feedback.observe_coverage(&[0; 8]));
@@ -363,6 +491,14 @@ fn campaign_scorer_rewards_economic_and_invariant_pressure() {
         .explanation
         .iter()
         .any(|entry| entry.contains("economic_pressure")));
+
+    let tuned_score = CampaignScorer::new(CampaignScoringConfig {
+        large_delta_weight: 400,
+        economic_finding_weight: 1_200,
+        ..CampaignScoringConfig::default()
+    })
+    .score(&input, &execution, &novelty, &findings);
+    assert!(tuned_score.economic_pressure > score.economic_pressure);
 }
 
 #[test]
@@ -411,6 +547,106 @@ fn corpus_metadata_records_state_novelty_hashes() {
     assert_eq!(metadata.state_hash, stable_execution_state_hash(&execution));
     assert_eq!(metadata.state_novelty_score, 24);
     assert_eq!(metadata.gas_used, execution.total_gas_used);
+}
+
+#[test]
+fn persistent_corpus_writes_campaign_artifact_with_fork_cache() {
+    let root = std::env::temp_dir().join(format!(
+        "rusty_fuzz_campaign_artifact_test_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let corpus = PersistentCorpus::new(&root).expect("corpus init");
+    let caller = addr(0x35);
+    let target = addr(0x36);
+    let input = EvmInput {
+        txs: vec![SingletonTx {
+            input: vec![0xa9, 0x05, 0x9c, 0xbb],
+            caller,
+            to: target,
+            value: U256::ZERO,
+            is_victim: true,
+        }],
+        base_snapshot_id: 0,
+        waypoints: Vec::new(),
+        mutation_provenance: Vec::new(),
+    };
+    let execution = SequenceExecutionResult {
+        tx_results: Vec::new(),
+        total_gas_used: 45_000,
+        final_coverage_hash: 777,
+        storage_reads: Vec::new(),
+        storage_writes: Vec::new(),
+        storage_diffs: vec![StorageDiff {
+            tx_index: 0,
+            address: target,
+            slot: U256::from(1).to_be_bytes::<32>().into(),
+            old_value: U256::ZERO,
+            new_value: U256::from(10),
+            pc: 9,
+        }],
+        call_trace: vec![call(0, target, vec![0xa9, 0x05, 0x9c, 0xbb], true)],
+        oracle_observations: Vec::new(),
+    };
+    let mut fork_state = test_db();
+    fork_state.insert_account_info(
+        target,
+        AccountInfo {
+            balance: U256::from(1),
+            ..AccountInfo::default()
+        },
+    );
+    let score = CampaignScore {
+        total: 1200,
+        economic_pressure: 600,
+        invariant_pressure: 0,
+        oracle_pressure: 100,
+        state_pressure: 24,
+        exploration_pressure: 10,
+        explanation: vec!["economic_pressure".to_string()],
+    };
+    let finding = rusty_fuzz::common::oracle::ProtocolFinding {
+        pack: ProtocolOraclePackKind::Erc20,
+        vuln: VulnType::AccountingDesync,
+        severity: ProtocolSeverity::Medium,
+        tx_index: Some(0),
+        target: Some(target),
+        evidence: "test finding".to_string(),
+    };
+
+    let record = corpus
+        .persist_campaign_artifact(CampaignArtifactRequest {
+            input: &input,
+            execution: &execution,
+            coverage: &[1, 0, 2, 0],
+            state_novelty_score: 24,
+            base_fork_state: &fork_state,
+            score: &score,
+            findings: &[finding],
+            block_number: 19_000_000,
+            target: Some(target),
+            reason: "protocol-oracle-finding",
+        })
+        .expect("persist campaign artifact");
+
+    assert_eq!(record.input_id, record.metadata.id);
+    assert_eq!(record.fork_cache_id, record.metadata.id);
+    assert_eq!(record.findings.len(), 1);
+    assert!(root
+        .join("campaign_artifacts")
+        .join(format!("{}.json", record.input_id))
+        .exists());
+    assert!(root
+        .join("fork_cache")
+        .join(format!("{}.json", record.fork_cache_id))
+        .exists());
+    let offline = corpus
+        .load_offline_fork_db(&record.fork_cache_id)
+        .expect("load offline fork cache");
+    assert!(offline
+        .basic_ref(target)
+        .expect("offline account lookup")
+        .is_some());
 }
 
 #[test]
@@ -617,6 +853,10 @@ fn foundry_poc_generation_embeds_protocol_oracle_assertions() {
     assert!(poc.contains("assertTrue(ok0"));
     assert!(poc.contains("vm.load"));
     assert!(poc.contains("storage diff not reproduced"));
+    assert!(poc.contains("protocol target has no code"));
+    assert!(poc.contains("assertRustyFuzzMarketEvidence"));
+    assert!(poc.contains("rustyFuzzWord"));
+    assert!(poc.contains("market/oracle evidence transaction changed status"));
 }
 
 #[test]
@@ -1232,6 +1472,41 @@ fn protocol_oracle_pack_detects_erc4626_and_lending_findings() {
         finding.pack == ProtocolOraclePackKind::Lending
             && matches!(finding.vuln, VulnType::AccountingDesync)
     }));
+}
+
+#[test]
+fn registry_builds_target_model_from_execution_artifact() {
+    let target = addr(0xe8);
+    let execution = SequenceExecutionResult {
+        tx_results: Vec::new(),
+        total_gas_used: 0,
+        final_coverage_hash: 0,
+        storage_reads: vec![rusty_fuzz::common::types::StorageAccess {
+            tx_index: 0,
+            address: target,
+            slot: U256::from(7).to_be_bytes::<32>().into(),
+            value: Some(U256::from(1)),
+            pc: 10,
+        }],
+        storage_writes: vec![rusty_fuzz::common::types::StorageAccess {
+            tx_index: 0,
+            address: target,
+            slot: U256::from(8).to_be_bytes::<32>().into(),
+            value: Some(U256::from(2)),
+            pc: 20,
+        }],
+        storage_diffs: Vec::new(),
+        call_trace: vec![call(0, target, vec![0xa9, 0x05, 0x9c, 0xbb], true)],
+        oracle_observations: Vec::new(),
+    };
+
+    let mut registry = GlobalAccountRegistry::default();
+    registry.observe_execution(&execution);
+    let model = registry.model_for(&target).expect("target model");
+    assert!(model.observed_selectors.contains(&[0xa9, 0x05, 0x9c, 0xbb]));
+    assert!(model.storage_reads.contains(&U256::from(7)));
+    assert!(model.storage_writes.contains(&U256::from(8)));
+    assert_eq!(model.successful_calls, 1);
 }
 
 fn call(tx_index: usize, target: Address, selector: Vec<u8>, success: bool) -> CallObservation {

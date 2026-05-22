@@ -231,6 +231,14 @@ impl ForkDb {
         self.inner.storage.lock().insert((address, slot), value);
     }
 
+    pub fn cache_code(&self, code_hash: B256, code: Bytecode) {
+        self.inner.code_by_hash.lock().insert(code_hash, code);
+    }
+
+    pub fn cache_block_hash(&self, number: u64, hash: B256) {
+        self.inner.block_hashes.lock().insert(number, hash);
+    }
+
     fn rpc<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T, ForkDbError> {
         let Some(rpc_url) = &self.inner.rpc_url else {
             return Err(ForkDbError::Rpc("offline fork database miss".to_string()));

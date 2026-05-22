@@ -1,9 +1,11 @@
 use crate::common::oracle::ProtocolOraclePack;
-use crate::common::types::{ChainState, EvmInput, SequenceExecutionResult, SingletonTx};
+use crate::common::types::{
+    ChainState, EvmInput, ExecutionStatus, SequenceExecutionResult, SingletonTx,
+};
 use crate::engine::foundry_ingest::FoundryHarnessManifest;
 use crate::engine::scheduler::RustyFuzzScheduler;
 use crate::engine::scoring::{CampaignScore, CampaignScorer};
-use crate::evm::corpus::SnapshotCorpus;
+use crate::evm::corpus::{CampaignArtifactRequest, PersistentCorpus, SnapshotCorpus};
 use crate::evm::dataflow::DataflowRegistry;
 use crate::evm::executor::EvmExecutor;
 use crate::evm::feedback::{EvmCoverageFeedback, EvmStateNoveltyFeedback, StateNoveltyReport};
@@ -98,6 +100,13 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 let mut initial_snapshot_corpus = SnapshotCorpus::new();
                 initial_snapshot_corpus.add_snapshot(0, 0, new_evm_snapshot(0, initial_db.clone()));
                 let snapshot_corpus = Arc::new(RwLock::new(initial_snapshot_corpus));
+                let persistent_corpus =
+                    Arc::new(PersistentCorpus::new(&config.corpus_dir).map_err(|err| {
+                        libafl::Error::unknown(format!(
+                            "failed to initialize persistent corpus `{}`: {err:#}",
+                            config.corpus_dir
+                        ))
+                    })?);
                 let dataflow_registry = Arc::new(RwLock::new(DataflowRegistry::new()));
                 let state_novelty_feedback =
                     Arc::new(RwLock::new(EvmStateNoveltyFeedback::new()));
@@ -171,6 +180,9 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     };
 
                     let mut current_state = base_snap_arc.read().state.read().clone();
+                    let base_fork_state = match &current_state {
+                        ChainState::Evm(db) => db.clone(),
+                    };
                     let mut current_env = initial_env.clone();
                     let mut tx_results = Vec::with_capacity(input.txs.len());
 
@@ -207,6 +219,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     let findings = protocol_oracles.evaluate(&execution);
                     let campaign_score =
                         campaign_scorer.score(input, &execution, &report, &findings);
+                    account_registry.write().observe_execution(&execution);
                     if report.interesting {
                         unsafe {
                             let map_ptr = (COVERAGE_MAP.0).get() as *mut u8;
@@ -240,6 +253,41 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                             campaign_score.explanation.join("; ")
                         );
                     }
+                    if let Some(reason) =
+                        campaign_artifact_reason(&execution, &report, &campaign_score, &findings)
+                    {
+                        let persisted = unsafe {
+                            let map_ptr = (COVERAGE_MAP.0).get() as *mut u8;
+                            let map_slice = std::slice::from_raw_parts(map_ptr, MAP_SIZE);
+                            persistent_corpus.persist_campaign_artifact(CampaignArtifactRequest {
+                                input,
+                                execution: &execution,
+                                coverage: map_slice,
+                                state_novelty_score: report.novelty_score(),
+                                base_fork_state: &base_fork_state,
+                                score: &campaign_score,
+                                findings: &findings,
+                                block_number: config.fork_block,
+                                target: Some(target_contract),
+                                reason,
+                            })
+                        };
+
+                        match persisted {
+                            Ok(record) => log::info!(
+                                "Persisted campaign artifact: input_id={}, fork_cache_id={}, reason={}, score={}, findings={}",
+                                record.input_id,
+                                record.fork_cache_id,
+                                record.reason,
+                                record.score.total,
+                                record.findings.len()
+                            ),
+                            Err(err) => log::error!(
+                                "Failed to persist campaign artifact for target {}: {err:#}",
+                                target_contract
+                            ),
+                        }
+                    }
                     *pending_campaign_score.write() = Some(campaign_score);
                     ExitKind::Ok
                 };
@@ -262,6 +310,31 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
         .launch()?;
 
     Ok(())
+}
+
+fn campaign_artifact_reason<'a>(
+    execution: &SequenceExecutionResult,
+    state_report: &StateNoveltyReport,
+    campaign_score: &CampaignScore,
+    findings: &[crate::common::oracle::ProtocolFinding],
+) -> Option<&'a str> {
+    if execution
+        .tx_results
+        .iter()
+        .any(|result| !matches!(result.status, ExecutionStatus::Success))
+    {
+        return Some("non-success-status");
+    }
+    if !findings.is_empty() {
+        return Some("protocol-oracle-finding");
+    }
+    if campaign_score.economic_pressure > 0 || campaign_score.invariant_pressure > 0 {
+        return Some("economic-or-invariant-pressure");
+    }
+    if state_report.interesting {
+        return Some("state-novelty");
+    }
+    None
 }
 
 fn sequence_result_from_tx_results(

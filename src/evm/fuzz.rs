@@ -81,7 +81,8 @@ where
         let bucket = rand.below(NonZero::new(100).unwrap());
 
         let result = match bucket {
-            0..=14 => self.concolic_mutation(rand, input),
+            0..=6 => self.concolic_mutation(rand, input),
+            7..=14 => self.concolic_sequence_synthesis(rand, input),
             15..=24 => self.structural_mutation(rand, input),
             25..=39 => self.semantic_chaining(rand, input),
             40..=49 => self.caller_mutation(rand, input),
@@ -133,7 +134,7 @@ impl EvmMutator {
                 input
                     .txs
                     .get(hint.tx_index)
-                    .is_some_and(|tx| tx.input.len() >= hint.calldata_offset.saturating_add(32))
+                    .is_some_and(|_| hint.calldata_offset <= 4096)
             })
             .collect();
 
@@ -141,13 +142,24 @@ impl EvmMutator {
             return MutationResult::Skipped;
         };
 
+        let parameter_types = input
+            .txs
+            .get(hint.tx_index)
+            .and_then(|tx| selector_for_calldata(&tx.input))
+            .and_then(|selector| self.abi_registry.functions.get(&selector))
+            .cloned();
+
         if let Some(tx) = input.txs.get_mut(hint.tx_index) {
-            let end = hint.calldata_offset + 32;
-            tx.input[hint.calldata_offset..end].copy_from_slice(&hint.word);
+            let placement = apply_concolic_hint(
+                tx,
+                hint.calldata_offset,
+                &hint.word,
+                parameter_types.as_deref(),
+            );
             let selector = selector_for_calldata(&tx.input);
             let detail = format!(
-                "solved {:?} at pc {} into calldata[{}..{}]",
-                hint.strategy, hint.pc, hint.calldata_offset, end
+                "solved {:?} at pc {} into {}",
+                hint.strategy, hint.pc, placement
             );
             self.record_mutation(
                 input,
@@ -160,6 +172,66 @@ impl EvmMutator {
         }
 
         MutationResult::Skipped
+    }
+
+    fn concolic_sequence_synthesis<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut EvmInput,
+    ) -> MutationResult {
+        if input.waypoints.is_empty() || input.txs.is_empty() {
+            return MutationResult::Skipped;
+        }
+
+        let solver = ConcolicSolver::new();
+        let hints = solver.solve_hints(
+            input
+                .waypoints
+                .iter()
+                .enumerate()
+                .flat_map(|(tx_idx, waypoints)| waypoints.iter().map(move |w| (tx_idx, w))),
+        );
+        let applicable: Vec<_> = hints
+            .iter()
+            .filter(|hint| {
+                input
+                    .txs
+                    .get(hint.tx_index)
+                    .is_some_and(|_| hint.calldata_offset <= 4096)
+            })
+            .collect();
+        let Some(hint) = self.pick_random(rand, &applicable) else {
+            return MutationResult::Skipped;
+        };
+        let Some(template) = input.txs.get(hint.tx_index).cloned() else {
+            return MutationResult::Skipped;
+        };
+
+        let parameter_types = selector_for_calldata(&template.input)
+            .and_then(|selector| self.abi_registry.functions.get(&selector))
+            .cloned();
+
+        let mut synthesized = template;
+        let placement = apply_concolic_hint(
+            &mut synthesized,
+            hint.calldata_offset,
+            &hint.word,
+            parameter_types.as_deref(),
+        );
+        let selector = selector_for_calldata(&synthesized.input);
+        let insert_at = (hint.tx_index + 1).min(input.txs.len());
+        input.txs.insert(insert_at, synthesized);
+        self.record_mutation(
+            input,
+            "concolic_sequence_synthesis",
+            Some(insert_at),
+            selector,
+            &format!(
+                "inserted solver-backed tx from pc {} with {:?} into {}",
+                hint.pc, hint.strategy, placement
+            ),
+        );
+        MutationResult::Mutated
     }
 
     fn structural_mutation<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
@@ -649,10 +721,146 @@ fn selector_for_calldata(calldata: &[u8]) -> Option<[u8; 4]> {
     Some(selector)
 }
 
+fn apply_concolic_hint(
+    tx: &mut SingletonTx,
+    offset: usize,
+    word: &[u8; 32],
+    parameter_types: Option<&[DynSolType]>,
+) -> String {
+    if let Some(types) = parameter_types {
+        repair_dynamic_abi_layout(&mut tx.input, types);
+    }
+
+    let placement = abi_hint_offset(&tx.input, offset, parameter_types).unwrap_or(offset);
+    let end = placement.saturating_add(32);
+    if tx.input.len() < end {
+        tx.input.resize(end, 0);
+    }
+    tx.input[placement..end].copy_from_slice(word);
+    if placement == offset {
+        format!("calldata[{placement}..{end}]")
+    } else {
+        format!("abi_word[{placement}..{end}] from source offset {offset}")
+    }
+}
+
+fn abi_hint_offset(
+    calldata: &[u8],
+    offset: usize,
+    parameter_types: Option<&[DynSolType]>,
+) -> Option<usize> {
+    if calldata.len() < 4 || offset < 4 {
+        return None;
+    }
+    let word_offset = 4 + ((offset - 4) / 32) * 32;
+
+    if let Some(types) = parameter_types {
+        let arg_index = (word_offset - 4) / 32;
+        if types
+            .get(arg_index)
+            .is_some_and(solidity_type_contains_dynamic_tail)
+        {
+            let placement = dynamic_tail_data_word(calldata, types, arg_index)
+                .unwrap_or_else(|| 4 + types.len() * 32 + 32);
+            if placement.saturating_add(32) <= 4096 {
+                return Some(placement);
+            }
+        }
+    }
+
+    if word_offset.saturating_add(32) <= 4096 {
+        Some(word_offset)
+    } else {
+        None
+    }
+}
+
+fn repair_dynamic_abi_layout(calldata: &mut Vec<u8>, parameter_types: &[DynSolType]) {
+    if parameter_types
+        .iter()
+        .all(|ty| !solidity_type_contains_dynamic_tail(ty))
+    {
+        return;
+    }
+
+    let head_size = 4 + parameter_types.len() * 32;
+    if calldata.len() < head_size {
+        calldata.resize(head_size, 0);
+    }
+
+    let mut tail_cursor = head_size;
+    for (idx, ty) in parameter_types.iter().enumerate() {
+        if !solidity_type_contains_dynamic_tail(ty) {
+            continue;
+        }
+
+        let head_word = 4 + idx * 32;
+        let encoded_offset = U256::from(tail_cursor.saturating_sub(4));
+        calldata[head_word..head_word + 32].copy_from_slice(&encoded_offset.to_be_bytes::<32>());
+
+        let minimum_tail_len = dynamic_tail_minimum_len(ty);
+        let tail_end = tail_cursor.saturating_add(minimum_tail_len);
+        if calldata.len() < tail_end {
+            calldata.resize(tail_end, 0);
+        }
+
+        if minimum_tail_len >= 32 {
+            let default_len = dynamic_tail_default_length(ty);
+            calldata[tail_cursor..tail_cursor + 32]
+                .copy_from_slice(&U256::from(default_len).to_be_bytes::<32>());
+        }
+        tail_cursor = align_abi_word(tail_end);
+    }
+}
+
+fn dynamic_tail_data_word(
+    calldata: &[u8],
+    parameter_types: &[DynSolType],
+    arg_index: usize,
+) -> Option<usize> {
+    if arg_index >= parameter_types.len() {
+        return None;
+    }
+    let head_word = 4 + arg_index * 32;
+    let encoded = calldata.get(head_word..head_word + 32)?;
+    let relative = U256::from_be_slice(encoded);
+    let relative: usize = relative.try_into().ok()?;
+    Some(4 + relative + 32)
+}
+
+fn solidity_type_contains_dynamic_tail(ty: &DynSolType) -> bool {
+    match ty {
+        DynSolType::Bytes | DynSolType::String | DynSolType::Array(_) => true,
+        DynSolType::Tuple(fields) => fields.iter().any(solidity_type_contains_dynamic_tail),
+        _ => false,
+    }
+}
+
+fn dynamic_tail_minimum_len(ty: &DynSolType) -> usize {
+    match ty {
+        DynSolType::Bytes | DynSolType::String => 64,
+        DynSolType::Array(_) => 32,
+        DynSolType::Tuple(fields) => 32 + fields.len() * 32,
+        _ => 32,
+    }
+}
+
+fn dynamic_tail_default_length(ty: &DynSolType) -> usize {
+    match ty {
+        DynSolType::Bytes | DynSolType::String => 32,
+        DynSolType::Array(_) | DynSolType::Tuple(_) => 0,
+        _ => 0,
+    }
+}
+
+fn align_abi_word(value: usize) -> usize {
+    value.next_multiple_of(32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::types::{ComparisonOperand, TaintSource};
+    use crate::common::types::{ComparisonOperand, SymbolicExpression, TaintSource};
     use libafl::mutators::MutationResult;
     use libafl_bolts::rands::RomuDuoJrRand;
 
@@ -758,6 +966,9 @@ mod tests {
                     hit: false,
                     taint_source: Some(TaintSource::Storage(0, 36)),
                     tainted_operand: ComparisonOperand::Lhs,
+                    lhs_expression: Some(SymbolicExpression::Source(TaintSource::Storage(0, 36))),
+                    rhs_expression: Some(SymbolicExpression::Constant(U256::from(0xfeed_u64))),
+                    branch_distance: Some(U256::from(0xfeed_u64 - 1)),
                 }],
             ],
             mutation_provenance: Vec::new(),
@@ -774,5 +985,73 @@ mod tests {
         );
         assert!(input.txs[1].input[36..68].iter().all(|byte| *byte == 0));
         assert_eq!(input.mutation_provenance[0].strategy, "concolic_comparison");
+    }
+
+    #[test]
+    fn concolic_mutation_extends_short_originating_calldata() {
+        let mutator = EvmMutator::new(
+            Arc::new(AbiRegistry::default()),
+            Arc::new(RwLock::new(GlobalAccountRegistry::default())),
+        );
+        let mut input = EvmInput {
+            txs: vec![SingletonTx {
+                input: vec![0xde, 0xad, 0xbe, 0xef],
+                caller: Address::repeat_byte(0x11),
+                to: Address::repeat_byte(0x22),
+                value: U256::ZERO,
+                is_victim: false,
+            }],
+            base_snapshot_id: 0,
+            waypoints: vec![vec![Waypoint::Comparison {
+                op: 0x14,
+                lhs: U256::ZERO,
+                rhs: U256::from(99),
+                pc: 321,
+                calldata_offset: None,
+                condition: false,
+                hit: false,
+                taint_source: Some(TaintSource::Calldata(36)),
+                tainted_operand: ComparisonOperand::Lhs,
+                lhs_expression: Some(SymbolicExpression::Source(TaintSource::Calldata(36))),
+                rhs_expression: Some(SymbolicExpression::Constant(U256::from(99))),
+                branch_distance: Some(U256::from(99)),
+            }]],
+            mutation_provenance: Vec::new(),
+        };
+        let mut rand = RomuDuoJrRand::with_seed(23);
+
+        assert_eq!(
+            mutator.concolic_mutation(&mut rand, &mut input),
+            MutationResult::Mutated
+        );
+        assert_eq!(input.txs[0].input.len(), 68);
+        assert_eq!(
+            U256::from_be_slice(&input.txs[0].input[36..68]),
+            U256::from(99)
+        );
+    }
+
+    #[test]
+    fn concolic_hint_repairs_dynamic_abi_tail_before_writing_hint() {
+        let selector = [0x12, 0x34, 0x56, 0x78];
+        let mut tx = SingletonTx {
+            input: selector.to_vec(),
+            caller: Address::repeat_byte(0x11),
+            to: Address::repeat_byte(0x22),
+            value: U256::ZERO,
+            is_victim: false,
+        };
+        let word = U256::from(0xfeed_u64).to_be_bytes::<32>();
+
+        let placement = apply_concolic_hint(&mut tx, 4, &word, Some(&[DynSolType::Bytes]));
+
+        assert_eq!(placement, "abi_word[68..100] from source offset 4");
+        assert_eq!(tx.input.len(), 100);
+        assert_eq!(U256::from_be_slice(&tx.input[4..36]), U256::from(32));
+        assert_eq!(U256::from_be_slice(&tx.input[36..68]), U256::from(32));
+        assert_eq!(
+            U256::from_be_slice(&tx.input[68..100]),
+            U256::from(0xfeed_u64)
+        );
     }
 }

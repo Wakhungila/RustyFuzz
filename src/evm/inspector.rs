@@ -9,7 +9,9 @@ use revm::{
 // v38: OpCode is now in the bytecode module or directly available
 // use revm::bytecode::Bytecode; // Unused
 // use bitvec::prelude::{BitSlice, Lsb0}; // Unused
-use crate::common::types::{CallKind, CallPhase, ComparisonOperand, TaintSource, Waypoint};
+use crate::common::types::{
+    CallKind, CallPhase, ComparisonOperand, SymbolicExpression, TaintSource, Waypoint,
+};
 use crate::evm::dataflow::DataflowRegistry;
 use revm::primitives::{keccak256, Address, B256, U256};
 use std::collections::{HashMap, HashSet};
@@ -24,6 +26,7 @@ pub struct CoverageInspector<'a> {
     pub dataflow: &'a mut DataflowRegistry,
     pub waypoints: &'a mut Vec<Waypoint>,
     pub taint_stack: Vec<Option<TaintSource>>, // Mirror stack: stores taint source
+    pub symbolic_stack: Vec<Option<SymbolicExpression>>,
     pub read_set: HashSet<(Address, B256)>,
     pub write_set: HashSet<(Address, B256)>,
     pub last_pc: usize,
@@ -31,8 +34,10 @@ pub struct CoverageInspector<'a> {
     pub instruction_count: u64, // Virtual Performance Counter: total instructions
     pub gas_consumed: u64,     // Virtual Performance Counter: total gas
     pub symbolic_storage_map: HashMap<(Address, B256), TaintSource>, // (addr, slot) -> TaintSource of value
-    pub transient_taint_map: HashMap<(Address, B256), TaintSource>,  // EIP-1153 support
-    pub memory_taint: HashMap<usize, TaintSource>,                   // offset -> TaintSource
+    pub storage_expression_map: HashMap<(Address, B256), SymbolicExpression>,
+    pub transient_taint_map: HashMap<(Address, B256), TaintSource>, // EIP-1153 support
+    pub memory_taint: HashMap<usize, TaintSource>,                  // offset -> TaintSource
+    pub memory_expression: HashMap<usize, SymbolicExpression>,
     pub known_initialized_slots: HashSet<(Address, B256)>, // Track slots written in current or previous TXs
     pub call_depth: usize,
     pending_sload: Option<PendingStorageRead>,
@@ -45,6 +50,7 @@ struct PendingStorageRead {
     pc: usize,
     tx_idx: usize,
     taint_source: Option<TaintSource>,
+    expression: Option<SymbolicExpression>,
 }
 
 impl<'a> CoverageInspector<'a> {
@@ -59,6 +65,7 @@ impl<'a> CoverageInspector<'a> {
             dataflow,
             waypoints,
             taint_stack: Vec::with_capacity(1024), // Max stack depth
+            symbolic_stack: Vec::with_capacity(1024),
             read_set: HashSet::new(),
             write_set: HashSet::new(),
             last_pc: 0,
@@ -66,11 +73,29 @@ impl<'a> CoverageInspector<'a> {
             instruction_count: 0,
             gas_consumed: 0,
             symbolic_storage_map: HashMap::new(),
+            storage_expression_map: HashMap::new(),
             transient_taint_map: HashMap::new(),
             memory_taint: HashMap::new(),
+            memory_expression: HashMap::new(),
             known_initialized_slots: HashSet::new(),
             call_depth: 0,
             pending_sload: None,
+        }
+    }
+
+    fn push_symbolic(
+        &mut self,
+        taint: Option<TaintSource>,
+        expression: Option<SymbolicExpression>,
+    ) {
+        self.taint_stack.push(taint);
+        self.symbolic_stack.push(expression);
+    }
+
+    fn pop_symbolic_operands(&mut self, count: usize) {
+        for _ in 0..count {
+            self.taint_stack.pop();
+            self.symbolic_stack.pop();
         }
     }
 }
@@ -83,6 +108,22 @@ fn compare_condition(opcode: u8, lhs: U256, rhs: U256) -> bool {
         0x13 => signed_greater_than(lhs, rhs),
         0x14 => lhs == rhs,
         _ => false,
+    }
+}
+
+fn branch_distance(opcode: u8, lhs: U256, rhs: U256, condition: bool) -> Option<U256> {
+    if condition {
+        return Some(U256::ZERO);
+    }
+    match opcode {
+        0x10 | 0x12 => lhs
+            .checked_sub(rhs)
+            .map(|gap| gap.saturating_add(U256::from(1))),
+        0x11 | 0x13 => rhs
+            .checked_sub(lhs)
+            .map(|gap| gap.saturating_add(U256::from(1))),
+        0x14 => Some(if lhs > rhs { lhs - rhs } else { rhs - lhs }),
+        _ => None,
     }
 }
 
@@ -106,10 +147,61 @@ fn signed_greater_than(lhs: U256, rhs: U256) -> bool {
     }
 }
 
+fn bounded_expr(expr: SymbolicExpression) -> Option<SymbolicExpression> {
+    if expression_depth(&expr) <= 6 {
+        Some(expr)
+    } else {
+        None
+    }
+}
+
+fn expression_depth(expr: &SymbolicExpression) -> usize {
+    match expr {
+        SymbolicExpression::Source(_) | SymbolicExpression::Constant(_) => 1,
+        SymbolicExpression::Add(lhs, rhs)
+        | SymbolicExpression::Sub(lhs, rhs)
+        | SymbolicExpression::Mul(lhs, rhs)
+        | SymbolicExpression::Div(lhs, rhs)
+        | SymbolicExpression::Mod(lhs, rhs)
+        | SymbolicExpression::And(lhs, rhs)
+        | SymbolicExpression::Or(lhs, rhs)
+        | SymbolicExpression::Xor(lhs, rhs) => 1 + expression_depth(lhs).max(expression_depth(rhs)),
+    }
+}
+
+fn binary_expression(
+    opcode: u8,
+    lhs: Option<SymbolicExpression>,
+    lhs_value: U256,
+    rhs: Option<SymbolicExpression>,
+    rhs_value: U256,
+) -> Option<SymbolicExpression> {
+    let lhs = lhs.unwrap_or(SymbolicExpression::Constant(lhs_value));
+    let rhs = rhs.unwrap_or(SymbolicExpression::Constant(rhs_value));
+    let expr = match opcode {
+        0x01 => SymbolicExpression::Add(Box::new(lhs), Box::new(rhs)),
+        0x02 => SymbolicExpression::Mul(Box::new(lhs), Box::new(rhs)),
+        0x03 => SymbolicExpression::Sub(Box::new(lhs), Box::new(rhs)),
+        0x04 | 0x05 => SymbolicExpression::Div(Box::new(lhs), Box::new(rhs)),
+        0x06 | 0x07 => SymbolicExpression::Mod(Box::new(lhs), Box::new(rhs)),
+        0x16 => SymbolicExpression::And(Box::new(lhs), Box::new(rhs)),
+        0x17 => SymbolicExpression::Or(Box::new(lhs), Box::new(rhs)),
+        0x18 => SymbolicExpression::Xor(Box::new(lhs), Box::new(rhs)),
+        _ => return None,
+    };
+    bounded_expr(expr)
+}
+
 impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
     fn step(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
         let pc = interp.bytecode.pc();
         let opcode = interp.bytecode.opcode();
+        let stack_taint = |stack: &[Option<TaintSource>], idx: usize| {
+            stack.iter().rev().nth(idx).cloned().flatten()
+        };
+        let stack_expr = |stack: &[Option<SymbolicExpression>], idx: usize| {
+            stack.iter().rev().nth(idx).cloned().flatten()
+        };
 
         // --- Taint Propagation ---
         match opcode {
@@ -117,7 +209,12 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
             0x35 => {
                 if let Ok(offset_val) = interp.stack.peek(0) {
                     let offset: usize = offset_val.saturating_to();
-                    self.taint_stack.push(Some(TaintSource::Calldata(offset)));
+                    let source = TaintSource::Calldata(offset);
+                    self.pop_symbolic_operands(1);
+                    self.push_symbolic(
+                        Some(source.clone()),
+                        Some(SymbolicExpression::Source(source)),
+                    );
                 }
             }
             0x3C => {
@@ -133,36 +230,53 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                     for i in 0..len {
                         self.memory_taint
                             .insert(dest + i, TaintSource::Calldata(src + i));
+                        self.memory_expression.insert(
+                            dest + i,
+                            SymbolicExpression::Source(TaintSource::Calldata(src + i)),
+                        );
                     }
+                    self.pop_symbolic_operands(3);
                 }
             }
             0x51 => {
                 if let Ok(offset_val) = interp.stack.peek(0) {
                     let offset: usize = offset_val.saturating_to();
                     let taint = self.memory_taint.get(&offset).cloned();
-                    self.taint_stack.push(taint);
+                    let expr = self.memory_expression.get(&offset).cloned();
+                    self.pop_symbolic_operands(1);
+                    self.push_symbolic(taint, expr);
                     return;
                 }
-                self.taint_stack.push(None);
+                self.pop_symbolic_operands(1);
+                self.push_symbolic(None, None);
             }
             0x52 | 0x53 => {
-                if let (Ok(offset_val), Some(taint)) = (
-                    interp.stack.peek(0),
-                    self.taint_stack.last().cloned().flatten(),
-                ) {
+                if let Ok(offset_val) = interp.stack.peek(0) {
                     let offset: usize = offset_val.saturating_to();
                     let size = if opcode == 0x52 { 32 } else { 1 };
-                    for i in 0..size {
-                        self.memory_taint.insert(offset + i, taint.clone());
+                    let value_taint = stack_taint(&self.taint_stack, 1);
+                    let value_expr = stack_expr(&self.symbolic_stack, 1)
+                        .or_else(|| interp.stack.peek(1).ok().map(SymbolicExpression::Constant));
+                    if let Some(taint) = value_taint {
+                        for i in 0..size {
+                            self.memory_taint.insert(offset + i, taint.clone());
+                        }
+                    }
+                    if let Some(expr) = value_expr {
+                        for i in 0..size {
+                            self.memory_expression.insert(offset + i, expr.clone());
+                        }
                     }
                 }
+                self.pop_symbolic_operands(2);
             }
             // Propagation for stack operations
-            0x60..=0x7F => self.taint_stack.push(None),
+            0x60..=0x7F => self.push_symbolic(None, None),
             0x80..=0x8F => {
                 let idx = (opcode - 0x80) as usize;
                 let taint = self.taint_stack.iter().rev().nth(idx).cloned().flatten(); // Get taint from duplicated item
-                self.taint_stack.push(taint);
+                let expr = self.symbolic_stack.iter().rev().nth(idx).cloned().flatten();
+                self.push_symbolic(taint, expr);
             }
             0x90..=0x9F => {
                 let idx = (opcode - 0x90 + 1) as usize;
@@ -170,9 +284,13 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                 if len > idx {
                     self.taint_stack.swap(len - 1, len - 1 - idx);
                 }
+                let len = self.symbolic_stack.len();
+                if len > idx {
+                    self.symbolic_stack.swap(len - 1, len - 1 - idx);
+                }
             }
             0x50 => {
-                self.taint_stack.pop();
+                self.pop_symbolic_operands(1);
             } // Remove taint for popped item
             0x54 => {
                 if let Ok(slot_val) = interp.stack.peek(0) {
@@ -184,25 +302,41 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                     let slot = B256::from(slot_val);
 
                     // If this slot was written by a previous transaction in the sequence
-                    if let Some(taint_source_of_value) =
-                        self.symbolic_storage_map.get(&(addr, slot)).cloned()
+                    if let Some(taint_source_of_value) = self
+                        .symbolic_storage_map
+                        .get(&(addr, slot))
+                        .cloned()
+                        .or_else(|| self.dataflow.storage_taint(addr, slot))
                     {
                         if let TaintSource::Storage(written_tx_idx, _) = taint_source_of_value {
                             if written_tx_idx < self.current_tx_idx {
+                                let expr = self
+                                    .storage_expression_map
+                                    .get(&(addr, slot))
+                                    .cloned()
+                                    .or_else(|| self.dataflow.storage_expression(addr, slot))
+                                    .or_else(|| {
+                                        Some(SymbolicExpression::Source(
+                                            taint_source_of_value.clone(),
+                                        ))
+                                    });
                                 self.pending_sload = Some(PendingStorageRead {
                                     address: addr,
                                     slot,
                                     pc,
                                     tx_idx: self.current_tx_idx,
                                     taint_source: Some(taint_source_of_value.clone()),
+                                    expression: expr.clone(),
                                 });
-                                self.taint_stack.push(Some(taint_source_of_value)); // Propagate taint from storage read
+                                self.pop_symbolic_operands(1);
+                                self.push_symbolic(Some(taint_source_of_value), expr);
                                 return; // Skip default taint propagation
                             }
                         }
                     }
                 }
-                self.taint_stack.push(None); // SLOAD result is untainted by default unless explicitly tracked
+                self.pop_symbolic_operands(1);
+                self.push_symbolic(None, None); // SLOAD result is untainted by default unless explicitly tracked
             }
             0x5C => {
                 if let Ok(slot_val) = interp.stack.peek(0) {
@@ -220,11 +354,13 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                             value: U256::ZERO,
                             pc,
                         });
-                        self.taint_stack.push(Some(ts));
+                        self.pop_symbolic_operands(1);
+                        self.push_symbolic(Some(ts), None);
                         return;
                     }
                 }
-                self.taint_stack.push(None);
+                self.pop_symbolic_operands(1);
+                self.push_symbolic(None, None);
             }
             _ => {
                 // For multi-operand opcodes, we'd ideally merge taints.
@@ -265,6 +401,7 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                         pc,
                         tx_idx: self.current_tx_idx,
                         taint_source: None,
+                        expression: None,
                     });
                 }
 
@@ -291,10 +428,12 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
         // Dataflow tracking: monitor SSTORE (0x55)
         if opcode == 0x55 {
             // Get the value being stored and its taint source
-            let value_taint_source = self.taint_stack.last().cloned().flatten();
+            let value_taint_source = stack_taint(&self.taint_stack, 1);
             if let Ok(value_val) = interp.stack.peek(1) {
                 // Value is second on stack for SSTORE
                 let value = value_val;
+                let value_expression = stack_expr(&self.symbolic_stack, 1)
+                    .or(Some(SymbolicExpression::Constant(value)));
 
                 // Slot is the first item on the stack for SSTORE
                 if let Ok(slot_val) = interp.stack.peek(0) {
@@ -311,16 +450,26 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
 
                     // If the value being stored is tainted, convert its source to a
                     // persistent Storage source so subsequent reads know which TX produced it.
-                    if let Some(ts) = value_taint_source.clone() {
-                        let persistent_taint = match ts {
+                    let persistent_taint_for_value =
+                        value_taint_source.clone().map(|ts| match ts {
                             TaintSource::Calldata(offset) => {
                                 TaintSource::Storage(self.current_tx_idx, offset)
                             }
                             TaintSource::Storage(_, _) => ts,
-                        };
+                        });
+                    if let Some(persistent_taint) = persistent_taint_for_value.clone() {
                         self.symbolic_storage_map
                             .insert((address, slot), persistent_taint);
                     }
+                    if let Some(expr) = value_expression.clone() {
+                        self.storage_expression_map.insert((address, slot), expr);
+                    }
+                    self.dataflow.mark_storage_symbolic(
+                        address,
+                        slot,
+                        persistent_taint_for_value,
+                        value_expression.clone(),
+                    );
 
                     self.waypoints.push(Waypoint::StorageWrite {
                         address,
@@ -329,14 +478,16 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                         pc,
                         tx_idx: self.current_tx_idx,
                         taint_source_of_value: value_taint_source,
+                        value_expression,
                     });
                 }
             }
+            self.pop_symbolic_operands(2);
         }
 
         // Cancun Spec: Transient Storage (EIP-1153)
         if opcode == 0x5D {
-            let value_taint_source = self.taint_stack.last().cloned().flatten();
+            let value_taint_source = stack_taint(&self.taint_stack, 1);
             if let Ok(slot_val) = interp.stack.peek(0) {
                 let address = interp
                     .input
@@ -358,6 +509,7 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                     });
                 }
             }
+            self.pop_symbolic_operands(2);
         }
 
         // Capture Arithmetic results for ADD, MUL, SUB, DIV, SDIV, MOD, SMOD, ADDMOD, MULMOD
@@ -366,9 +518,12 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
             if stack_len >= 2 {
                 if let (Ok(lhs), Ok(rhs)) = (interp.stack.peek(0), interp.stack.peek(1)) {
                     // Get taint source for LHS and RHS
-                    let lhs_taint = self.taint_stack.iter().rev().nth(0).cloned().flatten();
-                    let rhs_taint = self.taint_stack.iter().rev().nth(1).cloned().flatten();
-                    let taint_source = lhs_taint.or(rhs_taint); // Combine taints (heuristic)
+                    let lhs_taint = stack_taint(&self.taint_stack, 0);
+                    let rhs_taint = stack_taint(&self.taint_stack, 1);
+                    let lhs_expr = stack_expr(&self.symbolic_stack, 0);
+                    let rhs_expr = stack_expr(&self.symbolic_stack, 1);
+                    let taint_source = lhs_taint.clone().or(rhs_taint.clone()); // Combine taints (heuristic)
+                    let result_expression = binary_expression(opcode, lhs_expr, lhs, rhs_expr, rhs);
 
                     let mut third = None;
                     // ADDMOD (0x08) and MULMOD (0x09) take 3 arguments
@@ -390,9 +545,29 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                             third,
                             pc,
                             taint_source,
+                            result_expression: result_expression.clone(),
                         });
                     }
+                    let operand_count = if opcode == 0x08 || opcode == 0x09 {
+                        3
+                    } else {
+                        2
+                    };
+                    self.pop_symbolic_operands(operand_count);
+                    self.push_symbolic(lhs_taint.or(rhs_taint), result_expression);
                 }
+            }
+        }
+
+        if (0x16..=0x18).contains(&opcode) {
+            if let (Ok(lhs), Ok(rhs)) = (interp.stack.peek(0), interp.stack.peek(1)) {
+                let lhs_taint = stack_taint(&self.taint_stack, 0);
+                let rhs_taint = stack_taint(&self.taint_stack, 1);
+                let lhs_expr = stack_expr(&self.symbolic_stack, 0);
+                let rhs_expr = stack_expr(&self.symbolic_stack, 1);
+                let result_expression = binary_expression(opcode, lhs_expr, lhs, rhs_expr, rhs);
+                self.pop_symbolic_operands(2);
+                self.push_symbolic(lhs_taint.or(rhs_taint), result_expression);
             }
         }
 
@@ -401,7 +576,8 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
         if opcode == 0x57 {
             if let (Ok(_dest), Ok(condition)) = (interp.stack.peek(0), interp.stack.peek(1)) {
                 let branch_taken = !condition.is_zero();
-                let taint = self.taint_stack.iter().rev().nth(1).cloned().flatten();
+                let taint = stack_taint(&self.taint_stack, 1);
+                let condition_expression = stack_expr(&self.symbolic_stack, 1);
 
                 if let Some(ts) = taint {
                     // Record the branch as a target for concolic inversion
@@ -422,10 +598,27 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                             condition: false,
                             hit: false,
                             tainted_operand: ComparisonOperand::Lhs,
+                            lhs_expression: condition_expression,
+                            rhs_expression: Some(SymbolicExpression::Constant(if branch_taken {
+                                U256::ZERO
+                            } else {
+                                U256::from(1)
+                            })),
+                            branch_distance: branch_distance(
+                                0x14,
+                                condition,
+                                if branch_taken {
+                                    U256::ZERO
+                                } else {
+                                    U256::from(1)
+                                },
+                                false,
+                            ),
                         }),
                     });
                 }
             }
+            self.pop_symbolic_operands(2);
         }
 
         // Capture Comparisons for Concolic Solving
@@ -433,8 +626,10 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
         if (0x10..=0x14).contains(&opcode) {
             if let (Ok(lhs), Ok(rhs)) = (interp.stack.peek(0), interp.stack.peek(1)) {
                 // Get taint source for LHS and RHS
-                let lhs_taint = self.taint_stack.iter().rev().nth(0).cloned().flatten();
-                let rhs_taint = self.taint_stack.iter().rev().nth(1).cloned().flatten();
+                let lhs_taint = stack_taint(&self.taint_stack, 0);
+                let rhs_taint = stack_taint(&self.taint_stack, 1);
+                let lhs_expression = stack_expr(&self.symbolic_stack, 0);
+                let rhs_expression = stack_expr(&self.symbolic_stack, 1);
                 let (taint_source, tainted_operand) = match (lhs_taint, rhs_taint) {
                     (Some(lhs), Some(_)) => (Some(lhs), ComparisonOperand::Unknown),
                     (Some(lhs), None) => (Some(lhs), ComparisonOperand::Lhs),
@@ -442,6 +637,7 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                     (None, None) => (None, ComparisonOperand::Unknown),
                 };
                 let condition = compare_condition(opcode, lhs, rhs);
+                let distance = branch_distance(opcode, lhs, rhs, condition);
 
                 self.waypoints.push(Waypoint::Comparison {
                     op: opcode,
@@ -453,8 +649,13 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                     condition,
                     hit: condition,
                     tainted_operand,
+                    lhs_expression,
+                    rhs_expression,
+                    branch_distance: distance,
                 });
             }
+            self.pop_symbolic_operands(2);
+            self.push_symbolic(None, None);
         }
 
         // Capture Mapping Derivations for high-fidelity Oracle reasoning
@@ -468,14 +669,20 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                     let data = interp.memory.slice_len(offset, size);
                     let key = U256::from_be_slice(&data[0..32]);
                     let base_slot = U256::from_be_slice(&data[32..64]);
+                    let key_expression = self.memory_expression.get(&offset).cloned();
+                    let base_slot_expression = self.memory_expression.get(&(offset + 32)).cloned();
 
                     self.waypoints.push(Waypoint::MappingDerivation {
                         base_slot,
                         key,
                         derived_slot: keccak256(&*data),
+                        key_expression,
+                        base_slot_expression,
                     });
                 }
             }
+            self.pop_symbolic_operands(2);
+            self.push_symbolic(None, None);
         }
 
         self.last_pc = pc;
@@ -491,6 +698,7 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                     pc: read.pc,
                     read_tx_idx: read.tx_idx,
                     taint_source: read.taint_source,
+                    expression: read.expression,
                 });
             }
         }

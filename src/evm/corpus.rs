@@ -1,6 +1,8 @@
-use crate::common::types::{ChainState, SequenceExecutionResult, Snapshot};
+use crate::common::oracle::ProtocolFinding;
+use crate::common::types::{ChainState, SequenceExecutionResult, Snapshot, Waypoint};
+use crate::engine::scoring::CampaignScore;
 use crate::evm::feedback::EvmCoverageFeedback;
-use crate::evm::fork_db::{ForkDb, ForkDbCacheSnapshot};
+use crate::evm::fork_db::{EvmCacheDb, ForkDb, ForkDbCacheSnapshot};
 use crate::evm::fuzz::EvmInput;
 use crate::evm::seed_ingester::MainnetSeedBundle;
 use libafl_bolts::rands::Rand;
@@ -27,6 +29,16 @@ pub struct CorpusEntryMetadata {
     pub coverage_edges: usize,
     pub gas_used: u64,
     pub crash_fingerprint: Option<String>,
+    #[serde(default)]
+    pub frontier: CorpusFrontierMetadata,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CorpusFrontierMetadata {
+    pub branch_distances: Vec<String>,
+    pub expression_backed_comparisons: usize,
+    pub mapping_derivations: usize,
+    pub oracle_observations: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,6 +59,31 @@ pub struct SnapshotManifest {
     pub gas_used: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CampaignArtifactRecord {
+    pub input_id: String,
+    pub fork_cache_id: String,
+    pub block_number: u64,
+    pub target: Option<Address>,
+    pub reason: String,
+    pub score: CampaignScore,
+    pub findings: Vec<ProtocolFinding>,
+    pub metadata: CorpusEntryMetadata,
+}
+
+pub struct CampaignArtifactRequest<'a> {
+    pub input: &'a EvmInput,
+    pub execution: &'a SequenceExecutionResult,
+    pub coverage: &'a [u8],
+    pub state_novelty_score: u64,
+    pub base_fork_state: &'a EvmCacheDb,
+    pub score: &'a CampaignScore,
+    pub findings: &'a [ProtocolFinding],
+    pub block_number: u64,
+    pub target: Option<Address>,
+    pub reason: &'a str,
+}
+
 pub struct PersistentCorpus {
     root: PathBuf,
 }
@@ -58,6 +95,7 @@ impl PersistentCorpus {
         fs::create_dir_all(root.join("crashes"))?;
         fs::create_dir_all(root.join("fork_cache"))?;
         fs::create_dir_all(root.join("mainnet_seeds"))?;
+        fs::create_dir_all(root.join("campaign_artifacts"))?;
         Ok(Self { root })
     }
 
@@ -79,6 +117,7 @@ impl PersistentCorpus {
             coverage_edges: coverage.iter().filter(|&&hit| hit != 0).count(),
             gas_used,
             crash_fingerprint: None,
+            frontier: CorpusFrontierMetadata::default(),
         };
 
         let input_path = self.root.join("inputs").join(format!("{id}.json"));
@@ -107,6 +146,7 @@ impl PersistentCorpus {
             coverage_edges: coverage.iter().filter(|&&hit| hit != 0).count(),
             gas_used: execution.total_gas_used,
             crash_fingerprint: None,
+            frontier: frontier_metadata(execution),
         };
 
         let input_path = self.root.join("inputs").join(format!("{id}.json"));
@@ -130,6 +170,67 @@ impl PersistentCorpus {
         let path = self.root.join("fork_cache").join(format!("{id}.json"));
         fs::write(path, serde_json::to_vec_pretty(&snapshot)?)?;
         Ok(snapshot)
+    }
+
+    pub fn persist_cache_db_fork_state(
+        &self,
+        id: &str,
+        cache_db: &EvmCacheDb,
+    ) -> anyhow::Result<ForkDbCacheSnapshot> {
+        let snapshot_db = ForkDb::from_cache_snapshot(cache_db.db.cache_snapshot());
+
+        for (address, account) in &cache_db.cache.accounts {
+            if let Some(info) = account.info() {
+                snapshot_db.cache_account(*address, info);
+            }
+            for (slot, value) in &account.storage {
+                snapshot_db.cache_storage(*address, *slot, *value);
+            }
+        }
+
+        for (code_hash, code) in &cache_db.cache.contracts {
+            snapshot_db.cache_code(*code_hash, code.clone());
+        }
+
+        for (number, hash) in &cache_db.cache.block_hashes {
+            if let Ok(number) = (*number).try_into() {
+                snapshot_db.cache_block_hash(number, *hash);
+            }
+        }
+
+        self.persist_fork_cache(id, &snapshot_db)
+    }
+
+    pub fn persist_campaign_artifact(
+        &self,
+        request: CampaignArtifactRequest<'_>,
+    ) -> anyhow::Result<CampaignArtifactRecord> {
+        let metadata = self.persist_execution_input(
+            request.input,
+            request.execution,
+            request.coverage,
+            request.state_novelty_score,
+        )?;
+        let fork_cache_id = metadata.id.clone();
+        self.persist_cache_db_fork_state(&fork_cache_id, request.base_fork_state)?;
+
+        let record = CampaignArtifactRecord {
+            input_id: metadata.id.clone(),
+            fork_cache_id,
+            block_number: request.block_number,
+            target: request.target,
+            reason: request.reason.to_string(),
+            score: request.score.clone(),
+            findings: request.findings.to_vec(),
+            metadata,
+        };
+        fs::write(
+            self.root
+                .join("campaign_artifacts")
+                .join(format!("{}.json", record.input_id)),
+            serde_json::to_vec_pretty(&record)?,
+        )?;
+        Ok(record)
     }
 
     pub fn load_fork_cache(&self, id: &str) -> anyhow::Result<ForkDbCacheSnapshot> {
@@ -297,6 +398,48 @@ impl PersistentCorpus {
 
         fs::write(&path, report)?;
         Ok(path)
+    }
+}
+
+fn frontier_metadata(execution: &SequenceExecutionResult) -> CorpusFrontierMetadata {
+    let mut branch_distances = Vec::new();
+    let mut expression_backed_comparisons = 0usize;
+    let mut mapping_derivations = 0usize;
+
+    for waypoint in execution
+        .tx_results
+        .iter()
+        .flat_map(|result| result.waypoints.iter())
+    {
+        match waypoint {
+            Waypoint::Comparison {
+                branch_distance,
+                lhs_expression,
+                rhs_expression,
+                ..
+            } => {
+                if let Some(distance) = branch_distance {
+                    branch_distances
+                        .push(format!("0x{}", hex::encode(distance.to_be_bytes::<32>())));
+                }
+                if lhs_expression.is_some() || rhs_expression.is_some() {
+                    expression_backed_comparisons += 1;
+                }
+            }
+            Waypoint::MappingDerivation { .. } => {
+                mapping_derivations += 1;
+            }
+            _ => {}
+        }
+    }
+
+    branch_distances.sort();
+    branch_distances.dedup();
+    CorpusFrontierMetadata {
+        branch_distances,
+        expression_backed_comparisons,
+        mapping_derivations,
+        oracle_observations: execution.oracle_observations.len(),
     }
 }
 

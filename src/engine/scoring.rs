@@ -1,5 +1,5 @@
 use crate::common::oracle::{ProtocolFinding, ProtocolSeverity, VulnType};
-use crate::common::types::SequenceExecutionResult;
+use crate::common::types::{SequenceExecutionResult, Waypoint};
 use crate::evm::feedback::StateNoveltyReport;
 use crate::evm::fuzz::EvmInput;
 use crate::evm::trace::ExecutionTrace;
@@ -35,6 +35,17 @@ impl CampaignScore {
 pub struct CampaignScoringConfig {
     pub large_storage_delta: U256,
     pub max_score: u64,
+    pub large_delta_weight: u64,
+    pub economic_finding_weight: u64,
+    pub invariant_finding_weight: u64,
+    pub critical_finding_weight: u64,
+    pub oracle_guided_mutation_weight: u64,
+    pub successful_tx_weight: u64,
+    pub call_depth_weight: u64,
+    pub sequence_depth_weight: u64,
+    pub near_miss_weight: u64,
+    pub expression_backed_weight: u64,
+    pub mapping_backed_weight: u64,
 }
 
 impl Default for CampaignScoringConfig {
@@ -42,6 +53,17 @@ impl Default for CampaignScoringConfig {
         Self {
             large_storage_delta: U256::from(10u128.pow(18)),
             max_score: 10_000,
+            large_delta_weight: 40,
+            economic_finding_weight: 600,
+            invariant_finding_weight: 700,
+            critical_finding_weight: 900,
+            oracle_guided_mutation_weight: 50,
+            successful_tx_weight: 5,
+            call_depth_weight: 10,
+            sequence_depth_weight: 15,
+            near_miss_weight: 40,
+            expression_backed_weight: 15,
+            mapping_backed_weight: 25,
         }
     }
 }
@@ -72,12 +94,14 @@ impl CampaignScorer {
             explanation.push(format!("state_novelty={state_pressure}"));
         }
         let exploration_pressure = self.exploration_pressure(input, execution, &mut explanation);
+        let branch_pressure = self.branch_frontier_pressure(execution, &mut explanation);
 
         let total = economic_pressure
             .saturating_add(invariant_pressure)
             .saturating_add(oracle_pressure)
             .saturating_add(state_pressure)
             .saturating_add(exploration_pressure)
+            .saturating_add(branch_pressure)
             .min(self.config.max_score);
 
         CampaignScore {
@@ -127,7 +151,9 @@ impl CampaignScorer {
                 )
             })
             .count() as u64;
-        let score = large_deltas * 40 + economic_findings * 600;
+        let score = large_deltas
+            .saturating_mul(self.config.large_delta_weight)
+            .saturating_add(economic_findings.saturating_mul(self.config.economic_finding_weight));
         if score > 0 {
             explanation.push(format!(
                 "economic_pressure: large_deltas={large_deltas}, economic_findings={economic_findings}"
@@ -168,8 +194,14 @@ impl CampaignScorer {
                 )
             })
             .count() as u64;
-        let score =
-            invariant_findings * 700 + governance_or_critical * 900 + oracle_guided_mutations * 50;
+        let score = invariant_findings
+            .saturating_mul(self.config.invariant_finding_weight)
+            .saturating_add(
+                governance_or_critical.saturating_mul(self.config.critical_finding_weight),
+            )
+            .saturating_add(
+                oracle_guided_mutations.saturating_mul(self.config.oracle_guided_mutation_weight),
+            );
         if score > 0 {
             explanation.push(format!(
                 "invariant_pressure: invariant_findings={invariant_findings}, critical={governance_or_critical}, guided_mutations={oracle_guided_mutations}"
@@ -218,10 +250,70 @@ impl CampaignScorer {
             .max()
             .unwrap_or_default() as u64;
         let sequence_depth = input.txs.len() as u64;
-        let score = successful_txs * 5 + call_depth * 10 + sequence_depth.saturating_sub(1) * 15;
+        let score = successful_txs
+            .saturating_mul(self.config.successful_tx_weight)
+            .saturating_add(call_depth.saturating_mul(self.config.call_depth_weight))
+            .saturating_add(
+                sequence_depth
+                    .saturating_sub(1)
+                    .saturating_mul(self.config.sequence_depth_weight),
+            );
         if score > 0 {
             explanation.push(format!(
                 "exploration_pressure: successful_txs={successful_txs}, call_depth={call_depth}, sequence_depth={sequence_depth}"
+            ));
+        }
+        score
+    }
+
+    fn branch_frontier_pressure(
+        &self,
+        execution: &SequenceExecutionResult,
+        explanation: &mut Vec<String>,
+    ) -> u64 {
+        let mut near_misses = 0u64;
+        let mut expression_backed = 0u64;
+        let mut mapping_backed = 0u64;
+
+        for waypoint in execution
+            .tx_results
+            .iter()
+            .flat_map(|result| result.waypoints.iter())
+        {
+            match waypoint {
+                Waypoint::Comparison {
+                    branch_distance: Some(distance),
+                    lhs_expression,
+                    rhs_expression,
+                    ..
+                } => {
+                    if *distance <= U256::from(256) {
+                        near_misses += 1;
+                    }
+                    if lhs_expression.is_some() || rhs_expression.is_some() {
+                        expression_backed += 1;
+                    }
+                }
+                Waypoint::MappingDerivation {
+                    key_expression,
+                    base_slot_expression,
+                    ..
+                } => {
+                    if key_expression.is_some() || base_slot_expression.is_some() {
+                        mapping_backed += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let score = near_misses
+            .saturating_mul(self.config.near_miss_weight)
+            .saturating_add(expression_backed.saturating_mul(self.config.expression_backed_weight))
+            .saturating_add(mapping_backed.saturating_mul(self.config.mapping_backed_weight));
+        if score > 0 {
+            explanation.push(format!(
+                "branch_frontier: near_misses={near_misses}, expression_backed={expression_backed}, mapping_backed={mapping_backed}"
             ));
         }
         score

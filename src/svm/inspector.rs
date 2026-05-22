@@ -54,6 +54,9 @@ impl<'a> SvmCoverageInspector<'a> {
             hit: result.result.is_ok(),
             taint_source: None,
             tainted_operand: ComparisonOperand::Unknown,
+            lhs_expression: None,
+            rhs_expression: None,
+            branch_distance: None,
         });
         
         // P0 Discovery: Missing Signer Check Detection
@@ -72,6 +75,9 @@ impl<'a> SvmCoverageInspector<'a> {
                         hit: true,
                         taint_source: None,
                         tainted_operand: ComparisonOperand::Unknown,
+                        lhs_expression: None,
+                        rhs_expression: None,
+                        branch_distance: None,
                     });
                 }
             }

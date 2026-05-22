@@ -1,4 +1,4 @@
-use crate::common::types::{ComparisonOperand, TaintSource, Waypoint};
+use crate::common::types::{ComparisonOperand, SymbolicExpression, TaintSource, Waypoint};
 use revm::primitives::U256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +20,17 @@ pub enum ConcolicStrategy {
 
 #[derive(Debug, Default)]
 pub struct ConcolicSolver;
+
+struct ComparisonSolveInput<'a> {
+    op: u8,
+    lhs: U256,
+    rhs: U256,
+    tainted_operand: &'a ComparisonOperand,
+    target_true: bool,
+    lhs_expression: Option<&'a SymbolicExpression>,
+    rhs_expression: Option<&'a SymbolicExpression>,
+    fallback_source: &'a TaintSource,
+}
 
 impl ConcolicSolver {
     pub fn new() -> Self {
@@ -43,6 +54,8 @@ impl ConcolicSolver {
                 condition,
                 taint_source: Some(source),
                 tainted_operand,
+                lhs_expression,
+                rhs_expression,
                 ..
             } => {
                 let target_true = !*condition;
@@ -52,9 +65,18 @@ impl ConcolicSolver {
                     }
                     known => known.clone(),
                 };
-                let solved = solve_comparison_word(*op, *lhs, *rhs, &operand, target_true)?;
+                let (source, solved) = solve_expression_comparison(ComparisonSolveInput {
+                    op: *op,
+                    lhs: *lhs,
+                    rhs: *rhs,
+                    tainted_operand: &operand,
+                    target_true,
+                    lhs_expression: lhs_expression.as_ref(),
+                    rhs_expression: rhs_expression.as_ref(),
+                    fallback_source: source,
+                })?;
                 Some(hint_from_source(
-                    source,
+                    &source,
                     tx_index,
                     *pc,
                     solved,
@@ -71,6 +93,7 @@ impl ConcolicSolver {
                 third,
                 pc,
                 taint_source: Some(source),
+                ..
             } => {
                 let solved = solve_arithmetic_boundary(*op, *lhs, *rhs, *third)?;
                 Some(hint_from_source(
@@ -150,6 +173,125 @@ fn solve_comparison_word(
     }
 }
 
+fn solve_expression_comparison(input: ComparisonSolveInput<'_>) -> Option<(TaintSource, U256)> {
+    match input.tainted_operand {
+        ComparisonOperand::Lhs => {
+            let desired = solve_lhs_comparison(input.op, input.rhs, input.target_true)?;
+            input
+                .lhs_expression
+                .and_then(|expr| solve_expression_to_source(expr, desired))
+                .or_else(|| Some((input.fallback_source.clone(), desired)))
+        }
+        ComparisonOperand::Rhs => {
+            let desired = solve_rhs_comparison(input.op, input.lhs, input.target_true)?;
+            input
+                .rhs_expression
+                .and_then(|expr| solve_expression_to_source(expr, desired))
+                .or_else(|| Some((input.fallback_source.clone(), desired)))
+        }
+        ComparisonOperand::Unknown => {
+            let lhs_desired = solve_lhs_comparison(input.op, input.rhs, input.target_true)
+                .and_then(|desired| solve_expression_to_source(input.lhs_expression?, desired));
+            lhs_desired.or_else(|| {
+                solve_rhs_comparison(input.op, input.lhs, input.target_true)
+                    .and_then(|desired| solve_expression_to_source(input.rhs_expression?, desired))
+            })
+        }
+    }
+}
+
+fn solve_expression_to_source(
+    expr: &SymbolicExpression,
+    target: U256,
+) -> Option<(TaintSource, U256)> {
+    match expr {
+        SymbolicExpression::Source(source) => Some((source.clone(), target)),
+        SymbolicExpression::Constant(_) => None,
+        SymbolicExpression::Add(lhs, rhs) => {
+            if let Some(rhs_const) = constant_value(rhs) {
+                return target
+                    .checked_sub(rhs_const)
+                    .and_then(|next| solve_expression_to_source(lhs, next));
+            }
+            if let Some(lhs_const) = constant_value(lhs) {
+                return target
+                    .checked_sub(lhs_const)
+                    .and_then(|next| solve_expression_to_source(rhs, next));
+            }
+            None
+        }
+        SymbolicExpression::Sub(lhs, rhs) => {
+            if let Some(rhs_const) = constant_value(rhs) {
+                return target
+                    .checked_add(rhs_const)
+                    .and_then(|next| solve_expression_to_source(lhs, next));
+            }
+            if let Some(lhs_const) = constant_value(lhs) {
+                return lhs_const
+                    .checked_sub(target)
+                    .and_then(|next| solve_expression_to_source(rhs, next));
+            }
+            None
+        }
+        SymbolicExpression::Mul(lhs, rhs) => {
+            if let Some(rhs_const) = constant_value(rhs) {
+                return solve_mul_inverse(lhs, rhs_const, target);
+            }
+            if let Some(lhs_const) = constant_value(lhs) {
+                return solve_mul_inverse(rhs, lhs_const, target);
+            }
+            None
+        }
+        SymbolicExpression::Div(lhs, rhs) => {
+            if let Some(rhs_const) = constant_value(rhs) {
+                if rhs_const.is_zero() {
+                    return None;
+                }
+                return target
+                    .checked_mul(rhs_const)
+                    .and_then(|next| solve_expression_to_source(lhs, next));
+            }
+            None
+        }
+        SymbolicExpression::Mod(lhs, rhs) => {
+            let modulus = constant_value(rhs)?;
+            if target < modulus {
+                solve_expression_to_source(lhs, target)
+            } else {
+                None
+            }
+        }
+        SymbolicExpression::Xor(lhs, rhs) => {
+            if let Some(rhs_const) = constant_value(rhs) {
+                return solve_expression_to_source(lhs, target ^ rhs_const);
+            }
+            if let Some(lhs_const) = constant_value(lhs) {
+                return solve_expression_to_source(rhs, target ^ lhs_const);
+            }
+            None
+        }
+        SymbolicExpression::And(_, _) | SymbolicExpression::Or(_, _) => None,
+    }
+}
+
+fn constant_value(expr: &SymbolicExpression) -> Option<U256> {
+    match expr {
+        SymbolicExpression::Constant(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn solve_mul_inverse(
+    expr: &SymbolicExpression,
+    factor: U256,
+    target: U256,
+) -> Option<(TaintSource, U256)> {
+    if factor.is_zero() || target % factor != U256::ZERO {
+        return None;
+    }
+    solve_expression_to_source(expr, target / factor)
+}
+
 fn solve_lhs_comparison(op: u8, rhs: U256, target_true: bool) -> Option<U256> {
     match (op, target_true) {
         (0x10 | 0x12, true) => rhs.checked_sub(U256::from(1)),
@@ -218,6 +360,9 @@ mod tests {
             hit: false,
             taint_source: Some(TaintSource::Calldata(4)),
             tainted_operand: ComparisonOperand::Lhs,
+            lhs_expression: Some(SymbolicExpression::Source(TaintSource::Calldata(4))),
+            rhs_expression: Some(SymbolicExpression::Constant(U256::from(42))),
+            branch_distance: Some(U256::from(35)),
         };
 
         let hint = ConcolicSolver::new()
@@ -240,6 +385,9 @@ mod tests {
             hit: false,
             taint_source: Some(TaintSource::Storage(1, 36)),
             tainted_operand: ComparisonOperand::Lhs,
+            lhs_expression: Some(SymbolicExpression::Source(TaintSource::Storage(1, 36))),
+            rhs_expression: Some(SymbolicExpression::Constant(U256::from(10))),
+            branch_distance: Some(U256::from(91)),
         };
 
         let hint = ConcolicSolver::new()
@@ -248,5 +396,33 @@ mod tests {
         assert_eq!(hint.tx_index, 1);
         assert_eq!(hint.calldata_offset, 36);
         assert_eq!(U256::from_be_bytes(hint.word), U256::from(9));
+    }
+
+    #[test]
+    fn solves_linear_expression_before_comparison() {
+        let source = TaintSource::Calldata(4);
+        let waypoint = Waypoint::Comparison {
+            op: 0x14,
+            lhs: U256::from(17),
+            rhs: U256::from(42),
+            pc: 77,
+            calldata_offset: None,
+            condition: false,
+            hit: false,
+            taint_source: Some(source.clone()),
+            tainted_operand: ComparisonOperand::Lhs,
+            lhs_expression: Some(SymbolicExpression::Add(
+                Box::new(SymbolicExpression::Source(source)),
+                Box::new(SymbolicExpression::Constant(U256::from(5))),
+            )),
+            rhs_expression: Some(SymbolicExpression::Constant(U256::from(42))),
+            branch_distance: Some(U256::from(25)),
+        };
+
+        let hint = ConcolicSolver::new()
+            .solve_hint(0, &waypoint)
+            .expect("hint");
+        assert_eq!(hint.calldata_offset, 4);
+        assert_eq!(U256::from_be_bytes(hint.word), U256::from(37));
     }
 }

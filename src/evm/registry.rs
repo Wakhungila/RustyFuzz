@@ -1,4 +1,4 @@
-use crate::common::types::ChainState;
+use crate::common::types::{CallPhase, ChainState, SequenceExecutionResult};
 use crate::evm::etherscan_abi_fetcher::EtherscanAbiFetcher;
 use crate::evm::fuzz::AbiRegistry;
 use crate::evm::trace::ExecutionTrace;
@@ -16,6 +16,18 @@ pub struct GlobalAccountRegistry {
     pub erc20_balance_slots: HashMap<Address, U256>, // token_address -> balance_slot
     pub erc20_total_supply_slots: HashMap<Address, U256>, // token_address -> total_supply_slot
     pub etherscan_abi_fetcher: Option<EtherscanAbiFetcher>,
+    pub target_models: HashMap<Address, TargetModel>,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct TargetModel {
+    pub observed_selectors: HashSet<[u8; 4]>,
+    pub callers: HashSet<Address>,
+    pub callees: HashSet<Address>,
+    pub storage_reads: HashSet<U256>,
+    pub storage_writes: HashSet<U256>,
+    pub successful_calls: usize,
+    pub reverting_calls: usize,
 }
 
 impl GlobalAccountRegistry {
@@ -117,6 +129,61 @@ impl GlobalAccountRegistry {
                     .insert(deployed);
             }
         }
+    }
+
+    pub fn observe_execution(&mut self, execution: &SequenceExecutionResult) {
+        for call in execution
+            .call_trace
+            .iter()
+            .filter(|call| call.phase == CallPhase::End)
+        {
+            self.contracts.insert(call.target);
+            self.contracts.insert(call.caller);
+            self.call_graph
+                .entry(call.caller)
+                .or_default()
+                .insert(call.target);
+
+            let model = self.target_models.entry(call.target).or_default();
+            model.callers.insert(call.caller);
+            if let Some(selector) = call.input.get(..4).and_then(|bytes| bytes.try_into().ok()) {
+                model.observed_selectors.insert(selector);
+            }
+            if call.success {
+                model.successful_calls += 1;
+            } else {
+                model.reverting_calls += 1;
+            }
+        }
+
+        for edge in &execution.call_trace {
+            if edge.phase == CallPhase::End {
+                self.target_models
+                    .entry(edge.caller)
+                    .or_default()
+                    .callees
+                    .insert(edge.target);
+            }
+        }
+
+        for read in &execution.storage_reads {
+            self.target_models
+                .entry(read.address)
+                .or_default()
+                .storage_reads
+                .insert(U256::from_be_bytes(read.slot.0));
+        }
+        for write in &execution.storage_writes {
+            self.target_models
+                .entry(write.address)
+                .or_default()
+                .storage_writes
+                .insert(U256::from_be_bytes(write.slot.0));
+        }
+    }
+
+    pub fn model_for(&self, target: &Address) -> Option<&TargetModel> {
+        self.target_models.get(target)
     }
 
     /// Fetches and populates the ABI for a given contract from Etherscan.

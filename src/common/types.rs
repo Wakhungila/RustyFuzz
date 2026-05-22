@@ -144,6 +144,20 @@ pub enum ComparisonOperand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum SymbolicExpression {
+    Source(TaintSource),
+    Constant(U256),
+    Add(Box<SymbolicExpression>, Box<SymbolicExpression>),
+    Sub(Box<SymbolicExpression>, Box<SymbolicExpression>),
+    Mul(Box<SymbolicExpression>, Box<SymbolicExpression>),
+    Div(Box<SymbolicExpression>, Box<SymbolicExpression>),
+    Mod(Box<SymbolicExpression>, Box<SymbolicExpression>),
+    And(Box<SymbolicExpression>, Box<SymbolicExpression>),
+    Or(Box<SymbolicExpression>, Box<SymbolicExpression>),
+    Xor(Box<SymbolicExpression>, Box<SymbolicExpression>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Waypoint {
     Dataflow {
         address: Address,
@@ -160,6 +174,9 @@ pub enum Waypoint {
         hit: bool,
         taint_source: Option<TaintSource>,
         tainted_operand: ComparisonOperand,
+        lhs_expression: Option<SymbolicExpression>,
+        rhs_expression: Option<SymbolicExpression>,
+        branch_distance: Option<U256>,
     },
     StaticCall {
         caller: Address,
@@ -204,6 +221,7 @@ pub enum Waypoint {
         third: Option<U256>,
         pc: usize,
         taint_source: Option<TaintSource>,
+        result_expression: Option<SymbolicExpression>,
     },
     StorageRead {
         address: Address,
@@ -212,6 +230,7 @@ pub enum Waypoint {
         pc: usize,
         read_tx_idx: usize,
         taint_source: Option<TaintSource>,
+        expression: Option<SymbolicExpression>,
     },
     StorageWrite {
         address: Address,
@@ -220,6 +239,7 @@ pub enum Waypoint {
         pc: usize,
         tx_idx: usize,
         taint_source_of_value: Option<TaintSource>,
+        value_expression: Option<SymbolicExpression>,
     },
     TransientStorageRead {
         address: Address,
@@ -237,6 +257,8 @@ pub enum Waypoint {
         base_slot: U256,
         key: U256,
         derived_slot: B256,
+        key_expression: Option<SymbolicExpression>,
+        base_slot_expression: Option<SymbolicExpression>,
     },
     FlashloanExecution {
         lender: Address,

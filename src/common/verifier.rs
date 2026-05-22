@@ -5,15 +5,28 @@ use crate::evm::dataflow::DataflowRegistry;
 use crate::evm::executor::EvmExecutor;
 use crate::evm::feedback::EvmCoverageFeedback;
 use crate::evm::fork_db::EvmCacheDb;
+use crate::evm::fork_db::ForkDb;
 use crate::evm::fuzz::EvmInput;
 use anyhow::Result;
 use async_trait::async_trait;
 use revm::context::BlockEnv;
 use revm::database::CacheDB;
+use serde::{Deserialize, Serialize};
 
 pub struct ReplayVerifier {
     executor: EvmExecutor,
     map_size: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DifferentialReplayReport {
+    pub equivalent: bool,
+    pub gas_delta: i128,
+    pub cached_coverage_hash: u64,
+    pub live_coverage_hash: u64,
+    pub cached_tx_count: usize,
+    pub live_tx_count: usize,
+    pub mismatches: Vec<String>,
 }
 
 impl ReplayVerifier {
@@ -102,6 +115,43 @@ impl ReplayVerifier {
         self.verify_deterministic(&ChainState::Evm(base_db), block_env, &input)
     }
 
+    pub fn verify_cached_vs_live(
+        &self,
+        cached_fork_db: ForkDb,
+        live_fork_db: ForkDb,
+        block_env: &BlockEnv,
+        input: &EvmInput,
+    ) -> Result<SequenceExecutionResult> {
+        let (cached, report) =
+            self.compare_cached_vs_live(cached_fork_db, live_fork_db, block_env, input)?;
+        anyhow::ensure!(
+            report.equivalent,
+            "cached-vs-live replay mismatch: {report:?}"
+        );
+        Ok(cached)
+    }
+
+    pub fn compare_cached_vs_live(
+        &self,
+        cached_fork_db: ForkDb,
+        live_fork_db: ForkDb,
+        block_env: &BlockEnv,
+        input: &EvmInput,
+    ) -> Result<(SequenceExecutionResult, DifferentialReplayReport)> {
+        let cached = self.verify_deterministic(
+            &ChainState::Evm(CacheDB::new(cached_fork_db)),
+            block_env,
+            input,
+        )?;
+        let live = self.verify_deterministic(
+            &ChainState::Evm(CacheDB::new(live_fork_db)),
+            block_env,
+            input,
+        )?;
+        let report = differential_report(&cached, &live);
+        Ok((cached, report))
+    }
+
     pub fn evaluate_oracle(
         &self,
         execution: &mut SequenceExecutionResult,
@@ -123,6 +173,69 @@ impl ReplayVerifier {
             ),
         });
         Some(finding)
+    }
+}
+
+fn differential_report(
+    cached: &SequenceExecutionResult,
+    live: &SequenceExecutionResult,
+) -> DifferentialReplayReport {
+    let mut mismatches = Vec::new();
+    if cached.tx_results.len() != live.tx_results.len() {
+        mismatches.push(format!(
+            "tx_count cached={} live={}",
+            cached.tx_results.len(),
+            live.tx_results.len()
+        ));
+    }
+    if cached.final_coverage_hash != live.final_coverage_hash {
+        mismatches.push(format!(
+            "coverage_hash cached={} live={}",
+            cached.final_coverage_hash, live.final_coverage_hash
+        ));
+    }
+    if cached.storage_diffs != live.storage_diffs {
+        mismatches.push(format!(
+            "storage_diffs cached={} live={}",
+            cached.storage_diffs.len(),
+            live.storage_diffs.len()
+        ));
+    }
+    if cached.call_trace != live.call_trace {
+        mismatches.push(format!(
+            "call_trace cached={} live={}",
+            cached.call_trace.len(),
+            live.call_trace.len()
+        ));
+    }
+    for (idx, (cached_tx, live_tx)) in cached
+        .tx_results
+        .iter()
+        .zip(live.tx_results.iter())
+        .enumerate()
+    {
+        if cached_tx.status != live_tx.status {
+            mismatches.push(format!(
+                "tx {idx} status cached={:?} live={:?}",
+                cached_tx.status, live_tx.status
+            ));
+        }
+        if cached_tx.output != live_tx.output {
+            mismatches.push(format!(
+                "tx {idx} output cached_len={} live_len={}",
+                cached_tx.output.len(),
+                live_tx.output.len()
+            ));
+        }
+    }
+    DifferentialReplayReport {
+        equivalent: mismatches.is_empty(),
+        gas_delta: cached.total_gas_used as i128 - live.total_gas_used as i128,
+        cached_coverage_hash: cached.final_coverage_hash,
+        live_coverage_hash: live.final_coverage_hash,
+        cached_tx_count: cached.tx_results.len(),
+        live_tx_count: live.tx_results.len(),
+        mismatches,
     }
 }
 

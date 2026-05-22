@@ -386,6 +386,7 @@ impl UniswapV3InvariantOracle {
                 base_slot,
                 key,
                 derived_slot,
+                ..
             } = waypoint
             {
                 if *base_slot == U256::from(5) && *derived_slot == target_slot {
