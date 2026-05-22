@@ -1,13 +1,66 @@
-# Dependencies
-target/
-.cargo/
-.cargo.lock
-.cargo.toml
-node_modules/
-vendor/
-config.toml
+# ─────────────────────────────────────────────────────────────
+# Rust build output
+# ─────────────────────────────────────────────────────────────
+/target/
 
+# Keep Cargo.toml committed.
+# For this project, keep Cargo.lock committed too because RustyFuzz is a binary/tool.
+# Do not ignore Cargo.toml or Cargo.lock.
+
+# Local Cargo config only if you use machine-specific settings.
+/.cargo/
+
+# ─────────────────────────────────────────────────────────────
+# RustyFuzz runtime artifacts
+# ─────────────────────────────────────────────────────────────
+/corpus/
+/reports/
+/crashes/
+/findings/
+/artifacts/
+/fork-cache/
+/fork_cache/
+/seed-bundles/
+/seed_bundles/
+/replays/
+/minimized/
+/coverage/
+/.runs/
+
+# Runtime campaign databases / generated state
+*.cache
+*.db
+*.sqlite
+*.sqlite3
+*.profraw
+*.profdata
+*.trace
+
+# ─────────────────────────────────────────────────────────────
+# Config / secrets
+# ─────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*
+*.env.*
+config.toml
+config.local.toml
+*.rpc
+
+# Keep a sanitized config.example.toml committed.
+
+# ─────────────────────────────────────────────────────────────
+# Logs and temp files
+# ─────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.swp
+*.swo
+*.bak
+
+# ─────────────────────────────────────────────────────────────
 # Compiled and build artifacts
+# ─────────────────────────────────────────────────────────────
 *.o
 *.obj
 *.a
@@ -17,27 +70,28 @@ config.toml
 *.dylib
 *.exe
 
-# Logs and temp files
-*.log
-*.tmp
-*.swp
+# ─────────────────────────────────────────────────────────────
+# Node / vendored deps
+# ─────────────────────────────────────────────────────────────
+node_modules/
 
-# Environment
-.env
-.env.local
-*.env.*
+# Only ignore vendor/ if you are not intentionally vendoring dependencies.
+/vendor/
 
+# ─────────────────────────────────────────────────────────────
 # Editors
+# ─────────────────────────────────────────────────────────────
 .vscode/
 .idea/
-*.swp
-*.swo
 
+# ─────────────────────────────────────────────────────────────
 # Coverage
-coverage/
+# ─────────────────────────────────────────────────────────────
 htmlcov/
 .coverage
 
+# ─────────────────────────────────────────────────────────────
 # OS
+# ─────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
