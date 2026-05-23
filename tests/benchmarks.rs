@@ -27,8 +27,8 @@ use rusty_fuzz::evm::feedback::{
 use rusty_fuzz::evm::fork_db::ForkDb;
 use rusty_fuzz::evm::registry::GlobalAccountRegistry;
 use rusty_fuzz::evm::seed_ingester::{
-    discover_accounts_from_seeds, extract_address_hints, normalize_seeds, MainnetSeed,
-    MainnetSeedBundle, SeedMetadata,
+    discover_accounts_from_seeds, extract_address_hints, normalize_seeds, seed_match_kind,
+    MainnetSeed, MainnetSeedBundle, SeedMetadata,
 };
 use rusty_fuzz::evm::snapshot::new_evm_snapshot;
 
@@ -1208,6 +1208,8 @@ fn mainnet_seed_ingestion_normalizes_and_discovers_accounts() {
             selector: Some([0x09, 0x5e, 0xa7, 0xb3]),
             calldata_len: calldata.len(),
             discovered_address_hints: extract_address_hints(&calldata),
+            matched_target: Some(target),
+            match_kind: Some("direct".to_string()),
         },
     };
     let duplicate = MainnetSeed {
@@ -1252,6 +1254,26 @@ fn mainnet_seed_ingestion_normalizes_and_discovers_accounts() {
         .expect("caller discovered");
     assert!(!caller_account.is_contract);
     assert_eq!(caller_account.nonce, 7);
+}
+
+#[test]
+fn seed_matching_accepts_direct_and_routed_target_references() {
+    let target = addr(0x61);
+    let router = addr(0x62);
+
+    let mut routed_calldata = vec![0x12, 0x34, 0x56, 0x78];
+    routed_calldata.extend_from_slice(&[0u8; 12]);
+    routed_calldata.extend_from_slice(target.as_slice());
+
+    assert_eq!(seed_match_kind(target, target, &[], false), Some("direct"));
+    assert_eq!(
+        seed_match_kind(router, target, &routed_calldata, false),
+        None
+    );
+    assert_eq!(
+        seed_match_kind(router, target, &routed_calldata, true),
+        Some("address-hint")
+    );
 }
 
 #[test]
@@ -1302,6 +1324,8 @@ fn persistent_corpus_round_trips_mainnet_seed_bundle() {
             selector: Some([0xa9, 0x05, 0x9c, 0xbb]),
             calldata_len: 4,
             discovered_address_hints: Vec::new(),
+            matched_target: Some(target),
+            match_kind: Some("direct".to_string()),
         },
     };
     let bundle = MainnetSeedBundle {

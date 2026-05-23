@@ -508,9 +508,11 @@ use crate::common::oracle::ProtocolOraclePack;
 use crate::common::types::{
     ChainState, EvmInput, ExecutionStatus, SequenceExecutionResult, SingletonTx,
 };
+use crate::engine::exploit_path::ExploitPathBuilder;
 use crate::engine::foundry_ingest::FoundryHarnessManifest;
 use crate::engine::scheduler::RustyFuzzScheduler;
 use crate::engine::scoring::{CampaignScore, CampaignScorer};
+use crate::engine::seed_intelligence::{SeedIntelligence, SeedIntelligenceConfig};
 use crate::evm::corpus::{CampaignArtifactRequest, PersistentCorpus, SnapshotCorpus};
 use crate::evm::dataflow::DataflowRegistry;
 use crate::evm::executor::EvmExecutor;
@@ -521,15 +523,82 @@ use crate::evm::snapshot::new_evm_snapshot;
 
 use libafl::corpus::{Corpus, Testcase};
 use libafl::state::HasCorpus;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use revm::primitives::{Address, U256};
 use revm::state::AccountInfo;
 use std::cell::UnsafeCell;
-use std::{sync::Arc, time::Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 // Sync wrapper for UnsafeCell to allow thread-safe static usage.
 struct SyncUnsafeCell<T>(UnsafeCell<T>);
 unsafe impl<T: Send> Sync for SyncUnsafeCell<T> {}
+
+struct CampaignTelemetry {
+    start: Instant,
+    executions: AtomicU64,
+    artifacts: AtomicU64,
+    oracle_findings: AtomicU64,
+    last_report: Mutex<(Instant, u64)>,
+}
+
+impl CampaignTelemetry {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            start: now,
+            executions: AtomicU64::new(0),
+            artifacts: AtomicU64::new(0),
+            oracle_findings: AtomicU64::new(0),
+            last_report: Mutex::new((now, 0)),
+        }
+    }
+
+    fn record_execution(
+        &self,
+        core_id: usize,
+        tx_count: usize,
+        findings: usize,
+        campaign_score: u64,
+    ) {
+        let total = self.executions.fetch_add(1, Ordering::Relaxed) + 1;
+        if findings > 0 {
+            self.oracle_findings
+                .fetch_add(findings as u64, Ordering::Relaxed);
+        }
+
+        let now = Instant::now();
+        let mut last = self.last_report.lock();
+        let elapsed = now.duration_since(last.0);
+        if elapsed < CAMPAIGN_TELEMETRY_INTERVAL {
+            return;
+        }
+
+        let delta_execs = total.saturating_sub(last.1);
+        let interval_execs_per_sec = delta_execs as f64 / elapsed.as_secs_f64().max(0.001);
+        let total_execs_per_sec =
+            total as f64 / now.duration_since(self.start).as_secs_f64().max(0.001);
+        log::info!(
+            "RustyFuzz telemetry: core={}, execs={}, exec_sec_30s={:.3}, exec_sec_avg={:.3}, artifacts={}, oracle_findings={}, txs_last={}, score_last={}",
+            core_id,
+            total,
+            interval_execs_per_sec,
+            total_execs_per_sec,
+            self.artifacts.load(Ordering::Relaxed),
+            self.oracle_findings.load(Ordering::Relaxed),
+            tx_count,
+            campaign_score
+        );
+        *last = (now, total);
+    }
+
+    fn record_artifact(&self) {
+        self.artifacts.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 // LibAFL 0.15.4 imports.
 use libafl::events::ClientDescription;
@@ -544,6 +613,7 @@ use libafl_bolts::tuples::tuple_list;
 const MAP_SIZE: usize = 65_536;
 const STATE_NOVELTY_MAP_SLOTS: usize = 2_048;
 const CAMPAIGN_SCORE_MAP_SLOTS: usize = 1_024;
+const CAMPAIGN_TELEMETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct Config {
     pub rpc_url: String,
@@ -552,6 +622,7 @@ pub struct Config {
     pub corpus_dir: String,
     pub report_dir: String,
     pub foundry_harness: Option<FoundryHarnessManifest>,
+    pub mainnet_seed_bundle: Option<String>,
 }
 
 pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
@@ -622,6 +693,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 let dataflow_registry = Arc::new(RwLock::new(DataflowRegistry::new()));
                 let state_novelty_feedback =
                     Arc::new(RwLock::new(EvmStateNoveltyFeedback::new()));
+                let telemetry = Arc::new(CampaignTelemetry::new());
                 let pending_campaign_score = Arc::new(RwLock::new(None));
                 let campaign_scorer = Arc::new(CampaignScorer::default());
                 let protocol_oracles = Arc::new(ProtocolOraclePack::default());
@@ -662,9 +734,78 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 });
 
                 if state.corpus().count() == 0 {
-                    state
-                        .corpus_mut()
-                        .add(Testcase::new(seed_input(target_contract, fuzzer_address)))?;
+                    let mut inserted_seed_count = 0usize;
+                    if let Some(bundle_id) = &config.mainnet_seed_bundle {
+                        match persistent_corpus.load_mainnet_seed_bundle(bundle_id) {
+                            Ok(bundle) if bundle.target == target_contract => {
+                                for seed in bundle.seeds {
+                                    state.corpus_mut().add(Testcase::new(seed.input))?;
+                                    inserted_seed_count += 1;
+                                }
+                                if inserted_seed_count == 0 {
+                                    log::warn!(
+                                        "Mainnet seed bundle `{}` matched target {} but contained no seeds; using synthetic seed",
+                                        bundle_id,
+                                        target_contract
+                                    );
+                                } else {
+                                    log::info!(
+                                        "Loaded mainnet seed bundle `{}` into campaign corpus: {} seeds",
+                                        bundle_id,
+                                        inserted_seed_count
+                                    );
+                                }
+                            }
+                            Ok(bundle) => {
+                                log::warn!(
+                                    "Ignoring mainnet seed bundle `{}` for target {}; campaign target is {}",
+                                    bundle_id,
+                                    bundle.target,
+                                    target_contract
+                                );
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "Failed to load mainnet seed bundle `{}` from `{}`: {err:#}",
+                                    bundle_id,
+                                    config.corpus_dir
+                                );
+                            }
+                        }
+                    }
+
+                    if config.foundry_harness.is_some() {
+                        let seed_intelligence =
+                            SeedIntelligence::new(SeedIntelligenceConfig::default());
+                        let intelligent_seeds = seed_intelligence.generate_candidates(
+                            target_contract,
+                            fuzzer_address,
+                            abi_registry.as_ref(),
+                            config.foundry_harness.as_ref(),
+                        );
+                        for seed in intelligent_seeds {
+                            state
+                                .corpus_mut()
+                                .add(Testcase::new(seed.into_evm_input(0)))?;
+                            inserted_seed_count += 1;
+                        }
+                        if inserted_seed_count > 0 {
+                            log::info!(
+                                "Initialized campaign corpus with {} seed inputs including trusted ABI/Foundry seed intelligence",
+                                inserted_seed_count
+                            );
+                        }
+                    } else {
+                        log::info!(
+                            "No trusted ABI/Foundry seed source configured; starting from synthetic seed and preserving generic ABI registry for mutations"
+                        );
+                    }
+
+                    if inserted_seed_count == 0 {
+                        state
+                            .corpus_mut()
+                            .add(Testcase::new(seed_input(target_contract, fuzzer_address)))?;
+                    }
                 }
 
                 let mutator = EvmMutator::new(abi_registry, account_registry.clone());
@@ -745,8 +886,20 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
                     let campaign_score =
                         campaign_scorer.score(input, &execution, &report, &findings);
+                    let exploit_candidate = ExploitPathBuilder::from_execution(
+                        input,
+                        &execution,
+                        &findings,
+                        &campaign_score,
+                    );
 
                     account_registry.write().observe_execution(&execution);
+                    telemetry.record_execution(
+                        core_id.0,
+                        input.txs.len(),
+                        findings.len(),
+                        campaign_score.total,
+                    );
 
                     if report.interesting {
                         unsafe {
@@ -785,6 +938,19 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                         );
                     }
 
+                    if let Some(candidate) = &exploit_candidate {
+                        if candidate.confidence >= 80 {
+                            log::debug!(
+                                "Exploit path candidate: confidence={}, target={:?}, invariant={:?}, replay={:?}, minimize={:?}",
+                                candidate.confidence,
+                                candidate.target,
+                                candidate.violated_invariant,
+                                candidate.replayability_status,
+                                candidate.minimized_sequence_status
+                            );
+                        }
+                    }
+
                     if let Some(reason) =
                         campaign_artifact_reason(&execution, &report, &campaign_score, &findings)
                     {
@@ -807,14 +973,17 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                         };
 
                         match persisted {
-                            Ok(record) => log::info!(
-                                "Persisted campaign artifact: input_id={}, fork_cache_id={}, reason={}, score={}, findings={}",
-                                record.input_id,
-                                record.fork_cache_id,
-                                record.reason,
-                                record.score.total,
-                                record.findings.len()
-                            ),
+                            Ok(record) => {
+                                telemetry.record_artifact();
+                                log::info!(
+                                    "Persisted campaign artifact: input_id={}, fork_cache_id={}, reason={}, score={}, findings={}",
+                                    record.input_id,
+                                    record.fork_cache_id,
+                                    record.reason,
+                                    record.score.total,
+                                    record.findings.len()
+                                );
+                            }
                             Err(err) => log::error!(
                                 "Failed to persist campaign artifact for target {}: {err:#}",
                                 target_contract
@@ -861,6 +1030,15 @@ fn campaign_artifact_reason(
     // sequence includes a revert/halt before or after the meaningful action.
     if !findings.is_empty() {
         return Some("protocol-oracle-finding");
+    }
+
+    if campaign_score
+        .explanation
+        .iter()
+        .any(|reason| reason.contains("exploit-directed"))
+        && campaign_score.total >= MIN_ECONOMIC_OR_INVARIANT_SCORE
+    {
+        return Some("exploit-path-candidate");
     }
 
     let has_non_success_tx = execution

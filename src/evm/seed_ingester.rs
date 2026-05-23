@@ -14,6 +14,8 @@ use std::time::Duration;
 const DEFAULT_SEARCH_DEPTH: u64 = 100;
 const DEFAULT_MAX_RETRIES: usize = 3;
 const DEFAULT_RETRY_BACKOFF_MS: u64 = 250;
+const DIRECT_MATCH: &str = "direct";
+const ADDRESS_HINT_MATCH: &str = "address-hint";
 
 /// Controls deterministic mainnet seed ingestion. Every range is walked from
 /// newest to oldest, then normalized before being returned.
@@ -26,6 +28,7 @@ pub struct MainnetSeedConfig {
     pub max_seeds: usize,
     pub max_retries: usize,
     pub retry_backoff_ms: u64,
+    pub include_address_hints: bool,
 }
 
 impl MainnetSeedConfig {
@@ -38,6 +41,7 @@ impl MainnetSeedConfig {
             max_seeds,
             max_retries: DEFAULT_MAX_RETRIES,
             retry_backoff_ms: DEFAULT_RETRY_BACKOFF_MS,
+            include_address_hints: false,
         }
     }
 }
@@ -69,6 +73,10 @@ pub struct SeedMetadata {
     pub selector: Option<[u8; 4]>,
     pub calldata_len: usize,
     pub discovered_address_hints: Vec<Address>,
+    #[serde(default)]
+    pub matched_target: Option<Address>,
+    #[serde(default)]
+    pub match_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -148,17 +156,25 @@ impl<P: Provider> SeedIngester<P> {
 
             for (transaction_ordinal, tx) in txs.into_iter().enumerate() {
                 let envelope = &*tx.inner;
-                if envelope.to() != Some(config.target) {
+                let Some(to) = envelope.to() else {
                     continue;
-                }
-
+                };
                 let input_bytes = envelope.input().to_vec();
+                let Some(match_kind) = seed_match_kind(
+                    to,
+                    config.target,
+                    &input_bytes,
+                    config.include_address_hints,
+                ) else {
+                    continue;
+                };
+
                 let caller = Address::from(*tx.inner.signer());
                 let seed_input = EvmInput {
                     txs: vec![SingletonTx {
                         input: input_bytes.clone(),
                         caller,
-                        to: config.target,
+                        to,
                         value: envelope.value(),
                         is_victim: false,
                     }],
@@ -171,11 +187,13 @@ impl<P: Provider> SeedIngester<P> {
                     block_offset: offset,
                     transaction_ordinal,
                     caller,
-                    target: config.target,
+                    target: to,
                     value: envelope.value(),
                     selector: selector(&input_bytes),
                     calldata_len: input_bytes.len(),
                     discovered_address_hints: extract_address_hints(&input_bytes),
+                    matched_target: Some(config.target),
+                    match_kind: Some(match_kind.to_string()),
                 };
                 candidates.push(MainnetSeed {
                     id: stable_seed_id(&seed_input, &metadata),
@@ -324,6 +342,21 @@ pub fn extract_address_hints(calldata: &[u8]) -> Vec<Address> {
         }
     }
     hints.into_iter().collect()
+}
+
+pub fn seed_match_kind(
+    to: Address,
+    target: Address,
+    calldata: &[u8],
+    include_address_hints: bool,
+) -> Option<&'static str> {
+    if to == target {
+        return Some(DIRECT_MATCH);
+    }
+    if include_address_hints && extract_address_hints(calldata).contains(&target) {
+        return Some(ADDRESS_HINT_MATCH);
+    }
+    None
 }
 
 fn stable_seed_id(input: &EvmInput, metadata: &SeedMetadata) -> String {

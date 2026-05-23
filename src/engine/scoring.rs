@@ -1,5 +1,7 @@
 use crate::common::oracle::{ProtocolFinding, ProtocolSeverity, VulnType};
 use crate::common::types::{SequenceExecutionResult, Waypoint};
+use crate::engine::dependency::dependency_sequence_score;
+use crate::engine::exploit_path::exploit_path_score;
 use crate::evm::feedback::StateNoveltyReport;
 use crate::evm::fuzz::EvmInput;
 use crate::evm::trace::ExecutionTrace;
@@ -93,7 +95,22 @@ impl CampaignScorer {
         if state_pressure > 0 {
             explanation.push(format!("state_novelty={state_pressure}"));
         }
-        let exploration_pressure = self.exploration_pressure(input, execution, &mut explanation);
+        let mut exploration_pressure =
+            self.exploration_pressure(input, execution, &mut explanation);
+        let dependency_pressure = dependency_sequence_score(input);
+        if dependency_pressure > 0 {
+            explanation.push(format!(
+                "dependency-aware sequence pressure {dependency_pressure}"
+            ));
+            exploration_pressure = exploration_pressure.saturating_add(dependency_pressure);
+        }
+        let exploit_pressure = exploit_path_score(input);
+        if exploit_pressure > 0 {
+            explanation.push(format!(
+                "exploit-directed sequence pressure {exploit_pressure}"
+            ));
+            exploration_pressure = exploration_pressure.saturating_add(exploit_pressure);
+        }
         let branch_pressure = self.branch_frontier_pressure(execution, &mut explanation);
 
         let total = economic_pressure

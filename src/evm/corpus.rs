@@ -1,4 +1,5 @@
 use crate::common::oracle::ProtocolFinding;
+use crate::common::oracle::ProtocolSeverity;
 use crate::common::types::{ChainState, SequenceExecutionResult, Snapshot, Waypoint};
 use crate::engine::scoring::CampaignScore;
 use crate::evm::feedback::EvmCoverageFeedback;
@@ -63,12 +64,26 @@ pub struct SnapshotManifest {
 pub struct CampaignArtifactRecord {
     pub input_id: String,
     pub fork_cache_id: String,
+    #[serde(default)]
+    pub artifact_key: String,
     pub block_number: u64,
     pub target: Option<Address>,
     pub reason: String,
     pub score: CampaignScore,
     pub findings: Vec<ProtocolFinding>,
     pub metadata: CorpusEntryMetadata,
+    #[serde(default)]
+    pub triage: CampaignArtifactTriageSummary,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CampaignArtifactTriageSummary {
+    pub persisted_reason: String,
+    pub confidence: u64,
+    pub false_positive_risks: Vec<String>,
+    pub suggested_next_command: String,
+    pub dedup_key: String,
+    pub finding_kinds: Vec<String>,
 }
 
 pub struct CampaignArtifactRequest<'a> {
@@ -96,6 +111,8 @@ impl PersistentCorpus {
         fs::create_dir_all(root.join("fork_cache"))?;
         fs::create_dir_all(root.join("mainnet_seeds"))?;
         fs::create_dir_all(root.join("campaign_artifacts"))?;
+        fs::create_dir_all(root.join("campaign_artifacts").join("index"))?;
+        fs::create_dir_all(root.join("campaign_artifacts").join("summaries"))?;
         Ok(Self { root })
     }
 
@@ -205,6 +222,20 @@ impl PersistentCorpus {
         &self,
         request: CampaignArtifactRequest<'_>,
     ) -> anyhow::Result<CampaignArtifactRecord> {
+        let artifact_key = artifact_equivalence_key(&request)?;
+        let index_path = self
+            .root
+            .join("campaign_artifacts")
+            .join("index")
+            .join(format!("{artifact_key}.json"));
+        if let Ok(bytes) = fs::read(&index_path) {
+            if let Ok(existing) = serde_json::from_slice::<CampaignArtifactRecord>(&bytes) {
+                if existing.score.total >= request.score.total {
+                    return Ok(existing);
+                }
+            }
+        }
+
         let metadata = self.persist_execution_input(
             request.input,
             request.execution,
@@ -217,18 +248,35 @@ impl PersistentCorpus {
         let record = CampaignArtifactRecord {
             input_id: metadata.id.clone(),
             fork_cache_id,
+            artifact_key: artifact_key.clone(),
             block_number: request.block_number,
             target: request.target,
             reason: request.reason.to_string(),
             score: request.score.clone(),
             findings: request.findings.to_vec(),
             metadata,
+            triage: triage_summary(
+                &artifact_key,
+                request.reason,
+                request.score,
+                request.findings,
+                request.target,
+            ),
         };
+        let record_bytes = serde_json::to_vec_pretty(&record)?;
         fs::write(
             self.root
                 .join("campaign_artifacts")
                 .join(format!("{}.json", record.input_id)),
-            serde_json::to_vec_pretty(&record)?,
+            &record_bytes,
+        )?;
+        fs::write(index_path, &record_bytes)?;
+        fs::write(
+            self.root
+                .join("campaign_artifacts")
+                .join("summaries")
+                .join(format!("{}.md", record.input_id)),
+            triage_markdown(&record),
         )?;
         Ok(record)
     }
@@ -463,6 +511,224 @@ fn hash_snapshot_state(snapshot: &Snapshot) -> String {
         }
     }
     format!("0x{}", hex::encode(revm::primitives::keccak256(material)))
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactEquivalenceComponents {
+    sequence_hash: String,
+    final_coverage_hash: u64,
+    finding_types: Vec<String>,
+    target: Option<Address>,
+    touched_slots: Vec<(Address, B256)>,
+    reason: String,
+}
+
+fn artifact_equivalence_key(request: &CampaignArtifactRequest<'_>) -> anyhow::Result<String> {
+    let components = artifact_equivalence_components(
+        request.input,
+        request.execution,
+        request.findings,
+        request.target,
+        request.reason,
+    )?;
+    let encoded = serde_json::to_vec(&components)?;
+    Ok(hex::encode(revm::primitives::keccak256(encoded)))
+}
+
+fn artifact_equivalence_components(
+    input: &EvmInput,
+    execution: &SequenceExecutionResult,
+    findings: &[ProtocolFinding],
+    target: Option<Address>,
+    reason: &str,
+) -> anyhow::Result<ArtifactEquivalenceComponents> {
+    let encoded = serde_json::to_vec(input)?;
+    let sequence_hash = format!("0x{}", hex::encode(revm::primitives::keccak256(encoded)));
+    let mut finding_types: Vec<_> = findings
+        .iter()
+        .map(|finding| format!("{:?}:{:?}", finding.pack, finding.vuln))
+        .collect();
+    finding_types.sort();
+    finding_types.dedup();
+
+    let mut touched_slots: Vec<_> = execution
+        .storage_diffs
+        .iter()
+        .map(|diff| (diff.address, diff.slot))
+        .collect();
+    touched_slots.sort();
+    touched_slots.dedup();
+    touched_slots.truncate(64);
+
+    Ok(ArtifactEquivalenceComponents {
+        sequence_hash,
+        final_coverage_hash: execution.final_coverage_hash,
+        finding_types,
+        target,
+        touched_slots,
+        reason: reason.to_string(),
+    })
+}
+
+fn triage_summary(
+    artifact_key: &str,
+    reason: &str,
+    score: &CampaignScore,
+    findings: &[ProtocolFinding],
+    target: Option<Address>,
+) -> CampaignArtifactTriageSummary {
+    let finding_kinds: Vec<_> = findings
+        .iter()
+        .map(|finding| format!("{:?}:{:?}", finding.pack, finding.vuln))
+        .collect();
+    let max_severity = findings
+        .iter()
+        .map(|finding| severity_confidence(&finding.severity))
+        .max()
+        .unwrap_or(0);
+    let confidence = max_severity
+        .saturating_add((score.total / 100).min(25))
+        .min(100);
+    let false_positive_risks = if findings.is_empty() {
+        vec![
+            "score-only artifact; replay before treating as vulnerability evidence".to_string(),
+            "state novelty or economic pressure may be benign protocol behavior".to_string(),
+        ]
+    } else {
+        findings
+            .iter()
+            .flat_map(|finding| {
+                [
+                    format!(
+                        "{} evidence is heuristic unless replay/minimization preserves it",
+                        finding.vuln
+                    ),
+                    "fork-specific balances, roles, or oracle state may affect reproducibility"
+                        .to_string(),
+                ]
+            })
+            .collect()
+    };
+    let suggested_next_command = match target {
+        Some(address) => {
+            format!("cargo run --release -- fuzz --chain evm --contract {address}")
+        }
+        None => "cargo run --release -- fuzz --chain evm".to_string(),
+    };
+
+    CampaignArtifactTriageSummary {
+        persisted_reason: reason.to_string(),
+        confidence,
+        false_positive_risks,
+        suggested_next_command,
+        dedup_key: artifact_key.to_string(),
+        finding_kinds,
+    }
+}
+
+fn severity_confidence(severity: &ProtocolSeverity) -> u64 {
+    match severity {
+        ProtocolSeverity::Info => 20,
+        ProtocolSeverity::Low => 35,
+        ProtocolSeverity::Medium => 55,
+        ProtocolSeverity::High => 75,
+        ProtocolSeverity::Critical => 90,
+    }
+}
+
+fn triage_markdown(record: &CampaignArtifactRecord) -> String {
+    format!(
+        "# RustyFuzz Campaign Artifact\n\n- input_id: `{}`\n- reason: `{}`\n- confidence: `{}`\n- score: `{}`\n- target: `{:?}`\n- dedup_key: `{}`\n- findings: `{}`\n\n## False-positive risks\n{}\n\n## Next command\n`{}`\n",
+        record.input_id,
+        record.reason,
+        record.triage.confidence,
+        record.score.total,
+        record.target,
+        record.artifact_key,
+        record.triage.finding_kinds.join(", "),
+        record
+            .triage
+            .false_positive_risks
+            .iter()
+            .map(|risk| format!("- {risk}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        record.triage.suggested_next_command
+    )
+}
+
+#[cfg(test)]
+mod artifact_tests {
+    use super::*;
+    use crate::common::types::{ExecutionStatus, SingletonTx, StorageDiff, TxExecutionResult};
+    use revm::primitives::U256;
+
+    #[test]
+    fn artifact_equivalence_deduplicates_same_sequence_coverage_finding_and_slots() {
+        let input = EvmInput {
+            txs: vec![SingletonTx {
+                input: vec![0xde, 0xad, 0xbe, 0xef],
+                caller: Address::repeat_byte(0x13),
+                to: Address::repeat_byte(0xaa),
+                value: U256::ZERO,
+                is_victim: false,
+            }],
+            base_snapshot_id: 0,
+            waypoints: Vec::new(),
+            mutation_provenance: Vec::new(),
+        };
+        let execution = SequenceExecutionResult {
+            tx_results: vec![TxExecutionResult {
+                tx_index: 0,
+                status: ExecutionStatus::Success,
+                gas_used: 0,
+                output: Vec::new(),
+                coverage_hash: 7,
+                coverage_edges: 1,
+                storage_reads: Vec::new(),
+                storage_writes: Vec::new(),
+                storage_diffs: Vec::new(),
+                call_trace: Vec::new(),
+                waypoints: Vec::new(),
+            }],
+            total_gas_used: 0,
+            final_coverage_hash: 7,
+            storage_reads: Vec::new(),
+            storage_writes: Vec::new(),
+            storage_diffs: vec![StorageDiff {
+                tx_index: 0,
+                address: Address::repeat_byte(0xaa),
+                slot: B256::from([0x11; 32]),
+                old_value: U256::ZERO,
+                new_value: U256::from(1),
+                pc: 0,
+            }],
+            call_trace: Vec::new(),
+            oracle_observations: Vec::new(),
+        };
+
+        let left = artifact_equivalence_components(
+            &input,
+            &execution,
+            &[],
+            Some(Address::repeat_byte(0xaa)),
+            "state-novelty",
+        )
+        .expect("components");
+        let right = artifact_equivalence_components(
+            &input,
+            &execution,
+            &[],
+            Some(Address::repeat_byte(0xaa)),
+            "state-novelty",
+        )
+        .expect("components");
+
+        assert_eq!(
+            serde_json::to_vec(&left).unwrap(),
+            serde_json::to_vec(&right).unwrap()
+        );
+    }
 }
 
 /// A specialized corpus for managing EVM state snapshots.

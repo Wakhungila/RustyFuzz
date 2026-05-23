@@ -207,6 +207,7 @@ corpus_dir = "corpus"
 report_dir = "reports"
 llm_enabled = false
 foundry_project = "."
+mainnet_seed_bundle = "target-mainnet"
 ```
 
 Run a fuzz campaign:
@@ -218,8 +219,14 @@ cargo run -- fuzz --chain evm --contract 0xTarget
 Seed a campaign from mainnet fork history:
 
 ```bash
-cargo run -- seed --target 0xTarget --max-seeds 32 --bundle-id target-mainnet
+cargo run -- seed --target 0xTarget --max-seeds 64 --bundle-id target-mainnet --search-depth 50000 --include-address-hints
 ```
+
+Set `mainnet_seed_bundle` to the same bundle id before running `fuzz` to
+load those historical calldata sequences into the initial campaign corpus.
+Use `--start-block <block>` to scan backward from a known active range. The
+`--include-address-hints` mode also accepts transactions whose calldata
+contains the target address, which helps seed router/proxy-mediated protocols.
 
 Replay a persisted input against cached fork state:
 

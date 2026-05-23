@@ -12,6 +12,8 @@ pub struct Config {
     pub report_dir: String,
     pub llm_enabled: bool,
     pub foundry_project: Option<String>,
+    #[serde(default)]
+    pub mainnet_seed_bundle: Option<String>,
 }
 
 impl Config {

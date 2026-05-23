@@ -8,4 +8,5 @@ initial_seeds = 50
 timeout_secs = 60
 corpus_dir = "corpus"
 report_dir = "reports"
+mainnet_seed_bundle = "target-mainnet"
 llm_enabled = false

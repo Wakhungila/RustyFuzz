@@ -1,8 +1,11 @@
 pub mod concolic;
 pub mod corpus_minimizer;
+pub mod dependency;
+pub mod exploit_path;
 pub mod exploit_synthesizer;
 pub mod foundry_ingest;
 pub mod fuzz_engine;
 pub mod minimizer;
 pub mod scheduler;
 pub mod scoring;
+pub mod seed_intelligence;

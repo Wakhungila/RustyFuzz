@@ -37,6 +37,12 @@ enum Command {
         max_seeds: usize,
         #[arg(long, default_value = "default")]
         bundle_id: String,
+        #[arg(long)]
+        start_block: Option<u64>,
+        #[arg(long, default_value_t = 10_000)]
+        search_depth: u64,
+        #[arg(long, default_value_t = false)]
+        include_address_hints: bool,
     },
     Replay {
         #[arg(long)]
@@ -93,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
                     .as_deref()
                     .map(FoundryHarnessManifest::ingest)
                     .transpose()?,
+                mainnet_seed_bundle: config.mainnet_seed_bundle.clone(),
             };
             rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await?;
         }
@@ -100,6 +107,9 @@ async fn main() -> anyhow::Result<()> {
             target,
             max_seeds,
             bundle_id,
+            start_block,
+            search_depth,
+            include_address_hints,
         } => {
             ensure_evm_chain(&config)?;
             let target = target_address(target.as_deref(), &config)?;
@@ -108,11 +118,12 @@ async fn main() -> anyhow::Result<()> {
             let provider = ProviderBuilder::new().connect_http(url);
             let fork_db = ForkDb::new(config.rpc_url.clone(), fork_block);
             let ingester = SeedIngester::new(provider);
+            let mut seed_config = MainnetSeedConfig::new(fork_block, target, max_seeds);
+            seed_config.start_block = start_block;
+            seed_config.search_depth = search_depth;
+            seed_config.include_address_hints = include_address_hints;
             let bundle = ingester
-                .ingest_bundle_from_target(
-                    &MainnetSeedConfig::new(fork_block, target, max_seeds),
-                    &fork_db,
-                )
+                .ingest_bundle_from_target(&seed_config, &fork_db)
                 .await?;
             let corpus = PersistentCorpus::new(&config.corpus_dir)?;
             corpus.persist_mainnet_seed_bundle(&bundle_id, &bundle)?;

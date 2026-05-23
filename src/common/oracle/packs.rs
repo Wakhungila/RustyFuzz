@@ -1,4 +1,4 @@
-use crate::common::oracle::VulnType;
+use crate::common::oracle::{ProtocolInvariantEvaluator, VulnType};
 use crate::common::types::{
     CallKind, CallObservation, CallPhase, OracleObservation, SequenceExecutionResult, StorageDiff,
 };
@@ -105,6 +105,13 @@ impl ProtocolOraclePack {
         if self.enabled.contains(&ProtocolOraclePackKind::Governance) {
             self.evaluate_governance(execution, &mut findings);
         }
+        findings.extend(
+            ProtocolInvariantEvaluator {
+                large_delta_threshold: self.large_diff_threshold,
+                ..ProtocolInvariantEvaluator::default()
+            }
+            .evaluate_as_protocol_findings(execution),
+        );
         findings.sort_by(|a, b| {
             (&b.severity, &a.pack, a.tx_index, a.target).cmp(&(
                 &a.severity,
