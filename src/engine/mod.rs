@@ -1,6 +1,9 @@
+pub mod actors;
+pub mod benchmark;
 pub mod concolic;
 pub mod corpus_minimizer;
 pub mod dependency;
+pub mod economic_delta;
 pub mod exploit_path;
 pub mod exploit_synthesizer;
 pub mod foundry_ingest;
@@ -9,3 +12,4 @@ pub mod minimizer;
 pub mod scheduler;
 pub mod scoring;
 pub mod seed_intelligence;
+pub mod target_profile;

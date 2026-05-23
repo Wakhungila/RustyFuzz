@@ -10,3 +10,13 @@ corpus_dir = "corpus"
 report_dir = "reports"
 mainnet_seed_bundle = "target-mainnet"
 llm_enabled = false
+
+[hardened_defi]
+enabled = false
+historical_seed_file = "seeds/example_historical_seed.json"
+max_template_sequences = 128
+enable_actor_model = true
+enable_economic_delta = true
+enable_protocol_invariants = true
+enable_exploit_templates = true
+min_persist_confidence = 0.70

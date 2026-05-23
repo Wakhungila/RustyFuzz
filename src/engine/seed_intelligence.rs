@@ -617,6 +617,196 @@ fn parse_u256(value: Option<&str>) -> anyhow::Result<U256> {
     U256::from_str(value).map_err(|err| anyhow::anyhow!("invalid U256 `{value}`: {err}"))
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct HistoricalSeedJson {
+    chain_id: Option<u64>,
+    block_number: Option<u64>,
+    target: Option<String>,
+    #[serde(default)]
+    transactions: Vec<HistoricalSeedTx>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HistoricalSeedTx {
+    hash: Option<String>,
+    #[serde(rename = "from")]
+    from_addr: Option<String>,
+    to: Option<String>,
+    value: Option<String>,
+    input: Option<String>,
+    selector: Option<String>,
+    success: Option<bool>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+impl SeedIntelligence {
+    pub fn parse_historical_seed_json(&self, json: &str) -> anyhow::Result<Vec<SeedCandidate>> {
+        let bundle: HistoricalSeedJson = serde_json::from_str(json)?;
+        let target_hint = bundle
+            .target
+            .as_deref()
+            .and_then(|value| Address::from_str(value).ok());
+        let mut out = Vec::new();
+        for tx in bundle.transactions {
+            if tx.success == Some(false) {
+                continue;
+            }
+            let Some(to) = tx
+                .to
+                .as_deref()
+                .and_then(|value| Address::from_str(value).ok())
+            else {
+                continue;
+            };
+            let caller = tx
+                .from_addr
+                .as_deref()
+                .and_then(|value| Address::from_str(value).ok())
+                .unwrap_or_else(|| Address::repeat_byte(0x13));
+            let calldata = parse_bytes(tx.input.as_deref())?;
+            if !calldata.is_empty() && calldata.len() < 4 {
+                continue;
+            }
+            let selector = calldata
+                .get(0..4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .or_else(|| {
+                    tx.selector
+                        .as_deref()
+                        .and_then(|raw| parse_selector_hex(raw).ok())
+                });
+            let priority = selector
+                .map(selector_priority_detail)
+                .unwrap_or_else(fallback_priority);
+            let mut tags = tx
+                .tags
+                .iter()
+                .filter_map(|tag| seed_tag_from_text(tag))
+                .collect::<BTreeSet<_>>();
+            if tags.is_empty() {
+                tags = priority.tags;
+            }
+            let target_relevant = target_hint.is_some_and(|target| target == to);
+            out.push(SeedCandidate {
+                target: to,
+                caller,
+                calldata,
+                selector,
+                value: parse_u256(tx.value.as_deref()).unwrap_or_default(),
+                source_type: SeedSourceType::Historical,
+                confidence_score: (priority.base_confidence
+                    + if target_relevant { 25 } else { 10 })
+                .min(100),
+                reason: format!(
+                    "historical tx seed{}{}{}",
+                    tx.hash
+                        .as_deref()
+                        .map(|hash| format!(" {hash}"))
+                        .unwrap_or_default(),
+                    bundle
+                        .chain_id
+                        .map(|chain| format!(" on chain {chain}"))
+                        .unwrap_or_default(),
+                    bundle
+                        .block_number
+                        .map(|block| format!(" at block {block}"))
+                        .unwrap_or_default()
+                ),
+                touched_addresses: vec![to],
+                touched_slots: Vec::new(),
+                prerequisites: Vec::new(),
+                tags,
+            });
+        }
+        out.sort_by(|a, b| b.confidence_score.cmp(&a.confidence_score));
+        out.truncate(self.config.max_candidates);
+        Ok(out)
+    }
+
+    pub fn historical_candidates_to_inputs(
+        &self,
+        candidates: Vec<SeedCandidate>,
+        base_snapshot_id: u64,
+        max_sequence_len: usize,
+    ) -> Vec<EvmInput> {
+        let mut inputs = candidates
+            .iter()
+            .cloned()
+            .map(|candidate| candidate.into_evm_input(base_snapshot_id))
+            .collect::<Vec<_>>();
+        for window in candidates.windows(max_sequence_len.max(2).min(4)) {
+            if window.len() < 2 {
+                continue;
+            }
+            let mut txs = Vec::new();
+            let mut provenance = Vec::new();
+            for (idx, candidate) in window.iter().enumerate() {
+                txs.push(SingletonTx {
+                    input: candidate.calldata.clone(),
+                    caller: candidate.caller,
+                    to: candidate.target,
+                    value: candidate.value,
+                    is_victim: false,
+                });
+                provenance.push(MutationProvenance {
+                    strategy: "historical_seed_sequence".to_string(),
+                    tx_index: Some(idx),
+                    selector: candidate.selector,
+                    detail: candidate.reason.clone(),
+                });
+            }
+            inputs.push(EvmInput {
+                txs,
+                base_snapshot_id,
+                waypoints: Vec::new(),
+                mutation_provenance: provenance,
+            });
+        }
+        inputs
+    }
+}
+
+fn parse_selector_hex(raw: &str) -> anyhow::Result<[u8; 4]> {
+    let raw = raw.trim().strip_prefix("0x").unwrap_or(raw.trim());
+    let bytes = hex::decode(raw)?;
+    let selector = bytes
+        .get(0..4)
+        .ok_or_else(|| anyhow::anyhow!("selector too short"))?;
+    Ok(selector.try_into().expect("slice length checked"))
+}
+
+fn seed_tag_from_text(tag: &str) -> Option<SeedTag> {
+    let tag = tag.to_ascii_lowercase();
+    Some(
+        if tag.contains("erc20") || tag.contains("token") || tag.contains("approve") {
+            SeedTag::Erc20
+        } else if tag.contains("4626")
+            || tag.contains("vault")
+            || tag.contains("deposit")
+            || tag.contains("redeem")
+        {
+            SeedTag::Erc4626
+        } else if tag.contains("amm") || tag.contains("swap") || tag.contains("pool") {
+            SeedTag::Amm
+        } else if tag.contains("lend") || tag.contains("borrow") || tag.contains("liquidat") {
+            SeedTag::Lending
+        } else if tag.contains("oracle") || tag.contains("price") {
+            SeedTag::Oracle
+        } else if tag.contains("govern") || tag.contains("vote") || tag.contains("queue") {
+            SeedTag::Governance
+        } else if tag.contains("bridge") || tag.contains("message") {
+            SeedTag::Bridge
+        } else if tag.contains("stake") || tag.contains("reward") {
+            SeedTag::Staking
+        } else if tag.contains("access") || tag.contains("admin") || tag.contains("owner") {
+            SeedTag::AccessControl
+        } else {
+            return None;
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,6 +837,56 @@ mod tests {
         assert!(seeds[0].tags.contains(&SeedTag::Erc20));
         assert!(seeds[0].reason.contains("ABI selector"));
         assert!(seeds[0].calldata.len() > 4);
+    }
+
+    #[test]
+    fn historical_seed_json_converts_valid_tx_to_seed_and_input() {
+        let json = r#"{
+          "chain_id": 1,
+          "block_number": 123,
+          "target": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "transactions": [{
+            "hash": "0xabc",
+            "from": "0x1313131313131313131313131313131313131313",
+            "to": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "value": "0",
+            "input": "0x095ea7b3000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000000000000000000000000000000000000000000000000000001",
+            "selector": "0x095ea7b3",
+            "success": true,
+            "tags": ["approve", "vault"]
+          }]
+        }"#;
+        let intelligence = SeedIntelligence::default();
+        let seeds = intelligence
+            .parse_historical_seed_json(json)
+            .expect("historical seeds");
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].source_type, SeedSourceType::Historical);
+        assert_eq!(
+            seeds[0].selector,
+            Some(function_selector("approve(address,uint256)"))
+        );
+        assert!(seeds[0].confidence_score >= 90);
+        assert!(seeds[0].tags.contains(&SeedTag::Erc20));
+        let inputs = intelligence.historical_candidates_to_inputs(seeds, 0, 2);
+        assert!(!inputs.is_empty());
+        assert_eq!(inputs[0].txs[0].caller, Address::repeat_byte(0x13));
+    }
+
+    #[test]
+    fn historical_seed_json_rejects_too_short_calldata() {
+        let json = r#"{
+          "transactions": [{
+            "from": "0x1313131313131313131313131313131313131313",
+            "to": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "input": "0x1234",
+            "success": true
+          }]
+        }"#;
+        let seeds = SeedIntelligence::default()
+            .parse_historical_seed_json(json)
+            .unwrap();
+        assert!(seeds.is_empty());
     }
 
     #[test]

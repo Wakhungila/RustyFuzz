@@ -6,13 +6,17 @@ use rusty_fuzz::chain::mempool::MempoolScanner;
 use rusty_fuzz::common::oracle::{ProtocolOraclePack, ReentrancyOracle, VulnType};
 use rusty_fuzz::common::verifier::ReplayVerifier;
 use rusty_fuzz::config::Config;
+use rusty_fuzz::engine::benchmark::ValidationRunner;
 use rusty_fuzz::engine::foundry_ingest::FoundryHarnessManifest;
 use rusty_fuzz::engine::minimizer::Minimizer;
+use rusty_fuzz::engine::seed_intelligence::SeedIntelligence;
 use rusty_fuzz::evm::corpus::PersistentCorpus;
 use rusty_fuzz::evm::executor::EvmExecutor;
 use rusty_fuzz::evm::fork::create_fork_block_env;
 use rusty_fuzz::evm::fork_db::ForkDb;
-use rusty_fuzz::evm::seed_ingester::{MainnetSeedConfig, SeedIngester};
+use rusty_fuzz::evm::seed_ingester::{
+    MainnetSeed, MainnetSeedBundle, MainnetSeedConfig, SeedIngester, SeedMetadata,
+};
 use std::str::FromStr;
 
 #[derive(Parser, Debug)]
@@ -29,6 +33,10 @@ enum Command {
         chain: Option<String>,
         #[arg(long)]
         contract: Option<String>,
+        #[arg(long, default_value_t = false)]
+        hardened_defi: bool,
+        #[arg(long)]
+        seed_file: Option<String>,
     },
     Seed {
         #[arg(long)]
@@ -43,6 +51,12 @@ enum Command {
         search_depth: u64,
         #[arg(long, default_value_t = false)]
         include_address_hints: bool,
+    },
+    SeedIngest {
+        #[arg(long)]
+        file: String,
+        #[arg(long, default_value = "historical-json")]
+        bundle_id: String,
     },
     Replay {
         #[arg(long)]
@@ -68,6 +82,12 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    Validate {
+        #[arg(long)]
+        benchmarks: String,
+        #[arg(long)]
+        output: Option<String>,
+    },
     ScanMempool,
 }
 
@@ -79,17 +99,29 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load("config.toml")?;
 
     match args.command {
-        Command::Fuzz { chain, contract } => {
+        Command::Fuzz {
+            chain,
+            contract,
+            hardened_defi,
+            seed_file,
+        } => {
             println!(
                 "Starting fuzz campaign on {:?} for contract {:?}",
                 chain, contract
             );
+            let mut hardened_defi_config = config.hardened_defi.clone();
+            if hardened_defi {
+                hardened_defi_config.enabled = true;
+            }
+            if seed_file.is_some() {
+                hardened_defi_config.historical_seed_file = seed_file;
+            }
             let fuzz_config = rusty_fuzz::engine::fuzz_engine::Config {
                 rpc_url: config.rpc_url.clone(),
                 fork_block: config.fork_block.unwrap_or(0),
-                target_contract: config
-                    .target_contract
+                target_contract: contract
                     .as_deref()
+                    .or(config.target_contract.as_deref())
                     .map(Address::from_str)
                     .transpose()?,
                 corpus_dir: config.corpus_dir.clone(),
@@ -100,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
                     .map(FoundryHarnessManifest::ingest)
                     .transpose()?,
                 mainnet_seed_bundle: config.mainnet_seed_bundle.clone(),
+                hardened_defi: hardened_defi_config,
             };
             rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await?;
         }
@@ -132,6 +165,64 @@ async fn main() -> anyhow::Result<()> {
                 bundle_id,
                 bundle.seeds.len(),
                 bundle.discovered_accounts.len()
+            );
+        }
+        Command::SeedIngest { file, bundle_id } => {
+            ensure_evm_chain(&config)?;
+            let raw = std::fs::read_to_string(&file)?;
+            let intelligence = SeedIntelligence::default();
+            let candidates = intelligence.parse_historical_seed_json(&raw)?;
+            anyhow::ensure!(
+                !candidates.is_empty(),
+                "no valid historical seeds in {}",
+                file
+            );
+            let target = candidates[0].target;
+            let seeds = candidates
+                .into_iter()
+                .enumerate()
+                .map(|(idx, candidate)| {
+                    let selector = candidate.selector;
+                    let caller = candidate.caller;
+                    let target = candidate.target;
+                    let value = candidate.value;
+                    let input = candidate.into_evm_input(0);
+                    MainnetSeed {
+                        id: format!("historical-json-{idx:04}"),
+                        metadata: SeedMetadata {
+                            source_block: config.fork_block.unwrap_or(0),
+                            block_offset: 0,
+                            transaction_ordinal: idx,
+                            caller,
+                            target,
+                            value,
+                            selector,
+                            calldata_len: input
+                                .txs
+                                .first()
+                                .map(|tx| tx.input.len())
+                                .unwrap_or_default(),
+                            discovered_address_hints: Vec::new(),
+                            matched_target: Some(target),
+                            match_kind: Some("historical-json".to_string()),
+                        },
+                        input,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let bundle = MainnetSeedBundle {
+                fork_block: config.fork_block.unwrap_or(0),
+                target,
+                seeds,
+                discovered_accounts: Vec::new(),
+                fork_cache: ForkDb::empty().cache_snapshot(),
+            };
+            let corpus = PersistentCorpus::new(&config.corpus_dir)?;
+            corpus.persist_mainnet_seed_bundle(&bundle_id, &bundle)?;
+            println!(
+                "Persisted historical seed bundle `{}`: {} seeds",
+                bundle_id,
+                bundle.seeds.len()
             );
         }
         Command::Replay {
@@ -233,6 +324,18 @@ async fn main() -> anyhow::Result<()> {
             };
             let report = corpus.write_reproduction_report(&input, &execution, crash.as_ref())?;
             println!("Report written: {}", report.display());
+        }
+        Command::Validate { benchmarks, output } => {
+            let manifests = ValidationRunner::load_manifests(&benchmarks)?;
+            let runner = ValidationRunner;
+            let report = runner.run_manifest_only(&manifests);
+            let output =
+                output.unwrap_or_else(|| format!("{}/validation_report.json", config.report_dir));
+            runner.write_report(&report, &output)?;
+            println!(
+                "Validation report written: {} (benchmarks={}, found={}, not_run={})",
+                output, report.summary.total, report.summary.found, report.summary.not_run
+            );
         }
         Command::ScanMempool => {
             println!("Starting mempool scanner for chain: {}", config.chain);

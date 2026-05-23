@@ -319,3 +319,83 @@ The goal of this codebase is to make those inputs compound instead of fighting a
 ## License
 
 MIT.
+
+## Validation Mode
+
+RustyFuzz can load benchmark manifests and emit an honest validation report for known vulnerability-class targets. The initial validation runner is manifest-first: it records benchmark intent, seed hints, expected invariants, success criteria, and report shape without claiming a live exploit was found unless matching campaign observations are supplied by the engine.
+
+Run manifest validation:
+
+```bash
+cargo run --release -- validate --benchmarks benchmarks/ --output reports/validation_report.json
+```
+
+A benchmark manifest may be TOML or JSON. Minimal TOML example:
+
+```toml
+id = "erc4626-share-inflation-basic"
+class = "share_inflation"
+mode = "local_fixture"
+target = "0x1111111111111111111111111111111111111111"
+fixture = "fixtures/ERC4626ShareInflation.sol"
+expected_invariant = "attacker_profit_or_share_price_manipulation"
+expected_selectors = ["deposit", "withdraw", "redeem"]
+success_criteria = ["expected_finding", "invariant_violation", "share_price_manipulation"]
+max_duration_secs = 600
+seed_hints = ["deposit", "redeem"]
+```
+
+Report fields include:
+
+- `found`, `status`, `finding_type`, and `confidence`
+- `exploit_path_length`, `minimized`, `replayable`, and `foundry_poc_generated`
+- `executions_to_signal` and `time_to_signal_secs`
+- `artifact_path`, `matched_criteria`, `missing_criteria`, and `false_positive_notes`
+
+Example manifests live under `benchmarks/`, including ERC4626 share inflation, stale accounting, access-control bypass, AMM reserve manipulation, and stale oracle price cases. A sample report format lives at `docs/sample_validation_report.json`. These are synthetic validation fixtures/manifests, not claims that RustyFuzz has reproduced historical exploits.
+
+## Hardened DeFi Mode
+
+Hardened DeFi Mode is an optional target-adaptive layer for mature DeFi targets. It does not claim reliable exploitation by itself; it adds machinery to profile a target, seed realistic flows, model actors, score economic state deltas, and measure progress through validation benchmarks.
+
+Enable through config:
+
+```toml
+[hardened_defi]
+enabled = true
+historical_seed_file = "seeds/example_historical_seed.json"
+max_template_sequences = 128
+enable_actor_model = true
+enable_economic_delta = true
+enable_protocol_invariants = true
+enable_exploit_templates = true
+min_persist_confidence = 0.70
+```
+
+Or for a single fuzz run:
+
+```bash
+cargo run --release -- fuzz \
+  --chain evm \
+  --contract 0xTarget \
+  --hardened-defi \
+  --seed-file seeds/example_historical_seed.json
+```
+
+Historical seed JSON can be persisted into the existing seed-bundle store:
+
+```bash
+cargo run --release -- seed-ingest \
+  --file seeds/example_historical_seed.json \
+  --bundle-id target-historical
+```
+
+Current Hardened DeFi components:
+
+- Target profiling from ABI selectors, Foundry hints, and seed metadata.
+- Role-specific actor generation for attacker, victim, whale, depositor, borrower, liquidator, trader, governance actors, keeper, privileged candidate, and random users.
+- Historical transaction JSON ingestion into `SeedCandidate` and `EvmInput` seeds.
+- Profile-gated dependency/exploit template startup seeds.
+- Heuristic economic delta scoring from observed token-balance inputs or execution storage deltas.
+
+Limitations: protocol-specific invariants are still heuristic packs, historical seeds require useful calldata, economic deltas are strongest when token/share balances are observable, and benchmark success should be treated as the source of truth for exploit-class capability.

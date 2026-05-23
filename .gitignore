@@ -15,6 +15,9 @@
 # ─────────────────────────────────────────────────────────────
 /corpus/
 /reports/
+/benchmarks/
+/seeds/
+/docs/
 /crashes/
 /findings/
 /artifacts/
