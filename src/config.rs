@@ -23,9 +23,21 @@ pub struct HardenedDefiConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
+    pub single_process: bool,
+    #[serde(default)]
+    pub deterministic: bool,
+    #[serde(default)]
+    pub rng_seed: Option<u64>,
+    #[serde(default)]
+    pub enable_bounded_search: bool,
+    #[serde(default)]
     pub historical_seed_file: Option<String>,
     #[serde(default = "default_max_template_sequences")]
     pub max_template_sequences: usize,
+    #[serde(default = "default_max_actor_roles")]
+    pub max_actor_roles: usize,
+    #[serde(default = "default_max_tx_depth")]
+    pub max_tx_depth: usize,
     #[serde(default = "default_true")]
     pub enable_actor_model: bool,
     #[serde(default = "default_true")]
@@ -42,8 +54,14 @@ impl Default for HardenedDefiConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            single_process: false,
+            deterministic: false,
+            rng_seed: None,
+            enable_bounded_search: true,
             historical_seed_file: None,
             max_template_sequences: default_max_template_sequences(),
+            max_actor_roles: default_max_actor_roles(),
+            max_tx_depth: default_max_tx_depth(),
             enable_actor_model: true,
             enable_economic_delta: true,
             enable_protocol_invariants: true,
@@ -61,6 +79,14 @@ fn default_max_template_sequences() -> usize {
     128
 }
 
+fn default_max_actor_roles() -> usize {
+    4
+}
+
+fn default_max_tx_depth() -> usize {
+    4
+}
+
 fn default_min_persist_confidence() -> f64 {
     0.70
 }
@@ -70,5 +96,19 @@ impl Config {
         let content = fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)?;
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hardened_defi_defaults_include_deterministic_controls() {
+        let config = HardenedDefiConfig::default();
+        assert!(!config.deterministic);
+        assert_eq!(config.rng_seed, None);
+        assert!(config.enable_bounded_search);
+        assert!(config.enable_actor_model);
     }
 }

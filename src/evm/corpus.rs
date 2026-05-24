@@ -1,19 +1,25 @@
 use crate::common::oracle::ProtocolFinding;
 use crate::common::oracle::ProtocolSeverity;
 use crate::common::types::{ChainState, SequenceExecutionResult, Snapshot, Waypoint};
+use crate::engine::exploit_path::ExploitPathCandidate;
+use crate::engine::proof::{ProofCarryingFinding, ProofConfidenceTier};
 use crate::engine::scoring::CampaignScore;
 use crate::evm::feedback::EvmCoverageFeedback;
 use crate::evm::fork_db::{EvmCacheDb, ForkDb, ForkDbCacheSnapshot};
 use crate::evm::fuzz::EvmInput;
 use crate::evm::seed_ingester::MainnetSeedBundle;
+use anyhow::Context;
 use libafl_bolts::rands::Rand;
 use parking_lot::RwLock;
 use revm::primitives::{Address, B256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::fs::OpenOptions;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 // use bitvec::bitvec; // Unused
 use bitvec::prelude::{BitVec, Lsb0};
 use serde::{Deserialize, Serialize};
@@ -71,15 +77,27 @@ pub struct CampaignArtifactRecord {
     pub reason: String,
     pub score: CampaignScore,
     pub findings: Vec<ProtocolFinding>,
+    #[serde(default)]
+    pub proof: Option<ProofCarryingFinding>,
     pub metadata: CorpusEntryMetadata,
     #[serde(default)]
     pub triage: CampaignArtifactTriageSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CampaignArtifactOutcome {
+    pub record: CampaignArtifactRecord,
+    pub created_new: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CampaignArtifactTriageSummary {
     pub persisted_reason: String,
     pub confidence: u64,
+    #[serde(default)]
+    pub proof_tier: Option<ProofConfidenceTier>,
+    #[serde(default)]
+    pub replayable: bool,
     pub false_positive_risks: Vec<String>,
     pub suggested_next_command: String,
     pub dedup_key: String,
@@ -94,6 +112,7 @@ pub struct CampaignArtifactRequest<'a> {
     pub base_fork_state: &'a EvmCacheDb,
     pub score: &'a CampaignScore,
     pub findings: &'a [ProtocolFinding],
+    pub exploit_candidate: Option<&'a ExploitPathCandidate>,
     pub block_number: u64,
     pub target: Option<Address>,
     pub reason: &'a str,
@@ -221,17 +240,78 @@ impl PersistentCorpus {
     pub fn persist_campaign_artifact(
         &self,
         request: CampaignArtifactRequest<'_>,
-    ) -> anyhow::Result<CampaignArtifactRecord> {
+    ) -> anyhow::Result<CampaignArtifactOutcome> {
         let artifact_key = artifact_equivalence_key(&request)?;
         let index_path = self
             .root
             .join("campaign_artifacts")
             .join("index")
             .join(format!("{artifact_key}.json"));
+        let lock_path = index_path.with_extension("lock");
         if let Ok(bytes) = fs::read(&index_path) {
             if let Ok(existing) = serde_json::from_slice::<CampaignArtifactRecord>(&bytes) {
                 if existing.score.total >= request.score.total {
-                    return Ok(existing);
+                    return Ok(CampaignArtifactOutcome {
+                        record: existing,
+                        created_new: false,
+                    });
+                }
+            }
+        }
+
+        let lock_file = match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(_) => {
+                let mut waited = 0u64;
+                loop {
+                    if let Ok(bytes) = fs::read(&index_path) {
+                        if let Ok(existing) =
+                            serde_json::from_slice::<CampaignArtifactRecord>(&bytes)
+                        {
+                            return Ok(CampaignArtifactOutcome {
+                                record: existing,
+                                created_new: false,
+                            });
+                        }
+                    }
+
+                    if waited >= 1_000 {
+                        break;
+                    }
+                    waited += 1;
+                    thread::sleep(Duration::from_millis(10));
+                }
+
+                if let Ok(bytes) = fs::read(&index_path) {
+                    if let Ok(existing) = serde_json::from_slice::<CampaignArtifactRecord>(&bytes) {
+                        return Ok(CampaignArtifactOutcome {
+                            record: existing,
+                            created_new: false,
+                        });
+                    }
+                }
+
+                OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&lock_path)
+                    .with_context(|| format!("acquire artifact lock {}", lock_path.display()))?
+            }
+        };
+        let _lock_file = lock_file;
+
+        if let Ok(bytes) = fs::read(&index_path) {
+            if let Ok(existing) = serde_json::from_slice::<CampaignArtifactRecord>(&bytes) {
+                if existing.score.total >= request.score.total {
+                    let _ = fs::remove_file(&lock_path);
+                    return Ok(CampaignArtifactOutcome {
+                        record: existing,
+                        created_new: false,
+                    });
                 }
             }
         }
@@ -244,6 +324,9 @@ impl PersistentCorpus {
         )?;
         let fork_cache_id = metadata.id.clone();
         self.persist_cache_db_fork_state(&fork_cache_id, request.base_fork_state)?;
+        let proof = request.exploit_candidate.map(|candidate| {
+            ProofCarryingFinding::from_candidate(candidate, request.execution, request.findings)
+        });
 
         let record = CampaignArtifactRecord {
             input_id: metadata.id.clone(),
@@ -254,6 +337,7 @@ impl PersistentCorpus {
             reason: request.reason.to_string(),
             score: request.score.clone(),
             findings: request.findings.to_vec(),
+            proof: proof.clone(),
             metadata,
             triage: triage_summary(
                 &artifact_key,
@@ -261,16 +345,22 @@ impl PersistentCorpus {
                 request.score,
                 request.findings,
                 request.target,
+                proof.as_ref().map(|proof| proof.confidence_tier.clone()),
+                proof
+                    .as_ref()
+                    .is_some_and(ProofCarryingFinding::confidence_is_confirmed),
             ),
         };
         let record_bytes = serde_json::to_vec_pretty(&record)?;
+        let tmp_index_path = index_path.with_extension("json.tmp");
         fs::write(
             self.root
                 .join("campaign_artifacts")
                 .join(format!("{}.json", record.input_id)),
             &record_bytes,
         )?;
-        fs::write(index_path, &record_bytes)?;
+        fs::write(&tmp_index_path, &record_bytes)?;
+        fs::rename(&tmp_index_path, &index_path)?;
         fs::write(
             self.root
                 .join("campaign_artifacts")
@@ -278,7 +368,11 @@ impl PersistentCorpus {
                 .join(format!("{}.md", record.input_id)),
             triage_markdown(&record),
         )?;
-        Ok(record)
+        let _ = fs::remove_file(&lock_path);
+        Ok(CampaignArtifactOutcome {
+            record,
+            created_new: true,
+        })
     }
 
     pub fn load_fork_cache(&self, id: &str) -> anyhow::Result<ForkDbCacheSnapshot> {
@@ -576,6 +670,8 @@ fn triage_summary(
     score: &CampaignScore,
     findings: &[ProtocolFinding],
     target: Option<Address>,
+    proof_tier: Option<ProofConfidenceTier>,
+    replayable: bool,
 ) -> CampaignArtifactTriageSummary {
     let finding_kinds: Vec<_> = findings
         .iter()
@@ -619,6 +715,8 @@ fn triage_summary(
     CampaignArtifactTriageSummary {
         persisted_reason: reason.to_string(),
         confidence,
+        proof_tier,
+        replayable,
         false_positive_risks,
         suggested_next_command,
         dedup_key: artifact_key.to_string(),
@@ -638,10 +736,12 @@ fn severity_confidence(severity: &ProtocolSeverity) -> u64 {
 
 fn triage_markdown(record: &CampaignArtifactRecord) -> String {
     format!(
-        "# RustyFuzz Campaign Artifact\n\n- input_id: `{}`\n- reason: `{}`\n- confidence: `{}`\n- score: `{}`\n- target: `{:?}`\n- dedup_key: `{}`\n- findings: `{}`\n\n## False-positive risks\n{}\n\n## Next command\n`{}`\n",
+        "# RustyFuzz Campaign Artifact\n\n- input_id: `{}`\n- reason: `{}`\n- confidence: `{}`\n- proof_tier: `{:?}`\n- replayable: `{}`\n- score: `{}`\n- target: `{:?}`\n- dedup_key: `{}`\n- findings: `{}`\n\n## False-positive risks\n{}\n\n## Next command\n`{}`\n",
         record.input_id,
         record.reason,
         record.triage.confidence,
+        record.triage.proof_tier,
+        record.triage.replayable,
         record.score.total,
         record.target,
         record.artifact_key,

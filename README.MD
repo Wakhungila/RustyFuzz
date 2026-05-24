@@ -216,6 +216,22 @@ Run a fuzz campaign:
 cargo run -- fuzz --chain evm --contract 0xTarget
 ```
 
+Single-process mode avoids the LibAFL broker/TCP launcher and keeps the campaign inside one process:
+
+```bash
+cargo run --release -- fuzz \
+  --chain evm \
+  --contract 0xTarget \
+  --single-process \
+  --bounded-search
+```
+
+`--bounded-search` enables the exhaustive bounded search layer over the configured transaction-depth and actor-role bounds. Within those bounds, RustyFuzz records whether a candidate is:
+
+- `heuristic_only`
+- `abstractly_proven`
+- `concretely_replayed`
+
 Seed a campaign from mainnet fork history:
 
 ```bash
@@ -322,13 +338,34 @@ MIT.
 
 ## Validation Mode
 
-RustyFuzz can load benchmark manifests and emit an honest validation report for known vulnerability-class targets. The initial validation runner is manifest-first: it records benchmark intent, seed hints, expected invariants, success criteria, and report shape without claiming a live exploit was found unless matching campaign observations are supplied by the engine.
+RustyFuzz can load benchmark manifests and emit an honest validation report for known vulnerability-class targets. Validation now executes local synthetic fixtures for supported benchmark modes and reports explicit statuses when a benchmark cannot run.
 
 Run manifest validation:
 
 ```bash
 cargo run --release -- validate --benchmarks benchmarks/ --output reports/validation_report.json
 ```
+
+Live-fork validation benchmarks are supported as a separate opt-in path. They consume historical/trace seed JSON fixtures and replay them against the fork settings from `config.toml`:
+
+```bash
+cargo run --release -- validate --benchmarks benchmarks/live --output reports/live_validation_report.json
+```
+
+If the validation context does not include an RPC URL, fork block, or block environment, live-fork benchmarks are reported as `skipped_by_config` rather than being misclassified as failures. If RPC-backed replay fails, the benchmark is reported as `failed_execution` with the underlying replay/RPC cause. Live-fork benchmarks do not silently fall back to synthetic bytecode. To prove a fork benchmark offline, the fixture must explicitly include a serialized `fork_cache` captured from fork state.
+
+Current live-fork manifests require replay proof and PoC output before they can be counted as `found`:
+
+```toml
+success_criteria = [
+  "expected_finding",
+  "invariant_violation",
+  "replayable_artifact",
+  "foundry_poc_generated",
+]
+```
+
+PoC generation is gated behind proof confirmation. Heuristic-only evidence can be reported for triage, but it is not enough to mark a forked rediscovery benchmark as found.
 
 A benchmark manifest may be TOML or JSON. Minimal TOML example:
 
@@ -337,7 +374,7 @@ id = "erc4626-share-inflation-basic"
 class = "share_inflation"
 mode = "local_fixture"
 target = "0x1111111111111111111111111111111111111111"
-fixture = "fixtures/ERC4626ShareInflation.sol"
+fixture = "benchmarks/fixtures/erc4626-share-inflation-basic.json"
 expected_invariant = "attacker_profit_or_share_price_manipulation"
 expected_selectors = ["deposit", "withdraw", "redeem"]
 success_criteria = ["expected_finding", "invariant_violation", "share_price_manipulation"]
@@ -347,12 +384,39 @@ seed_hints = ["deposit", "redeem"]
 
 Report fields include:
 
-- `found`, `status`, `finding_type`, and `confidence`
-- `exploit_path_length`, `minimized`, `replayable`, and `foundry_poc_generated`
-- `executions_to_signal` and `time_to_signal_secs`
-- `artifact_path`, `matched_criteria`, `missing_criteria`, and `false_positive_notes`
+- `status`, `reason`, `executed`, `found`, `observed_finding`, and `confidence`
+- `expected_invariant`, `exploit_path_length`, `minimized`, `replayable`, and `foundry_poc_generated`
+- `executions_to_signal`, `time_to_signal_secs`, `artifact_path`
+- `matched_criteria`, `missing_criteria`, and `false_positive_notes`
+
+Validation statuses are explicit and stable:
+
+- `found`
+- `not_found`
+- `not_run_missing_fixture`
+- `not_run_missing_target`
+- `not_run_missing_success_criteria`
+- `not_run_unsupported_mode`
+- `failed_execution`
+- `skipped_by_config`
+
+Proof-status reporting is carried through validation results and exploit candidates:
+
+- `heuristic_only`
+- `abstractly_proven`
+- `concretely_replayed`
 
 Example manifests live under `benchmarks/`, including ERC4626 share inflation, stale accounting, access-control bypass, AMM reserve manipulation, and stale oracle price cases. A sample report format lives at `docs/sample_validation_report.json`. These are synthetic validation fixtures/manifests, not claims that RustyFuzz has reproduced historical exploits.
+
+Live-fork example manifests live under `benchmarks/live/` and demonstrate real fork-backed replay of historical seed JSON. They are intended for honest measurement against a configured RPC/fork block, not for claiming a bug was reproduced unless the report says `found`.
+
+Cached-fork rediscovery manifests live under `benchmarks/forked/`. These are deterministic vulnerable benchmark deployments encoded as explicit cached fork fixtures, not historical exploit claims. They are useful for measuring the full confirmation pipeline:
+
+```bash
+cargo run --release -- validate --benchmarks benchmarks/forked --output reports/forked_validation_report.json
+```
+
+The cached-fork pack currently covers ERC4626 inflation, Uniswap-style reserve/oracle manipulation, lending bad-debt accounting, proxy initializer/upgrade takeover, permit/allowance replay, and stale/sudden oracle price movement. A benchmark only passes when it has a replay-confirmed proof, a minimized sequence, and a generated Foundry PoC artifact.
 
 ## Hardened DeFi Mode
 

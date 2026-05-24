@@ -735,33 +735,33 @@ impl SeedIntelligence {
             .cloned()
             .map(|candidate| candidate.into_evm_input(base_snapshot_id))
             .collect::<Vec<_>>();
-        for window in candidates.windows(max_sequence_len.max(2).min(4)) {
-            if window.len() < 2 {
-                continue;
-            }
-            let mut txs = Vec::new();
-            let mut provenance = Vec::new();
-            for (idx, candidate) in window.iter().enumerate() {
-                txs.push(SingletonTx {
-                    input: candidate.calldata.clone(),
-                    caller: candidate.caller,
-                    to: candidate.target,
-                    value: candidate.value,
-                    is_victim: false,
+        let max_window = max_sequence_len.max(2).min(4).min(candidates.len());
+        for window_len in 2..=max_window {
+            for window in candidates.windows(window_len) {
+                let mut txs = Vec::new();
+                let mut provenance = Vec::new();
+                for (idx, candidate) in window.iter().enumerate() {
+                    txs.push(SingletonTx {
+                        input: candidate.calldata.clone(),
+                        caller: candidate.caller,
+                        to: candidate.target,
+                        value: candidate.value,
+                        is_victim: false,
+                    });
+                    provenance.push(MutationProvenance {
+                        strategy: "historical_seed_sequence".to_string(),
+                        tx_index: Some(idx),
+                        selector: candidate.selector,
+                        detail: candidate.reason.clone(),
+                    });
+                }
+                inputs.push(EvmInput {
+                    txs,
+                    base_snapshot_id,
+                    waypoints: Vec::new(),
+                    mutation_provenance: provenance,
                 });
-                provenance.push(MutationProvenance {
-                    strategy: "historical_seed_sequence".to_string(),
-                    tx_index: Some(idx),
-                    selector: candidate.selector,
-                    detail: candidate.reason.clone(),
-                });
             }
-            inputs.push(EvmInput {
-                txs,
-                base_snapshot_id,
-                waypoints: Vec::new(),
-                mutation_provenance: provenance,
-            });
         }
         inputs
     }
@@ -871,6 +871,41 @@ mod tests {
         let inputs = intelligence.historical_candidates_to_inputs(seeds, 0, 2);
         assert!(!inputs.is_empty());
         assert_eq!(inputs[0].txs[0].caller, Address::repeat_byte(0x13));
+    }
+
+    #[test]
+    fn historical_seed_json_builds_adjacent_two_transaction_sequences() {
+        let json = r#"{
+          "chain_id": 1,
+          "block_number": 123,
+          "target": "0x1111111111111111111111111111111111111111",
+          "transactions": [
+            {
+              "hash": "0x1",
+              "from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "to": "0x1111111111111111111111111111111111111111",
+              "value": "0",
+              "input": "0xfeaf968c",
+              "success": true,
+              "tags": ["oracle"]
+            },
+            {
+              "hash": "0x2",
+              "from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "to": "0x1111111111111111111111111111111111111111",
+              "value": "0",
+              "input": "0xfeaf968c",
+              "success": true,
+              "tags": ["oracle"]
+            }
+          ]
+        }"#;
+        let intelligence = SeedIntelligence::default();
+        let seeds = intelligence
+            .parse_historical_seed_json(json)
+            .expect("historical seeds");
+        let inputs = intelligence.historical_candidates_to_inputs(seeds, 0, 4);
+        assert!(inputs.iter().any(|input| input.txs.len() == 2));
     }
 
     #[test]

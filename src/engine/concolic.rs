@@ -1,7 +1,8 @@
 use crate::common::types::{ComparisonOperand, SymbolicExpression, TaintSource, Waypoint};
 use revm::primitives::U256;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConcolicHint {
     pub source: TaintSource,
     pub tx_index: usize,
@@ -11,7 +12,7 @@ pub struct ConcolicHint {
     pub strategy: ConcolicStrategy,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConcolicStrategy {
     FlipComparison { opcode: u8, target_true: bool },
     FlipBranch { taken: bool },

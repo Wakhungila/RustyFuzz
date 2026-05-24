@@ -79,7 +79,7 @@ use alloy::rpc::types::eth::BlockNumberOrTag;
 use anyhow::Context;
 use revm::context::BlockEnv;
 use revm::database::CacheDB;
-use revm::primitives::{Address, U256};
+use revm::primitives::{Address, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
 
 use crate::evm::fork_db::{EvmCacheDb, ForkDb};
@@ -153,4 +153,50 @@ pub async fn create_fork_block_env(rpc_url: &str, block_number: u64) -> anyhow::
     block_env.set_blob_excess_gas_and_price(0, 3_338_477);
 
     Ok(block_env)
+}
+
+pub fn create_offline_fallback_fork_db(target_contract: Option<Address>) -> EvmCacheDb {
+    let db = CacheDB::new(ForkDb::empty());
+    if let Some(target) = target_contract {
+        let code = Bytecode::new_raw(offline_fallback_runtime_bytecode().into());
+        db.db
+            .cache_account(target, AccountInfo::default().with_code(code));
+    }
+    db
+}
+
+pub fn create_offline_fallback_block_env(block_number: u64) -> BlockEnv {
+    let mut block_env = BlockEnv {
+        number: U256::from(block_number),
+        beneficiary: Address::ZERO,
+        timestamp: U256::ZERO,
+        gas_limit: 30_000_000,
+        basefee: 0,
+        difficulty: U256::ZERO,
+        prevrandao: Some(B256::ZERO),
+        blob_excess_gas_and_price: None,
+        slot_num: 0,
+    };
+    block_env.set_blob_excess_gas_and_price(0, 3_338_477);
+    block_env
+}
+
+pub fn offline_fallback_runtime_bytecode() -> Vec<u8> {
+    let mut code = vec![
+        0x60, 0x00, 0x54, // PUSH1 0x00; SLOAD
+        0x60, 0x01, 0x01, // PUSH1 0x01; ADD
+        0x80, // DUP1
+        0x60, 0x00, 0x55, // PUSH1 0x00; SSTORE
+        0x60, 0x01, 0x60, 0x01, 0x55, // PUSH1 0x01; PUSH1 0x01; SSTORE
+        0x61, 0x03, 0xe8, 0x60, 0x02, 0x55, // PUSH2 1000; PUSH1 0x02; SSTORE
+    ];
+    code.push(0x7f);
+    code.extend_from_slice(&U256::from(10u128.pow(18)).to_be_bytes::<32>());
+    code.extend_from_slice(&[0x60, 0x03, 0x55]); // PUSH1 0x03; SSTORE
+    code.extend_from_slice(&[
+        0x61, 0x01, 0x00, 0x60, 0x04, 0x55, // PUSH2 256; PUSH1 0x04; SSTORE
+        0x60, 0x00, 0x52, // PUSH1 0x00; MSTORE
+        0x60, 0x20, 0x60, 0x00, 0xf3, // PUSH1 0x20; PUSH1 0x00; RETURN
+    ]);
+    code
 }

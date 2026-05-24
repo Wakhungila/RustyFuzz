@@ -51,6 +51,7 @@ impl ProtocolInvariantEvaluator {
         self.evaluate_generic_accounting(execution, &mut findings);
         self.evaluate_erc20(execution, &mut findings);
         self.evaluate_erc4626(execution, &mut findings);
+        self.evaluate_oracle_freshness(execution, &mut findings);
         self.evaluate_access_control(execution, &mut findings);
 
         findings.retain(|finding| finding.confidence >= self.min_persistable_confidence);
@@ -246,6 +247,59 @@ impl ProtocolInvariantEvaluator {
             });
         }
     }
+
+    fn evaluate_oracle_freshness(
+        &self,
+        execution: &SequenceExecutionResult,
+        findings: &mut Vec<ProtocolInvariantFinding>,
+    ) {
+        const LATEST_ANSWER: [u8; 4] = [0xfe, 0xaf, 0x96, 0x8c];
+        const GET_PRICE: [u8; 4] = [0x98, 0x74, 0x5a, 0x8c];
+        const PRICE: [u8; 4] = [0xa1, 0x57, 0xf5, 0x68];
+        const SET_PRICE: [u8; 4] = [0xfe, 0xaf, 0x96, 0x8d];
+
+        let oracle_calls =
+            calls_with_selectors(execution, &[LATEST_ANSWER, GET_PRICE, PRICE, SET_PRICE]);
+        if oracle_calls.len() < 2 {
+            return;
+        }
+
+        for window in oracle_calls.windows(2) {
+            let a = window[0];
+            let b = window[1];
+            let out_a = output_word(a);
+            let out_b = output_word(b);
+            if let (Some(a_value), Some(b_value)) = (out_a, out_b) {
+                let delta = if a_value > b_value {
+                    a_value - b_value
+                } else {
+                    b_value - a_value
+                };
+                if delta.is_zero() {
+                    continue;
+                }
+                findings.push(ProtocolInvariantFinding {
+                    family: ProtocolInvariantFamily::OracleFreshness,
+                    severity_hint: ProtocolSeverity::High,
+                    confidence: 81,
+                    affected_contracts: vec![a.target],
+                    evidence: format!(
+                        "oracle output changed from {} to {} between consecutive reads",
+                        a_value, b_value
+                    ),
+                    recommended_reproduction_sequence: vec![
+                        selector_hex(a),
+                        selector_hex(b),
+                    ],
+                    false_positive_caveats: vec![
+                        "updating oracle feeds or switching price sources can legitimately change outputs"
+                            .to_string(),
+                    ],
+                });
+                break;
+            }
+        }
+    }
 }
 
 fn protocol_invariant_to_finding(finding: ProtocolInvariantFinding) -> ProtocolFinding {
@@ -370,6 +424,10 @@ fn selector_hex(call: &CallObservation) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
+fn output_word(call: &CallObservation) -> Option<U256> {
+    (call.output.len() >= 32).then(|| U256::from_be_slice(&call.output[..32]))
+}
+
 fn function_selector(signature: &str) -> [u8; 4] {
     let hash = keccak256(signature.as_bytes());
     let mut selector = [0u8; 4];
@@ -435,6 +493,64 @@ mod tests {
         assert!(findings
             .iter()
             .any(|finding| finding.family == ProtocolInvariantFamily::AccessControl));
+    }
+
+    #[test]
+    fn detects_oracle_freshness_invariant_case() {
+        let target = Address::repeat_byte(0xee);
+        let mut first =
+            execution_with_call_and_writes(target, [0xfe, 0xaf, 0x96, 0x8c], 0, 1, U256::from(100));
+        first.call_trace.push(CallObservation {
+            tx_index: 1,
+            depth: 0,
+            caller: Address::repeat_byte(0x14),
+            target,
+            value: U256::ZERO,
+            input: vec![0xfe, 0xaf, 0x96, 0x8c],
+            output: U256::from(200).to_be_bytes::<32>().to_vec(),
+            gas_limit: 0,
+            gas_used: 0,
+            success: true,
+            kind: CallKind::Transaction,
+            phase: CallPhase::End,
+            created_address: None,
+            result: Some("Success".to_string()),
+        });
+        first.call_trace[0].output = U256::from(100).to_be_bytes::<32>().to_vec();
+        first.tx_results.push(TxExecutionResult {
+            tx_index: 1,
+            status: ExecutionStatus::Success,
+            gas_used: 0,
+            output: U256::from(200).to_be_bytes::<32>().to_vec(),
+            coverage_hash: 0,
+            coverage_edges: 0,
+            storage_reads: Vec::new(),
+            storage_writes: Vec::new(),
+            storage_diffs: vec![StorageDiff {
+                tx_index: 1,
+                address: target,
+                slot: B256::from([0x01; 32]),
+                old_value: U256::from(100),
+                new_value: U256::from(200),
+                pc: 0,
+            }],
+            call_trace: Vec::new(),
+            waypoints: Vec::new(),
+        });
+        first.storage_diffs.push(StorageDiff {
+            tx_index: 1,
+            address: target,
+            slot: B256::from([0x01; 32]),
+            old_value: U256::from(100),
+            new_value: U256::from(200),
+            pc: 0,
+        });
+        first.total_gas_used = 0;
+
+        let findings = ProtocolInvariantEvaluator::default().evaluate(&first);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.family == ProtocolInvariantFamily::OracleFreshness));
     }
 
     #[test]

@@ -35,6 +35,14 @@ enum Command {
         contract: Option<String>,
         #[arg(long, default_value_t = false)]
         hardened_defi: bool,
+        #[arg(long, default_value_t = false)]
+        single_process: bool,
+        #[arg(long, default_value_t = false)]
+        deterministic: bool,
+        #[arg(long)]
+        rng_seed: Option<u64>,
+        #[arg(long, default_value_t = false)]
+        bounded_search: bool,
         #[arg(long)]
         seed_file: Option<String>,
     },
@@ -59,8 +67,8 @@ enum Command {
         bundle_id: String,
     },
     Replay {
-        #[arg(long)]
-        input_id: String,
+        #[arg(long, alias = "input_id")]
+        input: String,
         #[arg(long)]
         fork_cache_id: Option<String>,
         #[arg(long, default_value_t = false)]
@@ -87,6 +95,8 @@ enum Command {
         benchmarks: String,
         #[arg(long)]
         output: Option<String>,
+        #[arg(long, default_value_t = true)]
+        broker_free: bool,
     },
     ScanMempool,
 }
@@ -103,6 +113,10 @@ async fn main() -> anyhow::Result<()> {
             chain,
             contract,
             hardened_defi,
+            single_process,
+            deterministic,
+            rng_seed,
+            bounded_search,
             seed_file,
         } => {
             println!(
@@ -112,6 +126,19 @@ async fn main() -> anyhow::Result<()> {
             let mut hardened_defi_config = config.hardened_defi.clone();
             if hardened_defi {
                 hardened_defi_config.enabled = true;
+            }
+            if single_process {
+                hardened_defi_config.single_process = true;
+            }
+            if deterministic {
+                hardened_defi_config.deterministic = true;
+            }
+            if rng_seed.is_some() {
+                hardened_defi_config.rng_seed = rng_seed;
+                hardened_defi_config.deterministic = true;
+            }
+            if bounded_search {
+                hardened_defi_config.enable_bounded_search = true;
             }
             if seed_file.is_some() {
                 hardened_defi_config.historical_seed_file = seed_file;
@@ -226,17 +253,17 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Command::Replay {
-            input_id,
+            input,
             fork_cache_id,
             live,
         } => {
             ensure_evm_chain(&config)?;
-            let fork_cache_id = fork_cache_id.unwrap_or_else(|| input_id.clone());
+            let fork_cache_id = fork_cache_id.unwrap_or_else(|| input.clone());
             let corpus = PersistentCorpus::new(&config.corpus_dir)?;
             let block_env = campaign_block_env(&config).await?;
             let verifier = ReplayVerifier::new(65_536);
             let execution = if live {
-                let input = corpus.load_input(&input_id)?;
+                let input = load_replay_input(&corpus, &input)?;
                 let (execution, report) = verifier.compare_cached_vs_live(
                     corpus.load_offline_fork_db(&fork_cache_id)?,
                     ForkDb::new(config.rpc_url.clone(), config.fork_block.unwrap_or(0)),
@@ -247,7 +274,20 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::ensure!(report.equivalent, "cached-vs-live replay mismatch");
                 execution
             } else {
-                verifier.verify_persisted_input(&corpus, &input_id, &fork_cache_id, &block_env)?
+                if std::path::Path::new(&input).exists() {
+                    anyhow::ensure!(
+                        fork_cache_id != input,
+                        "replaying a raw JSON input path requires --fork-cache-id"
+                    );
+                    let input = load_json_replay_input(&input)?;
+                    verifier.verify_deterministic(
+                        &replay_base_state(&corpus, &fork_cache_id)?,
+                        &block_env,
+                        &input,
+                    )?
+                } else {
+                    verifier.verify_persisted_input(&corpus, &input, &fork_cache_id, &block_env)?
+                }
             };
             println!(
                 "Replay ok: txs={}, gas={}, coverage_hash={}",
@@ -325,16 +365,46 @@ async fn main() -> anyhow::Result<()> {
             let report = corpus.write_reproduction_report(&input, &execution, crash.as_ref())?;
             println!("Report written: {}", report.display());
         }
-        Command::Validate { benchmarks, output } => {
+        Command::Validate {
+            benchmarks,
+            output,
+            broker_free: _,
+        } => {
             let manifests = ValidationRunner::load_manifests(&benchmarks)?;
             let runner = ValidationRunner;
-            let report = runner.run_manifest_only(&manifests);
+            let block_env = campaign_block_env(&config).await.ok();
+            let report_dir = output
+                .as_deref()
+                .and_then(|path| std::path::Path::new(path).parent())
+                .map(std::path::Path::to_path_buf)
+                .or_else(|| Some(std::path::PathBuf::from(&config.report_dir)));
+            let context = rusty_fuzz::engine::benchmark::ValidationContext {
+                rpc_url: Some(config.rpc_url.clone()),
+                fork_block: config.fork_block,
+                block_env,
+                report_dir,
+            };
+            let report = runner.run_manifests_with_context(&manifests, &context);
             let output =
                 output.unwrap_or_else(|| format!("{}/validation_report.json", config.report_dir));
             runner.write_report(&report, &output)?;
+            let calibration_output = std::path::Path::new(&output)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("scoring_calibration.json");
+            std::fs::write(
+                &calibration_output,
+                serde_json::to_string_pretty(&report.calibration)?,
+            )?;
             println!(
-                "Validation report written: {} (benchmarks={}, found={}, not_run={})",
-                output, report.summary.total, report.summary.found, report.summary.not_run
+                "Validation report written: {} (benchmarks={}, executed={}, found={}, not_found={}, not_run={}); calibration={}",
+                output,
+                report.summary.total,
+                report.summary.executed,
+                report.summary.found,
+                report.summary.not_found,
+                report.summary.not_run,
+                calibration_output.display()
             );
         }
         Command::ScanMempool => {
@@ -345,6 +415,32 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn load_replay_input(
+    corpus: &PersistentCorpus,
+    input: &str,
+) -> anyhow::Result<rusty_fuzz::evm::fuzz::EvmInput> {
+    if std::path::Path::new(input).exists() {
+        load_json_replay_input(input)
+    } else {
+        corpus.load_input(input)
+    }
+}
+
+fn load_json_replay_input(path: &str) -> anyhow::Result<rusty_fuzz::evm::fuzz::EvmInput> {
+    let raw = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&raw)?)
+}
+
+fn replay_base_state(
+    corpus: &PersistentCorpus,
+    fork_cache_id: &str,
+) -> anyhow::Result<rusty_fuzz::common::types::ChainState> {
+    let fork_db = corpus.load_offline_fork_db(fork_cache_id)?;
+    Ok(rusty_fuzz::common::types::ChainState::Evm(
+        revm::database::CacheDB::new(fork_db),
+    ))
 }
 
 fn ensure_evm_chain(config: &Config) -> anyhow::Result<()> {

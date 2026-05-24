@@ -600,6 +600,7 @@ fn persistent_corpus_writes_campaign_artifact_with_fork_cache() {
         total: 1200,
         economic_pressure: 600,
         invariant_pressure: 0,
+        counterexample_pressure: 140,
         oracle_pressure: 100,
         state_pressure: 24,
         exploration_pressure: 10,
@@ -623,11 +624,13 @@ fn persistent_corpus_writes_campaign_artifact_with_fork_cache() {
             base_fork_state: &fork_state,
             score: &score,
             findings: &[finding],
+            exploit_candidate: None,
             block_number: 19_000_000,
             target: Some(target),
             reason: "protocol-oracle-finding",
         })
-        .expect("persist campaign artifact");
+        .expect("persist campaign artifact")
+        .record;
 
     assert_eq!(record.input_id, record.metadata.id);
     assert_eq!(record.fork_cache_id, record.metadata.id);

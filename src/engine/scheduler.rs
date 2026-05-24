@@ -236,6 +236,7 @@ mod tests {
             total,
             economic_pressure: economic,
             invariant_pressure: invariant,
+            counterexample_pressure: 0,
             oracle_pressure: 0,
             state_pressure: 0,
             exploration_pressure: 0,

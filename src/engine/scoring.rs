@@ -2,6 +2,7 @@ use crate::common::oracle::{ProtocolFinding, ProtocolSeverity, VulnType};
 use crate::common::types::{SequenceExecutionResult, Waypoint};
 use crate::engine::dependency::dependency_sequence_score;
 use crate::engine::exploit_path::exploit_path_score;
+use crate::engine::protocol_model::FormalProtocolModel;
 use crate::evm::feedback::StateNoveltyReport;
 use crate::evm::fuzz::EvmInput;
 use crate::evm::trace::ExecutionTrace;
@@ -21,6 +22,7 @@ pub struct CampaignScore {
     pub total: u64,
     pub economic_pressure: u64,
     pub invariant_pressure: u64,
+    pub counterexample_pressure: u64,
     pub oracle_pressure: u64,
     pub state_pressure: u64,
     pub exploration_pressure: u64,
@@ -90,6 +92,17 @@ impl CampaignScorer {
         let mut explanation = Vec::new();
         let economic_pressure = self.economic_pressure(execution, findings, &mut explanation);
         let invariant_pressure = self.invariant_pressure(findings, input, &mut explanation);
+        let protocol_model = FormalProtocolModel::synthesize(input, execution, findings, None);
+        let counterexample_pressure = protocol_model.counterexample_pressure();
+        if counterexample_pressure > 0 {
+            explanation.push(format!(
+                "formal_protocol_model: confidence={}, pressure={}, invariants={}, protocols={:?}",
+                protocol_model.confidence,
+                counterexample_pressure,
+                protocol_model.invariant_hypotheses.len(),
+                protocol_model.inferred_protocol_types
+            ));
+        }
         let oracle_pressure = self.oracle_pressure(findings, &mut explanation);
         let state_pressure = state_novelty.novelty_score();
         if state_pressure > 0 {
@@ -115,6 +128,7 @@ impl CampaignScorer {
 
         let total = economic_pressure
             .saturating_add(invariant_pressure)
+            .saturating_add(counterexample_pressure)
             .saturating_add(oracle_pressure)
             .saturating_add(state_pressure)
             .saturating_add(exploration_pressure)
@@ -125,6 +139,7 @@ impl CampaignScorer {
             total,
             economic_pressure,
             invariant_pressure,
+            counterexample_pressure,
             oracle_pressure,
             state_pressure,
             exploration_pressure,

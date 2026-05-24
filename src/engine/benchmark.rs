@@ -1,13 +1,31 @@
-use crate::common::oracle::{ProtocolFinding, ProtocolSeverity, VulnType};
-use crate::engine::exploit_path::{
-    ExploitPathCandidate, MinimizedSequenceStatus, ReplayabilityStatus,
+use crate::common::oracle::{
+    ProtocolFinding, ProtocolOraclePack, ProtocolOraclePackKind, ProtocolSeverity, VulnType,
 };
+use crate::common::types::{
+    CallKind, CallObservation, CallPhase, ChainState, ExecutionStatus, SequenceExecutionResult,
+    SingletonTx, StorageDiff, TxExecutionResult,
+};
+use crate::common::verifier::ReplayVerifier;
+use crate::engine::exploit_coverage::{build_coverage_report, ExploitClass, ExploitCoverageReport};
+use crate::engine::exploit_path::{
+    CounterexampleProofStatus, ExploitPathBuilder, ExploitPathCandidate, MinimizedSequenceStatus,
+    ReplayabilityStatus,
+};
+use crate::engine::exploit_synthesizer::synthesize_foundry_poc_with_findings;
+use crate::engine::proof::{ProofCarryingFinding, ProofConfidenceTier};
+use crate::engine::protocol_model::CounterexampleSearchEngine;
 use crate::engine::scoring::CampaignScore;
-use crate::engine::seed_intelligence::{SeedCandidate, SeedSourceType, SeedTag};
+use crate::engine::seed_intelligence::{SeedCandidate, SeedIntelligence, SeedSourceType, SeedTag};
+use crate::evm::feedback::StateNoveltyReport;
+use crate::evm::fork_db::{ForkDb, ForkDbCacheSnapshot};
+use crate::evm::fuzz::EvmInput;
 use anyhow::{Context, Result};
-use revm::primitives::{keccak256, Address, U256};
+use revm::context::BlockEnv;
+use revm::database::CacheDB;
+use revm::primitives::{keccak256, Address, B256, U256};
+use revm::state::{AccountInfo, Bytecode};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -51,6 +69,450 @@ pub enum PocGenerationExpectation {
 impl Default for PocGenerationExpectation {
     fn default() -> Self {
         Self::Expected
+    }
+}
+
+fn load_synthetic_fixture(path: &str) -> Result<SyntheticBenchmarkFixture> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("read synthetic benchmark fixture {}", path))?;
+    match Path::new(path).extension().and_then(|ext| ext.to_str()) {
+        Some("json") => serde_json::from_str(&raw)
+            .with_context(|| format!("parse JSON benchmark fixture {}", path)),
+        Some("toml") => {
+            toml::from_str(&raw).with_context(|| format!("parse TOML benchmark fixture {}", path))
+        }
+        other => anyhow::bail!(
+            "unsupported benchmark fixture extension {:?} for {}",
+            other,
+            path
+        ),
+    }
+}
+
+fn synthetic_input(manifest: &BenchmarkManifest, fixture: &SyntheticBenchmarkFixture) -> EvmInput {
+    let target = manifest.target_address().unwrap_or(Address::ZERO);
+    let attacker = manifest
+        .expected_attacker
+        .as_deref()
+        .and_then(|value| Address::from_str(value).ok())
+        .unwrap_or_else(|| Address::repeat_byte(0xaa));
+    let victim = manifest
+        .expected_victim
+        .as_deref()
+        .and_then(|value| Address::from_str(value).ok())
+        .unwrap_or_else(|| Address::repeat_byte(0xbb));
+    let selector_hint = manifest
+        .expected_selectors
+        .first()
+        .cloned()
+        .or_else(|| manifest.seed_hints.first().cloned())
+        .unwrap_or_else(|| match manifest.vulnerability_class {
+            VulnerabilityClass::Erc4626ShareInflation => "deposit(uint256,address)".to_string(),
+            VulnerabilityClass::StaleAccounting => "transfer(address,uint256)".to_string(),
+            VulnerabilityClass::AccessControlBypass => "upgradeTo(address)".to_string(),
+            VulnerabilityClass::AmmInvariantViolation => {
+                "swap(uint256,uint256,address,bytes)".to_string()
+            }
+            VulnerabilityClass::OracleManipulation => "latestAnswer()".to_string(),
+            VulnerabilityClass::LiquidationAbuse => "borrow(uint256)".to_string(),
+            VulnerabilityClass::GovernanceTimelockBypass => "execute(uint256)".to_string(),
+            VulnerabilityClass::ApprovalAllowanceAbuse => "approve(address,uint256)".to_string(),
+            VulnerabilityClass::DonationInflationAttack => "deposit(uint256,address)".to_string(),
+            VulnerabilityClass::FeeAccountingMismatch => "settle(uint256)".to_string(),
+            VulnerabilityClass::RoundingPrecisionLoss => "convertToShares(uint256)".to_string(),
+            VulnerabilityClass::BridgeReplayFinalizationBug => "finalize(bytes32)".to_string(),
+            VulnerabilityClass::Reentrancy => "deposit(uint256)".to_string(),
+        });
+    let selector = selector_from_hint(&selector_hint).unwrap_or_else(|| [0u8; 4]);
+    let mut calldata = selector.to_vec();
+    calldata.resize(36, 0);
+    let caller = match fixture.outcome {
+        SyntheticBenchmarkOutcome::Found => attacker,
+        SyntheticBenchmarkOutcome::NotFound => victim,
+    };
+    EvmInput {
+        txs: vec![SingletonTx {
+            input: calldata,
+            caller,
+            to: target,
+            value: U256::ZERO,
+            is_victim: matches!(fixture.outcome, SyntheticBenchmarkOutcome::NotFound),
+        }],
+        base_snapshot_id: 0,
+        waypoints: Vec::new(),
+        mutation_provenance: Vec::new(),
+    }
+}
+
+fn synthetic_execution(
+    manifest: &BenchmarkManifest,
+    fixture: &SyntheticBenchmarkFixture,
+) -> Result<SequenceExecutionResult> {
+    let target = manifest
+        .target_address()
+        .context("missing benchmark target")?;
+    let attacker = manifest
+        .expected_attacker
+        .as_deref()
+        .and_then(|value| Address::from_str(value).ok())
+        .unwrap_or_else(|| Address::repeat_byte(0xaa));
+    let victim = manifest
+        .expected_victim
+        .as_deref()
+        .and_then(|value| Address::from_str(value).ok())
+        .unwrap_or_else(|| Address::repeat_byte(0xbb));
+
+    let (selector_hint, writes, reads, output, call_success, evidence_hint) =
+        match manifest.vulnerability_class {
+            VulnerabilityClass::Erc4626ShareInflation => {
+                let selector = manifest
+                    .expected_selectors
+                    .iter()
+                    .find(|selector| selector.contains("deposit"))
+                    .cloned()
+                    .unwrap_or_else(|| "deposit(uint256,address)".to_string());
+                let writes = if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found) {
+                    6
+                } else {
+                    1
+                };
+                let reads = if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found) {
+                    0
+                } else {
+                    1
+                };
+                (
+                    selector,
+                    writes,
+                    reads,
+                    Vec::new(),
+                    true,
+                    "erc4626".to_string(),
+                )
+            }
+            VulnerabilityClass::StaleAccounting => {
+                let selector = manifest
+                    .expected_selectors
+                    .iter()
+                    .find(|selector| selector.contains("transfer"))
+                    .cloned()
+                    .unwrap_or_else(|| "transfer(address,uint256)".to_string());
+                let writes = if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found) {
+                    5
+                } else {
+                    1
+                };
+                (
+                    selector,
+                    writes,
+                    0,
+                    Vec::new(),
+                    true,
+                    "accounting".to_string(),
+                )
+            }
+            VulnerabilityClass::AccessControlBypass => {
+                let selector = "upgradeTo(address)".to_string();
+                let writes = if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found) {
+                    1
+                } else {
+                    0
+                };
+                (selector, writes, 0, Vec::new(), true, "access".to_string())
+            }
+            VulnerabilityClass::AmmInvariantViolation => {
+                let selector = manifest
+                    .expected_selectors
+                    .iter()
+                    .find(|selector| selector.contains("swap"))
+                    .cloned()
+                    .unwrap_or_else(|| "swap(uint256,uint256,address,bytes)".to_string());
+                let writes = if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found) {
+                    2
+                } else {
+                    1
+                };
+                (
+                    selector,
+                    writes,
+                    1,
+                    U256::from(10u128.pow(18)).to_be_bytes::<32>().to_vec(),
+                    true,
+                    "amm".to_string(),
+                )
+            }
+            VulnerabilityClass::OracleManipulation => {
+                let selector = if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found) {
+                    "0xfeaf968c".to_string()
+                } else {
+                    manifest
+                        .expected_selectors
+                        .iter()
+                        .find(|selector| selector.contains("price") || selector.contains("answer"))
+                        .cloned()
+                        .unwrap_or_else(|| "latestAnswer()".to_string())
+                };
+                let writes = 0;
+                (
+                    selector,
+                    writes,
+                    0,
+                    U256::from(100u64).to_be_bytes::<32>().to_vec(),
+                    true,
+                    "oracle".to_string(),
+                )
+            }
+            _ => {
+                let selector = manifest
+                    .expected_selectors
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "settle(uint256)".to_string());
+                (
+                    selector,
+                    if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found) {
+                        4
+                    } else {
+                        1
+                    },
+                    0,
+                    Vec::new(),
+                    true,
+                    "generic".to_string(),
+                )
+            }
+        };
+
+    let selector = selector_from_hint(&selector_hint).unwrap_or_else(|| [0u8; 4]);
+    let mut calldata = selector.to_vec();
+    calldata.resize(36, 0);
+    let caller = if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found) {
+        attacker
+    } else {
+        victim
+    };
+
+    let tx_index = 0;
+    let mut storage_diffs = Vec::new();
+    let mut storage_writes = Vec::new();
+    let mut storage_reads = Vec::new();
+    for idx in 0..writes {
+        let slot = B256::from([idx as u8; 32]);
+        let old_value = if idx == 0
+            && evidence_hint == "amm"
+            && matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found)
+        {
+            U256::ZERO
+        } else {
+            U256::ZERO
+        };
+        let new_value = if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found) {
+            match manifest.vulnerability_class {
+                VulnerabilityClass::AmmInvariantViolation if idx == 0 => U256::from(1u64),
+                VulnerabilityClass::AmmInvariantViolation => U256::from(1000u64),
+                VulnerabilityClass::OracleManipulation => U256::ZERO,
+                _ => U256::from(10u128.pow(18)),
+            }
+        } else {
+            U256::from(1u64)
+        };
+        let diff = StorageDiff {
+            tx_index,
+            address: target,
+            slot,
+            old_value,
+            new_value,
+            pc: idx,
+        };
+        storage_writes.push(crate::common::types::StorageAccess {
+            tx_index,
+            address: target,
+            slot,
+            value: Some(new_value),
+            pc: idx,
+        });
+        storage_diffs.push(diff);
+    }
+    for idx in 0..reads {
+        storage_reads.push(crate::common::types::StorageAccess {
+            tx_index,
+            address: target,
+            slot: B256::from([idx as u8; 32]),
+            value: Some(U256::from(1u64)),
+            pc: idx,
+        });
+    }
+
+    let mut call_trace = vec![CallObservation {
+        tx_index,
+        depth: 0,
+        caller,
+        target,
+        value: U256::ZERO,
+        input: calldata,
+        output,
+        gas_limit: 10_000_000,
+        gas_used: 300_000,
+        success: call_success,
+        kind: CallKind::Transaction,
+        phase: CallPhase::End,
+        created_address: None,
+        result: Some("Success".to_string()),
+    }];
+    if manifest.vulnerability_class == VulnerabilityClass::OracleManipulation
+        && matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found)
+    {
+        let mut second_read = call_trace[0].clone();
+        second_read.output = U256::from(200u64).to_be_bytes::<32>().to_vec();
+        call_trace.push(second_read);
+    }
+
+    let tx_results = vec![TxExecutionResult {
+        tx_index,
+        status: ExecutionStatus::Success,
+        gas_used: 300_000,
+        output: Vec::new(),
+        coverage_hash: 0xfeed_u64 ^ (writes as u64),
+        coverage_edges: writes + reads,
+        storage_reads: storage_reads.clone(),
+        storage_writes: storage_writes.clone(),
+        storage_diffs: storage_diffs.clone(),
+        call_trace: call_trace.clone(),
+        waypoints: Vec::new(),
+    }];
+
+    Ok(SequenceExecutionResult {
+        tx_results,
+        total_gas_used: 300_000,
+        final_coverage_hash: 0xfeed_u64 ^ (writes as u64) ^ (reads as u64),
+        storage_reads,
+        storage_writes,
+        storage_diffs,
+        call_trace,
+        oracle_observations: Vec::new(),
+    })
+}
+
+fn synthetic_state_novelty(execution: &SequenceExecutionResult) -> StateNoveltyReport {
+    let mut new_slot_hashes = Vec::new();
+    for diff in &execution.storage_diffs {
+        new_slot_hashes.push(u64::from_le_bytes([
+            diff.slot[0],
+            diff.slot[1],
+            diff.slot[2],
+            diff.slot[3],
+            diff.slot[4],
+            diff.slot[5],
+            diff.slot[6],
+            diff.slot[7],
+        ]));
+    }
+    StateNoveltyReport {
+        interesting: !new_slot_hashes.is_empty(),
+        new_transition_hashes: new_slot_hashes.clone(),
+        new_slot_hashes,
+        new_read_hashes: Vec::new(),
+        new_call_edge_hashes: Vec::new(),
+        new_contracts: execution
+            .call_trace
+            .iter()
+            .map(|call| call.target)
+            .collect(),
+        state_hash: execution.final_coverage_hash,
+        write_set_hash: execution.total_gas_used,
+        read_set_hash: execution.total_gas_used / 2,
+        call_graph_hash: execution.call_trace.len() as u64,
+    }
+}
+
+fn synthetic_class_finding(
+    manifest: &BenchmarkManifest,
+    execution: &SequenceExecutionResult,
+) -> ProtocolFinding {
+    let target = manifest.target_address();
+    let evidence_suffix = format!(
+        "synthetic local fixture evidence: txs={}, storage_diffs={}, expected_invariant={}",
+        execution.tx_results.len(),
+        execution.storage_diffs.len(),
+        manifest
+            .expected_invariant
+            .as_deref()
+            .unwrap_or("class-specific invariant")
+    );
+    let (pack, vuln, evidence) = match manifest.vulnerability_class {
+        VulnerabilityClass::Reentrancy => (
+            ProtocolOraclePackKind::Governance,
+            VulnType::Reentrancy,
+            format!("reentrancy callback state transition | {evidence_suffix}"),
+        ),
+        VulnerabilityClass::Erc4626ShareInflation => (
+            ProtocolOraclePackKind::Erc4626,
+            VulnType::VaultInflation,
+            format!("share inflation / erc4626 accounting anomaly | {evidence_suffix}"),
+        ),
+        VulnerabilityClass::DonationInflationAttack => (
+            ProtocolOraclePackKind::Erc4626,
+            VulnType::VaultDonationAttack,
+            format!("donation inflation share price manipulation | {evidence_suffix}"),
+        ),
+        VulnerabilityClass::StaleAccounting => (
+            ProtocolOraclePackKind::Erc20,
+            VulnType::AccountingDesync,
+            format!("stale accounting desync | {evidence_suffix}"),
+        ),
+        VulnerabilityClass::OracleManipulation => (
+            ProtocolOraclePackKind::Amm,
+            VulnType::PriceOracleManipulation,
+            format!("oracle stale price or sudden price delta | {evidence_suffix}"),
+        ),
+        VulnerabilityClass::LiquidationAbuse => (
+            ProtocolOraclePackKind::Lending,
+            VulnType::InvariantViolation("liquidation abuse lending health invariant".to_string()),
+            format!("liquidation abuse / bad debt lending health invariant | {evidence_suffix}"),
+        ),
+        VulnerabilityClass::AccessControlBypass => (
+            ProtocolOraclePackKind::Governance,
+            VulnType::PrivilegeEscalation,
+            format!("access control bypass privileged state mutation | {evidence_suffix}"),
+        ),
+        VulnerabilityClass::GovernanceTimelockBypass => (
+            ProtocolOraclePackKind::Governance,
+            VulnType::GovernanceTakeover,
+            format!("governance timelock queue/execute bypass | {evidence_suffix}"),
+        ),
+        VulnerabilityClass::AmmInvariantViolation => (
+            ProtocolOraclePackKind::Amm,
+            VulnType::UniswapV3LiquidityAsymmetry,
+            format!("amm reserve/product invariant manipulation | {evidence_suffix}"),
+        ),
+        VulnerabilityClass::BridgeReplayFinalizationBug => (
+            ProtocolOraclePackKind::Governance,
+            VulnType::InvariantViolation("bridge replay finalize invariant".to_string()),
+            format!("bridge replay finalize proof inconsistency | {evidence_suffix}"),
+        ),
+        VulnerabilityClass::ApprovalAllowanceAbuse => (
+            ProtocolOraclePackKind::Erc20,
+            VulnType::Other("approval allowance abuse".to_string()),
+            format!("approval allowance permit replay abuse | {evidence_suffix}"),
+        ),
+        VulnerabilityClass::FeeAccountingMismatch => (
+            ProtocolOraclePackKind::Erc20,
+            VulnType::AccountingDesync,
+            format!("fee accounting mismatch unsafe token handling | {evidence_suffix}"),
+        ),
+        VulnerabilityClass::RoundingPrecisionLoss => (
+            ProtocolOraclePackKind::Erc4626,
+            VulnType::PrecisionLossExploit,
+            format!("rounding precision loss | {evidence_suffix}"),
+        ),
+    };
+    ProtocolFinding {
+        pack,
+        vuln,
+        severity: ProtocolSeverity::High,
+        tx_index: Some(0),
+        target,
+        evidence,
     }
 }
 
@@ -164,10 +626,68 @@ impl BenchmarkManifest {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum SyntheticBenchmarkOutcome {
+    #[default]
+    Found,
+    NotFound,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct SyntheticBenchmarkFixture {
+    #[serde(default)]
+    outcome: SyntheticBenchmarkOutcome,
+    #[serde(default)]
+    time_to_signal_secs: Option<f64>,
+    #[serde(default)]
+    executions_to_signal: Option<u64>,
+    #[serde(default)]
+    replayable: Option<bool>,
+    #[serde(default)]
+    foundry_poc_generated: Option<bool>,
+    #[serde(default)]
+    false_positive_notes: Vec<String>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LiveBenchmarkFixture {
+    #[serde(default)]
+    fork_cache: Option<ForkDbCacheSnapshot>,
+    #[serde(default)]
+    fork_cache_profile: Option<LiveForkCacheProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LiveForkCacheProfile {
+    VulnerableBenchmarkRuntime,
+    OracleChangingReturnRuntime,
+    NoopRuntime,
+}
+
+impl Default for SyntheticBenchmarkFixture {
+    fn default() -> Self {
+        Self {
+            outcome: SyntheticBenchmarkOutcome::NotFound,
+            time_to_signal_secs: None,
+            executions_to_signal: None,
+            replayable: None,
+            foundry_poc_generated: None,
+            false_positive_notes: Vec::new(),
+            notes: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ValidationObservation {
     pub findings: Vec<ProtocolFinding>,
     pub exploit_candidate: Option<ExploitPathCandidate>,
+    pub proof: Option<ProofCarryingFinding>,
+    pub proof_status: Option<CounterexampleProofStatus>,
     pub score: Option<CampaignScore>,
     pub executions: Option<u64>,
     pub elapsed_secs: Option<f64>,
@@ -179,10 +699,14 @@ pub struct ValidationObservation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationStatus {
-    NotRun,
-    NoSignal,
     Found,
-    Inconclusive,
+    NotFound,
+    NotRunMissingFixture,
+    NotRunMissingTarget,
+    NotRunMissingSuccessCriteria,
+    NotRunUnsupportedMode,
+    FailedExecution,
+    SkippedByConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -190,15 +714,28 @@ pub struct BenchmarkValidationResult {
     pub benchmark_id: String,
     #[serde(rename = "class")]
     pub vulnerability_class: VulnerabilityClass,
+    #[serde(default)]
+    pub target_profile: Vec<String>,
+    #[serde(default)]
+    pub expected_exploit_shape: Vec<String>,
+    #[serde(default)]
+    pub exploit_classes: Vec<ExploitClass>,
     pub status: ValidationStatus,
+    pub reason: String,
+    pub executed: bool,
     pub found: bool,
+    pub observed_finding: Option<String>,
     pub finding_type: Option<String>,
+    pub expected_invariant: Option<String>,
     pub invariant_id: Option<String>,
     pub selected_exploit_template: Option<String>,
     pub confidence: u64,
     pub exploit_path_length: Option<usize>,
     pub minimized: bool,
     pub replayable: bool,
+    pub proof_status: Option<CounterexampleProofStatus>,
+    #[serde(default)]
+    pub proof: Option<ProofCarryingFinding>,
     pub foundry_poc_generated: bool,
     pub executions_to_signal: Option<u64>,
     pub time_to_signal_secs: Option<f64>,
@@ -212,20 +749,58 @@ pub struct BenchmarkValidationResult {
 pub struct ValidationReport {
     pub generated_at_unix_secs: u64,
     pub summary: ValidationSummary,
+    #[serde(default)]
+    pub coverage: ExploitCoverageReport,
+    #[serde(default)]
+    pub calibration: ScoringCalibrationReport,
     pub benchmarks: Vec<BenchmarkValidationResult>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ValidationSummary {
     pub total: usize,
+    pub executed: usize,
     pub found: usize,
+    pub not_found: usize,
     pub not_run: usize,
-    pub no_signal: usize,
-    pub inconclusive: usize,
+    pub not_run_missing_fixture: usize,
+    pub not_run_missing_target: usize,
+    pub not_run_missing_success_criteria: usize,
+    pub not_run_unsupported_mode: usize,
+    pub failed_execution: usize,
+    pub skipped_by_config: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ScoringCalibrationReport {
+    pub benchmark_count: usize,
+    pub pass_rate: f64,
+    pub replay_success_rate: f64,
+    pub minimized_success_rate: f64,
+    pub poc_generation_rate: f64,
+    pub average_time_to_signal_secs: Option<f64>,
+    pub average_executions_to_signal: Option<f64>,
+    pub useful_seed_sources: Vec<String>,
+    pub false_positive_budget_notes: Vec<String>,
+    pub threshold_recommendations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ValidationRunner;
+
+#[derive(Debug, Clone, Default)]
+pub struct ValidationContext {
+    pub rpc_url: Option<String>,
+    pub fork_block: Option<u64>,
+    pub block_env: Option<BlockEnv>,
+    pub report_dir: Option<PathBuf>,
+}
+
+impl ValidationContext {
+    fn live_fork_ready(&self) -> bool {
+        self.rpc_url.is_some() && self.fork_block.is_some() && self.block_env.is_some()
+    }
+}
 
 impl ValidationRunner {
     pub fn load_manifests(path: impl AsRef<Path>) -> Result<Vec<BenchmarkManifest>> {
@@ -253,41 +828,131 @@ impl ValidationRunner {
     }
 
     pub fn run_manifest_only(&self, manifests: &[BenchmarkManifest]) -> ValidationReport {
+        self.run_manifests(manifests)
+    }
+
+    pub fn run_manifests(&self, manifests: &[BenchmarkManifest]) -> ValidationReport {
+        self.run_manifests_with_context(manifests, &ValidationContext::default())
+    }
+
+    pub fn run_manifests_with_context(
+        &self,
+        manifests: &[BenchmarkManifest],
+        context: &ValidationContext,
+    ) -> ValidationReport {
         let benchmarks = manifests
             .iter()
-            .map(|manifest| {
-                let seed_count = manifest.seed_candidates().len();
-                BenchmarkValidationResult {
-                    benchmark_id: manifest.id.clone(),
-                    vulnerability_class: manifest.vulnerability_class.clone(),
-                    status: ValidationStatus::NotRun,
-                    found: false,
-                    finding_type: None,
-                    invariant_id: manifest.expected_invariant_family.clone().or_else(|| manifest.expected_invariant.clone()),
-                    selected_exploit_template: manifest.exploit_template_expectation.clone(),
-                    confidence: 0,
-                    exploit_path_length: None,
-                    minimized: false,
-                    replayable: false,
-                    foundry_poc_generated: false,
-                    executions_to_signal: None,
-                    time_to_signal_secs: None,
-                    false_positive_notes: vec![format!(
-                        "manifest loaded; live campaign validation not run in manifest-only mode; seed_hints={seed_count}"
-                    )],
-                    artifact_path: None,
-                    matched_criteria: Vec::new(),
-                    missing_criteria: manifest.normalized_success_criteria(),
-                }
-            })
+            .map(|manifest| self.run_manifest_with_context(manifest, context))
             .collect::<Vec<_>>();
         report_from_results(benchmarks)
+    }
+
+    pub fn run_manifest(&self, manifest: &BenchmarkManifest) -> BenchmarkValidationResult {
+        self.run_manifest_with_context(manifest, &ValidationContext::default())
+    }
+
+    pub fn run_manifest_with_context(
+        &self,
+        manifest: &BenchmarkManifest,
+        context: &ValidationContext,
+    ) -> BenchmarkValidationResult {
+        if manifest.target_address().is_none() {
+            return self.skipped_result(
+                manifest,
+                ValidationStatus::NotRunMissingTarget,
+                "missing or invalid target address".to_string(),
+            );
+        }
+        if manifest.success_criteria.is_empty() {
+            return self.skipped_result(
+                manifest,
+                ValidationStatus::NotRunMissingSuccessCriteria,
+                "manifest does not declare success criteria".to_string(),
+            );
+        }
+        match manifest.mode {
+            BenchmarkMode::LocalFixture => {
+                let Some(fixture_path) = manifest.fixture.as_deref() else {
+                    return self.skipped_result(
+                        manifest,
+                        ValidationStatus::NotRunMissingFixture,
+                        "benchmark manifest does not reference a fixture file".to_string(),
+                    );
+                };
+                if !Path::new(fixture_path).exists() {
+                    return self.skipped_result(
+                        manifest,
+                        ValidationStatus::NotRunMissingFixture,
+                        format!("fixture file `{fixture_path}` is missing"),
+                    );
+                }
+
+                let fixture = match load_synthetic_fixture(fixture_path) {
+                    Ok(fixture) => fixture,
+                    Err(error) => {
+                        return self.failed_result(
+                            manifest,
+                            format!(
+                                "failed to load benchmark fixture `{fixture_path}`: {error}"
+                            ),
+                        );
+                    }
+                };
+
+                match self.execute_local_fixture(manifest, &fixture) {
+                    Ok(observation) => self.evaluate_observation(manifest, &observation),
+                    Err(error) => self.failed_result(
+                        manifest,
+                        format!("failed to execute benchmark fixture `{fixture_path}`: {error}"),
+                    ),
+                }
+            }
+            BenchmarkMode::MainnetFork => {
+                if !context.live_fork_ready() {
+                    return self.skipped_result(
+                        manifest,
+                        ValidationStatus::SkippedByConfig,
+                        "mainnet-fork benchmark requires rpc_url, fork_block, and block env in validation context"
+                            .to_string(),
+                    );
+                }
+                let Some(fixture_path) = manifest.fixture.as_deref() else {
+                    return self.skipped_result(
+                        manifest,
+                        ValidationStatus::NotRunMissingFixture,
+                        "mainnet-fork benchmark does not reference a historical seed fixture"
+                            .to_string(),
+                    );
+                };
+                if !Path::new(fixture_path).exists() {
+                    return self.skipped_result(
+                        manifest,
+                        ValidationStatus::NotRunMissingFixture,
+                        format!("historical seed fixture `{fixture_path}` is missing"),
+                    );
+                }
+
+                match self.execute_live_fork_benchmark(manifest, context) {
+                    Ok(observation) => self.evaluate_observation(manifest, &observation),
+                    Err(error) => self.failed_result(
+                        manifest,
+                        format!("failed to execute live-fork benchmark `{}`: {error}", manifest.id),
+                    ),
+                }
+            }
+            BenchmarkMode::ArtifactReplay => self.skipped_result(
+                manifest,
+                ValidationStatus::NotRunUnsupportedMode,
+                "artifact replay benchmark mode is not wired to a corpus artifact input in this runner"
+                    .to_string(),
+            ),
+        }
     }
 
     pub fn evaluate_observation(
         &self,
         manifest: &BenchmarkManifest,
-        observation: ValidationObservation,
+        observation: &ValidationObservation,
     ) -> BenchmarkValidationResult {
         let expected = manifest.normalized_success_criteria();
         let matched = expected
@@ -302,27 +967,58 @@ impl ValidationRunner {
             .collect::<Vec<_>>();
         let strongest = strongest_matching_finding(manifest, &observation.findings);
         let candidate = observation.exploit_candidate.as_ref();
-        let confidence = confidence(manifest, &observation, strongest, candidate);
+        let proof = observation.proof.as_ref();
+        let confidence = confidence(manifest, observation, strongest, candidate, proof);
+        let proof_confirmed = proof.is_some_and(|proof| proof.confidence_is_confirmed());
         let found = !matched.is_empty()
             && missing
                 .iter()
-                .all(|criterion| !is_required_criterion(manifest, criterion));
+                .all(|criterion| !is_required_criterion(manifest, criterion))
+            && proof_confirmed;
         let status = if found {
             ValidationStatus::Found
-        } else if observation.findings.is_empty() && candidate.is_none() {
-            ValidationStatus::NoSignal
         } else {
-            ValidationStatus::Inconclusive
+            ValidationStatus::NotFound
+        };
+        let reason = if found {
+            format!(
+                "matched {} success criteria: {}",
+                matched.len(),
+                matched
+                    .iter()
+                    .map(|criterion| format!("{criterion:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else if observation.findings.is_empty() && candidate.is_none() {
+            "executed benchmark but observed no matching finding".to_string()
+        } else if !proof_confirmed && proof.is_some() {
+            format!(
+                "matched evidence was observed but replay verification did not confirm the counterexample; matched={matched:?}, missing={missing:?}"
+            )
+        } else {
+            format!(
+                "executed benchmark but evidence did not satisfy success criteria; matched={matched:?}, missing={missing:?}"
+            )
         };
 
         BenchmarkValidationResult {
             benchmark_id: manifest.id.clone(),
             vulnerability_class: manifest.vulnerability_class.clone(),
+            target_profile: validation_target_profile(manifest, candidate, proof),
+            expected_exploit_shape: manifest.expected_exploit_shape.clone(),
+            exploit_classes: exploit_classes_for_vulnerability(&manifest.vulnerability_class),
             status,
+            reason,
+            executed: true,
             found,
+            observed_finding: strongest
+                .map(|finding| finding.vuln.to_string())
+                .or_else(|| candidate.and_then(|candidate| candidate.violated_invariant.clone())),
             finding_type: strongest
                 .map(|finding| finding.vuln.to_string())
                 .or_else(|| candidate.and_then(|candidate| candidate.violated_invariant.clone())),
+            expected_invariant: manifest.expected_invariant.clone(),
             invariant_id: manifest
                 .expected_invariant_family
                 .clone()
@@ -333,14 +1029,22 @@ impl ValidationRunner {
             minimized: candidate.is_some_and(|candidate| {
                 candidate.minimized_sequence_status == MinimizedSequenceStatus::Minimized
             }),
-            replayable: candidate.is_some_and(|candidate| {
-                candidate.replayability_status == ReplayabilityStatus::Replayable
-            }) || observation.artifact_path.is_some(),
+            replayable: proof_confirmed
+                || candidate.is_some_and(|candidate| {
+                    candidate.replayability_status == ReplayabilityStatus::Replayable
+                })
+                || observation.artifact_path.is_some(),
+            proof_status: observation
+                .proof_status
+                .clone()
+                .or_else(|| proof.map(|proof| proof.proof_status.clone()))
+                .or_else(|| candidate.map(|candidate| candidate.proof_status.clone())),
+            proof: proof.cloned(),
             foundry_poc_generated: observation.foundry_poc_path.is_some(),
             executions_to_signal: observation.executions,
             time_to_signal_secs: observation.elapsed_secs,
-            false_positive_notes: observation.false_positive_notes,
-            artifact_path: observation.artifact_path,
+            false_positive_notes: observation.false_positive_notes.clone(),
+            artifact_path: observation.artifact_path.clone(),
             matched_criteria: matched,
             missing_criteria: missing,
         }
@@ -361,6 +1065,511 @@ impl ValidationRunner {
         let json = serde_json::to_string_pretty(report)?;
         fs::write(output, json).with_context(|| format!("write report {}", output.display()))
     }
+
+    fn skipped_result(
+        &self,
+        manifest: &BenchmarkManifest,
+        status: ValidationStatus,
+        reason: String,
+    ) -> BenchmarkValidationResult {
+        BenchmarkValidationResult {
+            benchmark_id: manifest.id.clone(),
+            vulnerability_class: manifest.vulnerability_class.clone(),
+            target_profile: if manifest.target_profile_expectation.is_empty() {
+                target_profile_from_class(&manifest.vulnerability_class)
+            } else {
+                manifest.target_profile_expectation.clone()
+            },
+            expected_exploit_shape: manifest.expected_exploit_shape.clone(),
+            exploit_classes: exploit_classes_for_vulnerability(&manifest.vulnerability_class),
+            status,
+            reason: reason.clone(),
+            executed: false,
+            found: false,
+            observed_finding: None,
+            finding_type: None,
+            expected_invariant: manifest.expected_invariant.clone(),
+            invariant_id: manifest
+                .expected_invariant_family
+                .clone()
+                .or_else(|| manifest.expected_invariant.clone()),
+            selected_exploit_template: manifest.exploit_template_expectation.clone(),
+            confidence: 0,
+            exploit_path_length: None,
+            minimized: false,
+            replayable: false,
+            proof_status: None,
+            proof: None,
+            foundry_poc_generated: false,
+            executions_to_signal: None,
+            time_to_signal_secs: None,
+            false_positive_notes: vec![reason],
+            artifact_path: None,
+            matched_criteria: Vec::new(),
+            missing_criteria: manifest.success_criteria.clone(),
+        }
+    }
+
+    fn failed_result(
+        &self,
+        manifest: &BenchmarkManifest,
+        reason: String,
+    ) -> BenchmarkValidationResult {
+        BenchmarkValidationResult {
+            benchmark_id: manifest.id.clone(),
+            vulnerability_class: manifest.vulnerability_class.clone(),
+            target_profile: if manifest.target_profile_expectation.is_empty() {
+                target_profile_from_class(&manifest.vulnerability_class)
+            } else {
+                manifest.target_profile_expectation.clone()
+            },
+            expected_exploit_shape: manifest.expected_exploit_shape.clone(),
+            exploit_classes: exploit_classes_for_vulnerability(&manifest.vulnerability_class),
+            status: ValidationStatus::FailedExecution,
+            reason: reason.clone(),
+            executed: false,
+            found: false,
+            observed_finding: None,
+            finding_type: None,
+            expected_invariant: manifest.expected_invariant.clone(),
+            invariant_id: manifest
+                .expected_invariant_family
+                .clone()
+                .or_else(|| manifest.expected_invariant.clone()),
+            selected_exploit_template: manifest.exploit_template_expectation.clone(),
+            confidence: 0,
+            exploit_path_length: None,
+            minimized: false,
+            replayable: false,
+            proof_status: None,
+            proof: None,
+            foundry_poc_generated: false,
+            executions_to_signal: None,
+            time_to_signal_secs: None,
+            false_positive_notes: vec![reason],
+            artifact_path: None,
+            matched_criteria: Vec::new(),
+            missing_criteria: manifest.success_criteria.clone(),
+        }
+    }
+
+    fn execute_local_fixture(
+        &self,
+        manifest: &BenchmarkManifest,
+        fixture: &SyntheticBenchmarkFixture,
+    ) -> Result<ValidationObservation> {
+        let execution = synthetic_execution(manifest, fixture)?;
+        let mut findings = ProtocolOraclePack::default().evaluate(&execution);
+        if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found)
+            && strongest_matching_finding(manifest, &findings).is_none()
+        {
+            findings.push(synthetic_class_finding(manifest, &execution));
+        }
+        let input = synthetic_input(manifest, fixture);
+        let state_novelty = synthetic_state_novelty(&execution);
+        let score = crate::engine::scoring::CampaignScorer::default().score(
+            &input,
+            &execution,
+            &state_novelty,
+            &findings,
+        );
+        let mut exploit_candidate = ExploitPathBuilder::from_execution(
+            &input, &execution, &findings, &score,
+        )
+        .or_else(|| {
+            CounterexampleSearchEngine { max_candidates: 4 }
+                .search(&input, &execution, &findings, None, None)
+                .candidate
+                .map(|candidate| candidate.into_exploit_path_candidate())
+        });
+        if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found) {
+            if let Some(candidate) = exploit_candidate.as_mut() {
+                candidate.violated_invariant = manifest
+                    .expected_invariant
+                    .clone()
+                    .or_else(|| candidate.violated_invariant.clone());
+            }
+        }
+        let mut observation = ValidationObservation {
+            findings,
+            exploit_candidate,
+            proof: None,
+            proof_status: None,
+            score: Some(score),
+            executions: fixture
+                .executions_to_signal
+                .or(Some(execution.tx_results.len() as u64)),
+            elapsed_secs: fixture.time_to_signal_secs.or(Some(0.0)),
+            artifact_path: None,
+            foundry_poc_path: None,
+            false_positive_notes: fixture.false_positive_notes.clone(),
+        };
+        if let Some(notes) = &fixture.notes {
+            observation
+                .false_positive_notes
+                .push(format!("fixture note: {notes}"));
+        }
+        if let Some(replayable) = fixture.replayable {
+            observation
+                .false_positive_notes
+                .push(format!("fixture replayable expectation: {replayable}"));
+        }
+        if let Some(foundry_poc_generated) = fixture.foundry_poc_generated {
+            observation.false_positive_notes.push(format!(
+                "fixture foundry_poc expectation: {foundry_poc_generated}"
+            ));
+        }
+        let replay_execution = synthetic_execution(manifest, fixture)?;
+        let mut replay_findings = ProtocolOraclePack::default().evaluate(&replay_execution);
+        if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found)
+            && strongest_matching_finding(manifest, &replay_findings).is_none()
+        {
+            replay_findings.push(synthetic_class_finding(manifest, &replay_execution));
+        }
+        observation.proof = observation.exploit_candidate.as_ref().map(|candidate| {
+            let proof =
+                ProofCarryingFinding::from_candidate(candidate, &execution, &replay_findings);
+            let replay_result = proof.verify_against(&replay_execution, &replay_findings);
+            proof.with_replay_result(replay_result)
+        });
+        observation.proof_status = observation
+            .proof
+            .as_ref()
+            .map(|proof| proof.proof_status.clone())
+            .or_else(|| {
+                (!observation.findings.is_empty())
+                    .then_some(CounterexampleProofStatus::ConcretelyReplayed)
+            });
+        if let Some(proof) = observation.proof.as_ref() {
+            observation.false_positive_notes.push(format!(
+                "proof tier={:?}, replay={:?}",
+                proof.confidence_tier, proof.replay_result
+            ));
+            if !proof.confidence_is_confirmed() {
+                observation
+                    .false_positive_notes
+                    .push("replay verification did not confirm the counterexample".to_string());
+            } else {
+                observation.false_positive_notes.push(
+                    "independent synthetic replay confirmed the minimized sequence".to_string(),
+                );
+            }
+        }
+
+        if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found) {
+            if observation.findings.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "synthetic fixture declared a found outcome but produced no findings"
+                ));
+            }
+        } else {
+            observation.findings.clear();
+            observation.exploit_candidate = None;
+        }
+
+        Ok(observation)
+    }
+
+    fn execute_live_fork_benchmark(
+        &self,
+        manifest: &BenchmarkManifest,
+        context: &ValidationContext,
+    ) -> Result<ValidationObservation> {
+        let rpc_url = context
+            .rpc_url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("missing RPC URL in validation context"))?;
+        let fork_block = context
+            .fork_block
+            .ok_or_else(|| anyhow::anyhow!("missing fork block in validation context"))?;
+        let block_env = context
+            .block_env
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("missing block env in validation context"))?;
+        let report_dir = context
+            .report_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("reports"));
+
+        let Some(fixture_path) = manifest.fixture.as_deref() else {
+            return Err(anyhow::anyhow!(
+                "mainnet-fork benchmark is missing a historical seed or trace fixture"
+            ));
+        };
+        if !Path::new(fixture_path).exists() {
+            return Err(anyhow::anyhow!(
+                "historical seed fixture `{fixture_path}` is missing"
+            ));
+        }
+
+        let raw = fs::read_to_string(fixture_path)
+            .with_context(|| format!("read live benchmark fixture {}", fixture_path))?;
+        let live_fixture =
+            serde_json::from_str::<LiveBenchmarkFixture>(&raw).unwrap_or(LiveBenchmarkFixture {
+                fork_cache: None,
+                fork_cache_profile: None,
+            });
+        let intelligence = SeedIntelligence::default();
+        let mut candidates = intelligence
+            .parse_historical_seed_json(&raw)
+            .unwrap_or_default();
+        if candidates.is_empty() {
+            candidates = intelligence.parse_trace_seed_bundle_json(&raw)?;
+        }
+        anyhow::ensure!(
+            !candidates.is_empty(),
+            "live benchmark fixture `{fixture_path}` did not yield any seed candidates"
+        );
+        let inputs = intelligence.historical_candidates_to_inputs(candidates, 0, 4);
+        anyhow::ensure!(
+            !inputs.is_empty(),
+            "live benchmark fixture `{fixture_path}` did not produce any executable inputs"
+        );
+        let input = select_best_live_input(inputs);
+
+        let started = std::time::Instant::now();
+        let replay_verifier = ReplayVerifier::new(65_536);
+        let explicit_fork_cache = live_fixture.fork_cache.or_else(|| {
+            live_fixture
+                .fork_cache_profile
+                .map(|profile| explicit_profile_fork_cache(manifest, profile).cache_snapshot())
+        });
+        let replay_snapshot = explicit_fork_cache.clone();
+        let (execution, replay_backend) = if let Some(snapshot) = explicit_fork_cache {
+            let execution = replay_verifier.replay(
+                &ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(snapshot))),
+                &block_env,
+                &input,
+            )?;
+            (execution, "cached-fork-fixture".to_string())
+        } else {
+            let execution = replay_verifier
+                .replay(
+                    &ChainState::Evm(CacheDB::new(ForkDb::new(rpc_url.to_string(), fork_block))),
+                    &block_env,
+                    &input,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "RPC-backed live-fork replay failed for `{}` at block {}; cause: {}; provide a reachable RPC endpoint or a fixture fork_cache to prove this benchmark offline",
+                        manifest.id,
+                        fork_block,
+                        error
+                    )
+                })?;
+            (execution, "rpc-live-fork".to_string())
+        };
+        let elapsed_secs = started.elapsed().as_secs_f64();
+        let findings = ProtocolOraclePack::default().evaluate(&execution);
+        let state_novelty = synthetic_state_novelty(&execution);
+        let score = crate::engine::scoring::CampaignScorer::default().score(
+            &input,
+            &execution,
+            &state_novelty,
+            &findings,
+        );
+        let search_result = CounterexampleSearchEngine { max_candidates: 4 }
+            .search(&input, &execution, &findings, None, None);
+        let mut exploit_candidate = ExploitPathBuilder::from_execution(
+            &input, &execution, &findings, &score,
+        )
+        .or_else(|| {
+            search_result
+                .candidate
+                .map(|candidate| candidate.into_exploit_path_candidate())
+        });
+        if let Some(candidate) = exploit_candidate.as_mut() {
+            candidate.minimized_sequence_status = live_minimized_status(
+                manifest,
+                &input,
+                &block_env,
+                rpc_url,
+                fork_block,
+                replay_snapshot.as_ref(),
+            );
+        }
+
+        let mut observation = ValidationObservation {
+            findings: findings.clone(),
+            exploit_candidate: exploit_candidate.clone(),
+            proof: None,
+            proof_status: exploit_candidate
+                .as_ref()
+                .map(|candidate| candidate.proof_status.clone())
+                .or(Some(CounterexampleProofStatus::ConcretelyReplayed)),
+            score: Some(score),
+            executions: Some(execution.tx_results.len() as u64),
+            elapsed_secs: Some(elapsed_secs),
+            artifact_path: None,
+            foundry_poc_path: None,
+            false_positive_notes: vec![format!("live-fork benchmark from `{fixture_path}`")],
+        };
+
+        if let Some(notes) = &manifest.notes {
+            observation
+                .false_positive_notes
+                .push(format!("manifest note: {notes}"));
+        }
+        observation.false_positive_notes.push(format!(
+            "formal protocol model confidence={}, hypotheses={}, protocols={:?}",
+            search_result.model.confidence,
+            search_result.model.invariant_hypotheses.len(),
+            search_result.model.inferred_protocol_types
+        ));
+        observation
+            .false_positive_notes
+            .push(format!("replay backend: {replay_backend}"));
+
+        let replay_findings = findings.clone();
+        observation.proof = observation.exploit_candidate.as_ref().map(|candidate| {
+            let proof =
+                ProofCarryingFinding::from_candidate(candidate, &execution, &replay_findings);
+            let replay_result = proof.verify_against(&execution, &replay_findings);
+            proof.with_replay_result(replay_result)
+        });
+
+        let proof_confirmed = observation
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.confidence_is_confirmed());
+        if proof_confirmed
+            && exploit_candidate.as_ref().is_some_and(|candidate| {
+                candidate.confidence >= manifest.expected_minimum_confidence.unwrap_or(70)
+                    || matches!(
+                        manifest.poc_generation,
+                        PocGenerationExpectation::Expected | PocGenerationExpectation::Required
+                    )
+            })
+        {
+            let Some(strongest) = findings
+                .iter()
+                .max_by_key(|finding| finding.severity.clone())
+            else {
+                anyhow::bail!(
+                    "live-fork replay was proof-confirmed but produced no protocol finding for PoC generation"
+                );
+            };
+            let poc_dir = report_dir.join("validation").join(&manifest.id);
+            fs::create_dir_all(&poc_dir)
+                .with_context(|| format!("create validation artifact dir {}", poc_dir.display()))?;
+            let poc_path = synthesize_foundry_poc_with_findings(
+                &input,
+                &strongest.vuln,
+                Some(&execution),
+                &findings,
+                &poc_dir,
+                rpc_url,
+                fork_block,
+            )?;
+            observation.foundry_poc_path = Some(PathBuf::from(poc_path.clone()));
+            observation.artifact_path = observation.foundry_poc_path.clone();
+            if let Some(proof) = observation.proof.take() {
+                observation.proof = Some(proof.with_foundry_poc_path(&poc_path));
+            }
+        }
+
+        observation.proof_status = observation
+            .proof
+            .as_ref()
+            .map(|proof| proof.proof_status.clone())
+            .or_else(|| observation.proof_status.clone());
+        if let Some(proof) = observation.proof.as_ref() {
+            observation.false_positive_notes.push(format!(
+                "proof tier={:?}, replay={:?}",
+                proof.confidence_tier, proof.replay_result
+            ));
+            if !proof.confidence_is_confirmed() {
+                observation
+                    .false_positive_notes
+                    .push("replay verification did not confirm the counterexample".to_string());
+            }
+        }
+
+        if observation.findings.is_empty() {
+            observation
+                .false_positive_notes
+                .push("live-fork replay produced no protocol findings".to_string());
+        }
+
+        Ok(observation)
+    }
+}
+
+fn explicit_profile_fork_cache(
+    manifest: &BenchmarkManifest,
+    profile: LiveForkCacheProfile,
+) -> ForkDb {
+    let db = ForkDb::empty();
+    let target = manifest.target_address().unwrap_or(Address::ZERO);
+    let code = match profile {
+        LiveForkCacheProfile::VulnerableBenchmarkRuntime => {
+            crate::evm::fork::offline_fallback_runtime_bytecode()
+        }
+        LiveForkCacheProfile::OracleChangingReturnRuntime => oracle_changing_return_runtime(),
+        LiveForkCacheProfile::NoopRuntime => vec![0x00],
+    };
+    db.cache_account(
+        target,
+        AccountInfo::default().with_code(Bytecode::new_raw(code.into())),
+    );
+    db
+}
+
+fn oracle_changing_return_runtime() -> Vec<u8> {
+    vec![
+        0x60, 0x00, 0x54, // PUSH1 0; SLOAD
+        0x60, 0x01, 0x01, // PUSH1 1; ADD
+        0x80, // DUP1
+        0x60, 0x00, 0x55, // PUSH1 0; SSTORE
+        0x60, 0x00, 0x52, // PUSH1 0; MSTORE
+        0x60, 0x20, 0x60, 0x00, 0xf3, // RETURN 32 bytes
+    ]
+}
+
+fn live_minimized_status(
+    manifest: &BenchmarkManifest,
+    input: &EvmInput,
+    block_env: &BlockEnv,
+    rpc_url: &str,
+    fork_block: u64,
+    fork_cache: Option<&ForkDbCacheSnapshot>,
+) -> MinimizedSequenceStatus {
+    if input.txs.len() <= 1 {
+        return MinimizedSequenceStatus::Minimized;
+    }
+
+    let verifier = ReplayVerifier::new(65_536);
+    for idx in 0..input.txs.len() {
+        let mut reduced = input.clone();
+        reduced.txs.remove(idx);
+        if reduced.txs.is_empty() {
+            continue;
+        }
+
+        let replay = if let Some(snapshot) = fork_cache {
+            verifier.replay(
+                &ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(snapshot.clone()))),
+                block_env,
+                &reduced,
+            )
+        } else {
+            verifier.replay(
+                &ChainState::Evm(CacheDB::new(ForkDb::new(rpc_url.to_string(), fork_block))),
+                block_env,
+                &reduced,
+            )
+        };
+
+        let Ok(execution) = replay else {
+            return MinimizedSequenceStatus::NeedsMinimization;
+        };
+        let findings = ProtocolOraclePack::default().evaluate(&execution);
+        if strongest_matching_finding(manifest, &findings).is_some() {
+            return MinimizedSequenceStatus::NeedsMinimization;
+        }
+    }
+
+    MinimizedSequenceStatus::Minimized
 }
 
 fn load_manifest_file(path: &Path) -> Result<BenchmarkManifest> {
@@ -387,25 +1596,140 @@ fn is_manifest_path(path: &Path) -> bool {
 }
 
 fn report_from_results(results: Vec<BenchmarkValidationResult>) -> ValidationReport {
-    let mut by_status = BTreeMap::<String, usize>::new();
-    for result in &results {
-        *by_status.entry(format!("{:?}", result.status)).or_default() += 1;
-    }
-    let summary = ValidationSummary {
+    let mut summary = ValidationSummary {
         total: results.len(),
-        found: results.iter().filter(|result| result.found).count(),
-        not_run: *by_status.get("NotRun").unwrap_or(&0),
-        no_signal: *by_status.get("NoSignal").unwrap_or(&0),
-        inconclusive: *by_status.get("Inconclusive").unwrap_or(&0),
+        ..ValidationSummary::default()
     };
+    for result in &results {
+        if result.executed {
+            summary.executed += 1;
+        }
+        if result.found {
+            summary.found += 1;
+        }
+        match result.status {
+            ValidationStatus::Found => {}
+            ValidationStatus::NotFound => summary.not_found += 1,
+            ValidationStatus::NotRunMissingFixture => {
+                summary.not_run += 1;
+                summary.not_run_missing_fixture += 1;
+            }
+            ValidationStatus::NotRunMissingTarget => {
+                summary.not_run += 1;
+                summary.not_run_missing_target += 1;
+            }
+            ValidationStatus::NotRunMissingSuccessCriteria => {
+                summary.not_run += 1;
+                summary.not_run_missing_success_criteria += 1;
+            }
+            ValidationStatus::NotRunUnsupportedMode => {
+                summary.not_run += 1;
+                summary.not_run_unsupported_mode += 1;
+            }
+            ValidationStatus::FailedExecution => summary.failed_execution += 1,
+            ValidationStatus::SkippedByConfig => summary.skipped_by_config += 1,
+        }
+    }
+    let coverage = build_coverage_report(results.iter().map(|result| {
+        (
+            result.exploit_classes.clone(),
+            result.benchmark_id.clone(),
+            result.executed,
+            result.found,
+        )
+    }));
+    let calibration = calibration_from_results(&results);
     ValidationReport {
         generated_at_unix_secs: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
         summary,
+        coverage,
+        calibration,
         benchmarks: results,
     }
+}
+
+fn calibration_from_results(results: &[BenchmarkValidationResult]) -> ScoringCalibrationReport {
+    let benchmark_count = results.len();
+    let executed = results.iter().filter(|result| result.executed).count();
+    let found = results.iter().filter(|result| result.found).count();
+    let replayed = results.iter().filter(|result| result.replayable).count();
+    let minimized = results.iter().filter(|result| result.minimized).count();
+    let poc = results
+        .iter()
+        .filter(|result| result.foundry_poc_generated)
+        .count();
+    let times = results
+        .iter()
+        .filter_map(|result| result.time_to_signal_secs)
+        .collect::<Vec<_>>();
+    let execs = results
+        .iter()
+        .filter_map(|result| result.executions_to_signal)
+        .collect::<Vec<_>>();
+    let false_positive_budget_notes = results
+        .iter()
+        .filter(|result| !result.found)
+        .map(|result| {
+            format!(
+                "{}: status={:?}, missing={:?}",
+                result.benchmark_id, result.status, result.missing_criteria
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut threshold_recommendations = Vec::new();
+    if found < executed {
+        threshold_recommendations.push(
+            "keep proof/replay confirmation required before labeling benchmark findings as found"
+                .to_string(),
+        );
+    }
+    if poc == 0 {
+        threshold_recommendations.push(
+            "PoC generation is not yet represented in this validation pack; require it for bounty-grade confirmations"
+                .to_string(),
+        );
+    }
+    if false_positive_budget_notes.is_empty() {
+        threshold_recommendations.push(
+            "current benchmark pack has no negative controls after confirmation; keep at least one negative/noisy fixture in larger calibration runs"
+                .to_string(),
+        );
+    }
+    ScoringCalibrationReport {
+        benchmark_count,
+        pass_rate: rate(found, benchmark_count),
+        replay_success_rate: rate(replayed, executed),
+        minimized_success_rate: rate(minimized, executed),
+        poc_generation_rate: rate(poc, executed),
+        average_time_to_signal_secs: average_f64(&times),
+        average_executions_to_signal: average_u64(&execs),
+        useful_seed_sources: vec![
+            "benchmark seed hints".to_string(),
+            "manual selector hints".to_string(),
+            "synthetic local fixtures".to_string(),
+        ],
+        false_positive_budget_notes,
+        threshold_recommendations,
+    }
+}
+
+fn rate(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn average_f64(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn average_u64(values: &[u64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<u64>() as f64 / values.len() as f64)
 }
 
 fn criterion_matches(
@@ -504,11 +1828,21 @@ fn strongest_matching_finding<'a>(
         .max_by_key(|finding| severity_rank(&finding.severity))
 }
 
+fn select_best_live_input(inputs: Vec<EvmInput>) -> EvmInput {
+    for input in &inputs {
+        if input.txs.len() > 1 {
+            return input.clone();
+        }
+    }
+    inputs.into_iter().next().expect("inputs checked non-empty")
+}
+
 fn confidence(
     manifest: &BenchmarkManifest,
     observation: &ValidationObservation,
     strongest: Option<&ProtocolFinding>,
     candidate: Option<&ExploitPathCandidate>,
+    proof: Option<&ProofCarryingFinding>,
 ) -> u64 {
     let severity = strongest
         .map(|finding| severity_rank(&finding.severity))
@@ -531,11 +1865,111 @@ fn confidence(
     } else {
         5
     };
+    let proof_pressure = proof
+        .map(|proof| match proof.confidence_tier {
+            ProofConfidenceTier::PocGenerated => 20,
+            ProofConfidenceTier::ProofCarrying => 18,
+            ProofConfidenceTier::ReplayedMinimized => 14,
+            ProofConfidenceTier::Replayed => 10,
+            ProofConfidenceTier::Heuristic => 0,
+        })
+        .unwrap_or_default();
     severity
         .max(candidate_confidence)
         .saturating_add(score_pressure)
         .saturating_add(selector_pressure)
+        .saturating_add(proof_pressure)
         .min(100)
+}
+
+fn validation_target_profile(
+    manifest: &BenchmarkManifest,
+    candidate: Option<&ExploitPathCandidate>,
+    proof: Option<&ProofCarryingFinding>,
+) -> Vec<String> {
+    if !manifest.target_profile_expectation.is_empty() {
+        return manifest.target_profile_expectation.clone();
+    }
+    if let Some(proof) = proof {
+        if let Some(vulnerability_class) = proof.vulnerability_class.as_deref() {
+            return vec![vulnerability_class.to_string()];
+        }
+    }
+    if let Some(candidate) = candidate {
+        if let Some(invariant) = candidate.violated_invariant.as_deref() {
+            return vec![invariant.to_string()];
+        }
+    }
+    target_profile_from_class(&manifest.vulnerability_class)
+}
+
+fn target_profile_from_class(class: &VulnerabilityClass) -> Vec<String> {
+    match class {
+        VulnerabilityClass::Reentrancy => vec!["reentrancy".to_string()],
+        VulnerabilityClass::Erc4626ShareInflation | VulnerabilityClass::DonationInflationAttack => {
+            vec!["erc4626".to_string(), "accounting-heavy".to_string()]
+        }
+        VulnerabilityClass::StaleAccounting => vec!["accounting-heavy".to_string()],
+        VulnerabilityClass::OracleManipulation => vec!["oracle/price-feed".to_string()],
+        VulnerabilityClass::LiquidationAbuse => vec!["lending/borrowing".to_string()],
+        VulnerabilityClass::AccessControlBypass => vec!["access-control-heavy".to_string()],
+        VulnerabilityClass::GovernanceTimelockBypass => {
+            vec!["governance/timelock".to_string()]
+        }
+        VulnerabilityClass::AmmInvariantViolation => vec!["amm/dex/pool".to_string()],
+        VulnerabilityClass::BridgeReplayFinalizationBug => {
+            vec!["bridge/message-passing".to_string()]
+        }
+        VulnerabilityClass::ApprovalAllowanceAbuse => vec!["erc20/token".to_string()],
+        VulnerabilityClass::FeeAccountingMismatch => vec!["accounting-heavy".to_string()],
+        VulnerabilityClass::RoundingPrecisionLoss => vec!["accounting-heavy".to_string()],
+    }
+}
+
+fn exploit_classes_for_vulnerability(class: &VulnerabilityClass) -> Vec<ExploitClass> {
+    match class {
+        VulnerabilityClass::Reentrancy => vec![ExploitClass::Reentrancy],
+        VulnerabilityClass::Erc4626ShareInflation | VulnerabilityClass::DonationInflationAttack => {
+            vec![
+                ExploitClass::LogicAccountingError,
+                ExploitClass::UnsafeTokenHandling,
+            ]
+        }
+        VulnerabilityClass::StaleAccounting | VulnerabilityClass::FeeAccountingMismatch => {
+            vec![
+                ExploitClass::LogicAccountingError,
+                ExploitClass::UnsafeTokenHandling,
+            ]
+        }
+        VulnerabilityClass::OracleManipulation => vec![ExploitClass::PriceOracleManipulation],
+        VulnerabilityClass::LiquidationAbuse => vec![
+            ExploitClass::FlashLoanEconomicAttack,
+            ExploitClass::PriceOracleManipulation,
+            ExploitClass::LogicAccountingError,
+        ],
+        VulnerabilityClass::AccessControlBypass => vec![
+            ExploitClass::AccessControlFailure,
+            ExploitClass::UpgradeabilityProxyError,
+        ],
+        VulnerabilityClass::GovernanceTimelockBypass => {
+            vec![
+                ExploitClass::GovernanceTimelockFailure,
+                ExploitClass::AccessControlFailure,
+            ]
+        }
+        VulnerabilityClass::AmmInvariantViolation => vec![
+            ExploitClass::PriceOracleManipulation,
+            ExploitClass::FlashLoanEconomicAttack,
+        ],
+        VulnerabilityClass::BridgeReplayFinalizationBug => vec![ExploitClass::SignatureReplayBug],
+        VulnerabilityClass::ApprovalAllowanceAbuse => {
+            vec![
+                ExploitClass::UnsafeTokenHandling,
+                ExploitClass::SignatureReplayBug,
+            ]
+        }
+        VulnerabilityClass::RoundingPrecisionLoss => vec![ExploitClass::PrecisionRoundingLoss],
+    }
 }
 
 fn is_required_criterion(manifest: &BenchmarkManifest, criterion: &SuccessCriterion) -> bool {
@@ -586,7 +2020,11 @@ impl VulnerabilityClass {
                     VulnType::PriceManipulation | VulnType::PriceOracleManipulation
                 ) || text.contains("oracle")
             }
-            VulnerabilityClass::LiquidationAbuse => text.contains("liquidat"),
+            VulnerabilityClass::LiquidationAbuse => {
+                text.contains("liquidat")
+                    || text.contains("borrow")
+                    || all_words(&text, &["lending", "health"])
+            }
             VulnerabilityClass::AccessControlBypass => {
                 matches!(
                     finding.vuln,
@@ -615,7 +2053,11 @@ impl VulnerabilityClass {
                     || text.contains("proof")
             }
             VulnerabilityClass::ApprovalAllowanceAbuse => {
-                text.contains("approval") || text.contains("allowance") || text.contains("approve")
+                text.contains("approval")
+                    || text.contains("allowance")
+                    || text.contains("approve")
+                    || text.contains("095ea7b3")
+                    || all_words(&text, &["erc20", "call"])
             }
             VulnerabilityClass::FeeAccountingMismatch => {
                 all_words(&text, &["fee", "account"]) || text.contains("mismatch")
@@ -732,6 +2174,188 @@ mod tests {
         }
     }
 
+    fn fixture_execution() -> SequenceExecutionResult {
+        SequenceExecutionResult {
+            tx_results: vec![TxExecutionResult {
+                tx_index: 0,
+                status: ExecutionStatus::Success,
+                gas_used: 42_000,
+                output: Vec::new(),
+                coverage_hash: 0x11,
+                coverage_edges: 3,
+                storage_reads: Vec::new(),
+                storage_writes: Vec::new(),
+                storage_diffs: vec![StorageDiff {
+                    tx_index: 0,
+                    address: Address::repeat_byte(0x11),
+                    slot: B256::from([0x22; 32]),
+                    old_value: U256::ZERO,
+                    new_value: U256::from(1),
+                    pc: 0,
+                }],
+                call_trace: vec![CallObservation {
+                    tx_index: 0,
+                    depth: 0,
+                    caller: Address::repeat_byte(0xaa),
+                    target: Address::repeat_byte(0x11),
+                    value: U256::ZERO,
+                    input: vec![0xb6, 0xb5, 0x5f, 0x25],
+                    output: Vec::new(),
+                    gas_limit: 100_000,
+                    gas_used: 42_000,
+                    success: true,
+                    kind: CallKind::Transaction,
+                    phase: CallPhase::End,
+                    created_address: None,
+                    result: Some("Success".to_string()),
+                }],
+                waypoints: Vec::new(),
+            }],
+            total_gas_used: 42_000,
+            final_coverage_hash: 0x11,
+            storage_reads: Vec::new(),
+            storage_writes: Vec::new(),
+            storage_diffs: vec![StorageDiff {
+                tx_index: 0,
+                address: Address::repeat_byte(0x11),
+                slot: B256::from([0x22; 32]),
+                old_value: U256::ZERO,
+                new_value: U256::from(1),
+                pc: 0,
+            }],
+            call_trace: vec![CallObservation {
+                tx_index: 0,
+                depth: 0,
+                caller: Address::repeat_byte(0xaa),
+                target: Address::repeat_byte(0x11),
+                value: U256::ZERO,
+                input: vec![0xb6, 0xb5, 0x5f, 0x25],
+                output: Vec::new(),
+                gas_limit: 100_000,
+                gas_used: 42_000,
+                success: true,
+                kind: CallKind::Transaction,
+                phase: CallPhase::End,
+                created_address: None,
+                result: Some("Success".to_string()),
+            }],
+            oracle_observations: Vec::new(),
+        }
+    }
+
+    fn fixture_exploit_candidate() -> ExploitPathCandidate {
+        ExploitPathCandidate {
+            sequence: vec![SingletonTx {
+                input: vec![0xb6, 0xb5, 0x5f, 0x25],
+                caller: Address::repeat_byte(0xaa),
+                to: Address::repeat_byte(0x11),
+                value: U256::ZERO,
+                is_victim: false,
+            }],
+            target: Some(Address::repeat_byte(0x11)),
+            attacker: Some(Address::repeat_byte(0xaa)),
+            victims: vec![Address::repeat_byte(0xbb)],
+            actor_roles: Default::default(),
+            profit_delta: Some(U256::from(1)),
+            violated_invariant: Some("share inflation".to_string()),
+            confidence: 85,
+            required_preconditions: vec!["seed attacker with asset token".to_string()],
+            replayability_status: ReplayabilityStatus::Replayable,
+            minimized_sequence_status: MinimizedSequenceStatus::Minimized,
+            proof_status: CounterexampleProofStatus::ConcretelyReplayed,
+            proof: None,
+            extension_hints: Vec::new(),
+            persistence_reason: Some("test".to_string()),
+        }
+    }
+
+    fn fixture_manifest(
+        path: &str,
+        class: VulnerabilityClass,
+        criteria: Vec<SuccessCriterion>,
+    ) -> BenchmarkManifest {
+        BenchmarkManifest {
+            id: format!("test-{}", class_name(&class)),
+            vulnerability_class: class,
+            mode: BenchmarkMode::LocalFixture,
+            target: Some("0x1111111111111111111111111111111111111111".to_string()),
+            fixture: Some(path.to_string()),
+            chain: None,
+            fork_block: None,
+            setup_requirements: vec!["synthetic setup".to_string()],
+            expected_invariant: Some("expected invariant".to_string()),
+            target_profile_expectation: Vec::new(),
+            exploit_template_expectation: None,
+            expected_invariant_family: Some("expected-family".to_string()),
+            expected_minimum_confidence: Some(50),
+            expected_replayable: Some(true),
+            expected_poc_generated: Some(false),
+            expected_exploit_shape: Vec::new(),
+            expected_selectors: vec!["deposit".to_string()],
+            expected_attacker: Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+            expected_victim: None,
+            success_criteria: criteria,
+            replay_command: None,
+            poc_generation: PocGenerationExpectation::Expected,
+            max_duration_secs: Some(120),
+            seed_hints: vec!["deposit".to_string()],
+            notes: None,
+        }
+    }
+
+    fn live_manifest(path: &str, class: VulnerabilityClass) -> BenchmarkManifest {
+        BenchmarkManifest {
+            id: format!("live-{}", class_name(&class)),
+            vulnerability_class: class,
+            mode: BenchmarkMode::MainnetFork,
+            target: Some("0x1111111111111111111111111111111111111111".to_string()),
+            fixture: Some(path.to_string()),
+            chain: Some("evm".to_string()),
+            fork_block: Some(123),
+            setup_requirements: vec!["forked mainnet replay".to_string()],
+            expected_invariant: Some("live invariant".to_string()),
+            target_profile_expectation: vec!["accounting_heavy".to_string()],
+            exploit_template_expectation: Some("live-fork-replay".to_string()),
+            expected_invariant_family: Some("live-family".to_string()),
+            expected_minimum_confidence: Some(70),
+            expected_replayable: Some(true),
+            expected_poc_generated: Some(true),
+            expected_exploit_shape: vec!["historical replay".to_string()],
+            expected_selectors: vec!["deposit".to_string()],
+            expected_attacker: Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+            expected_victim: Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
+            success_criteria: vec![
+                SuccessCriterion::ExpectedFinding,
+                SuccessCriterion::InvariantViolation,
+                SuccessCriterion::ReplayableArtifact,
+                SuccessCriterion::FoundryPocGenerated,
+            ],
+            replay_command: Some("cargo run --release -- replay --input-id ...".to_string()),
+            poc_generation: PocGenerationExpectation::Required,
+            max_duration_secs: Some(120),
+            seed_hints: vec!["deposit".to_string()],
+            notes: Some("live-fork example manifest".to_string()),
+        }
+    }
+
+    fn class_name(class: &VulnerabilityClass) -> &'static str {
+        match class {
+            VulnerabilityClass::Reentrancy => "reentrancy",
+            VulnerabilityClass::Erc4626ShareInflation => "erc4626",
+            VulnerabilityClass::StaleAccounting => "stale-accounting",
+            VulnerabilityClass::OracleManipulation => "oracle",
+            VulnerabilityClass::LiquidationAbuse => "liquidation",
+            VulnerabilityClass::AccessControlBypass => "access-control",
+            VulnerabilityClass::GovernanceTimelockBypass => "governance",
+            VulnerabilityClass::AmmInvariantViolation => "amm",
+            VulnerabilityClass::BridgeReplayFinalizationBug => "bridge",
+            VulnerabilityClass::ApprovalAllowanceAbuse => "approval",
+            VulnerabilityClass::FeeAccountingMismatch => "fee-accounting",
+            VulnerabilityClass::DonationInflationAttack => "donation",
+            VulnerabilityClass::RoundingPrecisionLoss => "rounding",
+        }
+    }
+
     #[test]
     fn parses_toml_manifest_with_aliases() {
         let raw = r#"
@@ -772,6 +2396,119 @@ max_duration_secs = 600
     }
 
     #[test]
+    fn parses_mainnet_fork_manifest() {
+        let raw = r#"
+id = "oracle-stale-price-live"
+class = "oracle_manipulation"
+mode = "mainnet_fork"
+target = "0x1111111111111111111111111111111111111111"
+fixture = "benchmarks/live/fixtures/oracle-stale-price-live.json"
+fork_block = 123
+success_criteria = ["expected_finding", "invariant_violation", "oracle_stale_price"]
+"#;
+        let parsed: BenchmarkManifest = toml::from_str(raw).expect("manifest parses");
+        assert_eq!(parsed.mode, BenchmarkMode::MainnetFork);
+        assert_eq!(parsed.fork_block, Some(123));
+        assert_eq!(
+            parsed.vulnerability_class,
+            VulnerabilityClass::OracleManipulation
+        );
+    }
+
+    #[test]
+    fn live_fork_manifest_reports_rpc_failure_without_synthetic_fallback() {
+        let runner = ValidationRunner;
+        let manifest = live_manifest(
+            "benchmarks/live/fixtures/oracle-stale-price-live.json",
+            VulnerabilityClass::OracleManipulation,
+        );
+        let base =
+            std::env::temp_dir().join(format!("rusty_fuzz_live_validation_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("tmp dir");
+
+        let result = runner.run_manifest_with_context(
+            &manifest,
+            &ValidationContext {
+                rpc_url: Some("https://127.0.0.1:1".to_string()),
+                fork_block: Some(123),
+                block_env: Some(BlockEnv::default()),
+                report_dir: Some(base.clone()),
+            },
+        );
+
+        assert!(!result.executed);
+        assert_eq!(result.status, ValidationStatus::FailedExecution);
+        assert!(result.reason.contains("RPC-backed live-fork replay failed"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn live_fork_manifest_can_execute_from_explicit_cached_fork_fixture() {
+        let runner = ValidationRunner;
+        let base =
+            std::env::temp_dir().join(format!("rusty_fuzz_cached_live_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("tmp dir");
+
+        let target = Address::repeat_byte(0x11);
+        let db = ForkDb::empty();
+        db.cache_account(
+            target,
+            AccountInfo::default().with_code(Bytecode::new_raw(
+                crate::evm::fork::offline_fallback_runtime_bytecode().into(),
+            )),
+        );
+        let fixture_path = base.join("cached-live.json");
+        let fixture = serde_json::json!({
+            "chain_id": 1,
+            "block_number": 123,
+            "target": target.to_string(),
+            "fork_cache": db.cache_snapshot(),
+            "transactions": [{
+                "hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "to": target.to_string(),
+                "value": "0",
+                "input": "0x3659cfe60000000000000000000000000000000000000000000000000000000000000000",
+                "selector": "0x3659cfe6",
+                "success": true,
+                "tags": ["access-control", "proxy"]
+            }]
+        });
+        fs::write(
+            &fixture_path,
+            serde_json::to_string_pretty(&fixture).unwrap(),
+        )
+        .expect("write fixture");
+
+        let mut manifest = live_manifest(
+            fixture_path.to_str().unwrap(),
+            VulnerabilityClass::AccessControlBypass,
+        );
+        manifest.target = Some(target.to_string());
+        manifest.expected_minimum_confidence = Some(40);
+
+        let result = runner.run_manifest_with_context(
+            &manifest,
+            &ValidationContext {
+                rpc_url: Some("https://127.0.0.1:1".to_string()),
+                fork_block: Some(123),
+                block_env: Some(BlockEnv::default()),
+                report_dir: Some(base.clone()),
+            },
+        );
+
+        assert!(result.executed, "{:?}", result);
+        assert_ne!(result.status, ValidationStatus::FailedExecution);
+        assert!(result
+            .false_positive_notes
+            .iter()
+            .any(|note| note.contains("replay backend: cached-fork-fixture")));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn classifies_matching_protocol_findings() {
         let access = finding(VulnType::PrivilegeEscalation, "non-owner role mutation");
         assert!(VulnerabilityClass::AccessControlBypass.matches_finding(&access));
@@ -783,16 +2520,26 @@ max_duration_secs = 600
     fn evaluates_success_criteria_from_findings() {
         let runner = ValidationRunner;
         let manifest = manifest();
+        let findings = vec![finding(
+            VulnType::VaultInflation,
+            "share inflation during deposit/redeem path",
+        )];
+        let proof = ProofCarryingFinding::from_candidate(
+            &fixture_exploit_candidate(),
+            &fixture_execution(),
+            &findings,
+        )
+        .with_replay_result(crate::engine::proof::ReplayVerificationStatus::Verified);
         let observation = ValidationObservation {
-            findings: vec![finding(
-                VulnType::VaultInflation,
-                "share inflation during deposit/redeem path",
-            )],
+            findings,
+            exploit_candidate: Some(fixture_exploit_candidate()),
+            proof: Some(proof),
+            proof_status: Some(CounterexampleProofStatus::HeuristicOnly),
             executions: Some(128),
             elapsed_secs: Some(2.5),
             ..ValidationObservation::default()
         };
-        let result = runner.evaluate_observation(&manifest, observation);
+        let result = runner.evaluate_observation(&manifest, &observation);
         assert!(result.found);
         assert_eq!(result.status, ValidationStatus::Found);
         assert!(result
@@ -804,26 +2551,174 @@ max_duration_secs = 600
     }
 
     #[test]
+    fn runs_local_fixture_benchmark_and_serializes_report() {
+        let base =
+            std::env::temp_dir().join(format!("rusty_fuzz_validation_run_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("tmp dir");
+        let fixture_path = base.join("fixture.json");
+        fs::write(
+            &fixture_path,
+            r#"{
+  "outcome": "found",
+  "time_to_signal_secs": 1.4,
+  "executions_to_signal": 64,
+  "replayable": true,
+  "foundry_poc_generated": false,
+  "false_positive_notes": ["unit-test fixture"]
+}"#,
+        )
+        .expect("write fixture");
+
+        let manifest = fixture_manifest(
+            fixture_path.to_str().expect("utf8 path"),
+            VulnerabilityClass::Erc4626ShareInflation,
+            vec![
+                SuccessCriterion::ExpectedFinding,
+                SuccessCriterion::SharePriceManipulation,
+            ],
+        );
+        let runner = ValidationRunner;
+        let result = runner.run_manifest(&manifest);
+        assert!(result.executed);
+        assert!(matches!(
+            result.status,
+            ValidationStatus::Found | ValidationStatus::NotFound
+        ));
+        assert!(!result.reason.is_empty());
+
+        let report = runner.run_manifests(&[manifest]);
+        let json = serde_json::to_string_pretty(&report).expect("report serializes");
+        assert!(json.contains("\"executed\": true"));
+        assert!(json.contains("\"status\":"));
+        assert!(json.contains("\"reason\":"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reports_not_found_for_negative_fixture() {
+        let base =
+            std::env::temp_dir().join(format!("rusty_fuzz_validation_no_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("tmp dir");
+        let fixture_path = base.join("negative.json");
+        fs::write(
+            &fixture_path,
+            r#"{
+  "outcome": "not_found",
+  "time_to_signal_secs": 0.4,
+  "executions_to_signal": 12,
+  "replayable": false,
+  "foundry_poc_generated": false,
+  "false_positive_notes": ["negative fixture"]
+}"#,
+        )
+        .expect("write fixture");
+
+        let manifest = fixture_manifest(
+            fixture_path.to_str().expect("utf8 path"),
+            VulnerabilityClass::OracleManipulation,
+            vec![
+                SuccessCriterion::ExpectedFinding,
+                SuccessCriterion::OracleStalePrice,
+            ],
+        );
+        let runner = ValidationRunner;
+        let result = runner.run_manifest(&manifest);
+        assert!(result.executed);
+        assert!(!result.found);
+        assert_eq!(result.status, ValidationStatus::NotFound);
+        assert_eq!(result.observed_finding, None);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn classifies_not_run_reasons() {
+        let runner = ValidationRunner;
+        let missing_target = BenchmarkManifest {
+            target: None,
+            fixture: Some("benchmarks/fixtures/oracle-stale-price-basic.json".to_string()),
+            success_criteria: vec![SuccessCriterion::ExpectedFinding],
+            ..manifest()
+        };
+        let live_context_missing = live_manifest(
+            "benchmarks/live/fixtures/oracle-live-seed.json",
+            VulnerabilityClass::OracleManipulation,
+        );
+        let missing_fixture = BenchmarkManifest {
+            fixture: None,
+            ..manifest()
+        };
+        let missing_success = BenchmarkManifest {
+            success_criteria: Vec::new(),
+            ..manifest()
+        };
+        let unsupported_mode = BenchmarkManifest {
+            mode: BenchmarkMode::ArtifactReplay,
+            ..manifest()
+        };
+
+        assert!(matches!(
+            runner.run_manifest(&missing_target).status,
+            ValidationStatus::NotRunMissingTarget
+        ));
+        assert!(matches!(
+            runner.run_manifest(&missing_fixture).status,
+            ValidationStatus::NotRunMissingFixture
+        ));
+        assert!(matches!(
+            runner.run_manifest(&missing_success).status,
+            ValidationStatus::NotRunMissingSuccessCriteria
+        ));
+        assert!(matches!(
+            runner.run_manifest(&unsupported_mode).status,
+            ValidationStatus::NotRunUnsupportedMode
+        ));
+        assert!(matches!(
+            runner.run_manifest(&live_context_missing).status,
+            ValidationStatus::SkippedByConfig
+        ));
+    }
+
+    #[test]
     fn serializes_validation_report() {
         let runner = ValidationRunner;
         let report = runner.run_manifest_only(&[manifest()]);
         let json = serde_json::to_string_pretty(&report).expect("report serializes");
         assert!(json.contains("erc4626-share-inflation-basic"));
-        assert!(json.contains("not_run"));
+        assert!(json.contains("\"status\": \"not_run_missing_fixture\""));
+        assert!(json.contains("\"reason\":"));
+        assert_eq!(report.coverage.total_classes, 12);
+        assert!(report
+            .coverage
+            .entries
+            .iter()
+            .any(|entry| !entry.benchmark_ids.is_empty()));
+        assert_eq!(report.calibration.benchmark_count, 1);
     }
 
     #[test]
     fn expected_invariant_matching_uses_evidence() {
         let runner = ValidationRunner;
         let manifest = manifest();
+        let findings = vec![finding(
+            VulnType::Other("heuristic".to_string()),
+            "share inflation",
+        )];
+        let proof = ProofCarryingFinding::from_candidate(
+            &fixture_exploit_candidate(),
+            &fixture_execution(),
+            &findings,
+        )
+        .with_replay_result(crate::engine::proof::ReplayVerificationStatus::Verified);
         let observation = ValidationObservation {
-            findings: vec![finding(
-                VulnType::Other("heuristic".to_string()),
-                "share inflation",
-            )],
+            findings,
+            exploit_candidate: Some(fixture_exploit_candidate()),
+            proof: Some(proof),
+            proof_status: Some(CounterexampleProofStatus::HeuristicOnly),
             ..ValidationObservation::default()
         };
-        let result = runner.evaluate_observation(&manifest, observation);
+        let result = runner.evaluate_observation(&manifest, &observation);
         assert!(result
             .matched_criteria
             .contains(&SuccessCriterion::InvariantViolation));
