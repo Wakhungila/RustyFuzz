@@ -561,9 +561,9 @@ If RustyFuzz is useful in your research, please cite:
 ```bibtex
 @software{rustyfuzz,
   title={RustyFuzz: Stateful EVM Fuzzing for Protocol Security Research},
-  author={pin0ccs},
+  author={Wakhungila},
   year={2025},
-  url={https://github.com/pin0ccs/RustyFuzz}
+  url={https://github.com/Wakhungila/RustyFuzz}
 }
 ```
 
@@ -582,4 +582,4 @@ For issues, feature requests, or discussion, please open a GitHub issue or pull 
 ---
 
 **Last Updated**: May 2025  
-**Maintainer**: @pin0ccs
+**Maintainers**: @Wakhungila and @nutcas3
