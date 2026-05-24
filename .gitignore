@@ -20,6 +20,8 @@
 !/benchmarks/historical/**
 !/benchmarks/blind/
 !/benchmarks/blind/**
+!/benchmarks/live/
+!/benchmarks/live/**
 /seeds/
 /docs/
 /crashes/
