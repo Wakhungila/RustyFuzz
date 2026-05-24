@@ -1,0 +1,34 @@
+id = "blind-euler-finance-donate-liquidation-2023"
+class = "liquidation_abuse"
+mode = "blind_rediscovery"
+target = "0x27182842E098f60e3D576794A5bFFb0777E025d3"
+fixture = "benchmarks/blind/fixtures/euler-finance-donate-liquidation-2023.json"
+chain = "evm"
+fork_block = 16817995
+setup_requirements = [
+  "Ethereum mainnet fork at the block before the public Euler incident",
+  "benign historical tx hints only; exploit calldata removed",
+  "lending donation/liquidation search against forked state"
+]
+success_invariant = "lending health invariant"
+known_exploit_class = "Euler donate-to-reserves liquidation"
+target_profile_expectation = ["lending", "flash-loan", "accounting-heavy", "historical-mainnet"]
+exploit_template_expectation = "lending-donation-liquidation"
+expected_invariant_family = "lending-health"
+expected_minimum_confidence = 50
+expected_replayable = true
+expected_poc_generated = true
+expected_exploit_shape = [
+  "benign historical selectors seed the search",
+  "bounded search synthesizes a lending donation/liquidation sequence",
+  "proof-carrying replay is only confirmed if the forked target reproduces the health-accounting violation"
+]
+expected_selectors = ["donateToReserves(uint256,uint256)", "liquidate(address,address,uint256,uint256)", "borrow(uint256)"]
+expected_attacker = "0x5F259D0B76665c337C6104145894f4D1D2758b8c"
+expected_victim = "0x583c21631c48d442b5c0e605d624f54a0b366c72"
+success_criteria = ["expected_finding", "invariant_violation", "replayable_artifact", "foundry_poc_generated", "minimized_path"]
+replay_command = "cargo run --release -- validate --benchmarks benchmarks/blind --output reports/blind_validation_report.json"
+poc_generation = "required"
+max_duration_secs = 600
+seed_hints = ["donateToReserves(uint256,uint256)", "liquidate(address,address,uint256,uint256)", "borrow(uint256)"]
+notes = "Blind rediscovery benchmark for the public Euler donate-to-reserves / liquidation exploit class. The fixture excludes exploit calldata and only provides selector/historical-state hints."

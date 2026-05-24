@@ -133,10 +133,38 @@ Built-in benchmark framework for honest measurement:
 - **Local fixtures**: Synthetic EVM bytecode deployments.
 - **Live-fork benchmarks**: Replay historical seed JSON against a configured RPC endpoint.
 - **Cached-fork rediscovery**: Deterministic vulnerable deployments encoded as fork snapshots.
+- **Historical fork-state benchmarks**: Replay public historical exploit transactions at pre-exploit fork blocks. These can use local `revm` archive-state replay when the RPC endpoint can serve all touched storage, or explicit provider-side `eth_call` replay when the fixture sets `provider_replay_only = true`.
+- **Blind rediscovery benchmarks**: Benign historical selector/state hints plus fork state, with bounded search synthesizing the candidate exploit path instead of replaying exploit calldata directly.
 
 Benchmarks report explicit statuses: `found`, `not_found`, `not_run_*`, `failed_execution`, `skipped_by_config`.
 
 Proof statuses are tracked: `heuristic_only`, `abstractly_proven`, `concretely_replayed`.
+
+Historical validation example:
+
+```bash
+export ETH_RPC_URL="https://your-archive-rpc"
+cargo run --release -- validate \
+  --benchmarks benchmarks/historical \
+  --output reports/historical_validation_report.json
+```
+
+Current historical examples include Euler Finance's 2023 donate/liquidation exploit replay and Audius' 2022 governance reinitialization exploit replay. Provider-side replay findings are labeled in the report and PoC evidence as real fork-state `eth_call` replay with local storage diffs unavailable; they are stronger than synthetic cached runtimes, but weaker than full local `revm` archive-state replay with storage-diff proof.
+
+Blind rediscovery example:
+
+```bash
+cargo run --release -- validate \
+  --benchmarks benchmarks/blind \
+  --output reports/blind_validation_report.json
+```
+
+Blind reports include:
+- `found`, `not_found`, `failed_execution`, and `not_run_*` statuses
+- `equivalence_class`
+- `synthesized_sequence`
+- `search_driver`
+- replay/minimize/PoC status fields
 
 ### Hardened DeFi Mode
 
@@ -354,11 +382,16 @@ cargo run --release -- validate --benchmarks benchmarks/live --output reports/li
 cargo run --release -- validate --benchmarks benchmarks/forked --output reports/forked_validation_report.json
 ```
 
+**Run blind rediscovery benchmarks**:
+```bash
+cargo run --release -- validate --benchmarks benchmarks/blind --output reports/blind_validation_report.json
+```
+
 Reports include:
 - `status` (found, not_found, not_run_*, failed_execution, skipped_by_config)
 - `proof_status` (heuristic_only, abstractly_proven, concretely_replayed)
 - Execution stats: `executions_to_signal`, `time_to_signal_secs`
-- Artifact paths, evidence, and match criteria
+- Artifact paths, evidence, match criteria, `equivalence_class`, and `synthesized_sequence`
 
 ### Mempool Scanning
 

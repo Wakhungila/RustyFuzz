@@ -1,0 +1,33 @@
+id = "historical-audius-governance-reinitialization-2022"
+class = "access_control_bypass"
+mode = "mainnet_fork"
+target = "0xbdbb5945f252bc3466a319cdcc3ee8056bf2e569"
+fixture = "benchmarks/historical/fixtures/audius-governance-reinitialization-2022.json"
+chain = "evm"
+fork_block = 15201793
+setup_requirements = [
+  "Ethereum mainnet fork at the block before the first public Audius attack transaction",
+  "historical exploit contract exists at 0xbdbb5945f252bc3466a319cdcc3ee8056bf2e569",
+  "RPC-backed replay of the public governance reinitialization transaction"
+]
+success_invariant = "access control"
+target_profile_expectation = ["governance", "proxy", "access-control-heavy", "historical-mainnet"]
+exploit_template_expectation = "reinitialize governance proxy state -> submit malicious proposal"
+expected_invariant_family = "access-control"
+expected_minimum_confidence = 50
+expected_replayable = true
+expected_poc_generated = true
+expected_exploit_shape = [
+  "historical exploit contract entrypoint replays on pre-exploit fork state",
+  "unauthorized governance/proxy state mutation evidence is observed",
+  "proof-carrying replay produces a Foundry PoC"
+]
+expected_selectors = ["0x5bc7c6ac"]
+expected_attacker = "0xa0c7bd318d69424603cbf91e9969870f21b8ab4c"
+expected_victim = "0x18aaa7115705e8be94bffebde57af9bfc265b998"
+success_criteria = ["expected_finding", "invariant_violation", "replayable_artifact", "foundry_poc_generated", "minimized_path"]
+replay_command = "cargo run --release -- validate --benchmarks benchmarks/historical --output reports/historical_validation_report.json"
+poc_generation = "required"
+max_duration_secs = 600
+seed_hints = ["0x5bc7c6ac", "initialize", "submitProposal"]
+notes = "Historical Audius exploit replay candidate. The fixture uses public transaction 0xfefd829e246002a8fd061eede7501bccb6e244a9aacea0ebceaecef5d877a984 against Ethereum state at block 15201793. This is an authorized regression benchmark, not live-chain execution."

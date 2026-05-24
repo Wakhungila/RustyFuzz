@@ -1,0 +1,34 @@
+id = "blind-audius-governance-reinitialization-2022"
+class = "access_control_bypass"
+mode = "blind_rediscovery"
+target = "0xbdbb5945f252bc3466a319cdcc3ee8056bf2e569"
+fixture = "benchmarks/blind/fixtures/audius-governance-reinitialization-2022.json"
+chain = "evm"
+fork_block = 15201793
+setup_requirements = [
+  "Ethereum mainnet fork at the block before the public Audius incident",
+  "benign historical tx hints only; exploit calldata removed",
+  "selector-valid governance/proxy reinitialization search"
+]
+success_invariant = "access control"
+known_exploit_class = "Audius governance reinitialization"
+target_profile_expectation = ["governance", "proxy", "access-control-heavy", "historical-mainnet"]
+exploit_template_expectation = "proxy-governance-reinitialization"
+expected_invariant_family = "access-control"
+expected_minimum_confidence = 50
+expected_replayable = true
+expected_poc_generated = true
+expected_exploit_shape = [
+  "benign historical selectors seed the search",
+  "bounded search synthesizes a proxy/governance reinitialization sequence",
+  "proof-carrying replay is only confirmed if the forked target reproduces the privilege escalation"
+]
+expected_selectors = ["initialize", "submitProposal", "upgradeTo(address)"]
+expected_attacker = "0xa0c7bd318d69424603cbf91e9969870f21b8ab4c"
+expected_victim = "0x18aaa7115705e8be94bffebde57af9bfc265b998"
+success_criteria = ["expected_finding", "invariant_violation", "replayable_artifact", "foundry_poc_generated", "minimized_path"]
+replay_command = "cargo run --release -- validate --benchmarks benchmarks/blind --output reports/blind_validation_report.json"
+poc_generation = "required"
+max_duration_secs = 600
+seed_hints = ["initialize", "submitProposal", "upgradeTo(address)"]
+notes = "Blind rediscovery benchmark for the public Audius governance reinitialization case. The fixture excludes exploit calldata and only provides selector/historical-state hints."

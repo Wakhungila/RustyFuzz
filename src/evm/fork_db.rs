@@ -8,6 +8,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 pub type EvmCacheDb = CacheDB<ForkDb>;
 
@@ -244,39 +246,79 @@ impl ForkDb {
             return Err(ForkDbError::Rpc("offline fork database miss".to_string()));
         };
 
-        let response: Value = self
-            .blocking_client()
-            .post(rpc_url)
-            .json(&json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": method,
-                "params": params,
-            }))
-            .send()
-            .map_err(|err| ForkDbError::Rpc(err.to_string()))?
-            .error_for_status()
-            .map_err(|err| ForkDbError::Rpc(err.to_string()))?
-            .json()
-            .map_err(|err| ForkDbError::Decode(err.to_string()))?;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        });
+        let mut last_rpc_error = None;
+        for attempt in 0..4 {
+            let result = self
+                .blocking_client()
+                .post(rpc_url)
+                .json(&request)
+                .send()
+                .map_err(|err| ForkDbError::Rpc(sanitize_rpc_error(&err.to_string())))
+                .and_then(|response| {
+                    response
+                        .error_for_status()
+                        .map_err(|err| ForkDbError::Rpc(sanitize_rpc_error(&err.to_string())))
+                });
 
-        if let Some(error) = response.get("error") {
-            return Err(ForkDbError::Rpc(error.to_string()));
+            match result {
+                Ok(response) => {
+                    let response: Value = response
+                        .json()
+                        .map_err(|err| ForkDbError::Decode(err.to_string()))?;
+
+                    if let Some(error) = response.get("error") {
+                        return Err(ForkDbError::Rpc(error.to_string()));
+                    }
+
+                    return serde_json::from_value(response.get("result").cloned().ok_or_else(
+                        || ForkDbError::Decode("missing JSON-RPC result".to_string()),
+                    )?)
+                    .map_err(|err| ForkDbError::Decode(err.to_string()));
+                }
+                Err(error) => {
+                    last_rpc_error = Some(error);
+                    if attempt < 3 {
+                        thread::sleep(Duration::from_millis(100 * (attempt + 1) as u64));
+                    }
+                }
+            }
         }
 
-        serde_json::from_value(
-            response
-                .get("result")
-                .cloned()
-                .ok_or_else(|| ForkDbError::Decode("missing JSON-RPC result".to_string()))?,
-        )
-        .map_err(|err| ForkDbError::Decode(err.to_string()))
+        Err(last_rpc_error
+            .unwrap_or_else(|| ForkDbError::Rpc("request failed without error".to_string())))
     }
 
     fn blocking_client(&self) -> &'static reqwest::blocking::Client {
         static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-        CLIENT.get_or_init(reqwest::blocking::Client::new)
+        CLIENT.get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .pool_max_idle_per_host(0)
+                .user_agent("rusty-fuzz-fork-db/0.1")
+                .build()
+                .expect("valid reqwest client")
+        })
     }
+}
+
+fn sanitize_rpc_error(message: &str) -> String {
+    message
+        .split_whitespace()
+        .map(|part| {
+            if part.starts_with("http://") || part.starts_with("https://") {
+                "<rpc-url>"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl ForkAccountInfo {

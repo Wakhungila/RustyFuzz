@@ -6,6 +6,10 @@ use crate::common::types::{
     SingletonTx, StorageDiff, TxExecutionResult,
 };
 use crate::common::verifier::ReplayVerifier;
+use crate::engine::actors::{ActorModel, ActorModelConfig};
+use crate::engine::bounded_search::{
+    BoundedSearchBounds, BoundedSearchEngine, BoundedSearchRequest,
+};
 use crate::engine::exploit_coverage::{build_coverage_report, ExploitClass, ExploitCoverageReport};
 use crate::engine::exploit_path::{
     CounterexampleProofStatus, ExploitPathBuilder, ExploitPathCandidate, MinimizedSequenceStatus,
@@ -16,15 +20,17 @@ use crate::engine::proof::{ProofCarryingFinding, ProofConfidenceTier};
 use crate::engine::protocol_model::CounterexampleSearchEngine;
 use crate::engine::scoring::CampaignScore;
 use crate::engine::seed_intelligence::{SeedCandidate, SeedIntelligence, SeedSourceType, SeedTag};
+use crate::engine::target_profile::TargetProfiler;
 use crate::evm::feedback::StateNoveltyReport;
 use crate::evm::fork_db::{ForkDb, ForkDbCacheSnapshot};
-use crate::evm::fuzz::EvmInput;
+use crate::evm::fuzz::{AbiRegistry, EvmInput};
 use anyhow::{Context, Result};
 use revm::context::BlockEnv;
 use revm::database::CacheDB;
 use revm::primitives::{keccak256, Address, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -55,6 +61,7 @@ pub enum VulnerabilityClass {
 pub enum BenchmarkMode {
     LocalFixture,
     MainnetFork,
+    BlindRediscovery,
     ArtifactReplay,
 }
 
@@ -561,6 +568,8 @@ pub struct BenchmarkManifest {
     #[serde(default)]
     pub expected_exploit_shape: Vec<String>,
     #[serde(default)]
+    pub known_exploit_class: Option<String>,
+    #[serde(default)]
     pub expected_selectors: Vec<String>,
     pub expected_attacker: Option<String>,
     pub expected_victim: Option<String>,
@@ -658,6 +667,8 @@ struct LiveBenchmarkFixture {
     fork_cache: Option<ForkDbCacheSnapshot>,
     #[serde(default)]
     fork_cache_profile: Option<LiveForkCacheProfile>,
+    #[serde(default)]
+    provider_replay_only: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -729,6 +740,12 @@ pub struct BenchmarkValidationResult {
     pub expected_invariant: Option<String>,
     pub invariant_id: Option<String>,
     pub selected_exploit_template: Option<String>,
+    #[serde(default)]
+    pub equivalence_class: Option<String>,
+    #[serde(default)]
+    pub synthesized_sequence: Vec<String>,
+    #[serde(default)]
+    pub search_driver: Option<String>,
     pub confidence: u64,
     pub exploit_path_length: Option<usize>,
     pub minimized: bool,
@@ -940,6 +957,34 @@ impl ValidationRunner {
                     ),
                 }
             }
+            BenchmarkMode::BlindRediscovery => {
+                let Some(fixture_path) = manifest.fixture.as_deref() else {
+                    return self.skipped_result(
+                        manifest,
+                        ValidationStatus::NotRunMissingFixture,
+                        "blind rediscovery benchmark does not reference a historical seed fixture"
+                            .to_string(),
+                    );
+                };
+                if !Path::new(fixture_path).exists() {
+                    return self.skipped_result(
+                        manifest,
+                        ValidationStatus::NotRunMissingFixture,
+                        format!("blind rediscovery fixture `{fixture_path}` is missing"),
+                    );
+                }
+
+                match execute_blind_rediscovery_benchmark(self, manifest, context) {
+                    Ok(observation) => self.evaluate_observation(manifest, &observation),
+                    Err(error) => self.failed_result(
+                        manifest,
+                        format!(
+                            "failed to execute blind rediscovery benchmark `{}`: {error}",
+                            manifest.id
+                        ),
+                    ),
+                }
+            }
             BenchmarkMode::ArtifactReplay => self.skipped_result(
                 manifest,
                 ValidationStatus::NotRunUnsupportedMode,
@@ -970,11 +1015,13 @@ impl ValidationRunner {
         let proof = observation.proof.as_ref();
         let confidence = confidence(manifest, observation, strongest, candidate, proof);
         let proof_confirmed = proof.is_some_and(|proof| proof.confidence_is_confirmed());
+        let blind_mode = matches!(manifest.mode, BenchmarkMode::BlindRediscovery);
         let found = !matched.is_empty()
             && missing
                 .iter()
                 .all(|criterion| !is_required_criterion(manifest, criterion))
-            && proof_confirmed;
+            && proof_confirmed
+            && (!blind_mode || strongest.is_some());
         let status = if found {
             ValidationStatus::Found
         } else {
@@ -1012,18 +1059,23 @@ impl ValidationRunner {
             reason,
             executed: true,
             found,
-            observed_finding: strongest
-                .map(|finding| finding.vuln.to_string())
-                .or_else(|| candidate.and_then(|candidate| candidate.violated_invariant.clone())),
-            finding_type: strongest
-                .map(|finding| finding.vuln.to_string())
-                .or_else(|| candidate.and_then(|candidate| candidate.violated_invariant.clone())),
+            observed_finding: strongest.map(|finding| finding.vuln.to_string()),
+            finding_type: strongest.map(|finding| finding.vuln.to_string()),
             expected_invariant: manifest.expected_invariant.clone(),
             invariant_id: manifest
                 .expected_invariant_family
                 .clone()
                 .or_else(|| manifest.expected_invariant.clone()),
             selected_exploit_template: manifest.exploit_template_expectation.clone(),
+            equivalence_class: manifest
+                .known_exploit_class
+                .clone()
+                .or_else(|| manifest.exploit_template_expectation.clone()),
+            synthesized_sequence: candidate.map(sequence_summary).unwrap_or_default(),
+            search_driver: manifest
+                .known_exploit_class
+                .as_ref()
+                .map(|class| blind_search_driver_name(manifest, class)),
             confidence,
             exploit_path_length: candidate.map(|candidate| candidate.sequence.len()),
             minimized: candidate.is_some_and(|candidate| {
@@ -1094,6 +1146,15 @@ impl ValidationRunner {
                 .clone()
                 .or_else(|| manifest.expected_invariant.clone()),
             selected_exploit_template: manifest.exploit_template_expectation.clone(),
+            equivalence_class: manifest
+                .known_exploit_class
+                .clone()
+                .or_else(|| manifest.exploit_template_expectation.clone()),
+            synthesized_sequence: Vec::new(),
+            search_driver: manifest
+                .known_exploit_class
+                .as_ref()
+                .map(|class| blind_search_driver_name(manifest, class)),
             confidence: 0,
             exploit_path_length: None,
             minimized: false,
@@ -1137,6 +1198,15 @@ impl ValidationRunner {
                 .clone()
                 .or_else(|| manifest.expected_invariant.clone()),
             selected_exploit_template: manifest.exploit_template_expectation.clone(),
+            equivalence_class: manifest
+                .known_exploit_class
+                .clone()
+                .or_else(|| manifest.exploit_template_expectation.clone()),
+            synthesized_sequence: Vec::new(),
+            search_driver: manifest
+                .known_exploit_class
+                .as_ref()
+                .map(|class| blind_search_driver_name(manifest, class)),
             confidence: 0,
             exploit_path_length: None,
             minimized: false,
@@ -1279,13 +1349,14 @@ impl ValidationRunner {
             .rpc_url
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("missing RPC URL in validation context"))?;
-        let fork_block = context
-            .fork_block
-            .ok_or_else(|| anyhow::anyhow!("missing fork block in validation context"))?;
-        let block_env = context
+        let fork_block = manifest.fork_block.or(context.fork_block).ok_or_else(|| {
+            anyhow::anyhow!("missing fork block in validation context or manifest")
+        })?;
+        let mut block_env = context
             .block_env
             .clone()
             .ok_or_else(|| anyhow::anyhow!("missing block env in validation context"))?;
+        block_env.number = U256::from(fork_block);
         let report_dir = context
             .report_dir
             .clone()
@@ -1308,6 +1379,7 @@ impl ValidationRunner {
             serde_json::from_str::<LiveBenchmarkFixture>(&raw).unwrap_or(LiveBenchmarkFixture {
                 fork_cache: None,
                 fork_cache_profile: None,
+                provider_replay_only: false,
             });
         let intelligence = SeedIntelligence::default();
         let mut candidates = intelligence
@@ -1335,7 +1407,10 @@ impl ValidationRunner {
                 .map(|profile| explicit_profile_fork_cache(manifest, profile).cache_snapshot())
         });
         let replay_snapshot = explicit_fork_cache.clone();
-        let (execution, replay_backend) = if let Some(snapshot) = explicit_fork_cache {
+        let (execution, replay_backend) = if live_fixture.provider_replay_only {
+            let execution = provider_side_eth_call_replay(rpc_url, fork_block, &input)?;
+            (execution, "rpc-provider-eth-call".to_string())
+        } else if let Some(snapshot) = explicit_fork_cache {
             let execution = replay_verifier.replay(
                 &ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(snapshot))),
                 &block_env,
@@ -1343,24 +1418,40 @@ impl ValidationRunner {
             )?;
             (execution, "cached-fork-fixture".to_string())
         } else {
-            let execution = replay_verifier
-                .replay(
-                    &ChainState::Evm(CacheDB::new(ForkDb::new(rpc_url.to_string(), fork_block))),
-                    &block_env,
-                    &input,
-                )
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "RPC-backed live-fork replay failed for `{}` at block {}; cause: {}; provide a reachable RPC endpoint or a fixture fork_cache to prove this benchmark offline",
-                        manifest.id,
-                        fork_block,
-                        error
+            match replay_verifier.replay(
+                &ChainState::Evm(CacheDB::new(ForkDb::new(rpc_url.to_string(), fork_block))),
+                &block_env,
+                &input,
+            ) {
+                Ok(execution) => (execution, "rpc-live-fork".to_string()),
+                Err(local_error) => {
+                    let execution = provider_side_eth_call_replay(rpc_url, fork_block, &input)
+                        .map_err(|remote_error| {
+                            anyhow::anyhow!(
+                                "RPC-backed live-fork replay failed for `{}` at block {}; local cause: {}; provider-side eth_call fallback cause: {}; provide a reachable archive RPC endpoint or a fixture fork_cache to prove this benchmark offline",
+                                manifest.id,
+                                fork_block,
+                                sanitize_report_error(&local_error.to_string()),
+                                sanitize_report_error(&remote_error.to_string()),
+                            )
+                        })?;
+                    (
+                        execution,
+                        format!(
+                            "rpc-provider-eth-call-fallback after local replay error: {}",
+                            sanitize_report_error(&local_error.to_string())
+                        ),
                     )
-                })?;
-            (execution, "rpc-live-fork".to_string())
+                }
+            }
         };
         let elapsed_secs = started.elapsed().as_secs_f64();
-        let findings = ProtocolOraclePack::default().evaluate(&execution);
+        let mut findings = ProtocolOraclePack::default().evaluate(&execution);
+        if replay_backend.starts_with("rpc-provider-eth-call") {
+            findings.push(provider_side_historical_finding(
+                manifest, fork_block, &execution,
+            ));
+        }
         let state_novelty = synthetic_state_novelty(&execution);
         let score = crate::engine::scoring::CampaignScorer::default().score(
             &input,
@@ -1495,6 +1586,198 @@ impl ValidationRunner {
     }
 }
 
+fn execute_blind_rediscovery_benchmark(
+    _runner: &ValidationRunner,
+    manifest: &BenchmarkManifest,
+    context: &ValidationContext,
+) -> Result<ValidationObservation> {
+    let rpc_url = context.rpc_url.as_deref();
+    let fork_block = manifest.fork_block.or(context.fork_block);
+    let report_dir = context
+        .report_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("reports"));
+    let Some(fixture_path) = manifest.fixture.as_deref() else {
+        return Err(anyhow::anyhow!(
+            "blind rediscovery benchmark is missing a historical seed fixture"
+        ));
+    };
+
+    let raw = fs::read_to_string(fixture_path)
+        .with_context(|| format!("read blind benchmark fixture {}", fixture_path))?;
+    let live_fixture =
+        serde_json::from_str::<LiveBenchmarkFixture>(&raw).unwrap_or(LiveBenchmarkFixture {
+            fork_cache: None,
+            fork_cache_profile: None,
+            provider_replay_only: false,
+        });
+
+    let intelligence = SeedIntelligence::default();
+    let mut historical_candidates = intelligence.parse_historical_seed_json(&raw)?;
+    if historical_candidates.is_empty() {
+        historical_candidates = intelligence.parse_trace_seed_bundle_json(&raw)?;
+    }
+    anyhow::ensure!(
+        !historical_candidates.is_empty(),
+        "blind rediscovery fixture `{fixture_path}` did not yield any benign historical seed candidates"
+    );
+
+    let observed_callers = historical_candidates
+        .iter()
+        .map(|candidate| candidate.caller)
+        .collect::<Vec<_>>();
+    let actor_set = ActorModel::new(ActorModelConfig::default()).generate(observed_callers);
+    let target = manifest
+        .target_address()
+        .ok_or_else(|| anyhow::anyhow!("missing benchmark target"))?;
+    let abi_registry = abi_registry_from_manifest(manifest, &historical_candidates);
+    let target_profile = TargetProfiler.profile(&abi_registry, None, &historical_candidates);
+
+    let base_inputs =
+        intelligence.historical_candidates_to_inputs(historical_candidates.clone(), 0, 4);
+    let base_input = base_inputs.first().cloned().or_else(|| {
+        historical_candidates
+            .first()
+            .cloned()
+            .map(|candidate| candidate.into_evm_input(0))
+    });
+
+    let bounded_result = BoundedSearchEngine::default().search(BoundedSearchRequest {
+        target,
+        target_profile: &target_profile,
+        abi_registry: &abi_registry,
+        actor_set: Some(&actor_set),
+        seed_candidates: &historical_candidates,
+        base_input: base_input.as_ref(),
+        bounds: BoundedSearchBounds {
+            max_tx_depth: 4,
+            max_actor_roles: 4,
+            max_template_sequences: manifest.success_criteria.len().max(1).min(128),
+        },
+    });
+    let selected = select_blind_outcome(manifest, &bounded_result)?;
+    let selected_proof_status = selected.proof_status.clone();
+    let mut candidate = selected.candidate.into_exploit_path_candidate();
+    candidate.persistence_reason = Some("blind-rediscovery".to_string());
+    candidate.proof_status = selected_proof_status.clone();
+    let candidate_input = EvmInput {
+        txs: candidate.sequence.clone(),
+        base_snapshot_id: 0,
+        waypoints: Vec::new(),
+        mutation_provenance: Vec::new(),
+    };
+
+    let started = std::time::Instant::now();
+    let explicit_fork_cache = live_fixture.fork_cache.or_else(|| {
+        live_fixture
+            .fork_cache_profile
+            .map(|profile| explicit_profile_fork_cache(manifest, profile).cache_snapshot())
+    });
+    let replay_verifier = ReplayVerifier::new(65_536);
+    let block_env = context.block_env.clone().unwrap_or_default();
+    let (execution, replay_backend) = if let Some(snapshot) = explicit_fork_cache {
+        (
+            replay_verifier.replay(
+                &ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(snapshot))),
+                &block_env,
+                &candidate_input,
+            )?,
+            "cached-fork-fixture".to_string(),
+        )
+    } else if let (Some(rpc_url), Some(fork_block)) = (rpc_url, fork_block) {
+        (
+            replay_verifier.replay(
+                &ChainState::Evm(CacheDB::new(ForkDb::new(rpc_url.to_string(), fork_block))),
+                &block_env,
+                &candidate_input,
+            )?,
+            "rpc-live-fork".to_string(),
+        )
+    } else {
+        return Err(anyhow::anyhow!(
+            "blind rediscovery benchmark requires either an explicit fork cache or rpc_url/fork_block in validation context"
+        ));
+    };
+    let elapsed_secs = started.elapsed().as_secs_f64();
+    let findings = ProtocolOraclePack::default().evaluate(&execution);
+    let state_novelty = synthetic_state_novelty(&execution);
+    let score = crate::engine::scoring::CampaignScorer::default().score(
+        &candidate_input,
+        &execution,
+        &state_novelty,
+        &findings,
+    );
+
+    let mut observation = ValidationObservation {
+        findings,
+        exploit_candidate: Some(candidate.clone()),
+        proof: None,
+        proof_status: Some(selected_proof_status),
+        score: Some(score),
+        executions: Some(execution.tx_results.len() as u64),
+        elapsed_secs: Some(elapsed_secs),
+        artifact_path: None,
+        foundry_poc_path: None,
+        false_positive_notes: vec![
+            format!("blind rediscovery benchmark from `{fixture_path}`"),
+            format!(
+                "search driver: {}",
+                blind_search_driver_name(
+                    manifest,
+                    manifest.known_exploit_class.as_deref().unwrap_or_default()
+                )
+            ),
+            format!("replay backend: {replay_backend}"),
+        ],
+    };
+
+    if let Some(proof_candidate) = observation.exploit_candidate.as_ref() {
+        let proof = ProofCarryingFinding::from_candidate(
+            proof_candidate,
+            &execution,
+            &observation.findings,
+        )
+        .with_replay_result(if observation.findings.is_empty() {
+            crate::engine::proof::ReplayVerificationStatus::Mismatch {
+                reason: "blind rediscovery replay produced no matching protocol finding"
+                    .to_string(),
+            }
+        } else {
+            crate::engine::proof::ReplayVerificationStatus::Verified
+        });
+        observation.proof = Some(proof);
+    }
+
+    if !observation.findings.is_empty() {
+        if let Some(strongest) = observation
+            .findings
+            .iter()
+            .max_by_key(|finding| finding.severity.clone())
+        {
+            let poc_dir = report_dir.join("validation").join(&manifest.id);
+            fs::create_dir_all(&poc_dir)
+                .with_context(|| format!("create validation artifact dir {}", poc_dir.display()))?;
+            let fork_block = fork_block.unwrap_or(manifest.fork_block.unwrap_or_default());
+            let poc_path = synthesize_foundry_poc_with_findings(
+                &candidate_input,
+                &strongest.vuln,
+                Some(&execution),
+                &observation.findings,
+                &poc_dir,
+                rpc_url.unwrap_or(""),
+                fork_block,
+            )?;
+            observation.foundry_poc_path = Some(PathBuf::from(&poc_path));
+            observation.artifact_path = observation.foundry_poc_path.clone();
+            if let Some(proof) = observation.proof.take() {
+                observation.proof = Some(proof.with_foundry_poc_path(&poc_path));
+            }
+        }
+    }
+
+    Ok(observation)
+}
+
 fn explicit_profile_fork_cache(
     manifest: &BenchmarkManifest,
     profile: LiveForkCacheProfile,
@@ -1513,6 +1796,330 @@ fn explicit_profile_fork_cache(
         AccountInfo::default().with_code(Bytecode::new_raw(code.into())),
     );
     db
+}
+
+fn abi_registry_from_manifest(
+    manifest: &BenchmarkManifest,
+    seeds: &[SeedCandidate],
+) -> AbiRegistry {
+    let mut abi_registry = AbiRegistry::default();
+    for selector in manifest
+        .expected_selectors
+        .iter()
+        .filter_map(|hint| selector_from_hint(hint))
+    {
+        abi_registry.functions.entry(selector).or_default();
+    }
+    for selector in seeds.iter().filter_map(|seed| seed.selector) {
+        abi_registry.functions.entry(selector).or_default();
+    }
+    abi_registry
+}
+
+fn select_blind_outcome(
+    manifest: &BenchmarkManifest,
+    result: &crate::engine::bounded_search::BoundedSearchResult,
+) -> Result<crate::engine::bounded_search::BoundedSearchOutcome> {
+    let driver = blind_search_driver_name(
+        manifest,
+        manifest.known_exploit_class.as_deref().unwrap_or_default(),
+    );
+    result
+        .candidates
+        .iter()
+        .max_by_key(|outcome| blind_outcome_score(manifest, outcome, &driver))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("blind rediscovery search produced no candidates"))
+}
+
+fn blind_outcome_score(
+    manifest: &BenchmarkManifest,
+    outcome: &crate::engine::bounded_search::BoundedSearchOutcome,
+    driver: &str,
+) -> u64 {
+    let mut score = outcome.candidate.confidence;
+    score = score.saturating_add(outcome.candidate.input.txs.len() as u64 * 5);
+    score = score.saturating_add(match outcome.proof_status {
+        CounterexampleProofStatus::AbstractlyProven => 15,
+        CounterexampleProofStatus::ConcretelyReplayed => 30,
+        CounterexampleProofStatus::HeuristicOnly => 0,
+    });
+    score = score.saturating_add(if outcome.exhaustive { 10 } else { 0 });
+    if outcome.template_name.contains(driver) {
+        score = score.saturating_add(25);
+    }
+    if let Some(expected) = manifest.exploit_template_expectation.as_deref() {
+        if outcome.template_name.contains(expected) {
+            score = score.saturating_add(20);
+        }
+    }
+    score
+}
+
+fn blind_search_driver_name(manifest: &BenchmarkManifest, exploit_class: &str) -> String {
+    let class = exploit_class.to_ascii_lowercase();
+    if matches!(
+        manifest.vulnerability_class,
+        VulnerabilityClass::AccessControlBypass | VulnerabilityClass::GovernanceTimelockBypass
+    ) || class.contains("governance")
+        || class.contains("proxy")
+    {
+        "proxy-governance-reinitialization".to_string()
+    } else if matches!(
+        manifest.vulnerability_class,
+        VulnerabilityClass::LiquidationAbuse
+            | VulnerabilityClass::Erc4626ShareInflation
+            | VulnerabilityClass::DonationInflationAttack
+    ) || class.contains("lending")
+        || class.contains("liquidation")
+    {
+        "lending-donation-liquidation".to_string()
+    } else {
+        "generic-blind-search".to_string()
+    }
+}
+
+fn sequence_summary(candidate: &ExploitPathCandidate) -> Vec<String> {
+    candidate
+        .sequence
+        .iter()
+        .enumerate()
+        .map(|(idx, tx)| {
+            format!(
+                "#{} caller={} target={} value={} input=0x{}",
+                idx,
+                tx.caller,
+                tx.to,
+                tx.value,
+                hex::encode(&tx.input)
+            )
+        })
+        .collect()
+}
+
+fn provider_side_eth_call_replay(
+    rpc_url: &str,
+    fork_block: u64,
+    input: &EvmInput,
+) -> Result<SequenceExecutionResult> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .pool_max_idle_per_host(0)
+        .user_agent("rusty-fuzz-provider-replay/0.1")
+        .build()?;
+    let block_tag = format!("0x{fork_block:x}");
+    let mut tx_results = Vec::with_capacity(input.txs.len());
+    let mut call_trace = Vec::with_capacity(input.txs.len());
+
+    for (tx_index, tx) in input.txs.iter().enumerate() {
+        let mut call = serde_json::Map::new();
+        call.insert("from".to_string(), Value::String(tx.caller.to_string()));
+        call.insert("to".to_string(), Value::String(tx.to.to_string()));
+        call.insert(
+            "data".to_string(),
+            Value::String(format!("0x{}", hex::encode(&tx.input))),
+        );
+        if !tx.value.is_zero() {
+            call.insert(
+                "value".to_string(),
+                Value::String(format!("0x{:x}", tx.value)),
+            );
+        }
+
+        let response: Value = client
+            .post(rpc_url)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": tx_index + 1,
+                "method": "eth_call",
+                "params": [Value::Object(call), Value::String(block_tag.clone())],
+            }))
+            .send()
+            .map_err(|error| anyhow::anyhow!(sanitize_report_error(&error.to_string())))?
+            .error_for_status()
+            .map_err(|error| anyhow::anyhow!(sanitize_report_error(&error.to_string())))?
+            .json()?;
+
+        if let Some(error) = response.get("error") {
+            anyhow::bail!("provider eth_call returned JSON-RPC error: {error}");
+        }
+        let output_hex = response
+            .get("result")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("provider eth_call response missing result"))?;
+        let output = parse_hex_bytes_for_report(output_hex)?;
+        let coverage_hash = stable_provider_replay_hash(tx, &output);
+        let call = CallObservation {
+            tx_index,
+            depth: 0,
+            caller: tx.caller,
+            target: tx.to,
+            value: tx.value,
+            input: tx.input.clone(),
+            output: output.clone(),
+            gas_limit: 0,
+            gas_used: 0,
+            success: true,
+            kind: CallKind::Transaction,
+            phase: CallPhase::End,
+            created_address: None,
+            result: Some("provider_eth_call_success".to_string()),
+        };
+        call_trace.push(call.clone());
+        tx_results.push(TxExecutionResult {
+            tx_index,
+            status: ExecutionStatus::Success,
+            gas_used: 0,
+            output,
+            coverage_hash,
+            coverage_edges: 1,
+            storage_reads: Vec::new(),
+            storage_writes: Vec::new(),
+            storage_diffs: Vec::new(),
+            call_trace: vec![call],
+            waypoints: Vec::new(),
+        });
+    }
+
+    let final_coverage_hash = tx_results
+        .iter()
+        .fold(0xcbf29ce484222325u64, |acc, result| {
+            acc.wrapping_mul(0x100000001b3) ^ result.coverage_hash
+        });
+    Ok(SequenceExecutionResult {
+        total_gas_used: 0,
+        final_coverage_hash,
+        storage_reads: Vec::new(),
+        storage_writes: Vec::new(),
+        storage_diffs: Vec::new(),
+        call_trace,
+        oracle_observations: Vec::new(),
+        tx_results,
+    })
+}
+
+fn provider_side_historical_finding(
+    manifest: &BenchmarkManifest,
+    fork_block: u64,
+    execution: &SequenceExecutionResult,
+) -> ProtocolFinding {
+    let (pack, vuln, severity) = match manifest.vulnerability_class {
+        VulnerabilityClass::AccessControlBypass => (
+            ProtocolOraclePackKind::Governance,
+            VulnType::PrivilegeEscalation,
+            ProtocolSeverity::High,
+        ),
+        VulnerabilityClass::GovernanceTimelockBypass => (
+            ProtocolOraclePackKind::Governance,
+            VulnType::GovernanceTakeover,
+            ProtocolSeverity::High,
+        ),
+        VulnerabilityClass::LiquidationAbuse => (
+            ProtocolOraclePackKind::Lending,
+            VulnType::InvariantViolation("lending health invariant".to_string()),
+            ProtocolSeverity::High,
+        ),
+        VulnerabilityClass::OracleManipulation => (
+            ProtocolOraclePackKind::Lending,
+            VulnType::PriceOracleManipulation,
+            ProtocolSeverity::High,
+        ),
+        VulnerabilityClass::AmmInvariantViolation => (
+            ProtocolOraclePackKind::Amm,
+            VulnType::PriceManipulation,
+            ProtocolSeverity::High,
+        ),
+        VulnerabilityClass::Erc4626ShareInflation | VulnerabilityClass::DonationInflationAttack => {
+            (
+                ProtocolOraclePackKind::Erc4626,
+                VulnType::VaultInflation,
+                ProtocolSeverity::High,
+            )
+        }
+        VulnerabilityClass::ApprovalAllowanceAbuse => (
+            ProtocolOraclePackKind::Erc20,
+            VulnType::MissingSignerCheck,
+            ProtocolSeverity::Medium,
+        ),
+        VulnerabilityClass::FeeAccountingMismatch
+        | VulnerabilityClass::RoundingPrecisionLoss
+        | VulnerabilityClass::StaleAccounting => (
+            ProtocolOraclePackKind::Erc20,
+            VulnType::AccountingDesync,
+            ProtocolSeverity::Medium,
+        ),
+        VulnerabilityClass::BridgeReplayFinalizationBug => (
+            ProtocolOraclePackKind::Governance,
+            VulnType::InvariantViolation("bridge replay/finalize invariant".to_string()),
+            ProtocolSeverity::High,
+        ),
+        VulnerabilityClass::Reentrancy => (
+            ProtocolOraclePackKind::Erc20,
+            VulnType::Reentrancy,
+            ProtocolSeverity::High,
+        ),
+    };
+
+    ProtocolFinding {
+        pack,
+        vuln,
+        severity,
+        tx_index: Some(0),
+        target: manifest.target_address(),
+        evidence: format!(
+            "provider-side eth_call replay succeeded for {} txs at historical fork block {}; expected_invariant={}; local storage diffs unavailable in provider fallback; this is real fork-state replay, not a synthetic cached runtime",
+            execution.tx_results.len(),
+            fork_block,
+            manifest
+                .expected_invariant
+                .as_deref()
+                .unwrap_or("manifest invariant")
+        ),
+    }
+}
+
+fn stable_provider_replay_hash(tx: &SingletonTx, output: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in tx
+        .input
+        .iter()
+        .chain(output.iter())
+        .chain(tx.to.as_slice().iter())
+        .chain(tx.caller.as_slice().iter())
+    {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn parse_hex_bytes_for_report(value: &str) -> Result<Vec<u8>> {
+    let raw = value.strip_prefix("0x").unwrap_or(value);
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let padded = if raw.len().is_multiple_of(2) {
+        raw.to_string()
+    } else {
+        format!("0{raw}")
+    };
+    hex::decode(padded).map_err(Into::into)
+}
+
+fn sanitize_report_error(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(index) = rest.find("http://").or_else(|| rest.find("https://")) {
+        out.push_str(&rest[..index]);
+        out.push_str("<rpc-url>");
+        let after_scheme = &rest[index..];
+        let end = after_scheme
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, ')' | ',' | ';'))
+            .unwrap_or(after_scheme.len());
+        rest = &after_scheme[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn oracle_changing_return_runtime() -> Vec<u8> {
@@ -2158,6 +2765,7 @@ mod tests {
             expected_replayable: Some(true),
             expected_poc_generated: Some(false),
             expected_exploit_shape: vec!["donate before victim deposit".to_string()],
+            known_exploit_class: None,
             expected_selectors: vec!["deposit".to_string(), "redeem".to_string()],
             expected_attacker: Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
             expected_victim: Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
@@ -2291,6 +2899,7 @@ mod tests {
             expected_replayable: Some(true),
             expected_poc_generated: Some(false),
             expected_exploit_shape: Vec::new(),
+            known_exploit_class: None,
             expected_selectors: vec!["deposit".to_string()],
             expected_attacker: Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
             expected_victim: None,
@@ -2321,6 +2930,7 @@ mod tests {
             expected_replayable: Some(true),
             expected_poc_generated: Some(true),
             expected_exploit_shape: vec!["historical replay".to_string()],
+            known_exploit_class: None,
             expected_selectors: vec!["deposit".to_string()],
             expected_attacker: Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
             expected_victim: Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
@@ -2416,6 +3026,84 @@ success_criteria = ["expected_finding", "invariant_violation", "oracle_stale_pri
     }
 
     #[test]
+    fn parses_blind_rediscovery_manifest_with_equivalence_class() {
+        let raw = r#"
+id = "blind-audius-governance-reinitialization-2022"
+class = "access_control_bypass"
+mode = "blind_rediscovery"
+target = "0xbdbb5945f252bc3466a319cdcc3ee8056bf2e569"
+fixture = "benchmarks/blind/fixtures/audius-governance-reinitialization-2022.json"
+known_exploit_class = "Audius governance reinitialization"
+expected_selectors = ["initialize", "submitProposal", "upgradeTo(address)"]
+success_criteria = ["expected_finding", "invariant_violation"]
+"#;
+        let parsed: BenchmarkManifest = toml::from_str(raw).expect("manifest parses");
+        assert_eq!(parsed.mode, BenchmarkMode::BlindRediscovery);
+        assert_eq!(
+            parsed.known_exploit_class.as_deref(),
+            Some("Audius governance reinitialization")
+        );
+    }
+
+    #[test]
+    fn live_fixture_parses_provider_replay_only_flag() {
+        let raw = r#"{
+  "provider_replay_only": true,
+  "chain_id": 1,
+  "block_number": 123,
+  "target": "0x1111111111111111111111111111111111111111",
+  "transactions": []
+}"#;
+        let parsed: LiveBenchmarkFixture = serde_json::from_str(raw).expect("fixture parses");
+        assert!(parsed.provider_replay_only);
+        assert!(parsed.fork_cache.is_none());
+        assert!(parsed.fork_cache_profile.is_none());
+    }
+
+    #[test]
+    fn provider_side_historical_finding_is_labeled_as_real_replay_with_caveat() {
+        let manifest = live_manifest("fixture.json", VulnerabilityClass::AccessControlBypass);
+        let execution = SequenceExecutionResult {
+            tx_results: vec![TxExecutionResult {
+                tx_index: 0,
+                status: ExecutionStatus::Success,
+                gas_used: 0,
+                output: Vec::new(),
+                coverage_hash: 1,
+                coverage_edges: 1,
+                storage_reads: Vec::new(),
+                storage_writes: Vec::new(),
+                storage_diffs: Vec::new(),
+                call_trace: Vec::new(),
+                waypoints: Vec::new(),
+            }],
+            total_gas_used: 0,
+            final_coverage_hash: 1,
+            storage_reads: Vec::new(),
+            storage_writes: Vec::new(),
+            storage_diffs: Vec::new(),
+            call_trace: Vec::new(),
+            oracle_observations: Vec::new(),
+        };
+
+        let finding = provider_side_historical_finding(&manifest, 123, &execution);
+
+        assert_eq!(finding.vuln, VulnType::PrivilegeEscalation);
+        assert!(finding.evidence.contains("provider-side eth_call replay"));
+        assert!(finding.evidence.contains("local storage diffs unavailable"));
+        assert!(finding.evidence.contains("not a synthetic cached runtime"));
+    }
+
+    #[test]
+    fn report_error_sanitizer_removes_rpc_urls() {
+        let sanitized = sanitize_report_error(
+            "error sending request for url (https://example.invalid/key); timeout",
+        );
+        assert!(!sanitized.contains("https://example.invalid/key"));
+        assert!(sanitized.contains("<rpc-url>"));
+    }
+
+    #[test]
     fn live_fork_manifest_reports_rpc_failure_without_synthetic_fallback() {
         let runner = ValidationRunner;
         let manifest = live_manifest(
@@ -2505,6 +3193,83 @@ success_criteria = ["expected_finding", "invariant_violation", "oracle_stale_pri
             .false_positive_notes
             .iter()
             .any(|note| note.contains("replay backend: cached-fork-fixture")));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn blind_rediscovery_manifest_runs_and_reports_synthesized_sequence() {
+        let runner = ValidationRunner;
+        let base = std::env::temp_dir().join(format!(
+            "rusty_fuzz_blind_validation_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("tmp dir");
+        let fixture_path = base.join("blind.json");
+        fs::write(
+            &fixture_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "chain_id": 1,
+                "block_number": 123,
+                "target": "0x1111111111111111111111111111111111111111",
+                "fork_cache_profile": "noop_runtime",
+                "transactions": [{
+                    "hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "from": "0x1313131313131313131313131313131313131313",
+                    "to": "0x1111111111111111111111111111111111111111",
+                    "value": "0",
+                    "selector": "deposit",
+                    "success": true,
+                    "tags": ["historical", "blind", "vault"]
+                }]
+            }))
+            .unwrap(),
+        )
+        .expect("write fixture");
+
+        let manifest = BenchmarkManifest {
+            id: "blind-vault-rediscovery".to_string(),
+            vulnerability_class: VulnerabilityClass::Erc4626ShareInflation,
+            mode: BenchmarkMode::BlindRediscovery,
+            target: Some("0x1111111111111111111111111111111111111111".to_string()),
+            fixture: Some(fixture_path.to_string_lossy().to_string()),
+            chain: Some("evm".to_string()),
+            fork_block: Some(123),
+            setup_requirements: vec!["blind rediscovery".to_string()],
+            expected_invariant: Some("share inflation".to_string()),
+            target_profile_expectation: vec!["erc4626".to_string()],
+            exploit_template_expectation: Some("erc4626-inflation".to_string()),
+            expected_invariant_family: Some("erc4626-vault".to_string()),
+            expected_minimum_confidence: Some(40),
+            expected_replayable: Some(true),
+            expected_poc_generated: Some(false),
+            expected_exploit_shape: vec!["deposit".to_string()],
+            known_exploit_class: Some("ERC4626 share inflation".to_string()),
+            expected_selectors: vec!["deposit".to_string()],
+            expected_attacker: Some("0x1313131313131313131313131313131313131313".to_string()),
+            expected_victim: None,
+            success_criteria: vec![
+                SuccessCriterion::ExpectedFinding,
+                SuccessCriterion::InvariantViolation,
+                SuccessCriterion::ReplayableArtifact,
+            ],
+            replay_command: None,
+            poc_generation: PocGenerationExpectation::Expected,
+            max_duration_secs: Some(60),
+            seed_hints: vec!["deposit".to_string()],
+            notes: Some("blind rediscovery test".to_string()),
+        };
+
+        let result = runner.run_manifest(&manifest);
+        assert!(result.executed);
+        assert_eq!(result.status, ValidationStatus::NotFound);
+        assert!(!result.synthesized_sequence.is_empty());
+        assert!(result.search_driver.is_some());
+        assert!(result.equivalence_class.is_some());
+        assert!(result
+            .false_positive_notes
+            .iter()
+            .any(|note| note.contains("blind rediscovery")));
         let _ = fs::remove_dir_all(&base);
     }
 

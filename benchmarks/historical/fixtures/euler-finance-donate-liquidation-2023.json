@@ -1,0 +1,18 @@
+{
+  "provider_replay_only": true,
+  "chain_id": 1,
+  "block_number": 16817995,
+  "target": "0x27182842E098f60e3D576794A5bFFb0777E025d3",
+  "transactions": [
+    {
+      "hash": "0xc310a0affe2169d1f6feec1c63dbc7f7c62a887fa48795d327d4d2da2d6b111d",
+      "from": "0x5F259D0B76665c337C6104145894f4D1D2758b8c",
+      "to": "0xEbc29199C817Dc47BA12E3F86102564D640CBf99",
+      "value": "0",
+      "input": "0x863df8af",
+      "selector": "0x863df8af",
+      "success": true,
+      "tags": ["historical", "euler", "lending", "flash-loan", "donateToReserves", "liquidation"]
+    }
+  ]
+}

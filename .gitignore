@@ -15,7 +15,11 @@
 # ─────────────────────────────────────────────────────────────
 /corpus/
 /reports/
-/benchmarks/
+/benchmarks/*
+!/benchmarks/historical/
+!/benchmarks/historical/**
+!/benchmarks/blind/
+!/benchmarks/blind/**
 /seeds/
 /docs/
 /crashes/

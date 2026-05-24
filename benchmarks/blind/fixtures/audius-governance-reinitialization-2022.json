@@ -1,0 +1,26 @@
+{
+  "fork_cache_profile": "noop_runtime",
+  "chain_id": 1,
+  "block_number": 15201793,
+  "target": "0xbdbb5945f252bc3466a319cdcc3ee8056bf2e569",
+  "transactions": [
+    {
+      "hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "from": "0xa0c7bd318d69424603cbf91e9969870f21b8ab4c",
+      "to": "0xbdbb5945f252bc3466a319cdcc3ee8056bf2e569",
+      "value": "0",
+      "selector": "0x5bc7c6ac",
+      "success": true,
+      "tags": ["historical", "audius", "governance", "proxy", "access-control", "blind"]
+    },
+    {
+      "hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+      "from": "0x18aaa7115705e8be94bffebde57af9bfc265b998",
+      "to": "0xbdbb5945f252bc3466a319cdcc3ee8056bf2e569",
+      "value": "0",
+      "selector": "initialize",
+      "success": true,
+      "tags": ["historical", "audius", "governance", "proxy", "access-control", "blind"]
+    }
+  ]
+}
