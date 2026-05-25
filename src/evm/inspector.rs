@@ -205,6 +205,22 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
 
         // --- Taint Propagation ---
         match opcode {
+            // CALLER: Mark msg.sender as a symbolic role source.
+            0x33 => {
+                let source = TaintSource::Caller;
+                self.push_symbolic(
+                    Some(source.clone()),
+                    Some(SymbolicExpression::Source(source)),
+                );
+            }
+            // CALLVALUE: Mark msg.value as a symbolic amount source.
+            0x34 => {
+                let source = TaintSource::CallValue;
+                self.push_symbolic(
+                    Some(source.clone()),
+                    Some(SymbolicExpression::Source(source)),
+                );
+            }
             // CALLDATALOAD: Mark the top of the stack as tainted with the offset
             0x35 => {
                 if let Ok(offset_val) = interp.stack.peek(0) {
@@ -456,6 +472,7 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                                 TaintSource::Storage(self.current_tx_idx, offset)
                             }
                             TaintSource::Storage(_, _) => ts,
+                            TaintSource::Caller | TaintSource::CallValue => ts,
                         });
                     if let Some(persistent_taint) = persistent_taint_for_value.clone() {
                         self.symbolic_storage_map

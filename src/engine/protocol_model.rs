@@ -1,7 +1,7 @@
 use crate::common::oracle::{ProtocolFinding, ProtocolSeverity};
 use crate::common::types::{CallKind, CallPhase, SequenceExecutionResult};
 use crate::engine::actors::{ActorSet, ActorType};
-use crate::engine::concolic::{ConcolicHint, ConcolicSolver};
+use crate::engine::concolic::{ConcolicHint, ConcolicRepairTarget, ConcolicSolver};
 use crate::engine::dependency::{
     dependency_sequence_score, generate_flow_template_inputs, TransactionDependencyGraph,
 };
@@ -591,11 +591,29 @@ fn apply_concolic_hints(input: &mut EvmInput, hints: &[ConcolicHint], limit: usi
         let Some(tx) = input.txs.get_mut(hint.tx_index) else {
             continue;
         };
-        if apply_word_at_offset(&mut tx.input, hint.calldata_offset, &hint.word) {
-            applied.push(format!(
-                "tx={} offset={} pc={} strategy={:?}",
-                hint.tx_index, hint.calldata_offset, hint.pc, hint.strategy
-            ));
+        match hint.repair_target {
+            ConcolicRepairTarget::CalldataWord => {
+                if apply_word_at_offset(&mut tx.input, hint.calldata_offset, &hint.word) {
+                    applied.push(format!(
+                        "tx={} offset={} pc={} strategy={:?}",
+                        hint.tx_index, hint.calldata_offset, hint.pc, hint.strategy
+                    ));
+                }
+            }
+            ConcolicRepairTarget::Caller => {
+                tx.caller = Address::from_slice(&hint.word[12..]);
+                applied.push(format!(
+                    "tx={} caller={:?} pc={} strategy={:?}",
+                    hint.tx_index, tx.caller, hint.pc, hint.strategy
+                ));
+            }
+            ConcolicRepairTarget::TxValue => {
+                tx.value = U256::from_be_bytes(hint.word);
+                applied.push(format!(
+                    "tx={} value={} pc={} strategy={:?}",
+                    hint.tx_index, tx.value, hint.pc, hint.strategy
+                ));
+            }
         }
     }
     applied

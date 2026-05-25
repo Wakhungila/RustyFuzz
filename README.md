@@ -322,6 +322,19 @@ cargo run --release -- seed-ingest \
 
 Converts transaction JSON into the seed bundle store. Useful for reproducing historical exploits.
 
+**Infer fork-state setup from a seed bundle**:
+```bash
+cargo run --release -- setup \
+  --bundle-id target-mainnet \
+  --output reports/fork_setup.json
+```
+
+The setup report summarizes observed and inferred target context for forked Immunefi-style testing:
+tokens, funded holders/whales, AMM pools, oracle feeds, collateral candidates, governance/timelock
+targets, EIP-1967 proxy/admin slots to probe, and recent valid transaction-flow windows. Findings are
+labeled by source, such as historical seed, discovered account, execution trace, selector heuristic,
+or known slot. This is setup automation, not proof of vulnerability.
+
 ### Replay and Verification
 
 **Replay a persisted input**:

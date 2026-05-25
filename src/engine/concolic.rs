@@ -10,6 +10,7 @@ pub struct ConcolicHint {
     pub word: [u8; 32],
     pub pc: usize,
     pub strategy: ConcolicStrategy,
+    pub repair_target: ConcolicRepairTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +18,13 @@ pub enum ConcolicStrategy {
     FlipComparison { opcode: u8, target_true: bool },
     FlipBranch { taken: bool },
     ArithmeticBoundary { opcode: u8 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConcolicRepairTarget {
+    CalldataWord,
+    Caller,
+    TxValue,
 }
 
 #[derive(Debug, Default)]
@@ -136,9 +144,17 @@ fn hint_from_source(
     value: U256,
     strategy: ConcolicStrategy,
 ) -> ConcolicHint {
-    let (tx_index, calldata_offset) = match source {
-        TaintSource::Calldata(offset) => (fallback_tx_index, *offset),
-        TaintSource::Storage(origin_tx, offset) => (*origin_tx, *offset),
+    let (tx_index, calldata_offset, repair_target) = match source {
+        TaintSource::Calldata(offset) => (
+            fallback_tx_index,
+            *offset,
+            ConcolicRepairTarget::CalldataWord,
+        ),
+        TaintSource::Storage(origin_tx, offset) => {
+            (*origin_tx, *offset, ConcolicRepairTarget::CalldataWord)
+        }
+        TaintSource::Caller => (fallback_tx_index, 0, ConcolicRepairTarget::Caller),
+        TaintSource::CallValue => (fallback_tx_index, 0, ConcolicRepairTarget::TxValue),
     };
     ConcolicHint {
         source: source.clone(),
@@ -147,6 +163,7 @@ fn hint_from_source(
         word: value.to_be_bytes::<32>(),
         pc,
         strategy,
+        repair_target,
     }
 }
 
@@ -425,5 +442,83 @@ mod tests {
             .expect("hint");
         assert_eq!(hint.calldata_offset, 4);
         assert_eq!(U256::from_be_bytes(hint.word), U256::from(37));
+    }
+
+    #[test]
+    fn solves_msg_value_threshold() {
+        let waypoint = Waypoint::Comparison {
+            op: 0x10,
+            lhs: U256::from(1),
+            rhs: U256::from(10),
+            pc: 101,
+            calldata_offset: None,
+            condition: true,
+            hit: true,
+            taint_source: Some(TaintSource::CallValue),
+            tainted_operand: ComparisonOperand::Lhs,
+            lhs_expression: Some(SymbolicExpression::Source(TaintSource::CallValue)),
+            rhs_expression: Some(SymbolicExpression::Constant(U256::from(10))),
+            branch_distance: Some(U256::from(9)),
+        };
+
+        let hint = ConcolicSolver::new()
+            .solve_hint(0, &waypoint)
+            .expect("hint");
+        assert_eq!(hint.repair_target, ConcolicRepairTarget::TxValue);
+        assert_eq!(U256::from_be_bytes(hint.word), U256::from(10));
+    }
+
+    #[test]
+    fn solves_msg_sender_role_equality() {
+        let expected = U256::from(0x1234_u64);
+        let waypoint = Waypoint::Comparison {
+            op: 0x14,
+            lhs: U256::from(0x99_u64),
+            rhs: expected,
+            pc: 102,
+            calldata_offset: None,
+            condition: false,
+            hit: false,
+            taint_source: Some(TaintSource::Caller),
+            tainted_operand: ComparisonOperand::Lhs,
+            lhs_expression: Some(SymbolicExpression::Source(TaintSource::Caller)),
+            rhs_expression: Some(SymbolicExpression::Constant(expected)),
+            branch_distance: Some(U256::from(1)),
+        };
+
+        let hint = ConcolicSolver::new()
+            .solve_hint(0, &waypoint)
+            .expect("hint");
+        assert_eq!(hint.repair_target, ConcolicRepairTarget::Caller);
+        assert_eq!(U256::from_be_bytes(hint.word), expected);
+    }
+
+    #[test]
+    fn solves_storage_derived_balance_threshold_to_originating_amount() {
+        let waypoint = Waypoint::Comparison {
+            op: 0x11,
+            lhs: U256::from(5),
+            rhs: U256::from(100),
+            pc: 103,
+            calldata_offset: None,
+            condition: false,
+            hit: false,
+            taint_source: Some(TaintSource::Storage(0, 36)),
+            tainted_operand: ComparisonOperand::Lhs,
+            lhs_expression: Some(SymbolicExpression::Add(
+                Box::new(SymbolicExpression::Source(TaintSource::Storage(0, 36))),
+                Box::new(SymbolicExpression::Constant(U256::from(5))),
+            )),
+            rhs_expression: Some(SymbolicExpression::Constant(U256::from(100))),
+            branch_distance: Some(U256::from(95)),
+        };
+
+        let hint = ConcolicSolver::new()
+            .solve_hint(2, &waypoint)
+            .expect("hint");
+        assert_eq!(hint.tx_index, 0);
+        assert_eq!(hint.calldata_offset, 36);
+        assert_eq!(hint.repair_target, ConcolicRepairTarget::CalldataWord);
+        assert_eq!(U256::from_be_bytes(hint.word), U256::from(96));
     }
 }

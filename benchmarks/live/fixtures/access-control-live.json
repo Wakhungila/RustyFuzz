@@ -1,0 +1,17 @@
+{
+  "chain_id": 1,
+  "block_number": 22000000,
+  "target": "0xA03d480cd2E10Ad36ED098898357DBe4C349fB02",
+  "transactions": [
+    {
+      "hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+      "from": "0x37a6A9094867c331477EDa7D7A3c250D5ba5D048",
+      "to": "0xA03d480cd2E10Ad36ED098898357DBe4C349fB02",
+      "value": "0",
+      "input": "0x3659cfe60000000000000000000000000000000000000000000000000000000000000000",
+      "selector": "0x3659cfe6",
+      "success": true,
+      "tags": ["access-control", "proxy"]
+    }
+  ]
+}

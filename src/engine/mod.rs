@@ -8,6 +8,7 @@ pub mod economic_delta;
 pub mod exploit_coverage;
 pub mod exploit_path;
 pub mod exploit_synthesizer;
+pub mod fork_setup;
 pub mod foundry_ingest;
 pub mod fuzz_engine;
 pub mod minimizer;

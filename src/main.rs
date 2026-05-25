@@ -7,6 +7,7 @@ use rusty_fuzz::common::oracle::{ProtocolOraclePack, ReentrancyOracle, VulnType}
 use rusty_fuzz::common::verifier::ReplayVerifier;
 use rusty_fuzz::config::Config;
 use rusty_fuzz::engine::benchmark::ValidationRunner;
+use rusty_fuzz::engine::fork_setup::ForkSetupDiscoverer;
 use rusty_fuzz::engine::foundry_ingest::FoundryHarnessManifest;
 use rusty_fuzz::engine::minimizer::Minimizer;
 use rusty_fuzz::engine::seed_intelligence::SeedIntelligence;
@@ -65,6 +66,14 @@ enum Command {
         file: String,
         #[arg(long, default_value = "historical-json")]
         bundle_id: String,
+    },
+    Setup {
+        #[arg(long, default_value = "default")]
+        bundle_id: String,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        output: Option<String>,
     },
     Replay {
         #[arg(long, alias = "input_id")]
@@ -251,6 +260,47 @@ async fn main() -> anyhow::Result<()> {
                 bundle_id,
                 bundle.seeds.len()
             );
+        }
+        Command::Setup {
+            bundle_id,
+            target,
+            output,
+        } => {
+            ensure_evm_chain(&config)?;
+            let corpus = PersistentCorpus::new(&config.corpus_dir)?;
+            let bundle = corpus.load_mainnet_seed_bundle(&bundle_id)?;
+            let target = target
+                .as_deref()
+                .map(Address::from_str)
+                .transpose()?
+                .unwrap_or(bundle.target);
+            let report = ForkSetupDiscoverer::discover_from_seed_bundle(
+                target,
+                &bundle.seeds,
+                &bundle.discovered_accounts,
+            );
+            let report_json = serde_json::to_string_pretty(&report)?;
+            if let Some(output) = output {
+                if let Some(parent) = std::path::Path::new(&output).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                }
+                std::fs::write(&output, report_json)?;
+                println!(
+                    "Wrote fork setup report `{}`: tokens={}, whales={}, holders={}, pools={}, oracles={}, collateral_assets={}, flows={}",
+                    output,
+                    report.tokens.len(),
+                    report.whales.len(),
+                    report.holders.len(),
+                    report.pools.len(),
+                    report.oracle_feeds.len(),
+                    report.collateral_assets.len(),
+                    report.recent_valid_flows.len()
+                );
+            } else {
+                println!("{report_json}");
+            }
         }
         Command::Replay {
             input,

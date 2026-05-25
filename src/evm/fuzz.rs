@@ -1,5 +1,5 @@
 use crate::common::types::{SingletonTx, Waypoint};
-use crate::engine::concolic::ConcolicSolver;
+use crate::engine::concolic::{ConcolicRepairTarget, ConcolicSolver};
 use crate::evm::registry::GlobalAccountRegistry;
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use hashlink::LruCache;
@@ -134,7 +134,10 @@ impl EvmMutator {
                 input
                     .txs
                     .get(hint.tx_index)
-                    .is_some_and(|_| hint.calldata_offset <= 4096)
+                    .is_some_and(|_| match hint.repair_target {
+                        ConcolicRepairTarget::CalldataWord => hint.calldata_offset <= 4096,
+                        ConcolicRepairTarget::Caller | ConcolicRepairTarget::TxValue => true,
+                    })
             })
             .collect();
 
@@ -142,20 +145,11 @@ impl EvmMutator {
             return MutationResult::Skipped;
         };
 
-        let parameter_types = input
-            .txs
-            .get(hint.tx_index)
-            .and_then(|tx| selector_for_calldata(&tx.input))
-            .and_then(|selector| self.abi_registry.functions.get(&selector))
-            .cloned();
-
         if let Some(tx) = input.txs.get_mut(hint.tx_index) {
-            let placement = apply_concolic_hint(
-                tx,
-                hint.calldata_offset,
-                &hint.word,
-                parameter_types.as_deref(),
-            );
+            let parameter_types = selector_for_calldata(&tx.input)
+                .and_then(|selector| self.abi_registry.functions.get(&selector))
+                .cloned();
+            let placement = apply_concolic_hint(tx, hint, parameter_types.as_deref());
             let selector = selector_for_calldata(&tx.input);
             let detail = format!(
                 "solved {:?} at pc {} into {}",
@@ -197,7 +191,10 @@ impl EvmMutator {
                 input
                     .txs
                     .get(hint.tx_index)
-                    .is_some_and(|_| hint.calldata_offset <= 4096)
+                    .is_some_and(|_| match hint.repair_target {
+                        ConcolicRepairTarget::CalldataWord => hint.calldata_offset <= 4096,
+                        ConcolicRepairTarget::Caller | ConcolicRepairTarget::TxValue => true,
+                    })
             })
             .collect();
         let Some(hint) = self.pick_random(rand, &applicable) else {
@@ -212,12 +209,7 @@ impl EvmMutator {
             .cloned();
 
         let mut synthesized = template;
-        let placement = apply_concolic_hint(
-            &mut synthesized,
-            hint.calldata_offset,
-            &hint.word,
-            parameter_types.as_deref(),
-        );
+        let placement = apply_concolic_hint(&mut synthesized, hint, parameter_types.as_deref());
         let selector = selector_for_calldata(&synthesized.input);
         let insert_at = (hint.tx_index + 1).min(input.txs.len());
         input.txs.insert(insert_at, synthesized);
@@ -723,20 +715,32 @@ fn selector_for_calldata(calldata: &[u8]) -> Option<[u8; 4]> {
 
 fn apply_concolic_hint(
     tx: &mut SingletonTx,
-    offset: usize,
-    word: &[u8; 32],
+    hint: &crate::engine::concolic::ConcolicHint,
     parameter_types: Option<&[DynSolType]>,
 ) -> String {
+    match hint.repair_target {
+        ConcolicRepairTarget::Caller => {
+            tx.caller = Address::from_slice(&hint.word[12..]);
+            return format!("msg.sender={:?}", tx.caller);
+        }
+        ConcolicRepairTarget::TxValue => {
+            tx.value = U256::from_be_bytes(hint.word);
+            return format!("msg.value={}", tx.value);
+        }
+        ConcolicRepairTarget::CalldataWord => {}
+    }
+
     if let Some(types) = parameter_types {
         repair_dynamic_abi_layout(&mut tx.input, types);
     }
 
+    let offset = hint.calldata_offset;
     let placement = abi_hint_offset(&tx.input, offset, parameter_types).unwrap_or(offset);
     let end = placement.saturating_add(32);
     if tx.input.len() < end {
         tx.input.resize(end, 0);
     }
-    tx.input[placement..end].copy_from_slice(word);
+    tx.input[placement..end].copy_from_slice(&hint.word);
     if placement == offset {
         format!("calldata[{placement}..{end}]")
     } else {
@@ -861,6 +865,7 @@ fn align_abi_word(value: usize) -> usize {
 mod tests {
     use super::*;
     use crate::common::types::{ComparisonOperand, SymbolicExpression, TaintSource};
+    use crate::engine::concolic::{ConcolicHint, ConcolicStrategy};
     use libafl::mutators::MutationResult;
     use libafl_bolts::rands::RomuDuoJrRand;
 
@@ -1042,8 +1047,20 @@ mod tests {
             is_victim: false,
         };
         let word = U256::from(0xfeed_u64).to_be_bytes::<32>();
+        let hint = ConcolicHint {
+            source: TaintSource::Calldata(4),
+            tx_index: 0,
+            calldata_offset: 4,
+            word,
+            pc: 1,
+            strategy: ConcolicStrategy::FlipComparison {
+                opcode: 0x14,
+                target_true: true,
+            },
+            repair_target: ConcolicRepairTarget::CalldataWord,
+        };
 
-        let placement = apply_concolic_hint(&mut tx, 4, &word, Some(&[DynSolType::Bytes]));
+        let placement = apply_concolic_hint(&mut tx, &hint, Some(&[DynSolType::Bytes]));
 
         assert_eq!(placement, "abi_word[68..100] from source offset 4");
         assert_eq!(tx.input.len(), 100);
@@ -1053,5 +1070,61 @@ mod tests {
             U256::from_be_slice(&tx.input[68..100]),
             U256::from(0xfeed_u64)
         );
+    }
+
+    #[test]
+    fn concolic_hint_repairs_msg_value() {
+        let mut tx = SingletonTx {
+            input: vec![0xab, 0xcd, 0xef, 0x01],
+            caller: Address::repeat_byte(0x11),
+            to: Address::repeat_byte(0x22),
+            value: U256::ZERO,
+            is_victim: false,
+        };
+        let hint = ConcolicHint {
+            source: TaintSource::CallValue,
+            tx_index: 0,
+            calldata_offset: 0,
+            word: U256::from(1_000_000_u64).to_be_bytes::<32>(),
+            pc: 1,
+            strategy: ConcolicStrategy::FlipComparison {
+                opcode: 0x10,
+                target_true: false,
+            },
+            repair_target: ConcolicRepairTarget::TxValue,
+        };
+
+        let placement = apply_concolic_hint(&mut tx, &hint, None);
+        assert_eq!(placement, "msg.value=1000000");
+        assert_eq!(tx.value, U256::from(1_000_000_u64));
+    }
+
+    #[test]
+    fn concolic_hint_repairs_msg_sender() {
+        let mut tx = SingletonTx {
+            input: vec![0xab, 0xcd, 0xef, 0x01],
+            caller: Address::repeat_byte(0x11),
+            to: Address::repeat_byte(0x22),
+            value: U256::ZERO,
+            is_victim: false,
+        };
+        let mut word = [0u8; 32];
+        word[12..].copy_from_slice(Address::repeat_byte(0x99).as_slice());
+        let hint = ConcolicHint {
+            source: TaintSource::Caller,
+            tx_index: 0,
+            calldata_offset: 0,
+            word,
+            pc: 1,
+            strategy: ConcolicStrategy::FlipComparison {
+                opcode: 0x14,
+                target_true: true,
+            },
+            repair_target: ConcolicRepairTarget::Caller,
+        };
+
+        let placement = apply_concolic_hint(&mut tx, &hint, None);
+        assert!(placement.contains("msg.sender="));
+        assert_eq!(tx.caller, Address::repeat_byte(0x99));
     }
 }

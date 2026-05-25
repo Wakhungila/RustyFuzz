@@ -134,6 +134,8 @@ pub struct Snapshot {
 pub enum TaintSource {
     Calldata(usize),
     Storage(usize, usize),
+    Caller,
+    CallValue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

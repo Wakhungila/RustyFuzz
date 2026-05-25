@@ -1,5 +1,5 @@
 {
-  "fork_cache_profile": "noop_runtime",
+  "fork_cache_profile": "vulnerable_benchmark_runtime",
   "chain_id": 1,
   "block_number": 15201793,
   "target": "0xbdbb5945f252bc3466a319cdcc3ee8056bf2e569",

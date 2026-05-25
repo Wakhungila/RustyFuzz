@@ -1,5 +1,7 @@
 use crate::common::oracle::{ProtocolFinding, ProtocolSeverity, VulnType};
-use crate::common::types::{SequenceExecutionResult, Waypoint};
+use crate::common::types::{
+    CallKind, CallPhase, SequenceExecutionResult, SymbolicExpression, TaintSource, Waypoint,
+};
 use crate::engine::dependency::dependency_sequence_score;
 use crate::engine::exploit_path::exploit_path_score;
 use crate::engine::protocol_model::FormalProtocolModel;
@@ -110,6 +112,8 @@ impl CampaignScorer {
         }
         let mut exploration_pressure =
             self.exploration_pressure(input, execution, &mut explanation);
+        let dataflow_pressure = self.dataflow_pressure(input, execution, &mut explanation);
+        exploration_pressure = exploration_pressure.saturating_add(dataflow_pressure);
         let dependency_pressure = dependency_sequence_score(input);
         if dependency_pressure > 0 {
             explanation.push(format!(
@@ -350,6 +354,317 @@ impl CampaignScorer {
         }
         score
     }
+
+    fn dataflow_pressure(
+        &self,
+        input: &EvmInput,
+        execution: &SequenceExecutionResult,
+        explanation: &mut Vec<String>,
+    ) -> u64 {
+        let report = DataflowScoreReport::from_execution(input, execution);
+        let score = report.score();
+        if score > 0 {
+            explanation.push(format!(
+                "dataflow_pressure: score={}, calldata_to_storage={}, caller_role_checks={}, approval_transfer_flows={}, oracle_to_lending={}, amount_to_accounting={}, evidence={}",
+                score,
+                report.calldata_to_storage,
+                report.caller_role_checks,
+                report.approval_to_transfer_from,
+                report.oracle_read_to_borrow_or_liquidate,
+                report.amount_to_share_debt_or_reserve,
+                report.evidence.join(" | ")
+            ));
+        }
+        score
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataflowScoreReport {
+    pub calldata_to_storage: u64,
+    pub caller_role_checks: u64,
+    pub approval_to_transfer_from: u64,
+    pub oracle_read_to_borrow_or_liquidate: u64,
+    pub amount_to_share_debt_or_reserve: u64,
+    pub evidence: Vec<String>,
+}
+
+impl DataflowScoreReport {
+    pub fn from_execution(input: &EvmInput, execution: &SequenceExecutionResult) -> Self {
+        let mut report = Self::default();
+        let selectors = input
+            .txs
+            .iter()
+            .map(|tx| selector_for_calldata(&tx.input))
+            .collect::<Vec<_>>();
+
+        for result in &execution.tx_results {
+            for waypoint in &result.waypoints {
+                match waypoint {
+                    Waypoint::StorageWrite {
+                        tx_idx,
+                        taint_source_of_value: Some(TaintSource::Calldata(offset)),
+                        value_expression,
+                        ..
+                    } => {
+                        report.calldata_to_storage += 1;
+                        if is_accounting_selector(selectors.get(*tx_idx).copied().flatten())
+                            || expression_uses_calldata(value_expression)
+                        {
+                            report.amount_to_share_debt_or_reserve += 1;
+                            report.evidence.push(format!(
+                                "calldata offset {offset} reached accounting storage in tx {tx_idx}"
+                            ));
+                        } else {
+                            report.evidence.push(format!(
+                                "calldata offset {offset} reached storage in tx {tx_idx}"
+                            ));
+                        }
+                    }
+                    Waypoint::StorageWrite {
+                        tx_idx,
+                        taint_source_of_value: Some(TaintSource::Storage(origin_tx, offset)),
+                        ..
+                    } => {
+                        report.calldata_to_storage += 1;
+                        report.amount_to_share_debt_or_reserve += u64::from(
+                            is_accounting_selector(selectors.get(*tx_idx).copied().flatten()),
+                        );
+                        report.evidence.push(format!(
+                            "storage value from tx {origin_tx} offset {offset} flowed into tx {tx_idx}"
+                        ));
+                    }
+                    Waypoint::Comparison {
+                        taint_source: Some(source),
+                        lhs_expression,
+                        rhs_expression,
+                        ..
+                    } => {
+                        if matches!(
+                            source,
+                            TaintSource::Storage(_, _)
+                                | TaintSource::Calldata(_)
+                                | TaintSource::Caller
+                        ) && expression_looks_role_sensitive(lhs_expression, rhs_expression)
+                        {
+                            report.caller_role_checks += 1;
+                            report.evidence.push(format!(
+                                "tainted comparison may gate role/access logic via {:?}",
+                                source
+                            ));
+                        }
+                    }
+                    Waypoint::BranchPath { constraint, .. } => {
+                        if let Waypoint::Comparison {
+                            taint_source: Some(source),
+                            lhs_expression,
+                            rhs_expression,
+                            ..
+                        } = constraint.as_ref()
+                        {
+                            if matches!(
+                                source,
+                                TaintSource::Storage(_, _)
+                                    | TaintSource::Calldata(_)
+                                    | TaintSource::Caller
+                            ) && expression_looks_role_sensitive(lhs_expression, rhs_expression)
+                            {
+                                report.caller_role_checks += 1;
+                                report.evidence.push(format!(
+                                    "tainted branch may gate role/access logic via {:?}",
+                                    source
+                                ));
+                            }
+                        }
+                    }
+                    Waypoint::StorageRead {
+                        read_tx_idx,
+                        taint_source: Some(TaintSource::Storage(origin_tx, offset)),
+                        ..
+                    } if origin_tx < read_tx_idx => {
+                        report.calldata_to_storage += 1;
+                        if is_accounting_selector(selectors.get(*read_tx_idx).copied().flatten()) {
+                            report.amount_to_share_debt_or_reserve += 1;
+                        }
+                        report.evidence.push(format!(
+                            "tx {read_tx_idx} read storage tainted by tx {origin_tx} calldata offset {offset}"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if has_ordered_selector_pair(
+            &selectors,
+            function_selector("approve(address,uint256)"),
+            function_selector("transferFrom(address,address,uint256)"),
+        ) {
+            report.approval_to_transfer_from += 1;
+            report
+                .evidence
+                .push("approval selector precedes transferFrom selector".to_string());
+        }
+
+        if has_oracle_read_before_lending_action(execution, &selectors) {
+            report.oracle_read_to_borrow_or_liquidate += 1;
+            report
+                .evidence
+                .push("oracle/price read precedes borrow or liquidation action".to_string());
+        }
+
+        report.evidence.sort();
+        report.evidence.dedup();
+        report
+    }
+
+    pub fn score(&self) -> u64 {
+        self.calldata_to_storage
+            .saturating_mul(35)
+            .saturating_add(self.caller_role_checks.saturating_mul(70))
+            .saturating_add(self.approval_to_transfer_from.saturating_mul(90))
+            .saturating_add(self.oracle_read_to_borrow_or_liquidate.saturating_mul(110))
+            .saturating_add(self.amount_to_share_debt_or_reserve.saturating_mul(85))
+            .min(500)
+    }
+}
+
+fn selector_for_calldata(calldata: &[u8]) -> Option<[u8; 4]> {
+    calldata.get(0..4).map(|selector| {
+        let mut out = [0u8; 4];
+        out.copy_from_slice(selector);
+        out
+    })
+}
+
+fn function_selector(signature: &str) -> [u8; 4] {
+    let hash = revm::primitives::keccak256(signature.as_bytes());
+    [hash[0], hash[1], hash[2], hash[3]]
+}
+
+fn is_accounting_selector(selector: Option<[u8; 4]>) -> bool {
+    let Some(selector) = selector else {
+        return false;
+    };
+    [
+        "deposit(uint256,address)",
+        "mint(uint256,address)",
+        "withdraw(uint256,address,address)",
+        "redeem(uint256,address,address)",
+        "borrow(uint256)",
+        "borrow(address,uint256,uint256,uint16,address)",
+        "repay(uint256)",
+        "repay(address,uint256,uint256,address)",
+        "liquidate(address,address,uint256,uint256)",
+        "liquidationCall(address,address,address,uint256,bool)",
+        "donateToReserves(uint256,uint256)",
+        "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)",
+        "swap(uint256,uint256,address,bytes)",
+    ]
+    .iter()
+    .map(|signature| function_selector(signature))
+    .any(|known| known == selector)
+}
+
+fn expression_uses_calldata(expression: &Option<SymbolicExpression>) -> bool {
+    match expression {
+        Some(SymbolicExpression::Source(TaintSource::Calldata(_)))
+        | Some(SymbolicExpression::Source(TaintSource::CallValue)) => true,
+        Some(SymbolicExpression::Add(left, right))
+        | Some(SymbolicExpression::Sub(left, right))
+        | Some(SymbolicExpression::Mul(left, right))
+        | Some(SymbolicExpression::Div(left, right))
+        | Some(SymbolicExpression::Mod(left, right))
+        | Some(SymbolicExpression::And(left, right))
+        | Some(SymbolicExpression::Or(left, right))
+        | Some(SymbolicExpression::Xor(left, right)) => {
+            expression_uses_calldata(&Some((**left).clone()))
+                || expression_uses_calldata(&Some((**right).clone()))
+        }
+        _ => false,
+    }
+}
+
+fn expression_looks_role_sensitive(
+    lhs: &Option<SymbolicExpression>,
+    rhs: &Option<SymbolicExpression>,
+) -> bool {
+    expression_uses_storage(lhs)
+        || expression_uses_storage(rhs)
+        || expression_uses_calldata(lhs)
+        || expression_uses_calldata(rhs)
+}
+
+fn expression_uses_storage(expression: &Option<SymbolicExpression>) -> bool {
+    match expression {
+        Some(SymbolicExpression::Source(TaintSource::Storage(_, _)))
+        | Some(SymbolicExpression::Source(TaintSource::Caller)) => true,
+        Some(SymbolicExpression::Add(left, right))
+        | Some(SymbolicExpression::Sub(left, right))
+        | Some(SymbolicExpression::Mul(left, right))
+        | Some(SymbolicExpression::Div(left, right))
+        | Some(SymbolicExpression::Mod(left, right))
+        | Some(SymbolicExpression::And(left, right))
+        | Some(SymbolicExpression::Or(left, right))
+        | Some(SymbolicExpression::Xor(left, right)) => {
+            expression_uses_storage(&Some((**left).clone()))
+                || expression_uses_storage(&Some((**right).clone()))
+        }
+        _ => false,
+    }
+}
+
+fn has_ordered_selector_pair(selectors: &[Option<[u8; 4]>], left: [u8; 4], right: [u8; 4]) -> bool {
+    let mut seen_left = false;
+    for selector in selectors.iter().flatten() {
+        if *selector == left {
+            seen_left = true;
+        }
+        if seen_left && *selector == right {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_oracle_read_before_lending_action(
+    execution: &SequenceExecutionResult,
+    selectors: &[Option<[u8; 4]>],
+) -> bool {
+    let oracle_selectors = [
+        function_selector("latestAnswer()"),
+        function_selector("latestRoundData()"),
+        function_selector("getPrice()"),
+        function_selector("price()"),
+    ];
+    let lending_selectors = [
+        function_selector("borrow(uint256)"),
+        function_selector("borrow(address,uint256,uint256,uint16,address)"),
+        function_selector("liquidate(address,address,uint256,uint256)"),
+        function_selector("liquidationCall(address,address,address,uint256,bool)"),
+    ];
+    let mut oracle_tx = None;
+    for call in execution.call_trace.iter().filter(|call| {
+        call.phase == CallPhase::End
+            && call.success
+            && matches!(
+                call.kind,
+                CallKind::StaticCall | CallKind::Call | CallKind::Transaction
+            )
+    }) {
+        let Some(selector) = selector_for_calldata(&call.input) else {
+            continue;
+        };
+        if oracle_selectors.contains(&selector) {
+            oracle_tx = Some(call.tx_index);
+        }
+    }
+    let Some(oracle_tx) = oracle_tx else {
+        return false;
+    };
+    selectors.iter().enumerate().any(|(idx, selector)| {
+        idx >= oracle_tx && selector.is_some_and(|selector| lending_selectors.contains(&selector))
+    })
 }
 
 impl Default for ProfitReport {
@@ -478,5 +793,182 @@ impl ScoringEngine {
         } else {
             "LOW"
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::{CallObservation, ExecutionStatus, SingletonTx, TxExecutionResult};
+    use revm::primitives::{Address, B256};
+
+    fn addr(byte: u8) -> Address {
+        Address::repeat_byte(byte)
+    }
+
+    fn tx(selector: [u8; 4]) -> SingletonTx {
+        SingletonTx {
+            input: selector.to_vec(),
+            caller: addr(0xaa),
+            to: addr(0xcc),
+            value: U256::ZERO,
+            is_victim: false,
+        }
+    }
+
+    fn execution_with_txs(
+        tx_results: Vec<TxExecutionResult>,
+        call_trace: Vec<CallObservation>,
+    ) -> SequenceExecutionResult {
+        let storage_diffs = tx_results
+            .iter()
+            .flat_map(|result| result.storage_diffs.clone())
+            .collect::<Vec<_>>();
+        SequenceExecutionResult {
+            tx_results,
+            total_gas_used: 1,
+            final_coverage_hash: 1,
+            storage_reads: Vec::new(),
+            storage_writes: Vec::new(),
+            storage_diffs,
+            call_trace,
+            oracle_observations: Vec::new(),
+        }
+    }
+
+    fn result(tx_index: usize, waypoints: Vec<Waypoint>) -> TxExecutionResult {
+        TxExecutionResult {
+            tx_index,
+            status: ExecutionStatus::Success,
+            gas_used: 1,
+            output: Vec::new(),
+            coverage_hash: 1,
+            coverage_edges: 1,
+            storage_reads: Vec::new(),
+            storage_writes: Vec::new(),
+            storage_diffs: Vec::new(),
+            call_trace: Vec::new(),
+            waypoints,
+        }
+    }
+
+    #[test]
+    fn dataflow_scores_calldata_to_accounting_storage() {
+        let input = EvmInput {
+            txs: vec![tx(function_selector("deposit(uint256,address)"))],
+            base_snapshot_id: 0,
+            waypoints: Vec::new(),
+            mutation_provenance: Vec::new(),
+        };
+        let execution = execution_with_txs(
+            vec![result(
+                0,
+                vec![Waypoint::StorageWrite {
+                    address: addr(0xcc),
+                    slot: B256::ZERO.to_vec(),
+                    value: U256::from(10),
+                    pc: 1,
+                    tx_idx: 0,
+                    taint_source_of_value: Some(TaintSource::Calldata(4)),
+                    value_expression: Some(SymbolicExpression::Source(TaintSource::Calldata(4))),
+                }],
+            )],
+            Vec::new(),
+        );
+
+        let report = DataflowScoreReport::from_execution(&input, &execution);
+        assert_eq!(report.calldata_to_storage, 1);
+        assert_eq!(report.amount_to_share_debt_or_reserve, 1);
+        assert!(report.score() >= 100);
+    }
+
+    #[test]
+    fn dataflow_scores_approval_to_transfer_from() {
+        let input = EvmInput {
+            txs: vec![
+                tx(function_selector("approve(address,uint256)")),
+                tx(function_selector("transferFrom(address,address,uint256)")),
+            ],
+            base_snapshot_id: 0,
+            waypoints: Vec::new(),
+            mutation_provenance: Vec::new(),
+        };
+        let execution = execution_with_txs(
+            vec![result(0, Vec::new()), result(1, Vec::new())],
+            Vec::new(),
+        );
+
+        let report = DataflowScoreReport::from_execution(&input, &execution);
+        assert_eq!(report.approval_to_transfer_from, 1);
+        assert!(report.score() >= 90);
+    }
+
+    #[test]
+    fn dataflow_scores_oracle_read_to_lending_action() {
+        let input = EvmInput {
+            txs: vec![tx(function_selector(
+                "liquidationCall(address,address,address,uint256,bool)",
+            ))],
+            base_snapshot_id: 0,
+            waypoints: Vec::new(),
+            mutation_provenance: Vec::new(),
+        };
+        let execution = execution_with_txs(
+            vec![result(0, Vec::new())],
+            vec![CallObservation {
+                tx_index: 0,
+                depth: 1,
+                caller: addr(0xcc),
+                target: addr(0x0f),
+                value: U256::ZERO,
+                input: function_selector("latestAnswer()").to_vec(),
+                output: U256::from(1).to_be_bytes::<32>().to_vec(),
+                gas_limit: 1,
+                gas_used: 1,
+                success: true,
+                kind: CallKind::StaticCall,
+                phase: CallPhase::End,
+                created_address: None,
+                result: None,
+            }],
+        );
+
+        let report = DataflowScoreReport::from_execution(&input, &execution);
+        assert_eq!(report.oracle_read_to_borrow_or_liquidate, 1);
+        assert!(report.score() >= 110);
+    }
+
+    #[test]
+    fn dataflow_scores_tainted_role_branch() {
+        let input = EvmInput {
+            txs: vec![tx(function_selector("upgradeTo(address)"))],
+            base_snapshot_id: 0,
+            waypoints: Vec::new(),
+            mutation_provenance: Vec::new(),
+        };
+        let execution = execution_with_txs(
+            vec![result(
+                0,
+                vec![Waypoint::Comparison {
+                    op: 0x14,
+                    lhs: U256::from(1),
+                    rhs: U256::from(2),
+                    pc: 1,
+                    calldata_offset: None,
+                    condition: false,
+                    hit: false,
+                    taint_source: Some(TaintSource::Storage(0, 4)),
+                    tainted_operand: crate::common::types::ComparisonOperand::Lhs,
+                    lhs_expression: Some(SymbolicExpression::Source(TaintSource::Storage(0, 4))),
+                    rhs_expression: Some(SymbolicExpression::Constant(U256::ZERO)),
+                    branch_distance: Some(U256::from(1)),
+                }],
+            )],
+            Vec::new(),
+        );
+
+        let report = DataflowScoreReport::from_execution(&input, &execution);
+        assert_eq!(report.caller_role_checks, 1);
+        assert!(report.score() >= 70);
     }
 }
