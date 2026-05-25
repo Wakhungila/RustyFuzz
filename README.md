@@ -621,11 +621,9 @@ RustyFuzz is built on:
 - [Alloy](https://github.com/alloy-rs/alloy) for Ethereum primitives and RPC
 - [Foundry](https://github.com/foundry-rs/foundry) for test harness integration
 
-## Contact
 
 For issues, feature requests, or discussion, please open a GitHub issue or pull request.
 
 ---
 
 **Last Updated**: May 2025  
-**Maintainers**: @Wakhungila and @nutcas3
