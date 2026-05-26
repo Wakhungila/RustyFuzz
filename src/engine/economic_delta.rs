@@ -131,6 +131,53 @@ pub struct NormalizedProfit {
     pub method: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EconomicViewSnapshot {
+    pub tx_index: usize,
+    pub actor: Option<Address>,
+    pub token_balances: Vec<TokenBalanceView>,
+    pub vault_share_prices_bps: Vec<ScalarView>,
+    pub amm_reserves: Vec<AmmReserveView>,
+    pub lending_health: Vec<LendingHealthView>,
+    pub oracle_answers: Vec<OracleAnswerView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenBalanceView {
+    pub token: Address,
+    pub owner: Address,
+    pub value: U256,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScalarView {
+    pub contract: Address,
+    pub value: U256,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AmmReserveView {
+    pub pool: Address,
+    pub reserve0: U256,
+    pub reserve1: U256,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LendingHealthView {
+    pub protocol: Address,
+    pub account: Address,
+    pub collateral: U256,
+    pub debt: U256,
+    pub health_factor: U256,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OracleAnswerView {
+    pub oracle: Address,
+    pub answer: U256,
+    pub updated_at: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EconomicDeltaEngine;
 
@@ -275,16 +322,16 @@ impl EconomicDeltaEngine {
                 "storage delta proxy"
             },
         );
-        let confidence = economic_confidence(
+        let confidence = economic_confidence(EconomicConfidenceSignals {
             suspicious_value_extraction,
             accounting_anomaly,
             flashloan_pressure,
             price_impact_pressure,
             debt_or_collateral_pressure,
             share_price_pressure,
-            positive_native_profit > 0,
+            direct_profit: positive_native_profit > 0,
             large_delta_count,
-        );
+        });
         let mut caveats = vec![
             "storage-derived share/debt/reserve classifications are heuristic unless balance/ABI reads confirm them".to_string(),
         ];
@@ -316,6 +363,13 @@ impl EconomicDeltaEngine {
             caveats,
             ..EconomicDeltaReport::default()
         }
+    }
+
+    pub fn from_view_snapshots(
+        before: &EconomicViewSnapshot,
+        after: &EconomicViewSnapshot,
+    ) -> EconomicDeltaReport {
+        economic_view_delta(before, after)
     }
 
     pub fn score(report: &EconomicDeltaReport) -> u64 {
@@ -375,6 +429,174 @@ fn summarize_storage_deltas(diffs: &[StorageDiff]) -> Vec<StorageDeltaSummary> {
         .collect()
 }
 
+pub fn economic_view_delta(
+    before: &EconomicViewSnapshot,
+    after: &EconomicViewSnapshot,
+) -> EconomicDeltaReport {
+    let attacker = before.actor.or(after.actor);
+    let mut report = EconomicDeltaReport {
+        attacker,
+        caveats: vec!["economic proof derived from concrete view-call snapshots".to_string()],
+        ..EconomicDeltaReport::default()
+    };
+
+    for before_balance in &before.token_balances {
+        let Some(after_balance) = after.token_balances.iter().find(|candidate| {
+            candidate.token == before_balance.token && candidate.owner == before_balance.owner
+        }) else {
+            continue;
+        };
+        let delta = signed_delta(before_balance.value, after_balance.value);
+        if Some(before_balance.owner) == attacker && delta > 0 {
+            report.estimated_profit = report
+                .estimated_profit
+                .saturating_add(U256::from(delta as u128));
+            report.suspicious_value_extraction = true;
+        }
+        report.token_deltas.push(TokenBalanceDelta {
+            token: before_balance.token,
+            owner: before_balance.owner,
+            delta,
+        });
+        report.semantic_deltas.push(SemanticValueDelta {
+            tx_index: after.tx_index,
+            address: before_balance.token,
+            slot: synthetic_balance_slot(before_balance.owner),
+            before: before_balance.value,
+            after: after_balance.value,
+            delta,
+            kind: EconomicStateKind::TokenBalance,
+            confidence: 95,
+            reason: "concrete balanceOf view delta".to_string(),
+        });
+    }
+
+    for before_price in &before.vault_share_prices_bps {
+        let Some(after_price) = after
+            .vault_share_prices_bps
+            .iter()
+            .find(|candidate| candidate.contract == before_price.contract)
+        else {
+            continue;
+        };
+        let delta = signed_delta(before_price.value, after_price.value);
+        if delta.unsigned_abs() >= 500 {
+            report.share_price_pressure = true;
+            report.accounting_anomaly = true;
+        }
+        report.semantic_deltas.push(SemanticValueDelta {
+            tx_index: after.tx_index,
+            address: before_price.contract,
+            slot: synthetic_balance_slot(before_price.contract),
+            before: before_price.value,
+            after: after_price.value,
+            delta,
+            kind: EconomicStateKind::ShareBalance,
+            confidence: 90,
+            reason: "concrete vault share-price view delta".to_string(),
+        });
+    }
+
+    for before_reserve in &before.amm_reserves {
+        let Some(after_reserve) = after
+            .amm_reserves
+            .iter()
+            .find(|candidate| candidate.pool == before_reserve.pool)
+        else {
+            continue;
+        };
+        let product_before = before_reserve
+            .reserve0
+            .saturating_mul(before_reserve.reserve1);
+        let product_after = after_reserve
+            .reserve0
+            .saturating_mul(after_reserve.reserve1);
+        let product_change_bps = view_bps_change(product_before, product_after);
+        let price_change_bps = ratio_bps(before_reserve.reserve1, before_reserve.reserve0)
+            .zip(ratio_bps(after_reserve.reserve1, after_reserve.reserve0))
+            .map(|(before, after)| view_bps_change(before, after))
+            .unwrap_or_default();
+        if product_change_bps.unsigned_abs() >= 100 || price_change_bps.unsigned_abs() >= 500 {
+            report.price_impact_pressure = true;
+            report.accounting_anomaly = true;
+        }
+        report.reserve_deltas.push(ReserveDelta {
+            pool: before_reserve.pool,
+            tx_index: after.tx_index,
+            slot_a: synthetic_balance_slot(before_reserve.pool),
+            slot_b: synthetic_balance_slot(after_reserve.pool),
+            reserve_a_before: before_reserve.reserve0,
+            reserve_a_after: after_reserve.reserve0,
+            reserve_b_before: before_reserve.reserve1,
+            reserve_b_after: after_reserve.reserve1,
+            product_before,
+            product_after,
+            product_change_bps,
+            price_change_bps: Some(price_change_bps),
+            confidence: 95,
+        });
+    }
+
+    for before_health in &before.lending_health {
+        let Some(after_health) = after.lending_health.iter().find(|candidate| {
+            candidate.protocol == before_health.protocol
+                && candidate.account == before_health.account
+        }) else {
+            continue;
+        };
+        if after_health.debt > before_health.debt
+            && after_health.health_factor < before_health.health_factor
+        {
+            report.debt_or_collateral_pressure = true;
+            report.accounting_anomaly = true;
+        }
+        if after_health.debt > after_health.collateral && after_health.debt > before_health.debt {
+            report.suspicious_value_extraction = true;
+        }
+    }
+
+    for before_answer in &before.oracle_answers {
+        let Some(after_answer) = after
+            .oracle_answers
+            .iter()
+            .find(|candidate| candidate.oracle == before_answer.oracle)
+        else {
+            continue;
+        };
+        if view_bps_change(before_answer.answer, after_answer.answer).unsigned_abs() >= 500 {
+            report.price_impact_pressure = true;
+        }
+        if before_answer.updated_at == after_answer.updated_at
+            && before_answer.answer != after_answer.answer
+        {
+            report.accounting_anomaly = true;
+        }
+    }
+
+    report.normalized_profit = normalize_profit(
+        report.estimated_profit,
+        before
+            .token_balances
+            .iter()
+            .map(|balance| balance.value)
+            .max()
+            .unwrap_or(U256::ZERO),
+        95,
+        "concrete view-call snapshots",
+    );
+    report.confidence =
+        if report.suspicious_value_extraction && report.estimated_profit > U256::ZERO {
+            95
+        } else if report.accounting_anomaly {
+            85
+        } else if report.estimated_profit > U256::ZERO {
+            80
+        } else {
+            35
+        };
+    report
+}
+
 fn absolute_delta(diff: &StorageDiff) -> U256 {
     if diff.new_value >= diff.old_value {
         diff.new_value - diff.old_value
@@ -394,6 +616,15 @@ fn signed_delta(before: U256, after: U256) -> i128 {
 fn u256_to_i128(value: U256) -> i128 {
     let capped = value.min(U256::from(i128::MAX as u128));
     capped.to::<u128>() as i128
+}
+
+fn view_bps_change(before: U256, after: U256) -> i128 {
+    if before.is_zero() {
+        return if after.is_zero() { 0 } else { i128::MAX };
+    }
+    let before_i = u256_to_i128(before).max(1);
+    let after_i = u256_to_i128(after);
+    ((after_i - before_i) * 10_000) / before_i
 }
 
 fn synthetic_balance_slot(owner: Address) -> B256 {
@@ -738,7 +969,7 @@ fn normalize_profit(
     })
 }
 
-fn economic_confidence(
+struct EconomicConfidenceSignals {
     suspicious_value_extraction: bool,
     accounting_anomaly: bool,
     flashloan_pressure: bool,
@@ -747,27 +978,29 @@ fn economic_confidence(
     share_price_pressure: bool,
     direct_profit: bool,
     large_delta_count: usize,
-) -> u64 {
+}
+
+fn economic_confidence(signals: EconomicConfidenceSignals) -> u64 {
     let mut confidence: u64 = 10;
-    if large_delta_count > 0 {
+    if signals.large_delta_count > 0 {
         confidence = confidence.max(35);
     }
-    if accounting_anomaly {
+    if signals.accounting_anomaly {
         confidence = confidence.max(55);
     }
-    if suspicious_value_extraction {
+    if signals.suspicious_value_extraction {
         confidence = confidence.max(70);
     }
-    if direct_profit {
+    if signals.direct_profit {
         confidence = confidence.max(82);
     }
-    if flashloan_pressure {
+    if signals.flashloan_pressure {
         confidence = confidence.max(75);
     }
-    if price_impact_pressure {
+    if signals.price_impact_pressure {
         confidence = confidence.max(72);
     }
-    if debt_or_collateral_pressure || share_price_pressure {
+    if signals.debt_or_collateral_pressure || signals.share_price_pressure {
         confidence = confidence.max(68);
     }
     confidence.min(95)
@@ -1172,5 +1405,47 @@ mod tests {
             .semantic_deltas
             .iter()
             .any(|delta| matches!(delta.kind, EconomicStateKind::Debt)));
+    }
+
+    #[test]
+    fn concrete_view_delta_proves_profit_and_share_price_pressure() {
+        let attacker = addr(0xaa);
+        let token = addr(0x10);
+        let vault = addr(0x20);
+        let before = EconomicViewSnapshot {
+            tx_index: 0,
+            actor: Some(attacker),
+            token_balances: vec![TokenBalanceView {
+                token,
+                owner: attacker,
+                value: U256::from(100u64),
+            }],
+            vault_share_prices_bps: vec![ScalarView {
+                contract: vault,
+                value: U256::from(10_000u64),
+            }],
+            ..EconomicViewSnapshot::default()
+        };
+        let after = EconomicViewSnapshot {
+            tx_index: 1,
+            actor: Some(attacker),
+            token_balances: vec![TokenBalanceView {
+                token,
+                owner: attacker,
+                value: U256::from(150u64),
+            }],
+            vault_share_prices_bps: vec![ScalarView {
+                contract: vault,
+                value: U256::from(10_700u64),
+            }],
+            ..EconomicViewSnapshot::default()
+        };
+
+        let report = economic_view_delta(&before, &after);
+        assert_eq!(report.estimated_profit, U256::from(50u64));
+        assert!(report.suspicious_value_extraction);
+        assert!(report.share_price_pressure);
+        assert!(report.accounting_anomaly);
+        assert!(report.confidence >= 90);
     }
 }

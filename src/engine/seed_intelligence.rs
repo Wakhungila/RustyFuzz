@@ -557,11 +557,8 @@ fn default_uint(idx: usize) -> U256 {
 }
 
 fn default_value_for_selector(selector: [u8; 4], types: &[DynSolType]) -> U256 {
-    if selector == function_selector("deposit()") || types.is_empty() {
-        U256::ZERO
-    } else {
-        U256::ZERO
-    }
+    let _ = (selector, types);
+    U256::ZERO
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -735,7 +732,7 @@ impl SeedIntelligence {
             .cloned()
             .map(|candidate| candidate.into_evm_input(base_snapshot_id))
             .collect::<Vec<_>>();
-        let max_window = max_sequence_len.max(2).min(4).min(candidates.len());
+        let max_window = max_sequence_len.clamp(2, 4).min(candidates.len());
         for window_len in 2..=max_window {
             for window in candidates.windows(window_len) {
                 let mut txs = Vec::new();

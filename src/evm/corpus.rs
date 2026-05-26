@@ -1,6 +1,7 @@
 use crate::common::oracle::ProtocolFinding;
 use crate::common::oracle::ProtocolSeverity;
 use crate::common::types::{ChainState, SequenceExecutionResult, Snapshot, Waypoint};
+use crate::engine::confirmation::{FindingConfirmation, FindingConfirmationGate};
 use crate::engine::exploit_path::ExploitPathCandidate;
 use crate::engine::proof::{ProofCarryingFinding, ProofConfidenceTier};
 use crate::engine::scoring::CampaignScore;
@@ -96,6 +97,10 @@ pub struct CampaignArtifactTriageSummary {
     pub confidence: u64,
     #[serde(default)]
     pub proof_tier: Option<ProofConfidenceTier>,
+    #[serde(default)]
+    pub confirmation: Option<FindingConfirmation>,
+    #[serde(default)]
+    pub high_value_artifact: bool,
     #[serde(default)]
     pub replayable: bool,
     pub false_positive_risks: Vec<String>,
@@ -327,6 +332,11 @@ impl PersistentCorpus {
         let proof = request.exploit_candidate.map(|candidate| {
             ProofCarryingFinding::from_candidate(candidate, request.execution, request.findings)
         });
+        let confirmation = FindingConfirmationGate::default().evaluate(
+            proof.as_ref(),
+            request.findings,
+            request.score,
+        );
 
         let record = CampaignArtifactRecord {
             input_id: metadata.id.clone(),
@@ -339,17 +349,16 @@ impl PersistentCorpus {
             findings: request.findings.to_vec(),
             proof: proof.clone(),
             metadata,
-            triage: triage_summary(
-                &artifact_key,
-                request.reason,
-                request.score,
-                request.findings,
-                request.target,
-                proof.as_ref().map(|proof| proof.confidence_tier.clone()),
-                proof
-                    .as_ref()
-                    .is_some_and(ProofCarryingFinding::confidence_is_confirmed),
-            ),
+            triage: triage_summary(TriageSummaryInput {
+                artifact_key: &artifact_key,
+                reason: request.reason,
+                score: request.score,
+                findings: request.findings,
+                target: request.target,
+                proof_tier: Some(confirmation.tier.clone()),
+                replayable: confirmation.replay_success,
+                confirmation: Some(confirmation),
+            }),
         };
         let record_bytes = serde_json::to_vec_pretty(&record)?;
         let tmp_index_path = index_path.with_extension("json.tmp");
@@ -664,34 +673,40 @@ fn artifact_equivalence_components(
     })
 }
 
-fn triage_summary(
-    artifact_key: &str,
-    reason: &str,
-    score: &CampaignScore,
-    findings: &[ProtocolFinding],
+struct TriageSummaryInput<'a> {
+    artifact_key: &'a str,
+    reason: &'a str,
+    score: &'a CampaignScore,
+    findings: &'a [ProtocolFinding],
     target: Option<Address>,
     proof_tier: Option<ProofConfidenceTier>,
     replayable: bool,
-) -> CampaignArtifactTriageSummary {
-    let finding_kinds: Vec<_> = findings
+    confirmation: Option<FindingConfirmation>,
+}
+
+fn triage_summary(input: TriageSummaryInput<'_>) -> CampaignArtifactTriageSummary {
+    let finding_kinds: Vec<_> = input
+        .findings
         .iter()
         .map(|finding| format!("{:?}:{:?}", finding.pack, finding.vuln))
         .collect();
-    let max_severity = findings
+    let max_severity = input
+        .findings
         .iter()
         .map(|finding| severity_confidence(&finding.severity))
         .max()
         .unwrap_or(0);
     let confidence = max_severity
-        .saturating_add((score.total / 100).min(25))
+        .saturating_add((input.score.total / 100).min(25))
         .min(100);
-    let false_positive_risks = if findings.is_empty() {
+    let false_positive_risks = if input.findings.is_empty() {
         vec![
             "score-only artifact; replay before treating as vulnerability evidence".to_string(),
             "state novelty or economic pressure may be benign protocol behavior".to_string(),
         ]
     } else {
-        findings
+        input
+            .findings
             .iter()
             .flat_map(|finding| {
                 [
@@ -705,7 +720,7 @@ fn triage_summary(
             })
             .collect()
     };
-    let suggested_next_command = match target {
+    let suggested_next_command = match input.target {
         Some(address) => {
             format!("cargo run --release -- fuzz --chain evm --contract {address}")
         }
@@ -713,13 +728,18 @@ fn triage_summary(
     };
 
     CampaignArtifactTriageSummary {
-        persisted_reason: reason.to_string(),
+        persisted_reason: input.reason.to_string(),
         confidence,
-        proof_tier,
-        replayable,
+        proof_tier: input.proof_tier,
+        high_value_artifact: input
+            .confirmation
+            .as_ref()
+            .is_some_and(|confirmation| confirmation.high_value_artifact),
+        confirmation: input.confirmation,
+        replayable: input.replayable,
         false_positive_risks,
         suggested_next_command,
-        dedup_key: artifact_key.to_string(),
+        dedup_key: input.artifact_key.to_string(),
         finding_kinds,
     }
 }
@@ -736,16 +756,23 @@ fn severity_confidence(severity: &ProtocolSeverity) -> u64 {
 
 fn triage_markdown(record: &CampaignArtifactRecord) -> String {
     format!(
-        "# RustyFuzz Campaign Artifact\n\n- input_id: `{}`\n- reason: `{}`\n- confidence: `{}`\n- proof_tier: `{:?}`\n- replayable: `{}`\n- score: `{}`\n- target: `{:?}`\n- dedup_key: `{}`\n- findings: `{}`\n\n## False-positive risks\n{}\n\n## Next command\n`{}`\n",
+        "# RustyFuzz Campaign Artifact\n\n- input_id: `{}`\n- reason: `{}`\n- confidence: `{}`\n- proof_tier: `{:?}`\n- high_value_artifact: `{}`\n- replayable: `{}`\n- score: `{}`\n- target: `{:?}`\n- dedup_key: `{}`\n- findings: `{}`\n- confirmation_blockers: `{}`\n\n## False-positive risks\n{}\n\n## Next command\n`{}`\n",
         record.input_id,
         record.reason,
         record.triage.confidence,
         record.triage.proof_tier,
+        record.triage.high_value_artifact,
         record.triage.replayable,
         record.score.total,
         record.target,
         record.artifact_key,
         record.triage.finding_kinds.join(", "),
+        record
+            .triage
+            .confirmation
+            .as_ref()
+            .map(|confirmation| confirmation.reasons.join(", "))
+            .unwrap_or_else(|| "not evaluated".to_string()),
         record
             .triage
             .false_positive_risks

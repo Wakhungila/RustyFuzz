@@ -2,6 +2,7 @@ use crate::common::oracle::{VulnType, VulnerabilityOracle};
 use crate::common::types::{ChainState, OracleObservation, SequenceExecutionResult, Snapshot};
 use crate::evm::corpus::PersistentCorpus;
 use crate::evm::dataflow::DataflowRegistry;
+use crate::evm::economic_views::{snapshot_economic_views, EconomicViewProbePlan};
 use crate::evm::executor::EvmExecutor;
 use crate::evm::feedback::EvmCoverageFeedback;
 use crate::evm::fork_db::EvmCacheDb;
@@ -11,6 +12,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use revm::context::BlockEnv;
 use revm::database::CacheDB;
+use revm::primitives::Address;
 use serde::{Deserialize, Serialize};
 
 pub struct ReplayVerifier {
@@ -27,6 +29,14 @@ pub struct DifferentialReplayReport {
     pub cached_tx_count: usize,
     pub live_tx_count: usize,
     pub mismatches: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplayEconomicResult {
+    pub execution: SequenceExecutionResult,
+    pub before: crate::engine::economic_delta::EconomicViewSnapshot,
+    pub after: crate::engine::economic_delta::EconomicViewSnapshot,
+    pub delta: crate::engine::economic_delta::EconomicDeltaReport,
 }
 
 impl ReplayVerifier {
@@ -84,6 +94,44 @@ impl ReplayVerifier {
                 .collect(),
             oracle_observations: Vec::new(),
             tx_results,
+        })
+    }
+
+    pub fn replay_with_economic_views(
+        &self,
+        base_state: &ChainState,
+        block_env: &BlockEnv,
+        input: &EvmInput,
+        target: Option<Address>,
+    ) -> Result<ReplayEconomicResult> {
+        let plan = EconomicViewProbePlan::from_sequence(input, target);
+        let before = snapshot_economic_views(base_state, block_env, &plan, 0);
+        let execution = self.replay(base_state, block_env, input)?;
+
+        let mut state = base_state.clone();
+        let mut env = block_env.clone();
+        let mut coverage = vec![0u8; self.map_size];
+        let mut dataflow = DataflowRegistry::new();
+        for (tx_idx, tx) in input.txs.iter().enumerate() {
+            let mut waypoints = Vec::new();
+            self.executor.execute_with_result(
+                &mut state,
+                &mut env,
+                tx,
+                &mut coverage,
+                &mut dataflow,
+                &mut waypoints,
+                tx_idx,
+            )?;
+        }
+
+        let after = snapshot_economic_views(&state, &env, &plan, input.txs.len());
+        let delta = crate::engine::economic_delta::economic_view_delta(&before, &after);
+        Ok(ReplayEconomicResult {
+            execution,
+            before,
+            after,
+            delta,
         })
     }
 

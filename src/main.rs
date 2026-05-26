@@ -169,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
                     .transpose()?,
                 mainnet_seed_bundle: config.mainnet_seed_bundle.clone(),
                 hardened_defi: hardened_defi_config,
+                target_invariant_manifest: config.target_invariant_manifest.clone(),
             };
             rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await?;
         }
@@ -323,21 +324,19 @@ async fn main() -> anyhow::Result<()> {
                 println!("Differential replay report: {report:?}");
                 anyhow::ensure!(report.equivalent, "cached-vs-live replay mismatch");
                 execution
+            } else if std::path::Path::new(&input).exists() {
+                anyhow::ensure!(
+                    fork_cache_id != input,
+                    "replaying a raw JSON input path requires --fork-cache-id"
+                );
+                let input = load_json_replay_input(&input)?;
+                verifier.verify_deterministic(
+                    &replay_base_state(&corpus, &fork_cache_id)?,
+                    &block_env,
+                    &input,
+                )?
             } else {
-                if std::path::Path::new(&input).exists() {
-                    anyhow::ensure!(
-                        fork_cache_id != input,
-                        "replaying a raw JSON input path requires --fork-cache-id"
-                    );
-                    let input = load_json_replay_input(&input)?;
-                    verifier.verify_deterministic(
-                        &replay_base_state(&corpus, &fork_cache_id)?,
-                        &block_env,
-                        &input,
-                    )?
-                } else {
-                    verifier.verify_persisted_input(&corpus, &input, &fork_cache_id, &block_env)?
-                }
+                verifier.verify_persisted_input(&corpus, &input, &fork_cache_id, &block_env)?
             };
             println!(
                 "Replay ok: txs={}, gas={}, coverage_hash={}",

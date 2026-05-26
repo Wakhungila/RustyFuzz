@@ -16,6 +16,8 @@ pub struct Config {
     pub mainnet_seed_bundle: Option<String>,
     #[serde(default)]
     pub hardened_defi: HardenedDefiConfig,
+    #[serde(default)]
+    pub target_invariant_manifest: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,6 +50,8 @@ pub struct HardenedDefiConfig {
     pub enable_exploit_templates: bool,
     #[serde(default = "default_min_persist_confidence")]
     pub min_persist_confidence: f64,
+    #[serde(default)]
+    pub require_confirmation_for_poc: bool,
 }
 
 impl Default for HardenedDefiConfig {
@@ -67,6 +71,7 @@ impl Default for HardenedDefiConfig {
             enable_protocol_invariants: true,
             enable_exploit_templates: true,
             min_persist_confidence: default_min_persist_confidence(),
+            require_confirmation_for_poc: true,
         }
     }
 }

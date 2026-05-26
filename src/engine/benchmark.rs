@@ -10,12 +10,14 @@ use crate::engine::actors::{ActorModel, ActorModelConfig};
 use crate::engine::bounded_search::{
     BoundedSearchBounds, BoundedSearchEngine, BoundedSearchRequest,
 };
+use crate::engine::confirmation::{FindingConfirmationConfig, FindingConfirmationGate};
 use crate::engine::exploit_coverage::{build_coverage_report, ExploitClass, ExploitCoverageReport};
 use crate::engine::exploit_path::{
     CounterexampleProofStatus, ExploitPathBuilder, ExploitPathCandidate, MinimizedSequenceStatus,
     ReplayabilityStatus,
 };
 use crate::engine::exploit_synthesizer::synthesize_foundry_poc_with_findings;
+use crate::engine::flashloan::validate_flashloan_profit;
 use crate::engine::proof::{ProofCarryingFinding, ProofConfidenceTier};
 use crate::engine::protocol_model::CounterexampleSearchEngine;
 use crate::engine::scoring::CampaignScore;
@@ -65,18 +67,13 @@ pub enum BenchmarkMode {
     ArtifactReplay,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PocGenerationExpectation {
     NotRequired,
+    #[default]
     Expected,
     Required,
-}
-
-impl Default for PocGenerationExpectation {
-    fn default() -> Self {
-        Self::Expected
-    }
 }
 
 fn load_synthetic_fixture(path: &str) -> Result<SyntheticBenchmarkFixture> {
@@ -130,7 +127,7 @@ fn synthetic_input(manifest: &BenchmarkManifest, fixture: &SyntheticBenchmarkFix
             VulnerabilityClass::BridgeReplayFinalizationBug => "finalize(bytes32)".to_string(),
             VulnerabilityClass::Reentrancy => "deposit(uint256)".to_string(),
         });
-    let selector = selector_from_hint(&selector_hint).unwrap_or_else(|| [0u8; 4]);
+    let selector = selector_from_hint(&selector_hint).unwrap_or([0u8; 4]);
     let mut calldata = selector.to_vec();
     calldata.resize(36, 0);
     let caller = match fixture.outcome {
@@ -169,7 +166,7 @@ fn synthetic_execution(
         .and_then(|value| Address::from_str(value).ok())
         .unwrap_or_else(|| Address::repeat_byte(0xbb));
 
-    let (selector_hint, writes, reads, output, call_success, evidence_hint) =
+    let (selector_hint, writes, reads, output, call_success, _evidence_hint) =
         match manifest.vulnerability_class {
             VulnerabilityClass::Erc4626ShareInflation => {
                 let selector = manifest
@@ -290,7 +287,7 @@ fn synthetic_execution(
             }
         };
 
-    let selector = selector_from_hint(&selector_hint).unwrap_or_else(|| [0u8; 4]);
+    let selector = selector_from_hint(&selector_hint).unwrap_or([0u8; 4]);
     let mut calldata = selector.to_vec();
     calldata.resize(36, 0);
     let caller = if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found) {
@@ -305,14 +302,7 @@ fn synthetic_execution(
     let mut storage_reads = Vec::new();
     for idx in 0..writes {
         let slot = B256::from([idx as u8; 32]);
-        let old_value = if idx == 0
-            && evidence_hint == "amm"
-            && matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found)
-        {
-            U256::ZERO
-        } else {
-            U256::ZERO
-        };
+        let old_value = U256::ZERO;
         let new_value = if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found) {
             match manifest.vulnerability_class {
                 VulnerabilityClass::AmmInvariantViolation if idx == 0 => U256::from(1u64),
@@ -674,9 +664,12 @@ struct LiveBenchmarkFixture {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum LiveForkCacheProfile {
-    VulnerableBenchmarkRuntime,
-    OracleChangingReturnRuntime,
-    NoopRuntime,
+    #[serde(alias = "vulnerable_benchmark_runtime")]
+    VulnerableBenchmark,
+    #[serde(alias = "oracle_changing_return_runtime")]
+    OracleChangingReturn,
+    #[serde(alias = "noop_runtime")]
+    Noop,
 }
 
 impl Default for SyntheticBenchmarkFixture {
@@ -1002,7 +995,7 @@ impl ValidationRunner {
         let expected = manifest.normalized_success_criteria();
         let matched = expected
             .iter()
-            .filter(|criterion| criterion_matches(manifest, criterion, &observation))
+            .filter(|criterion| criterion_matches(manifest, criterion, observation))
             .cloned()
             .collect::<Vec<_>>();
         let missing = expected
@@ -1265,7 +1258,7 @@ impl ValidationRunner {
             exploit_candidate,
             proof: None,
             proof_status: None,
-            score: Some(score),
+            score: Some(score.clone()),
             executions: fixture
                 .executions_to_signal
                 .or(Some(execution.tx_results.len() as u64)),
@@ -1407,23 +1400,31 @@ impl ValidationRunner {
                 .map(|profile| explicit_profile_fork_cache(manifest, profile).cache_snapshot())
         });
         let replay_snapshot = explicit_fork_cache.clone();
+        let mut replay_economic_delta = None;
         let (execution, replay_backend) = if live_fixture.provider_replay_only {
             let execution = provider_side_eth_call_replay(rpc_url, fork_block, &input)?;
             (execution, "rpc-provider-eth-call".to_string())
         } else if let Some(snapshot) = explicit_fork_cache {
-            let execution = replay_verifier.replay(
+            let replay = replay_verifier.replay_with_economic_views(
                 &ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(snapshot))),
                 &block_env,
                 &input,
+                manifest.target_address(),
             )?;
+            replay_economic_delta = Some(replay.delta);
+            let execution = replay.execution;
             (execution, "cached-fork-fixture".to_string())
         } else {
-            match replay_verifier.replay(
+            match replay_verifier.replay_with_economic_views(
                 &ChainState::Evm(CacheDB::new(ForkDb::new(rpc_url.to_string(), fork_block))),
                 &block_env,
                 &input,
+                manifest.target_address(),
             ) {
-                Ok(execution) => (execution, "rpc-live-fork".to_string()),
+                Ok(replay) => {
+                    replay_economic_delta = Some(replay.delta);
+                    (replay.execution, "rpc-live-fork".to_string())
+                }
                 Err(local_error) => {
                     let execution = provider_side_eth_call_replay(rpc_url, fork_block, &input)
                         .map_err(|remote_error| {
@@ -1453,12 +1454,26 @@ impl ValidationRunner {
             ));
         }
         let state_novelty = synthetic_state_novelty(&execution);
-        let score = crate::engine::scoring::CampaignScorer::default().score(
+        let mut score = crate::engine::scoring::CampaignScorer::default().score(
             &input,
             &execution,
             &state_novelty,
             &findings,
         );
+        if let Some(delta) = replay_economic_delta.as_ref() {
+            let delta_score = crate::engine::economic_delta::EconomicDeltaEngine::score(delta);
+            score.economic_pressure = score.economic_pressure.saturating_add(delta_score);
+            score.total = score.total.saturating_add(delta_score).min(10_000);
+            score.explanation.push(format!(
+                "replay_economic_views: score={}, confidence={}, profit={}, suspicious={}, accounting={}, flashloan={}",
+                delta_score,
+                delta.confidence,
+                delta.estimated_profit,
+                delta.suspicious_value_extraction,
+                delta.accounting_anomaly,
+                validate_flashloan_profit(delta).confirmed
+            ));
+        }
         let search_result = CounterexampleSearchEngine { max_candidates: 4 }
             .search(&input, &execution, &findings, None, None);
         let mut exploit_candidate = ExploitPathBuilder::from_execution(
@@ -1488,7 +1503,7 @@ impl ValidationRunner {
                 .as_ref()
                 .map(|candidate| candidate.proof_status.clone())
                 .or(Some(CounterexampleProofStatus::ConcretelyReplayed)),
-            score: Some(score),
+            score: Some(score.clone()),
             executions: Some(execution.tx_results.len() as u64),
             elapsed_secs: Some(elapsed_secs),
             artifact_path: None,
@@ -1513,16 +1528,25 @@ impl ValidationRunner {
 
         let replay_findings = findings.clone();
         observation.proof = observation.exploit_candidate.as_ref().map(|candidate| {
-            let proof =
+            let mut proof =
                 ProofCarryingFinding::from_candidate(candidate, &execution, &replay_findings);
+            if let Some(delta) = replay_economic_delta.clone() {
+                proof = proof.with_economic_delta(delta);
+            }
             let replay_result = proof.verify_against(&execution, &replay_findings);
             proof.with_replay_result(replay_result)
         });
 
-        let proof_confirmed = observation
-            .proof
-            .as_ref()
-            .is_some_and(|proof| proof.confidence_is_confirmed());
+        let proof_confirmed = observation.proof.as_ref().is_some_and(|proof| {
+            FindingConfirmationGate {
+                config: FindingConfirmationConfig {
+                    require_protocol_assertion: false,
+                    ..FindingConfirmationConfig::default()
+                },
+            }
+            .evaluate(Some(proof), &findings, &score)
+            .confirmed
+        });
         if proof_confirmed
             && exploit_candidate.as_ref().is_some_and(|candidate| {
                 candidate.confidence >= manifest.expected_minimum_confidence.unwrap_or(70)
@@ -1642,7 +1666,7 @@ fn execute_blind_rediscovery_benchmark(
             .map(|candidate| candidate.into_evm_input(0))
     });
 
-    let bounded_result = BoundedSearchEngine::default().search(BoundedSearchRequest {
+    let bounded_result = BoundedSearchEngine.search(BoundedSearchRequest {
         target,
         target_profile: &target_profile,
         abi_registry: &abi_registry,
@@ -1652,7 +1676,7 @@ fn execute_blind_rediscovery_benchmark(
         bounds: BoundedSearchBounds {
             max_tx_depth: 4,
             max_actor_roles: 4,
-            max_template_sequences: manifest.success_criteria.len().max(1).min(128),
+            max_template_sequences: manifest.success_criteria.len().clamp(1, 128),
         },
     });
     let selected = select_blind_outcome(manifest, &bounded_result)?;
@@ -1675,23 +1699,31 @@ fn execute_blind_rediscovery_benchmark(
     });
     let replay_verifier = ReplayVerifier::new(65_536);
     let block_env = context.block_env.clone().unwrap_or_default();
-    let (execution, replay_backend) = if let Some(snapshot) = explicit_fork_cache {
+    let (execution, replay_backend, replay_economic_delta) = if let Some(snapshot) =
+        explicit_fork_cache
+    {
+        let replay = replay_verifier.replay_with_economic_views(
+            &ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(snapshot))),
+            &block_env,
+            &candidate_input,
+            manifest.target_address(),
+        )?;
         (
-            replay_verifier.replay(
-                &ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(snapshot))),
-                &block_env,
-                &candidate_input,
-            )?,
+            replay.execution,
             "cached-fork-fixture".to_string(),
+            Some(replay.delta),
         )
     } else if let (Some(rpc_url), Some(fork_block)) = (rpc_url, fork_block) {
+        let replay = replay_verifier.replay_with_economic_views(
+            &ChainState::Evm(CacheDB::new(ForkDb::new(rpc_url.to_string(), fork_block))),
+            &block_env,
+            &candidate_input,
+            manifest.target_address(),
+        )?;
         (
-            replay_verifier.replay(
-                &ChainState::Evm(CacheDB::new(ForkDb::new(rpc_url.to_string(), fork_block))),
-                &block_env,
-                &candidate_input,
-            )?,
+            replay.execution,
             "rpc-live-fork".to_string(),
+            Some(replay.delta),
         )
     } else {
         return Err(anyhow::anyhow!(
@@ -1708,12 +1740,21 @@ fn execute_blind_rediscovery_benchmark(
         }
     }
     let state_novelty = synthetic_state_novelty(&execution);
-    let score = crate::engine::scoring::CampaignScorer::default().score(
+    let mut score = crate::engine::scoring::CampaignScorer::default().score(
         &candidate_input,
         &execution,
         &state_novelty,
         &findings,
     );
+    if let Some(delta) = replay_economic_delta.as_ref() {
+        let delta_score = crate::engine::economic_delta::EconomicDeltaEngine::score(delta);
+        score.economic_pressure = score.economic_pressure.saturating_add(delta_score);
+        score.total = score.total.saturating_add(delta_score).min(10_000);
+        score.explanation.push(format!(
+            "replay_economic_views: score={}, confidence={}, profit={}",
+            delta_score, delta.confidence, delta.estimated_profit
+        ));
+    }
 
     let mut observation = ValidationObservation {
         findings,
@@ -1752,7 +1793,7 @@ fn execute_blind_rediscovery_benchmark(
     }
 
     if let Some(proof_candidate) = observation.exploit_candidate.as_ref() {
-        let proof = ProofCarryingFinding::from_candidate(
+        let mut proof = ProofCarryingFinding::from_candidate(
             proof_candidate,
             &execution,
             &observation.findings,
@@ -1765,10 +1806,28 @@ fn execute_blind_rediscovery_benchmark(
         } else {
             crate::engine::proof::ReplayVerificationStatus::Verified
         });
+        if let Some(delta) = replay_economic_delta.clone() {
+            proof = proof.with_economic_delta(delta);
+        }
         observation.proof = Some(proof);
     }
 
-    if !observation.findings.is_empty() {
+    let poc_gate_passed = observation.proof.as_ref().is_some_and(|proof| {
+        FindingConfirmationGate {
+            config: FindingConfirmationConfig {
+                require_protocol_assertion: false,
+                ..FindingConfirmationConfig::default()
+            },
+        }
+        .evaluate(
+            Some(proof),
+            &observation.findings,
+            observation.score.as_ref().unwrap(),
+        )
+        .confirmed
+    });
+
+    if !observation.findings.is_empty() && poc_gate_passed {
         if let Some(strongest) = observation
             .findings
             .iter()
@@ -1922,11 +1981,11 @@ fn explicit_profile_fork_cache(
     let db = ForkDb::empty();
     let target = manifest.target_address().unwrap_or(Address::ZERO);
     let code = match profile {
-        LiveForkCacheProfile::VulnerableBenchmarkRuntime => {
+        LiveForkCacheProfile::VulnerableBenchmark => {
             crate::evm::fork::offline_fallback_runtime_bytecode()
         }
-        LiveForkCacheProfile::OracleChangingReturnRuntime => oracle_changing_return_runtime(),
-        LiveForkCacheProfile::NoopRuntime => vec![0x00],
+        LiveForkCacheProfile::OracleChangingReturn => oracle_changing_return_runtime(),
+        LiveForkCacheProfile::Noop => vec![0x00],
     };
     db.cache_account(
         target,
@@ -2611,6 +2670,7 @@ fn confidence(
     };
     let proof_pressure = proof
         .map(|proof| match proof.confidence_tier {
+            ProofConfidenceTier::Confirmed => 25,
             ProofConfidenceTier::PocGenerated => 20,
             ProofConfidenceTier::ProofCarrying => 18,
             ProofConfidenceTier::ReplayedMinimized => 14,
@@ -2831,7 +2891,7 @@ fn selector_from_hint(hint: &str) -> Option<[u8; 4]> {
     let trimmed = hint.trim();
     if let Some(hex) = trimmed.strip_prefix("0x") {
         let bytes = hex::decode(hex).ok()?;
-        return bytes.get(0..4).map(|bytes| bytes.try_into().ok()).flatten();
+        return bytes.get(0..4).and_then(|bytes| bytes.try_into().ok());
     }
     let signature = if trimmed.contains('(') {
         trimmed.to_string()
@@ -2849,7 +2909,7 @@ fn selector_from_hint(hint: &str) -> Option<[u8; 4]> {
             other => format!("{other}()"),
         }
     };
-    Some(keccak256(signature.as_bytes()).0[0..4].try_into().ok()?)
+    keccak256(signature.as_bytes()).0[0..4].try_into().ok()
 }
 
 fn vulnerability_tags(class: &VulnerabilityClass) -> BTreeSet<SeedTag> {

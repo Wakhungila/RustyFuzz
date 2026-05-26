@@ -11,6 +11,7 @@ use crate::engine::dependency::generate_flow_template_inputs;
 use crate::engine::economic_delta::EconomicDeltaEngine;
 use crate::engine::exploit_path::ExploitPathBuilder;
 use crate::engine::foundry_ingest::FoundryHarnessManifest;
+use crate::engine::invariant_manifest::TargetInvariantManifest;
 use crate::engine::protocol_model::CounterexampleSearchEngine;
 use crate::engine::scheduler::RustyFuzzScheduler;
 use crate::engine::scoring::{CampaignScore, CampaignScorer};
@@ -147,6 +148,7 @@ pub struct Config {
     pub foundry_harness: Option<FoundryHarnessManifest>,
     pub mainnet_seed_bundle: Option<String>,
     pub hardened_defi: HardenedDefiConfig,
+    pub target_invariant_manifest: Option<String>,
 }
 
 pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
@@ -367,7 +369,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
                 let mut state = state.unwrap_or_else(|| {
                     StdState::new(
-                        StdRand::with_seed(campaign_rng_seed(&config, core_id.0 as usize)),
+                        StdRand::with_seed(campaign_rng_seed(&config, core_id.0)),
                         InMemoryCorpus::<EvmInput>::new(),
                         InMemoryCorpus::<EvmInput>::new(),
                         &mut feedback,
@@ -563,12 +565,22 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                         .write()
                         .observe_execution(&execution);
 
-                    let findings = protocol_oracles.evaluate(&execution);
+                    let mut findings = protocol_oracles.evaluate(&execution);
+                    let economic_delta = (config.hardened_defi.enabled
+                        && config.hardened_defi.enable_economic_delta)
+                        .then(|| EconomicDeltaEngine::from_execution(input, &execution));
+                    if let (Some(path), Some(delta)) =
+                        (config.target_invariant_manifest.as_deref(), economic_delta.as_ref())
+                    {
+                        match TargetInvariantManifest::load(path) {
+                            Ok(manifest) => findings.extend(manifest.evaluate(delta)),
+                            Err(err) => log::warn!("Failed to load target invariant manifest: {err:#}"),
+                        }
+                    }
 
                     let mut campaign_score =
                         campaign_scorer.score(input, &execution, &report, &findings);
-                    if config.hardened_defi.enabled && config.hardened_defi.enable_economic_delta {
-                        let economic_delta = EconomicDeltaEngine::from_execution(input, &execution);
+                    if let Some(economic_delta) = economic_delta {
                         let delta_score = EconomicDeltaEngine::score(&economic_delta);
                         if delta_score > 0 {
                             campaign_score.economic_pressure = campaign_score
@@ -1130,11 +1142,22 @@ async fn run_single_process_campaign(
 
         let execution = sequence_result_from_tx_results(tx_results);
         let report = state_novelty_feedback.write().observe_execution(&execution);
-        let findings = protocol_oracles.evaluate(&execution);
+        let mut findings = protocol_oracles.evaluate(&execution);
+        let economic_delta = (config.hardened_defi.enabled
+            && config.hardened_defi.enable_economic_delta)
+            .then(|| EconomicDeltaEngine::from_execution(input, &execution));
+        if let (Some(path), Some(delta)) = (
+            config.target_invariant_manifest.as_deref(),
+            economic_delta.as_ref(),
+        ) {
+            match TargetInvariantManifest::load(path) {
+                Ok(manifest) => findings.extend(manifest.evaluate(delta)),
+                Err(err) => log::warn!("Failed to load target invariant manifest: {err:#}"),
+            }
+        }
 
         let mut campaign_score = campaign_scorer.score(input, &execution, &report, &findings);
-        if config.hardened_defi.enabled && config.hardened_defi.enable_economic_delta {
-            let economic_delta = EconomicDeltaEngine::from_execution(input, &execution);
+        if let Some(economic_delta) = economic_delta {
             let delta_score = EconomicDeltaEngine::score(&economic_delta);
             if delta_score > 0 {
                 campaign_score.economic_pressure =

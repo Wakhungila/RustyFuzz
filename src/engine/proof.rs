@@ -18,7 +18,7 @@ pub enum ReplayVerificationStatus {
     Mismatch { reason: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ProofConfidenceTier {
     Heuristic,
@@ -26,6 +26,7 @@ pub enum ProofConfidenceTier {
     ReplayedMinimized,
     ProofCarrying,
     PocGenerated,
+    Confirmed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,6 +129,12 @@ impl ProofCarryingFinding {
         self
     }
 
+    pub fn with_economic_delta(mut self, economic_delta: EconomicDeltaReport) -> Self {
+        self.economic_delta = economic_delta;
+        self.confidence_tier = self.compute_confidence_tier();
+        self
+    }
+
     pub fn verify_against(
         &self,
         execution: &SequenceExecutionResult,
@@ -209,7 +216,12 @@ impl ProofCarryingFinding {
                 | ProofConfidenceTier::ReplayedMinimized
                 | ProofConfidenceTier::ProofCarrying
                 | ProofConfidenceTier::PocGenerated
+                | ProofConfidenceTier::Confirmed
         )
+    }
+
+    pub fn confidence_is_strictly_confirmed(&self) -> bool {
+        matches!(self.confidence_tier, ProofConfidenceTier::Confirmed)
     }
 }
 

@@ -1,5 +1,6 @@
 use crate::common::types::{SingletonTx, Waypoint};
 use crate::engine::concolic::{ConcolicRepairTarget, ConcolicSolver};
+use crate::engine::flashloan::{FlashLoanTemplate, EIP3156_FLASHLOAN_SELECTOR};
 use crate::evm::registry::GlobalAccountRegistry;
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use hashlink::LruCache;
@@ -87,10 +88,11 @@ where
             25..=39 => self.semantic_chaining(rand, input),
             40..=49 => self.caller_mutation(rand, input),
             50..=59 => self.discovery_mutation(rand, input),
-            60..=84 => self.abi_mutation(rand, input),
-            85..=92 => self.wrap_flashloan(rand, input),
-            93..=96 => self.oracle_pressure(rand, input),
-            97..=98 => self.mev_sandwich(rand, input),
+            60..=79 => self.abi_mutation(rand, input),
+            80..=88 => self.economic_objective_mutation(rand, input),
+            89..=94 => self.wrap_flashloan(rand, input),
+            95..=97 => self.oracle_pressure(rand, input),
+            98 => self.mev_sandwich(rand, input),
             _ => self.value_boundary(rand, input),
         };
 
@@ -403,34 +405,62 @@ impl EvmMutator {
             None => return MutationResult::Skipped,
         };
 
-        let token = Address::new([0x17; 20]);
-        let amount = U256::from(10u128.pow(21));
-        let sequence_data = bincode::serde::encode_to_vec(&input.txs, bincode::config::standard())
-            .unwrap_or_else(|_| vec![]);
-
-        let mut call_data = vec![0x5c, 0x19, 0xe9, 0x51];
-        call_data.extend_from_slice(&[0u8; 12]);
-        call_data.extend_from_slice(&[0u8; 20]);
-        call_data.extend_from_slice(&[0u8; 12]);
-        call_data.extend_from_slice(token.as_slice());
-        call_data.extend_from_slice(&amount.to_be_bytes::<32>());
-        call_data.extend_from_slice(&U256::from(128).to_be_bytes::<32>());
-        call_data.extend_from_slice(&U256::from(sequence_data.len()).to_be_bytes::<32>());
-        std::iter::Extend::extend(&mut call_data, sequence_data);
-
-        input.txs = vec![SingletonTx {
-            input: call_data,
-            caller: Address::new([0x18; 20]),
-            to: lender,
-            value: U256::ZERO,
-            is_victim: false,
-        }];
+        let template = FlashLoanTemplate {
+            lender,
+            receiver: Address::new([0x18; 20]),
+            token: Address::new([0x17; 20]),
+            amount: U256::from(10u128.pow(21)),
+        };
+        *input = template.wrap_sequence(input.clone());
         self.record_mutation(
             input,
             "flashloan_wrap",
             Some(0),
-            Some([0x5c, 0x19, 0xe9, 0x51]),
+            Some(EIP3156_FLASHLOAN_SELECTOR),
             "wrapped sequence in EIP-3156-style flashloan call",
+        );
+        MutationResult::Mutated
+    }
+
+    fn economic_objective_mutation<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut EvmInput,
+    ) -> MutationResult {
+        if input.txs.is_empty() {
+            return MutationResult::Skipped;
+        }
+        let idx = rand.below(NonZero::new(input.txs.len()).unwrap());
+        let Some(tx) = input.txs.get_mut(idx) else {
+            return MutationResult::Skipped;
+        };
+        let objective = input
+            .mutation_provenance
+            .iter()
+            .rev()
+            .find(|entry| entry.strategy.starts_with("goal_"))
+            .map(|entry| entry.strategy.as_str())
+            .unwrap_or("goal_MaximizeAttackerProfit");
+        let amount = match objective {
+            name if name.contains("IncreaseSharesPerAsset") => U256::from(10u128.pow(18)),
+            name if name.contains("ReduceCollateralHealth") => U256::from(10u128.pow(22)),
+            name if name.contains("CreateReserveProductAnomaly") => U256::from(10u128.pow(24)),
+            name if name.contains("BypassRoleCheck") => {
+                tx.caller = Address::new([0x44; 20]);
+                U256::ONE
+            }
+            _ => U256::from(10u128.pow(21)),
+        };
+        if tx.input.len() < 36 {
+            tx.input.resize(36, 0);
+        }
+        tx.input[4..36].copy_from_slice(&amount.to_be_bytes::<32>());
+        self.record_mutation(
+            input,
+            "economic_objective",
+            Some(idx),
+            selector_for_calldata(&input.txs[idx].input),
+            format!("optimized calldata amount/caller for {objective}").as_str(),
         );
         MutationResult::Mutated
     }

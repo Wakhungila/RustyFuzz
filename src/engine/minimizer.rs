@@ -1,4 +1,7 @@
-use crate::common::oracle::{ProtocolFinding, ProtocolOraclePack, VulnType, VulnerabilityOracle};
+use crate::common::oracle::{
+    ProtocolFinding, ProtocolOraclePack, ProtocolOraclePackKind, ProtocolSeverity, VulnType,
+    VulnerabilityOracle,
+};
 use crate::common::types::{ChainState, SequenceExecutionResult, SingletonTx, Snapshot};
 use crate::engine::exploit_synthesizer::synthesize_foundry_poc_with_findings;
 use crate::evm::corpus::{CorpusEntryMetadata, CrashRecord, PersistentCorpus};
@@ -93,11 +96,27 @@ impl<'a> Minimizer<'a> {
         let reproduction_report =
             corpus.write_reproduction_report(&minimized, &execution, Some(&crash))?;
         let protocol_findings = ProtocolOraclePack::default().evaluate(&execution);
+        let poc_findings = if protocol_findings.is_empty() {
+            vec![ProtocolFinding {
+                pack: ProtocolOraclePackKind::Erc20,
+                vuln: vuln.clone(),
+                severity: ProtocolSeverity::Medium,
+                tx_index: execution.tx_results.last().map(|result| result.tx_index),
+                target: minimized.txs.last().map(|tx| tx.to),
+                evidence: format!(
+                    "minimized replay preserved crash predicate `{reason}`; txs={}; storage_diffs={}",
+                    minimized.txs.len(),
+                    execution.storage_diffs.len()
+                ),
+            }]
+        } else {
+            protocol_findings.clone()
+        };
         let foundry_poc = PathBuf::from(synthesize_foundry_poc_with_findings(
             &minimized,
             vuln,
             Some(&execution),
-            &protocol_findings,
+            &poc_findings,
             report_dir,
             rpc_url,
             fork_block,

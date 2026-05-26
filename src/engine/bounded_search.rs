@@ -282,7 +282,7 @@ pub fn evaluate_search_objectives(
         .filter_map(|tx| selector_for(&tx.input))
         .collect::<Vec<_>>();
     let mut hits = Vec::new();
-    if objective_supported(
+    let profit_profile = objective_supported(
         profile,
         &[ProtocolType::AmmDexPool, ProtocolType::RouterAggregator],
     ) || profile_has_signatures(
@@ -292,134 +292,126 @@ pub fn evaluate_search_objectives(
             "swap(uint256,uint256,address,bytes)",
             "borrow(uint256)",
         ],
-    ) || template_mentions(profile, &["swap", "flash", "borrow"])
-    {
-        if has_any_selector(
-            &selectors,
+    ) || template_mentions(profile, &["swap", "flash", "borrow"]);
+    let profit_path = has_any_selector(
+        &selectors,
+        &[
+            "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)",
+            "swap(uint256,uint256,address,bytes)",
+        ],
+    ) || template_mentions(profile, &["swap"]);
+    if profit_profile && profit_path {
+        hits.push(SearchObjectiveHit {
+            objective: SearchObjective::MaximizeAttackerProfit,
+            score: 90,
+            confidence: 65,
+            explanation: "swap-like path can be optimized for positive attacker balance delta"
+                .to_string(),
+        });
+    }
+    let lending_profile = objective_supported(profile, &[ProtocolType::LendingBorrowing])
+        || profile_has_signatures(
+            profile,
             &[
-                "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)",
-                "swap(uint256,uint256,address,bytes)",
+                "borrow(uint256)",
+                "borrow(address,uint256,uint256,uint16,address)",
+                "liquidate(address,address,uint256,uint256)",
+                "liquidationCall(address,address,address,uint256,bool)",
+                "repay(uint256)",
+                "repay(address,uint256,uint256,address)",
+                "donateToReserves(uint256,uint256)",
             ],
-        ) || template_mentions(profile, &["swap"])
-        {
-            hits.push(SearchObjectiveHit {
-                objective: SearchObjective::MaximizeAttackerProfit,
-                score: 90,
-                confidence: 65,
-                explanation: "swap-like path can be optimized for positive attacker balance delta"
+        )
+        || template_mentions(profile, &["borrow", "liquidate", "repay"]);
+    let lending_path = has_any_selector(
+        &selectors,
+        &[
+            "borrow(uint256)",
+            "borrow(address,uint256,uint256,uint16,address)",
+            "liquidate(address,address,uint256,uint256)",
+            "liquidationCall(address,address,address,uint256,bool)",
+            "repay(uint256)",
+            "repay(address,uint256,uint256,address)",
+            "donateToReserves(uint256,uint256)",
+        ],
+    ) || template_mentions(profile, &["borrow", "liquidate"]);
+    if lending_profile && lending_path {
+        hits.push(SearchObjectiveHit {
+            objective: SearchObjective::ReduceCollateralHealth,
+            score: 105,
+            confidence: 75,
+            explanation: "lending path should search amounts that worsen collateral/debt health"
+                .to_string(),
+        });
+    }
+    let vault_profile = objective_supported(profile, &[ProtocolType::Erc4626Vault])
+        || profile_has_signatures(
+            profile,
+            &[
+                "deposit(uint256,address)",
+                "mint(uint256,address)",
+                "withdraw(uint256,address,address)",
+                "redeem(uint256,address,address)",
+            ],
+        )
+        || template_mentions(profile, &["deposit", "mint", "redeem", "withdraw"]);
+    let vault_path = has_any_selector(
+        &selectors,
+        &[
+            "deposit(uint256,address)",
+            "mint(uint256,address)",
+            "withdraw(uint256,address,address)",
+            "redeem(uint256,address,address)",
+        ],
+    ) || template_mentions(profile, &["deposit", "redeem", "withdraw"]);
+    if vault_profile && vault_path {
+        hits.push(SearchObjectiveHit {
+            objective: SearchObjective::IncreaseSharesPerAsset,
+            score: 95,
+            confidence: 70,
+            explanation:
+                "vault path should search donation/deposit/redeem amounts that skew shares per asset"
                     .to_string(),
-            });
-        }
+        });
     }
-    if objective_supported(profile, &[ProtocolType::LendingBorrowing])
-        || profile_has_signatures(
+    let role_profile =
+        objective_supported(
             profile,
             &[
-                "borrow(uint256)",
-                "borrow(address,uint256,uint256,uint16,address)",
-                "liquidate(address,address,uint256,uint256)",
-                "liquidationCall(address,address,address,uint256,bool)",
-                "repay(uint256)",
-                "repay(address,uint256,uint256,address)",
-                "donateToReserves(uint256,uint256)",
+                ProtocolType::GovernanceTimelock,
+                ProtocolType::AccessControlHeavy,
+                ProtocolType::ProxyUpgradeable,
             ],
-        )
-        || template_mentions(profile, &["borrow", "liquidate", "repay"])
-    {
-        if has_any_selector(
-            &selectors,
-            &[
-                "borrow(uint256)",
-                "borrow(address,uint256,uint256,uint16,address)",
-                "liquidate(address,address,uint256,uint256)",
-                "liquidationCall(address,address,address,uint256,bool)",
-                "repay(uint256)",
-                "repay(address,uint256,uint256,address)",
-                "donateToReserves(uint256,uint256)",
-            ],
-        ) || template_mentions(profile, &["borrow", "liquidate"])
-        {
-            hits.push(SearchObjectiveHit {
-                objective: SearchObjective::ReduceCollateralHealth,
-                score: 105,
-                confidence: 75,
-                explanation:
-                    "lending path should search amounts that worsen collateral/debt health"
-                        .to_string(),
-            });
-        }
-    }
-    if objective_supported(profile, &[ProtocolType::Erc4626Vault])
-        || profile_has_signatures(
+        ) || profile_has_signatures(
             profile,
             &[
-                "deposit(uint256,address)",
-                "mint(uint256,address)",
-                "withdraw(uint256,address,address)",
-                "redeem(uint256,address,address)",
+                "initialize()",
+                "upgradeTo(address)",
+                "execute(uint256)",
+                "queue(uint256)",
             ],
-        )
-        || template_mentions(profile, &["deposit", "mint", "redeem", "withdraw"])
-    {
-        if has_any_selector(
+        ) || template_mentions(profile, &["initialize", "upgrade", "execute", "queue"]);
+    let role_path = template_mentions(profile, &["initialize", "upgrade", "execute", "queue"])
+        || has_any_selector(
             &selectors,
             &[
-                "deposit(uint256,address)",
-                "mint(uint256,address)",
-                "withdraw(uint256,address,address)",
-                "redeem(uint256,address,address)",
+                "initialize()",
+                "upgradeTo(address)",
+                "execute(uint256)",
+                "queue(uint256)",
             ],
-        ) || template_mentions(profile, &["deposit", "redeem", "withdraw"])
-        {
-            hits.push(SearchObjectiveHit {
-                objective: SearchObjective::IncreaseSharesPerAsset,
-                score: 95,
-                confidence: 70,
-                explanation:
-                    "vault path should search donation/deposit/redeem amounts that skew shares per asset"
-                        .to_string(),
-            });
-        }
+        );
+    if role_profile && role_path {
+        hits.push(SearchObjectiveHit {
+            objective: SearchObjective::BypassRoleCheck,
+            score: 110,
+            confidence: 76,
+            explanation:
+                "role-sensitive selector path should enumerate non-owner and role-like callers"
+                    .to_string(),
+        });
     }
-    if objective_supported(
-        profile,
-        &[
-            ProtocolType::GovernanceTimelock,
-            ProtocolType::AccessControlHeavy,
-            ProtocolType::ProxyUpgradeable,
-        ],
-    ) || profile_has_signatures(
-        profile,
-        &[
-            "initialize()",
-            "upgradeTo(address)",
-            "execute(uint256)",
-            "queue(uint256)",
-        ],
-    ) || template_mentions(profile, &["initialize", "upgrade", "execute", "queue"])
-    {
-        if template_mentions(profile, &["initialize", "upgrade", "execute", "queue"])
-            || has_any_selector(
-                &selectors,
-                &[
-                    "initialize()",
-                    "upgradeTo(address)",
-                    "execute(uint256)",
-                    "queue(uint256)",
-                ],
-            )
-        {
-            hits.push(SearchObjectiveHit {
-                objective: SearchObjective::BypassRoleCheck,
-                score: 110,
-                confidence: 76,
-                explanation:
-                    "role-sensitive selector path should enumerate non-owner and role-like callers"
-                        .to_string(),
-            });
-        }
-    }
-    if objective_supported(profile, &[ProtocolType::AmmDexPool])
+    let reserve_profile = objective_supported(profile, &[ProtocolType::AmmDexPool])
         || profile_has_signatures(
             profile,
             &[
@@ -427,25 +419,23 @@ pub fn evaluate_search_objectives(
                 "swap(uint256,uint256,address,bytes)",
             ],
         )
-        || template_mentions(profile, &["swap", "sync", "skim"])
-    {
-        if has_any_selector(
-            &selectors,
-            &[
-                "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)",
-                "swap(uint256,uint256,address,bytes)",
-            ],
-        ) || template_mentions(profile, &["swap"])
-        {
-            hits.push(SearchObjectiveHit {
-                objective: SearchObjective::CreateReserveProductAnomaly,
-                score: 100,
-                confidence: 72,
-                explanation:
-                    "AMM path should maximize reserve/product movement and round-trip imbalance"
-                        .to_string(),
-            });
-        }
+        || template_mentions(profile, &["swap", "sync", "skim"]);
+    let reserve_path = has_any_selector(
+        &selectors,
+        &[
+            "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)",
+            "swap(uint256,uint256,address,bytes)",
+        ],
+    ) || template_mentions(profile, &["swap"]);
+    if reserve_profile && reserve_path {
+        hits.push(SearchObjectiveHit {
+            objective: SearchObjective::CreateReserveProductAnomaly,
+            score: 100,
+            confidence: 72,
+            explanation:
+                "AMM path should maximize reserve/product movement and round-trip imbalance"
+                    .to_string(),
+        });
     }
     hits.sort_by(|left, right| right.score.cmp(&left.score));
     hits
