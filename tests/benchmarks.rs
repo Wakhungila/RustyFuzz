@@ -1213,6 +1213,8 @@ fn mainnet_seed_ingestion_normalizes_and_discovers_accounts() {
             discovered_address_hints: extract_address_hints(&calldata),
             matched_target: Some(target),
             match_kind: Some("direct".to_string()),
+            confidence: None,
+            provenance: None,
         },
     };
     let duplicate = MainnetSeed {
@@ -1329,6 +1331,8 @@ fn persistent_corpus_round_trips_mainnet_seed_bundle() {
             discovered_address_hints: Vec::new(),
             matched_target: Some(target),
             match_kind: Some("direct".to_string()),
+            confidence: None,
+            provenance: None,
         },
     };
     let bundle = MainnetSeedBundle {
@@ -1338,6 +1342,7 @@ fn persistent_corpus_round_trips_mainnet_seed_bundle() {
             .expect("discover accounts"),
         fork_cache: db.cache_snapshot(),
         seeds: vec![seed],
+        scan: None,
     };
 
     corpus

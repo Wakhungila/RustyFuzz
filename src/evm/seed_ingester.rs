@@ -8,8 +8,9 @@ use revm::database_interface::DatabaseRef;
 use revm::primitives::{keccak256, Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_SEARCH_DEPTH: u64 = 100;
 const DEFAULT_MAX_RETRIES: usize = 3;
@@ -19,7 +20,7 @@ const ADDRESS_HINT_MATCH: &str = "address-hint";
 
 /// Controls deterministic mainnet seed ingestion. Every range is walked from
 /// newest to oldest, then normalized before being returned.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MainnetSeedConfig {
     pub fork_block: u64,
     pub target: Address,
@@ -29,6 +30,12 @@ pub struct MainnetSeedConfig {
     pub max_retries: usize,
     pub retry_backoff_ms: u64,
     pub include_address_hints: bool,
+    #[serde(default)]
+    pub max_blocks_per_second: Option<f64>,
+    #[serde(default)]
+    pub resume_cursor: Option<String>,
+    #[serde(default)]
+    pub output_manifest: Option<String>,
 }
 
 impl MainnetSeedConfig {
@@ -42,17 +49,39 @@ impl MainnetSeedConfig {
             max_retries: DEFAULT_MAX_RETRIES,
             retry_backoff_ms: DEFAULT_RETRY_BACKOFF_MS,
             include_address_hints: false,
+            max_blocks_per_second: None,
+            resume_cursor: None,
+            output_manifest: None,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MainnetSeedBundle {
     pub fork_block: u64,
     pub target: Address,
     pub seeds: Vec<MainnetSeed>,
     pub discovered_accounts: Vec<DiscoveredAccount>,
     pub fork_cache: ForkDbCacheSnapshot,
+    #[serde(default)]
+    pub scan: Option<SeedScanManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SeedScanCursor {
+    pub last_scanned_block: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SeedScanManifest {
+    pub chain_id: Option<u64>,
+    pub start_block: Option<u64>,
+    pub end_block: Option<u64>,
+    pub search_depth: u64,
+    pub include_address_hints: bool,
+    pub max_blocks_per_second: Option<f64>,
+    pub seed_count: usize,
+    pub discovered_selectors: Vec<[u8; 4]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +106,10 @@ pub struct SeedMetadata {
     pub matched_target: Option<Address>,
     #[serde(default)]
     pub match_kind: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<u64>,
+    #[serde(default)]
+    pub provenance: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,17 +171,25 @@ impl<P: Provider> SeedIngester<P> {
             .get_block_number()
             .await
             .context("failed to fetch latest block number")?;
-        let start_block = config.start_block.unwrap_or(latest_block);
+        let start_block = resume_start_block(config)
+            .transpose()?
+            .flatten()
+            .or(config.start_block)
+            .unwrap_or(latest_block);
         let mut candidates = Vec::new();
+        let mut last_fetch = None::<Instant>;
 
         for offset in 0..config.search_depth {
             if candidates.len() >= config.max_seeds {
                 break;
             }
             let block_num = start_block.saturating_sub(offset);
+            rate_limit_block_fetch(config, &mut last_fetch).await;
             let Some(block) = self.fetch_block_with_retries(block_num, config).await? else {
+                write_seed_scan_cursor(config, block_num)?;
                 continue;
             };
+            write_seed_scan_cursor(config, block_num)?;
 
             let BlockTransactions::Full(txs) = block.transactions else {
                 continue;
@@ -194,6 +235,8 @@ impl<P: Provider> SeedIngester<P> {
                     discovered_address_hints: extract_address_hints(&input_bytes),
                     matched_target: Some(config.target),
                     match_kind: Some(match_kind.to_string()),
+                    confidence: Some(if match_kind == DIRECT_MATCH { 95 } else { 75 }),
+                    provenance: Some("rpc-block-scan".to_string()),
                 };
                 candidates.push(MainnetSeed {
                     id: stable_seed_id(&seed_input, &metadata),
@@ -210,6 +253,29 @@ impl<P: Provider> SeedIngester<P> {
         let seeds = normalize_seeds(candidates);
         let discovered_accounts = discover_accounts_from_seeds(&seeds, fork_db)?;
         let fork_cache = fork_db.cache_snapshot();
+        let scan = SeedScanManifest {
+            chain_id: None,
+            start_block: Some(start_block),
+            end_block: Some(start_block.saturating_sub(config.search_depth.saturating_sub(1))),
+            search_depth: config.search_depth,
+            include_address_hints: config.include_address_hints,
+            max_blocks_per_second: config.max_blocks_per_second,
+            seed_count: seeds.len(),
+            discovered_selectors: seeds
+                .iter()
+                .filter_map(|seed| seed.metadata.selector)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        };
+        if let Some(path) = &config.output_manifest {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            std::fs::write(path, serde_json::to_vec_pretty(&scan)?)?;
+        }
 
         log::info!(
             "Ingested {} mainnet seeds for target {} with {} discovered accounts",
@@ -224,6 +290,7 @@ impl<P: Provider> SeedIngester<P> {
             seeds,
             discovered_accounts,
             fork_cache,
+            scan: Some(scan),
         })
     }
 
@@ -239,10 +306,15 @@ impl<P: Provider> SeedIngester<P> {
                 Err(err) => {
                     last_error = Some(err);
                     if attempt + 1 < config.max_retries.max(1) {
-                        tokio::time::sleep(Duration::from_millis(
-                            config.retry_backoff_ms.max(1) * (attempt as u64 + 1),
-                        ))
-                        .await;
+                        let delay_ms = retry_backoff_delay_ms(config.retry_backoff_ms, attempt);
+                        log::warn!(
+                            "seed discovery RPC block fetch failed for block {}; retrying attempt {}/{} after {}ms",
+                            block_num,
+                            attempt + 2,
+                            config.max_retries.max(1),
+                            delay_ms
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     }
                 }
             }
@@ -359,10 +431,124 @@ pub fn seed_match_kind(
     None
 }
 
+fn resume_start_block(config: &MainnetSeedConfig) -> Option<anyhow::Result<Option<u64>>> {
+    config.resume_cursor.as_ref().map(|path| {
+        let path = PathBuf::from(path);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path)?;
+        let cursor: SeedScanCursor = serde_json::from_slice(&bytes)?;
+        Ok(cursor.last_scanned_block.checked_sub(1))
+    })
+}
+
+fn write_seed_scan_cursor(config: &MainnetSeedConfig, block_num: u64) -> anyhow::Result<()> {
+    let Some(path) = &config.resume_cursor else {
+        return Ok(());
+    };
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(&SeedScanCursor {
+            last_scanned_block: block_num,
+        })?,
+    )?;
+    Ok(())
+}
+
+fn retry_backoff_delay_ms(base_ms: u64, attempt: usize) -> u64 {
+    let multiplier = 1u64.checked_shl(attempt.min(20) as u32).unwrap_or(1 << 20);
+    base_ms.max(1).saturating_mul(multiplier)
+}
+
+async fn rate_limit_block_fetch(config: &MainnetSeedConfig, last_fetch: &mut Option<Instant>) {
+    let Some(blocks_per_second) = config.max_blocks_per_second else {
+        return;
+    };
+    if blocks_per_second <= 0.0 {
+        return;
+    }
+    let min_interval = Duration::from_secs_f64(1.0 / blocks_per_second);
+    if let Some(previous) = last_fetch {
+        let elapsed = previous.elapsed();
+        if elapsed < min_interval {
+            tokio::time::sleep(min_interval - elapsed).await;
+        }
+    }
+    *last_fetch = Some(Instant::now());
+}
+
 fn stable_seed_id(input: &EvmInput, metadata: &SeedMetadata) -> String {
     let mut material = Vec::new();
     material.extend_from_slice(&metadata.source_block.to_be_bytes());
     material.extend_from_slice(&metadata.transaction_ordinal.to_be_bytes());
     material.extend_from_slice(&serde_json::to_vec(input).unwrap_or_default());
     format!("seed-{}", &hex::encode(keccak256(material))[..16])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rustyfuzz-{name}-{}-{suffix}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn seed_match_kind_accepts_direct_and_address_hint_matches() {
+        let target = Address::repeat_byte(0xaa);
+        let router = Address::repeat_byte(0xbb);
+        let mut calldata = vec![0xde, 0xad, 0xbe, 0xef];
+        calldata.extend_from_slice(&[0u8; 12]);
+        calldata.extend_from_slice(target.as_slice());
+
+        assert_eq!(
+            seed_match_kind(target, target, &calldata, false),
+            Some(DIRECT_MATCH)
+        );
+        assert_eq!(
+            seed_match_kind(router, target, &calldata, true),
+            Some(ADDRESS_HINT_MATCH)
+        );
+        assert_eq!(seed_match_kind(router, target, &calldata, false), None);
+    }
+
+    #[test]
+    fn seed_scan_cursor_is_written_and_resume_continues_from_previous_block() {
+        let target = Address::repeat_byte(0xaa);
+        let cursor = temp_path("seed-cursor");
+        let mut config = MainnetSeedConfig::new(100, target, 8);
+        config.resume_cursor = Some(cursor.display().to_string());
+
+        write_seed_scan_cursor(&config, 99).expect("write cursor");
+        let resumed = resume_start_block(&config)
+            .expect("cursor configured")
+            .expect("read cursor")
+            .expect("resume block");
+
+        assert_eq!(resumed, 98);
+        let _ = std::fs::remove_file(cursor);
+    }
+
+    #[test]
+    fn retry_backoff_is_exponential_and_saturating() {
+        assert_eq!(retry_backoff_delay_ms(250, 0), 250);
+        assert_eq!(retry_backoff_delay_ms(250, 1), 500);
+        assert_eq!(retry_backoff_delay_ms(250, 2), 1000);
+        assert_eq!(retry_backoff_delay_ms(0, 3), 8);
+    }
 }

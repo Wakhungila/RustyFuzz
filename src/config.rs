@@ -15,6 +15,12 @@ pub struct Config {
     #[serde(default)]
     pub mainnet_seed_bundle: Option<String>,
     #[serde(default)]
+    pub require_seed_bundle: bool,
+    #[serde(default)]
+    pub require_rpc_fork: bool,
+    #[serde(default)]
+    pub allow_synthetic_fallback: bool,
+    #[serde(default)]
     pub hardened_defi: HardenedDefiConfig,
     #[serde(default)]
     pub target_invariant_manifest: Option<String>,

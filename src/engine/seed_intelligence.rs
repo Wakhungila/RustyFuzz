@@ -633,20 +633,33 @@ struct HistoricalSeedTx {
     input: Option<String>,
     selector: Option<String>,
     success: Option<bool>,
+    #[serde(rename = "isError")]
+    is_error: Option<String>,
+    #[serde(rename = "blockNumber")]
+    block_number: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
 }
 
 impl SeedIntelligence {
     pub fn parse_historical_seed_json(&self, json: &str) -> anyhow::Result<Vec<SeedCandidate>> {
-        let bundle: HistoricalSeedJson = serde_json::from_str(json)?;
+        self.parse_historical_seed_json_with_target(json, None)
+    }
+
+    pub fn parse_historical_seed_json_with_target(
+        &self,
+        json: &str,
+        explicit_target: Option<Address>,
+    ) -> anyhow::Result<Vec<SeedCandidate>> {
+        let bundle = parse_historical_seed_container(json)?;
         let target_hint = bundle
             .target
             .as_deref()
             .and_then(|value| Address::from_str(value).ok());
+        let target_hint = explicit_target.or(target_hint);
         let mut out = Vec::new();
         for tx in bundle.transactions {
-            if tx.success == Some(false) {
+            if tx.success == Some(false) || tx.is_error.as_deref() == Some("1") {
                 continue;
             }
             let Some(to) = tx
@@ -708,6 +721,11 @@ impl SeedIntelligence {
                     bundle
                         .block_number
                         .map(|block| format!(" at block {block}"))
+                        .or_else(|| {
+                            tx.block_number
+                                .as_deref()
+                                .map(|block| format!(" at block {block}"))
+                        })
                         .unwrap_or_default()
                 ),
                 touched_addresses: vec![to],
@@ -762,6 +780,27 @@ impl SeedIntelligence {
         }
         inputs
     }
+}
+
+fn parse_historical_seed_container(json: &str) -> anyhow::Result<HistoricalSeedJson> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    if value.is_array() {
+        return Ok(HistoricalSeedJson {
+            chain_id: None,
+            block_number: None,
+            target: None,
+            transactions: serde_json::from_value(value)?,
+        });
+    }
+    if let Some(result) = value.get("result").filter(|result| result.is_array()) {
+        return Ok(HistoricalSeedJson {
+            chain_id: None,
+            block_number: None,
+            target: None,
+            transactions: serde_json::from_value(result.clone())?,
+        });
+    }
+    Ok(serde_json::from_value(value)?)
 }
 
 fn parse_selector_hex(raw: &str) -> anyhow::Result<[u8; 4]> {
@@ -919,6 +958,71 @@ mod tests {
             .parse_historical_seed_json(json)
             .unwrap();
         assert!(seeds.is_empty());
+    }
+
+    #[test]
+    fn historical_seed_json_accepts_bscscan_result_list() {
+        let json = r#"{
+          "status": "1",
+          "message": "OK",
+          "result": [{
+            "hash": "0xabc",
+            "from": "0x1313131313131313131313131313131313131313",
+            "to": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "value": "0",
+            "input": "0x095ea7b3000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000000000000000000000000000000000000000000000000000001",
+            "blockNumber": "100600727",
+            "isError": "0"
+          }]
+        }"#;
+
+        let target = Address::repeat_byte(0xaa);
+        let seeds = SeedIntelligence::default()
+            .parse_historical_seed_json_with_target(json, Some(target))
+            .expect("bscscan seed list");
+
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].target, target);
+        assert!(seeds[0].reason.contains("100600727"));
+        assert_eq!(
+            seeds[0].selector,
+            Some(function_selector("approve(address,uint256)"))
+        );
+    }
+
+    #[test]
+    fn historical_seed_json_accepts_generic_tx_array_and_skips_errors() {
+        let json = r#"[
+          {
+            "hash": "0xok",
+            "from": "0x1313131313131313131313131313131313131313",
+            "to": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "value": "0",
+            "input": "0xa9059cbb000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000000000000000000000000000000000000000000000000000001",
+            "blockNumber": "7",
+            "isError": "0"
+          },
+          {
+            "hash": "0xbad",
+            "from": "0x1313131313131313131313131313131313131313",
+            "to": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "value": "0",
+            "input": "0xa9059cbb000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000000000000000000000000000000000000000000000000000001",
+            "blockNumber": "8",
+            "isError": "1"
+          }
+        ]"#;
+
+        let seeds = SeedIntelligence::default()
+            .parse_historical_seed_json_with_target(json, Some(Address::repeat_byte(0xaa)))
+            .expect("generic seed list");
+
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(
+            seeds[0].selector,
+            Some(function_selector("transfer(address,uint256)"))
+        );
+        assert!(seeds[0].reason.contains("0xok"));
     }
 
     #[test]

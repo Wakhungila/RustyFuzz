@@ -127,6 +127,38 @@ pub struct PersistentCorpus {
     root: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SeedBundleStatus {
+    Loaded {
+        bundle_id: String,
+        path: PathBuf,
+        seed_count: usize,
+        account_count: usize,
+    },
+    Missing {
+        bundle_id: String,
+        path: PathBuf,
+    },
+    Empty {
+        bundle_id: String,
+        path: PathBuf,
+        account_count: usize,
+    },
+    TargetMismatch {
+        bundle_id: String,
+        path: PathBuf,
+        bundle_target: Address,
+        campaign_target: Address,
+        seed_count: usize,
+    },
+    Invalid {
+        bundle_id: String,
+        path: PathBuf,
+        error: String,
+    },
+    Disabled,
+}
+
 impl PersistentCorpus {
     pub fn new(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
@@ -428,6 +460,55 @@ impl PersistentCorpus {
                 .join("manifest.json"),
         )?;
         Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    pub fn mainnet_seed_bundle_manifest_path(&self, id: &str) -> PathBuf {
+        self.root
+            .join("mainnet_seeds")
+            .join(id)
+            .join("manifest.json")
+    }
+
+    pub fn inspect_mainnet_seed_bundle(
+        &self,
+        id: Option<&str>,
+        campaign_target: Address,
+    ) -> SeedBundleStatus {
+        let Some(id) = id else {
+            return SeedBundleStatus::Disabled;
+        };
+        let path = self.mainnet_seed_bundle_manifest_path(id);
+        if !path.exists() {
+            return SeedBundleStatus::Missing {
+                bundle_id: id.to_string(),
+                path,
+            };
+        }
+        match self.load_mainnet_seed_bundle(id) {
+            Ok(bundle) if bundle.target != campaign_target => SeedBundleStatus::TargetMismatch {
+                bundle_id: id.to_string(),
+                path,
+                bundle_target: bundle.target,
+                campaign_target,
+                seed_count: bundle.seeds.len(),
+            },
+            Ok(bundle) if bundle.seeds.is_empty() => SeedBundleStatus::Empty {
+                bundle_id: id.to_string(),
+                path,
+                account_count: bundle.discovered_accounts.len(),
+            },
+            Ok(bundle) => SeedBundleStatus::Loaded {
+                bundle_id: id.to_string(),
+                path,
+                seed_count: bundle.seeds.len(),
+                account_count: bundle.discovered_accounts.len(),
+            },
+            Err(err) => SeedBundleStatus::Invalid {
+                bundle_id: id.to_string(),
+                path,
+                error: err.to_string(),
+            },
+        }
     }
 
     pub fn persist_crash(
@@ -788,7 +869,61 @@ fn triage_markdown(record: &CampaignArtifactRecord) -> String {
 mod artifact_tests {
     use super::*;
     use crate::common::types::{ExecutionStatus, SingletonTx, StorageDiff, TxExecutionResult};
+    use crate::evm::seed_ingester::{MainnetSeed, SeedMetadata};
     use revm::primitives::U256;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_corpus_root(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("rustyfuzz-{name}-{}-{suffix}", std::process::id()))
+    }
+
+    fn seed_bundle(target: Address, seeds: Vec<MainnetSeed>) -> MainnetSeedBundle {
+        MainnetSeedBundle {
+            fork_block: 100,
+            target,
+            seeds,
+            discovered_accounts: Vec::new(),
+            fork_cache: ForkDb::empty().cache_snapshot(),
+            scan: None,
+        }
+    }
+
+    fn seed(target: Address) -> MainnetSeed {
+        MainnetSeed {
+            id: "seed-1".to_string(),
+            input: EvmInput {
+                txs: vec![SingletonTx {
+                    input: vec![0xde, 0xad, 0xbe, 0xef],
+                    caller: Address::repeat_byte(0x13),
+                    to: target,
+                    value: U256::ZERO,
+                    is_victim: false,
+                }],
+                base_snapshot_id: 0,
+                waypoints: Vec::new(),
+                mutation_provenance: Vec::new(),
+            },
+            metadata: SeedMetadata {
+                source_block: 100,
+                block_offset: 0,
+                transaction_ordinal: 0,
+                caller: Address::repeat_byte(0x13),
+                target,
+                value: U256::ZERO,
+                selector: Some([0xde, 0xad, 0xbe, 0xef]),
+                calldata_len: 4,
+                discovered_address_hints: Vec::new(),
+                matched_target: Some(target),
+                match_kind: Some("direct".to_string()),
+                confidence: Some(95),
+                provenance: Some("test".to_string()),
+            },
+        }
+    }
 
     #[test]
     fn artifact_equivalence_deduplicates_same_sequence_coverage_finding_and_slots() {
@@ -855,6 +990,45 @@ mod artifact_tests {
             serde_json::to_vec(&left).unwrap(),
             serde_json::to_vec(&right).unwrap()
         );
+    }
+
+    #[test]
+    fn seed_bundle_status_distinguishes_missing_empty_loaded_and_mismatch() {
+        let root = temp_corpus_root("seed-bundle-status");
+        let corpus = PersistentCorpus::new(&root).expect("corpus");
+        let target = Address::repeat_byte(0xaa);
+
+        assert!(matches!(
+            corpus.inspect_mainnet_seed_bundle(Some("missing"), target),
+            SeedBundleStatus::Missing { .. }
+        ));
+
+        corpus
+            .persist_mainnet_seed_bundle("empty", &seed_bundle(target, Vec::new()))
+            .expect("persist empty");
+        assert!(matches!(
+            corpus.inspect_mainnet_seed_bundle(Some("empty"), target),
+            SeedBundleStatus::Empty { .. }
+        ));
+
+        corpus
+            .persist_mainnet_seed_bundle("loaded", &seed_bundle(target, vec![seed(target)]))
+            .expect("persist loaded");
+        assert!(matches!(
+            corpus.inspect_mainnet_seed_bundle(Some("loaded"), target),
+            SeedBundleStatus::Loaded { seed_count: 1, .. }
+        ));
+
+        let other = Address::repeat_byte(0xbb);
+        corpus
+            .persist_mainnet_seed_bundle("mismatch", &seed_bundle(other, vec![seed(other)]))
+            .expect("persist mismatch");
+        assert!(matches!(
+            corpus.inspect_mainnet_seed_bundle(Some("mismatch"), target),
+            SeedBundleStatus::TargetMismatch { .. }
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

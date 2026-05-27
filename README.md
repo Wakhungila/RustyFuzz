@@ -178,6 +178,91 @@ Target-adaptive machinery for mature DeFi protocols:
 
 **Limitations**: Protocol invariants are heuristic packs, not protocol-specific. Historical seeds require useful calldata. Economic deltas are strongest when token balances are observable. Benchmark validation is the source of truth.
 
+### Real-Fork Target Workflow
+
+Use fail-closed fork mode for real target campaigns so an RPC or bytecode failure cannot silently become synthetic-state fuzzing:
+
+```bash
+# Set rpc_url in your local config.toml to a BSC archive RPC first.
+export TARGET="0x85f86ef7E72e86BdEAb5F65e2B76A2c551f22109"
+
+RUST_LOG=info \
+LIBAFL_CORES=0-1 \
+RUSTYFUZZ_EXEC_TIMEOUT_SECS=60 \
+RUSTYFUZZ_REQUIRE_RPC_FORK=1 \
+timeout -k 60s 10m cargo run --release -- fuzz \
+  --chain evm \
+  --contract "$TARGET" \
+  --require-rpc-fork
+```
+
+`--allow-synthetic-fallback` is intentionally separate and should be reserved for local smoke tests and benchmarks. RPC errors are reported with the RPC host only; credentials, paths, and query strings are not logged.
+
+Seed bundle handling is explicit. If a configured bundle is missing or empty, default behavior is to continue as `synthetic-seed-start`; add `--require-seed-bundle` to abort instead:
+
+```bash
+cargo run --release -- fuzz \
+  --chain evm \
+  --contract "$TARGET" \
+  --require-rpc-fork \
+  --require-seed-bundle
+```
+
+### Rate-Aware Seed Discovery
+
+Discover bounded historical seeds without hammering public RPC endpoints:
+
+```bash
+cargo run --release -- seed \
+  --target "$TARGET" \
+  --bundle-id dexe-poolfactory-bsc \
+  --max-seeds 128 \
+  --search-depth 5000 \
+  --include-address-hints \
+  --rate-limit-rps 2 \
+  --seed-rpc-retry-count 5 \
+  --seed-rpc-backoff-ms 500 \
+  --resume \
+  --seed-output-manifest reports/seeds/dexe-poolfactory-bsc.scan.json
+```
+
+The seed manifest records the target, fork block, seed count, discovered accounts, selectors, scan range, and scan settings. Resume cursors are written under `corpus/seed_cursors/` by default when `--resume` is used.
+
+### Historical Seed Ingestion
+
+RustyFuzz can ingest existing RustyFuzz historical JSON, BscScan-style `result` exports, or a generic transaction array. Minimal generic format:
+
+```json
+[
+  {
+    "hash": "0x...",
+    "from": "0x1313131313131313131313131313131313131313",
+    "to": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "value": "0",
+    "input": "0x095ea7b3...",
+    "blockNumber": "100600727",
+    "isError": "0"
+  }
+]
+```
+
+Ingest it into a reusable bundle:
+
+```bash
+cargo run --release -- seed-ingest \
+  --file seeds/dexe-poolfactory-bsc.json \
+  --bundle-id dexe-poolfactory-bsc \
+  --target "$TARGET" \
+  --chain-id 56 \
+  --fork-block 100600727
+```
+
+Historical direct calls are high-confidence seeds; routed target references are medium/high; adjacent synthetic variants keep provenance and lower confidence. Reportable findings still require replay/proof evidence. Heuristic signals are not confirmed bugs.
+
+### Bytecode-Only Profiling
+
+When ABI/source metadata is unavailable, RustyFuzz extracts `PUSH4` selectors from runtime bytecode and feeds known selectors into target profiling, seed intelligence, mutation dictionaries, and scoring. This improves profiles beyond `Unknown` when selector evidence is meaningful. `Unknown` remains valid when bytecode evidence is weak.
+
 ### Satori AI Audit Harness
 
 Satori is RustyFuzz's AI-guided repo audit control plane. It ingests a Solidity/Vyper repository, builds deterministic protocol context, selects critical functions, creates compact packets, uses OpenAI `o3` behind `--features llm` for hypothesis generation, emits RustyFuzz job JSON, generates Foundry PoC scaffolds, stores memory, and writes reports that separate unvalidated hypotheses from locally validated findings.

@@ -196,6 +196,26 @@ impl TargetProfiler {
         }
         TargetProfiler.profile(&abi, None, &[])
     }
+
+    pub fn profile_from_bytecode(bytecode: &[u8]) -> TargetProfile {
+        Self::profile_from_selectors(extract_push4_selectors(bytecode))
+    }
+}
+
+pub fn extract_push4_selectors(bytecode: &[u8]) -> Vec<[u8; 4]> {
+    let mut selectors = BTreeSet::new();
+    let mut index = 0usize;
+    while index + 5 <= bytecode.len() {
+        if bytecode[index] == 0x63 {
+            let mut selector = [0u8; 4];
+            selector.copy_from_slice(&bytecode[index + 1..index + 5]);
+            selectors.insert(selector);
+            index += 5;
+        } else {
+            index += 1;
+        }
+    }
+    selectors.into_iter().collect()
 }
 
 #[derive(Debug, Clone)]
@@ -720,5 +740,34 @@ mod tests {
         let profile = TargetProfiler::profile_from_selectors([[0xde, 0xad, 0xbe, 0xef]]);
         assert_eq!(profile.protocol_types, vec![ProtocolType::Unknown]);
         assert!(profile.confidence <= 25);
+    }
+
+    #[test]
+    fn push4_selectors_are_extracted_from_bytecode() {
+        let approve = function_selector("approve(address,uint256)");
+        let transfer = function_selector("transfer(address,uint256)");
+        let mut bytecode = vec![0x60, 0x00, 0x63];
+        bytecode.extend_from_slice(&approve);
+        bytecode.extend_from_slice(&[0x57, 0x63]);
+        bytecode.extend_from_slice(&transfer);
+
+        let selectors = extract_push4_selectors(&bytecode);
+
+        assert_eq!(selectors, vec![approve, transfer]);
+    }
+
+    #[test]
+    fn bytecode_selectors_raise_profile_confidence() {
+        let mut bytecode = vec![0x63];
+        bytecode.extend_from_slice(&function_selector("deposit(uint256,address)"));
+        bytecode.push(0x63);
+        bytecode.extend_from_slice(&function_selector("redeem(uint256,address,address)"));
+        bytecode.push(0x63);
+        bytecode.extend_from_slice(&function_selector("totalAssets()"));
+
+        let profile = TargetProfiler::profile_from_bytecode(&bytecode);
+
+        assert!(profile.protocol_types.contains(&ProtocolType::Erc4626Vault));
+        assert!(profile.confidence > 25);
     }
 }

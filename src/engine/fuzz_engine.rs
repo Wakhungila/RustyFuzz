@@ -16,8 +16,10 @@ use crate::engine::protocol_model::CounterexampleSearchEngine;
 use crate::engine::scheduler::RustyFuzzScheduler;
 use crate::engine::scoring::{CampaignScore, CampaignScorer};
 use crate::engine::seed_intelligence::{SeedCandidate, SeedIntelligence, SeedIntelligenceConfig};
-use crate::engine::target_profile::{ProtocolType, TargetProfiler};
-use crate::evm::corpus::{CampaignArtifactRequest, PersistentCorpus, SnapshotCorpus};
+use crate::engine::target_profile::{extract_push4_selectors, ProtocolType, TargetProfiler};
+use crate::evm::corpus::{
+    CampaignArtifactRequest, PersistentCorpus, SeedBundleStatus, SnapshotCorpus,
+};
 use crate::evm::dataflow::DataflowRegistry;
 use crate::evm::executor::EvmExecutor;
 use crate::evm::feedback::{EvmCoverageFeedback, EvmStateNoveltyFeedback, StateNoveltyReport};
@@ -31,6 +33,7 @@ use libafl::events::NopEventManager;
 use libafl::state::HasCorpus;
 use parking_lot::{Mutex, RwLock};
 use revm::database::CacheDB;
+use revm::database_interface::DatabaseRef;
 use revm::primitives::{Address, U256};
 use revm::state::AccountInfo;
 use std::cell::UnsafeCell;
@@ -148,6 +151,9 @@ pub struct Config {
     pub report_dir: String,
     pub foundry_harness: Option<FoundryHarnessManifest>,
     pub mainnet_seed_bundle: Option<String>,
+    pub require_seed_bundle: bool,
+    pub require_rpc_fork: bool,
+    pub allow_synthetic_fallback: bool,
     pub hardened_defi: HardenedDefiConfig,
     pub target_invariant_manifest: Option<String>,
 }
@@ -166,6 +172,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
     let (mut initial_db, initial_env, synthetic_fork_mode) = {
         let mut synthetic_fork_mode = false;
+        let require_rpc_fork = config.require_rpc_fork || campaign_requires_rpc_fork();
         let db = match crate::evm::fork::create_fork_db(
             &config.rpc_url,
             config.fork_block,
@@ -175,6 +182,15 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
         {
             Ok(db) => db,
             Err(err) => {
+                if require_rpc_fork || !config.allow_synthetic_fallback {
+                    anyhow::bail!(
+                        "RPC-backed fork DB unavailable for chain=evm target={:?} fork_block={} rpc_host={}; synthetic fallback is disabled: {}",
+                        config.target_contract,
+                        config.fork_block,
+                        sanitize_rpc_host(&config.rpc_url),
+                        err
+                    );
+                }
                 log::warn!(
                     "RPC-backed fork DB unavailable for target {:?}; falling back to offline synthetic fork: {}",
                     config.target_contract,
@@ -190,6 +206,14 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
         {
             Ok(env) => env,
             Err(err) => {
+                if require_rpc_fork || !config.allow_synthetic_fallback {
+                    anyhow::bail!(
+                        "RPC-backed fork block env unavailable for chain=evm fork_block={} rpc_host={}; synthetic fallback is disabled: {}",
+                        config.fork_block,
+                        sanitize_rpc_host(&config.rpc_url),
+                        err
+                    );
+                }
                 log::warn!(
                     "RPC-backed fork block env unavailable for block {}; falling back to offline synthetic env: {}",
                     config.fork_block,
@@ -233,6 +257,15 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
     let launcher_fallback_env = initial_env.clone();
     let launcher_fallback_actor_set = hardened_actor_set.clone();
     let launcher_fallback_synthetic_fork_mode = synthetic_fork_mode;
+    let bytecode_selectors =
+        discover_target_bytecode_selectors(&initial_db, config.target_contract);
+    if !bytecode_selectors.is_empty() {
+        log::info!(
+            "Bytecode target profiling extracted {} PUSH4 selectors",
+            bytecode_selectors.len()
+        );
+    }
+    let launcher_fallback_bytecode_selectors = bytecode_selectors.clone();
 
     if config.hardened_defi.single_process {
         return run_single_process_campaign(
@@ -241,6 +274,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
             launcher_fallback_env,
             launcher_fallback_actor_set,
             launcher_fallback_synthetic_fork_mode,
+            launcher_fallback_bytecode_selectors,
         )
         .await;
     }
@@ -295,6 +329,9 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
                 let mut initial_abi = AbiRegistry::default();
                 account_registry.read().auto_populate_abi(&mut initial_abi);
+                for selector in &bytecode_selectors {
+                    initial_abi.functions.entry(*selector).or_default();
+                }
 
                 if let Some(harness) = &config.foundry_harness {
                     log::info!(
@@ -313,7 +350,8 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     include_low_confidence_fallbacks: false,
                     conservative_startup_only: false,
                 });
-                let has_trusted_abi_source = config.foundry_harness.is_some();
+                let has_trusted_abi_source =
+                    config.foundry_harness.is_some() || !bytecode_selectors.is_empty();
                 let mut hardened_seed_candidates = Vec::<SeedCandidate>::new();
                 if has_trusted_abi_source {
                     hardened_seed_candidates.extend(seed_intelligence.generate_candidates(
@@ -394,39 +432,23 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 if state.corpus().count() == 0 {
                     let mut inserted_seed_count = 0usize;
                     if let Some(bundle_id) = &config.mainnet_seed_bundle {
-                        match persistent_corpus.load_mainnet_seed_bundle(bundle_id) {
-                            Ok(bundle) if bundle.target == target_contract => {
+                        let status = persistent_corpus
+                            .inspect_mainnet_seed_bundle(Some(bundle_id), target_contract);
+                        log_seed_bundle_status(&status, config.require_seed_bundle)
+                            .map_err(|err| libafl::Error::unknown(err.to_string()))?;
+                        if let SeedBundleStatus::Loaded { .. } = status {
+                            let bundle = persistent_corpus
+                                .load_mainnet_seed_bundle(bundle_id)
+                                .map_err(|err| libafl::Error::unknown(err.to_string()))?;
+                            {
                                 for seed in bundle.seeds {
                                     state.corpus_mut().add(Testcase::new(seed.input))?;
                                     inserted_seed_count += 1;
                                 }
-                                if inserted_seed_count == 0 {
-                                    log::warn!(
-                                        "Mainnet seed bundle `{}` matched target {} but contained no seeds; using synthetic seed",
-                                        bundle_id,
-                                        target_contract
-                                    );
-                                } else {
-                                    log::info!(
-                                        "Loaded mainnet seed bundle `{}` into campaign corpus: {} seeds",
-                                        bundle_id,
-                                        inserted_seed_count
-                                    );
-                                }
-                            }
-                            Ok(bundle) => {
-                                log::warn!(
-                                    "Ignoring mainnet seed bundle `{}` for target {}; campaign target is {}",
+                                log::info!(
+                                    "Loaded mainnet seed bundle `{}` into campaign corpus: {} seeds",
                                     bundle_id,
-                                    bundle.target,
-                                    target_contract
-                                );
-                            }
-                            Err(err) => {
-                                log::warn!(
-                                    "Failed to load mainnet seed bundle `{}` from `{}`: {err:#}",
-                                    bundle_id,
-                                    config.corpus_dir
+                                    inserted_seed_count
                                 );
                             }
                         }
@@ -498,6 +520,9 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     }
 
                     if inserted_seed_count == 0 {
+                        log::info!(
+                            "Seed startup mode: synthetic-seed-start (fallback_allowed=true, inserted_seed_count=0)"
+                        );
                         state
                             .corpus_mut()
                             .add(Testcase::new(seed_input(target_contract, fuzzer_address)))?;
@@ -810,6 +835,10 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
     match launcher_result {
         Ok(_) => Ok(()),
         Err(err) => {
+            if broker_launcher_error_was_shutdown(&err.to_string()) {
+                log::info!("Brokered fuzz launcher shut down cleanly");
+                return Ok(());
+            }
             log::warn!(
                 "brokered fuzz launcher unavailable; falling back to broker-free single-process mode: {}",
                 err
@@ -820,6 +849,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 launcher_fallback_env,
                 launcher_fallback_actor_set,
                 launcher_fallback_synthetic_fork_mode,
+                launcher_fallback_bytecode_selectors,
             )
             .await
         }
@@ -832,6 +862,7 @@ async fn run_single_process_campaign(
     initial_env: revm::context::BlockEnv,
     hardened_actor_set: Option<ActorSet>,
     synthetic_fork_mode: bool,
+    bytecode_selectors: Vec<[u8; 4]>,
 ) -> anyhow::Result<()> {
     let start_time = Instant::now();
     let execution_timeout = campaign_execution_timeout();
@@ -872,6 +903,9 @@ async fn run_single_process_campaign(
 
     let mut initial_abi = AbiRegistry::default();
     account_registry.read().auto_populate_abi(&mut initial_abi);
+    for selector in &bytecode_selectors {
+        initial_abi.functions.entry(*selector).or_default();
+    }
 
     if let Some(harness) = &config.foundry_harness {
         log::info!(
@@ -889,7 +923,7 @@ async fn run_single_process_campaign(
         include_low_confidence_fallbacks: false,
         conservative_startup_only: false,
     });
-    let has_trusted_abi_source = config.foundry_harness.is_some();
+    let has_trusted_abi_source = config.foundry_harness.is_some() || !bytecode_selectors.is_empty();
     let mut hardened_seed_candidates = Vec::<SeedCandidate>::new();
     if has_trusted_abi_source {
         hardened_seed_candidates.extend(seed_intelligence.generate_candidates(
@@ -965,39 +999,20 @@ async fn run_single_process_campaign(
     if state.corpus().count() == 0 {
         let mut inserted_seed_count = 0usize;
         if let Some(bundle_id) = &config.mainnet_seed_bundle {
-            match persistent_corpus.load_mainnet_seed_bundle(bundle_id) {
-                Ok(bundle) if bundle.target == target_contract => {
+            let status =
+                persistent_corpus.inspect_mainnet_seed_bundle(Some(bundle_id), target_contract);
+            log_seed_bundle_status(&status, config.require_seed_bundle)?;
+            if let SeedBundleStatus::Loaded { .. } = status {
+                let bundle = persistent_corpus.load_mainnet_seed_bundle(bundle_id)?;
+                {
                     for seed in bundle.seeds {
                         state.corpus_mut().add(Testcase::new(seed.input))?;
                         inserted_seed_count += 1;
                     }
-                    if inserted_seed_count == 0 {
-                        log::warn!(
-                            "Mainnet seed bundle `{}` matched target {} but contained no seeds; using synthetic seed",
-                            bundle_id,
-                            target_contract
-                        );
-                    } else {
-                        log::info!(
-                            "Loaded mainnet seed bundle `{}` into campaign corpus: {} seeds",
-                            bundle_id,
-                            inserted_seed_count
-                        );
-                    }
-                }
-                Ok(bundle) => {
-                    log::warn!(
-                        "Ignoring mainnet seed bundle `{}` for target {}; campaign target is {}",
+                    log::info!(
+                        "Loaded mainnet seed bundle `{}` into campaign corpus: {} seeds",
                         bundle_id,
-                        bundle.target,
-                        target_contract
-                    );
-                }
-                Err(err) => {
-                    log::warn!(
-                        "Failed to load mainnet seed bundle `{}` from `{}`: {err:#}",
-                        bundle_id,
-                        config.corpus_dir
+                        inserted_seed_count
                     );
                 }
             }
@@ -1099,6 +1114,9 @@ async fn run_single_process_campaign(
         }
 
         if inserted_seed_count == 0 {
+            log::info!(
+                "Seed startup mode: synthetic-seed-start (fallback_allowed=true, inserted_seed_count=0)"
+            );
             state.corpus_mut().add(Testcase::new(seed_input(
                 target_contract,
                 Address::repeat_byte(0x13),
@@ -1336,6 +1354,10 @@ async fn run_single_process_campaign(
     Ok(())
 }
 
+fn broker_launcher_error_was_shutdown(message: &str) -> bool {
+    message.contains("Shutting down")
+}
+
 fn campaign_cores() -> anyhow::Result<Cores> {
     let requested = std::env::var("RUSTYFUZZ_CORES")
         .ok()
@@ -1353,6 +1375,127 @@ fn campaign_execution_timeout() -> Duration {
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_EXECUTION_TIMEOUT)
+}
+
+fn campaign_requires_rpc_fork() -> bool {
+    std::env::var("RUSTYFUZZ_REQUIRE_RPC_FORK")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn sanitize_rpc_host(rpc_url: &str) -> String {
+    url::Url::parse(rpc_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "<invalid-rpc-url>".to_string())
+}
+
+fn discover_target_bytecode_selectors(
+    db: &CacheDB<ForkDb>,
+    target: Option<Address>,
+) -> Vec<[u8; 4]> {
+    let Some(target) = target else {
+        return Vec::new();
+    };
+    let Ok(Some(account)) = db.db.basic_ref(target) else {
+        return Vec::new();
+    };
+    let Some(code) = account.code else {
+        return Vec::new();
+    };
+    extract_push4_selectors(code.original_byte_slice())
+}
+
+fn log_seed_bundle_status(status: &SeedBundleStatus, required: bool) -> anyhow::Result<()> {
+    match status {
+        SeedBundleStatus::Disabled => {
+            log::info!("Mainnet seed bundle: disabled; seed startup may use synthetic fallback");
+        }
+        SeedBundleStatus::Loaded {
+            bundle_id,
+            path,
+            seed_count,
+            account_count,
+        } => {
+            log::info!(
+                "Mainnet seed bundle `{}` loaded from `{}`: seeds={}, discovered_accounts={}",
+                bundle_id,
+                path.display(),
+                seed_count,
+                account_count
+            );
+        }
+        SeedBundleStatus::Missing { bundle_id, path } => {
+            let msg = format!(
+                "mainnet seed bundle `{}` missing at `{}`",
+                bundle_id,
+                path.display()
+            );
+            if required {
+                anyhow::bail!("{msg}; require_seed_bundle=true");
+            }
+            log::warn!(
+                "{msg}; continuing with synthetic-seed-start because require_seed_bundle=false"
+            );
+        }
+        SeedBundleStatus::Empty {
+            bundle_id,
+            path,
+            account_count,
+        } => {
+            let msg = format!(
+                "mainnet seed bundle `{}` at `{}` is empty (discovered_accounts={})",
+                bundle_id,
+                path.display(),
+                account_count
+            );
+            if required {
+                anyhow::bail!("{msg}; require_seed_bundle=true");
+            }
+            log::warn!(
+                "{msg}; continuing with synthetic-seed-start because require_seed_bundle=false"
+            );
+        }
+        SeedBundleStatus::TargetMismatch {
+            bundle_id,
+            path,
+            bundle_target,
+            campaign_target,
+            seed_count,
+        } => {
+            let msg = format!(
+                "mainnet seed bundle `{}` at `{}` targets {}, but campaign target is {} (seeds={})",
+                bundle_id,
+                path.display(),
+                bundle_target,
+                campaign_target,
+                seed_count
+            );
+            if required {
+                anyhow::bail!("{msg}; require_seed_bundle=true");
+            }
+            log::warn!("{msg}; ignoring bundle");
+        }
+        SeedBundleStatus::Invalid {
+            bundle_id,
+            path,
+            error,
+        } => {
+            let msg = format!(
+                "mainnet seed bundle `{}` at `{}` is invalid: {}",
+                bundle_id,
+                path.display(),
+                error
+            );
+            if required {
+                anyhow::bail!("{msg}; require_seed_bundle=true");
+            }
+            log::warn!(
+                "{msg}; continuing with synthetic-seed-start because require_seed_bundle=false"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn campaign_artifact_reason(
@@ -1620,5 +1763,44 @@ mod tests {
         std::env::set_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS", "7");
         assert_eq!(campaign_execution_timeout(), Duration::from_secs(7));
         std::env::remove_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn broker_shutdown_error_does_not_trigger_fallback() {
+        assert!(broker_launcher_error_was_shutdown("Shutting down!"));
+        assert!(!broker_launcher_error_was_shutdown(
+            "Failed to bind to port 1337"
+        ));
+    }
+
+    #[test]
+    fn rpc_fork_requirement_is_opt_in() {
+        std::env::remove_var("RUSTYFUZZ_REQUIRE_RPC_FORK");
+        assert!(!campaign_requires_rpc_fork());
+        std::env::set_var("RUSTYFUZZ_REQUIRE_RPC_FORK", "1");
+        assert!(campaign_requires_rpc_fork());
+        std::env::set_var("RUSTYFUZZ_REQUIRE_RPC_FORK", "false");
+        assert!(!campaign_requires_rpc_fork());
+        std::env::remove_var("RUSTYFUZZ_REQUIRE_RPC_FORK");
+    }
+
+    #[test]
+    fn rpc_url_sanitization_removes_credentials_and_path() {
+        assert_eq!(
+            sanitize_rpc_host("https://user:secret@example.com/path?token=hidden"),
+            "example.com"
+        );
+        assert_eq!(sanitize_rpc_host("not a url"), "<invalid-rpc-url>");
+    }
+
+    #[test]
+    fn required_seed_bundle_status_aborts_missing_bundle() {
+        let status = SeedBundleStatus::Missing {
+            bundle_id: "bundle".to_string(),
+            path: std::path::PathBuf::from("corpus/mainnet_seeds/bundle/manifest.json"),
+        };
+
+        assert!(log_seed_bundle_status(&status, false).is_ok());
+        assert!(log_seed_bundle_status(&status, true).is_err());
     }
 }

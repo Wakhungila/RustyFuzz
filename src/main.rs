@@ -47,6 +47,12 @@ enum Command {
         bounded_search: bool,
         #[arg(long)]
         seed_file: Option<String>,
+        #[arg(long, default_value_t = false)]
+        require_seed_bundle: bool,
+        #[arg(long, default_value_t = false)]
+        require_rpc_fork: bool,
+        #[arg(long, default_value_t = false)]
+        allow_synthetic_fallback: bool,
     },
     Seed {
         #[arg(long)]
@@ -61,12 +67,30 @@ enum Command {
         search_depth: u64,
         #[arg(long, default_value_t = false)]
         include_address_hints: bool,
+        #[arg(long, default_value_t = 0.0, alias = "rate-limit-rps")]
+        seed_max_blocks_per_second: f64,
+        #[arg(long, default_value_t = 3)]
+        seed_rpc_retry_count: usize,
+        #[arg(long, default_value_t = 250)]
+        seed_rpc_backoff_ms: u64,
+        #[arg(long, default_value_t = false)]
+        resume: bool,
+        #[arg(long)]
+        seed_resume_cursor: Option<String>,
+        #[arg(long)]
+        seed_output_manifest: Option<String>,
     },
     SeedIngest {
         #[arg(long)]
         file: String,
         #[arg(long, default_value = "historical-json")]
         bundle_id: String,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        chain_id: Option<u64>,
+        #[arg(long)]
+        fork_block: Option<u64>,
     },
     Setup {
         #[arg(long, default_value = "default")]
@@ -137,6 +161,9 @@ async fn main() -> anyhow::Result<()> {
             rng_seed,
             bounded_search,
             seed_file,
+            require_seed_bundle,
+            require_rpc_fork,
+            allow_synthetic_fallback,
         } => {
             let raw_target = match contract.as_deref() {
                 Some(target) if target.trim().is_empty() => {
@@ -197,6 +224,10 @@ async fn main() -> anyhow::Result<()> {
                     .map(FoundryHarnessManifest::ingest)
                     .transpose()?,
                 mainnet_seed_bundle: config.mainnet_seed_bundle.clone(),
+                require_seed_bundle: config.require_seed_bundle || require_seed_bundle,
+                require_rpc_fork: config.require_rpc_fork || require_rpc_fork,
+                allow_synthetic_fallback: config.allow_synthetic_fallback
+                    || allow_synthetic_fallback,
                 hardened_defi: hardened_defi_config,
                 target_invariant_manifest: config.target_invariant_manifest.clone(),
             };
@@ -209,6 +240,12 @@ async fn main() -> anyhow::Result<()> {
             start_block,
             search_depth,
             include_address_hints,
+            seed_max_blocks_per_second,
+            seed_rpc_retry_count,
+            seed_rpc_backoff_ms,
+            resume,
+            seed_resume_cursor,
+            seed_output_manifest,
         } => {
             ensure_evm_chain(&config)?;
             let target = target_address(target.as_deref(), &config)?;
@@ -221,6 +258,17 @@ async fn main() -> anyhow::Result<()> {
             seed_config.start_block = start_block;
             seed_config.search_depth = search_depth;
             seed_config.include_address_hints = include_address_hints;
+            seed_config.max_blocks_per_second = if seed_max_blocks_per_second > 0.0 {
+                Some(seed_max_blocks_per_second)
+            } else {
+                None
+            };
+            seed_config.max_retries = seed_rpc_retry_count;
+            seed_config.retry_backoff_ms = seed_rpc_backoff_ms;
+            seed_config.resume_cursor = seed_resume_cursor.or_else(|| {
+                resume.then(|| format!("{}/seed_cursors/{bundle_id}.json", config.corpus_dir))
+            });
+            seed_config.output_manifest = seed_output_manifest;
             let bundle = ingester
                 .ingest_bundle_from_target(&seed_config, &fork_db)
                 .await?;
@@ -233,34 +281,58 @@ async fn main() -> anyhow::Result<()> {
                 bundle.discovered_accounts.len()
             );
         }
-        Command::SeedIngest { file, bundle_id } => {
+        Command::SeedIngest {
+            file,
+            bundle_id,
+            target,
+            chain_id,
+            fork_block,
+        } => {
             ensure_evm_chain(&config)?;
             let raw = std::fs::read_to_string(&file)?;
             let intelligence = SeedIntelligence::default();
-            let candidates = intelligence.parse_historical_seed_json(&raw)?;
+            let target_hint = target
+                .as_deref()
+                .map(Address::from_str)
+                .transpose()?
+                .or_else(|| {
+                    config
+                        .target_contract
+                        .as_deref()
+                        .and_then(|value| Address::from_str(value).ok())
+                });
+            let candidates =
+                intelligence.parse_historical_seed_json_with_target(&raw, target_hint)?;
             anyhow::ensure!(
                 !candidates.is_empty(),
                 "no valid historical seeds in {}",
                 file
             );
-            let target = candidates[0].target;
-            let seeds = candidates
+            let target = target_hint.unwrap_or(candidates[0].target);
+            let inputs = intelligence.historical_candidates_to_inputs(candidates.clone(), 0, 3);
+            let seeds = inputs
                 .into_iter()
                 .enumerate()
-                .map(|(idx, candidate)| {
-                    let selector = candidate.selector;
-                    let caller = candidate.caller;
-                    let target = candidate.target;
-                    let value = candidate.value;
-                    let input = candidate.into_evm_input(0);
+                .map(|(idx, input)| {
+                    let first_tx = input.txs.first().cloned();
+                    let caller = first_tx
+                        .as_ref()
+                        .map(|tx| tx.caller)
+                        .unwrap_or(Address::repeat_byte(0x13));
+                    let seed_target = first_tx.as_ref().map(|tx| tx.to).unwrap_or(target);
+                    let value = first_tx.as_ref().map(|tx| tx.value).unwrap_or_default();
+                    let selector = first_tx
+                        .as_ref()
+                        .and_then(|tx| tx.input.get(0..4))
+                        .and_then(|bytes| bytes.try_into().ok());
                     MainnetSeed {
                         id: format!("historical-json-{idx:04}"),
                         metadata: SeedMetadata {
-                            source_block: config.fork_block.unwrap_or(0),
+                            source_block: fork_block.or(config.fork_block).unwrap_or(0),
                             block_offset: 0,
                             transaction_ordinal: idx,
                             caller,
-                            target,
+                            target: seed_target,
                             value,
                             selector,
                             calldata_len: input
@@ -271,17 +343,32 @@ async fn main() -> anyhow::Result<()> {
                             discovered_address_hints: Vec::new(),
                             matched_target: Some(target),
                             match_kind: Some("historical-json".to_string()),
+                            confidence: None,
+                            provenance: Some("historical-json-ingest".to_string()),
                         },
                         input,
                     }
                 })
                 .collect::<Vec<_>>();
             let bundle = MainnetSeedBundle {
-                fork_block: config.fork_block.unwrap_or(0),
+                fork_block: fork_block.or(config.fork_block).unwrap_or(0),
                 target,
                 seeds,
                 discovered_accounts: Vec::new(),
                 fork_cache: ForkDb::empty().cache_snapshot(),
+                scan: Some(rusty_fuzz::evm::seed_ingester::SeedScanManifest {
+                    chain_id,
+                    start_block: None,
+                    end_block: None,
+                    search_depth: 0,
+                    include_address_hints: false,
+                    max_blocks_per_second: None,
+                    seed_count: candidates.len(),
+                    discovered_selectors: candidates
+                        .iter()
+                        .filter_map(|seed| seed.selector)
+                        .collect(),
+                }),
             };
             let corpus = PersistentCorpus::new(&config.corpus_dir)?;
             corpus.persist_mainnet_seed_bundle(&bundle_id, &bundle)?;

@@ -715,6 +715,8 @@ mod tests {
                 discovered_address_hints: Vec::new(),
                 matched_target: Some(to),
                 match_kind: Some("test".to_string()),
+                confidence: None,
+                provenance: None,
             },
         }
     }
