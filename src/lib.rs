@@ -5,6 +5,7 @@ pub mod engine;
 pub mod evm;
 pub mod hybrid;
 pub mod oracles;
+pub mod satori;
 
 // SVM is disabled by default due to version conflicts with Solana 2.0.18
 // Enable only with: cargo build --features svm --no-default-features

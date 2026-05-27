@@ -1,0 +1,10 @@
+model = "o3"
+max_critical_functions = 8
+max_hypotheses_per_function = 2
+min_confidence = 0.40
+validate = true
+generate_jobs = true
+run_forge_tests = false
+run_slither = true
+cache_dir = "satori/cache"
+memory_path = "satori/memory/events.jsonl"

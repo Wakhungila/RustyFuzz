@@ -18,6 +18,7 @@ use rusty_fuzz::evm::fork_db::ForkDb;
 use rusty_fuzz::evm::seed_ingester::{
     MainnetSeed, MainnetSeedBundle, MainnetSeedConfig, SeedIngester, SeedMetadata,
 };
+use rusty_fuzz::satori::cli::SatoriCommand;
 use std::str::FromStr;
 
 #[derive(Parser, Debug)]
@@ -108,6 +109,10 @@ enum Command {
         broker_free: bool,
     },
     ScanMempool,
+    Satori {
+        #[command(subcommand)]
+        command: SatoriCommand,
+    },
 }
 
 #[tokio::main]
@@ -115,9 +120,14 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+    let command = args.command;
+    let command = match command {
+        Command::Satori { command } => return rusty_fuzz::satori::cli::run(command).await,
+        other => other,
+    };
     let config = Config::load("config.toml")?;
 
-    match args.command {
+    match command {
         Command::Fuzz {
             chain,
             contract,
@@ -128,9 +138,32 @@ async fn main() -> anyhow::Result<()> {
             bounded_search,
             seed_file,
         } => {
+            let raw_target = match contract.as_deref() {
+                Some(target) if target.trim().is_empty() => {
+                    anyhow::bail!(
+                        "--contract was provided but empty; export TARGET first or pass a 0x-prefixed 20-byte address"
+                    );
+                }
+                Some(target) => Some(target.trim()),
+                None => config
+                    .target_contract
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|target| !target.is_empty()),
+            };
+            let target_contract = raw_target
+                .map(Address::from_str)
+                .transpose()
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "invalid --contract/target_contract address; got {:?}: {err}",
+                        raw_target.unwrap_or("")
+                    )
+                })?;
             println!(
                 "Starting fuzz campaign on {:?} for contract {:?}",
-                chain, contract
+                chain,
+                target_contract.map(|address| address.to_string())
             );
             let mut hardened_defi_config = config.hardened_defi.clone();
             if hardened_defi {
@@ -155,11 +188,7 @@ async fn main() -> anyhow::Result<()> {
             let fuzz_config = rusty_fuzz::engine::fuzz_engine::Config {
                 rpc_url: config.rpc_url.clone(),
                 fork_block: config.fork_block.unwrap_or(0),
-                target_contract: contract
-                    .as_deref()
-                    .or(config.target_contract.as_deref())
-                    .map(Address::from_str)
-                    .transpose()?,
+                target_contract,
                 corpus_dir: config.corpus_dir.clone(),
                 report_dir: config.report_dir.clone(),
                 foundry_harness: config
@@ -461,6 +490,7 @@ async fn main() -> anyhow::Result<()> {
             let scanner = MempoolScanner::new(config.rpc_url.clone());
             scanner.scan_mempool().await?;
         }
+        Command::Satori { .. } => unreachable!("Satori command is dispatched before config load"),
     }
 
     Ok(())

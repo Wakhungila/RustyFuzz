@@ -137,6 +137,7 @@ const MAP_SIZE: usize = 65_536;
 const STATE_NOVELTY_MAP_SLOTS: usize = 2_048;
 const CAMPAIGN_SCORE_MAP_SLOTS: usize = 1_024;
 const CAMPAIGN_TELEMETRY_INTERVAL: Duration = Duration::from_secs(30);
+const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct Config {
@@ -163,7 +164,8 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
     log::info!("Initializing RustyFuzz v0.15.4 Campaign...");
 
-    let (mut initial_db, initial_env) = {
+    let (mut initial_db, initial_env, synthetic_fork_mode) = {
+        let mut synthetic_fork_mode = false;
         let db = match crate::evm::fork::create_fork_db(
             &config.rpc_url,
             config.fork_block,
@@ -178,6 +180,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     config.target_contract,
                     err
                 );
+                synthetic_fork_mode = true;
                 crate::evm::fork::create_offline_fallback_fork_db(config.target_contract)
             }
         };
@@ -196,7 +199,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
             }
         };
 
-        (db, env)
+        (db, env, synthetic_fork_mode)
     };
 
     let fuzzer_address = Address::repeat_byte(0x13);
@@ -229,6 +232,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
     let launcher_fallback_db = initial_db.clone();
     let launcher_fallback_env = initial_env.clone();
     let launcher_fallback_actor_set = hardened_actor_set.clone();
+    let launcher_fallback_synthetic_fork_mode = synthetic_fork_mode;
 
     if config.hardened_defi.single_process {
         return run_single_process_campaign(
@@ -236,9 +240,18 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
             launcher_fallback_db,
             launcher_fallback_env,
             launcher_fallback_actor_set,
+            launcher_fallback_synthetic_fork_mode,
         )
         .await;
     }
+
+    let cores = campaign_cores()?;
+    let execution_timeout = campaign_execution_timeout();
+    log::info!(
+        "Launching brokered fuzz campaign on cores `{}` with per-input timeout {:?}",
+        cores.cmdline,
+        execution_timeout
+    );
 
     let launcher_result = Launcher::builder()
         .shmem_provider(shmem_provider)
@@ -714,6 +727,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
                     if let Some(reason) =
                         campaign_artifact_reason(
+                            synthetic_fork_mode,
                             &execution,
                             &report,
                             &campaign_score,
@@ -775,12 +789,13 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     ExitKind::Ok
                 };
 
-                let mut executor = InProcessExecutor::new(
+                let mut executor = InProcessExecutor::with_timeout::<()>(
                     &mut harness,
                     tuple_list!(observer),
                     &mut fuzzer,
                     &mut state,
                     &mut manager,
+                    execution_timeout,
                 )?;
 
                 fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
@@ -788,7 +803,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 Ok(())
             },
         )
-        .cores(&Cores::from_cmdline("all")?)
+        .cores(&cores)
         .build()
         .launch();
 
@@ -804,6 +819,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 launcher_fallback_db,
                 launcher_fallback_env,
                 launcher_fallback_actor_set,
+                launcher_fallback_synthetic_fork_mode,
             )
             .await
         }
@@ -815,8 +831,14 @@ async fn run_single_process_campaign(
     initial_db: CacheDB<ForkDb>,
     initial_env: revm::context::BlockEnv,
     hardened_actor_set: Option<ActorSet>,
+    synthetic_fork_mode: bool,
 ) -> anyhow::Result<()> {
     let start_time = Instant::now();
+    let execution_timeout = campaign_execution_timeout();
+    log::info!(
+        "Launching broker-free single-process fuzz campaign with per-input timeout {:?}",
+        execution_timeout
+    );
     let _monitor = SimpleMonitor::new(|s| {
         log::info!("Stats: {} | Duration: {:?}", s, start_time.elapsed());
     });
@@ -1249,6 +1271,7 @@ async fn run_single_process_campaign(
         }
 
         if let Some(reason) = campaign_artifact_reason(
+            synthetic_fork_mode,
             &execution,
             &report,
             &campaign_score,
@@ -1299,12 +1322,13 @@ async fn run_single_process_campaign(
         ExitKind::Ok
     };
 
-    let mut executor = InProcessExecutor::new(
+    let mut executor = InProcessExecutor::with_timeout::<()>(
         &mut harness,
         tuple_list!(observer),
         &mut fuzzer,
         &mut state,
         &mut manager,
+        execution_timeout,
     )?;
 
     fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
@@ -1312,13 +1336,37 @@ async fn run_single_process_campaign(
     Ok(())
 }
 
+fn campaign_cores() -> anyhow::Result<Cores> {
+    let requested = std::env::var("RUSTYFUZZ_CORES")
+        .ok()
+        .or_else(|| std::env::var("LIBAFL_CORES").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "all".to_string());
+    Cores::from_cmdline(&requested)
+        .map_err(|err| anyhow::anyhow!("invalid core selection `{requested}`: {err}"))
+}
+
+fn campaign_execution_timeout() -> Duration {
+    std::env::var("RUSTYFUZZ_EXEC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_EXECUTION_TIMEOUT)
+}
+
 fn campaign_artifact_reason(
+    synthetic_fork_mode: bool,
     execution: &SequenceExecutionResult,
     state_report: &StateNoveltyReport,
     campaign_score: &CampaignScore,
     findings: &[crate::common::oracle::ProtocolFinding],
     exploit_candidate: Option<&crate::engine::exploit_path::ExploitPathCandidate>,
 ) -> Option<&'static str> {
+    if synthetic_fork_mode {
+        return None;
+    }
+
     const MIN_NON_SUCCESS_ARTIFACT_SCORE: u64 = 500;
     const MIN_ECONOMIC_OR_INVARIANT_SCORE: u64 = 250;
     const MIN_STATE_NOVELTY_ARTIFACT_SCORE: u64 = 150;
@@ -1553,5 +1601,24 @@ mod tests {
 
         assert!(coverage.iter().any(|hit| *hit > 0));
         assert!(coverage.iter().filter(|hit| **hit > 0).count() >= 4);
+    }
+
+    #[test]
+    fn campaign_cores_respects_libafl_env_alias() {
+        std::env::set_var("LIBAFL_CORES", "0-1");
+        std::env::remove_var("RUSTYFUZZ_CORES");
+        let cores = campaign_cores().unwrap();
+        assert_eq!(cores.cmdline, "0-1");
+        assert_eq!(cores.ids.len(), 2);
+        std::env::remove_var("LIBAFL_CORES");
+    }
+
+    #[test]
+    fn execution_timeout_uses_safe_default_and_env_override() {
+        std::env::remove_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS");
+        assert_eq!(campaign_execution_timeout(), DEFAULT_EXECUTION_TIMEOUT);
+        std::env::set_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS", "7");
+        assert_eq!(campaign_execution_timeout(), Duration::from_secs(7));
+        std::env::remove_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS");
     }
 }

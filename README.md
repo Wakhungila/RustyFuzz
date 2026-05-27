@@ -178,6 +178,31 @@ Target-adaptive machinery for mature DeFi protocols:
 
 **Limitations**: Protocol invariants are heuristic packs, not protocol-specific. Historical seeds require useful calldata. Economic deltas are strongest when token balances are observable. Benchmark validation is the source of truth.
 
+### Satori AI Audit Harness
+
+Satori is RustyFuzz's AI-guided repo audit control plane. It ingests a Solidity/Vyper repository, builds deterministic protocol context, selects critical functions, creates compact packets, uses OpenAI `o3` behind `--features llm` for hypothesis generation, emits RustyFuzz job JSON, generates Foundry PoC scaffolds, stores memory, and writes reports that separate unvalidated hypotheses from locally validated findings.
+
+No LLM:
+```bash
+cargo run -- satori ingest ./protocol
+cargo run -- satori graph ./protocol
+cargo run -- satori packets ./protocol
+```
+
+With `o3`:
+```bash
+export OPENAI_API_KEY="..."
+cargo run --features llm -- satori audit ./protocol \
+  --model o3 \
+  --max-critical-functions 8 \
+  --max-hypotheses-per-function 2 \
+  --min-confidence 0.40 \
+  --validate true \
+  --generate-jobs true
+```
+
+Satori does not broadcast transactions, use private keys, or label model output as confirmed findings without deterministic local evidence. See [docs/SATORI.md](docs/SATORI.md).
+
 ## Installation
 
 ### Prerequisites

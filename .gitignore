@@ -14,7 +14,8 @@
 # RustyFuzz runtime artifacts
 # ─────────────────────────────────────────────────────────────
 /corpus/
-/reports/
+/reports/*
+!/reports/satori_baseline.md
 /benchmarks/*
 !/benchmarks/historical/
 !/benchmarks/historical/**
@@ -23,7 +24,8 @@
 !/benchmarks/live/
 !/benchmarks/live/**
 /seeds/
-/docs/
+/docs/*
+!/docs/SATORI.md
 /crashes/
 /findings/
 /artifacts/
