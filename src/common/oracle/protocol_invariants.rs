@@ -53,6 +53,7 @@ impl ProtocolInvariantEvaluator {
         self.evaluate_erc4626(execution, &mut findings);
         self.evaluate_oracle_freshness(execution, &mut findings);
         self.evaluate_access_control(execution, &mut findings);
+        self.evaluate_bridge(execution, &mut findings);
 
         findings.retain(|finding| finding.confidence >= self.min_persistable_confidence);
         findings.sort_by(|a, b| {
@@ -300,6 +301,140 @@ impl ProtocolInvariantEvaluator {
             }
         }
     }
+
+    fn evaluate_bridge(
+        &self,
+        execution: &SequenceExecutionResult,
+        findings: &mut Vec<ProtocolInvariantFinding>,
+    ) {
+        let inbound_selectors = [
+            function_selector("lock(uint256)"),
+            function_selector("lock(address,uint256)"),
+            function_selector("deposit(uint256)"),
+            function_selector("deposit(address,uint256)"),
+            function_selector("send(bytes)"),
+            function_selector("sendMessage(bytes)"),
+            function_selector("burn(uint256)"),
+            function_selector("burn(address,uint256)"),
+        ];
+        let proof_selectors = [
+            function_selector("prove(bytes)"),
+            function_selector("proveMessage(bytes)"),
+            function_selector("relayMessage(bytes)"),
+        ];
+        let outbound_selectors = [
+            function_selector("finalize(bytes)"),
+            function_selector("finalizeMessage(bytes)"),
+            function_selector("claim()"),
+            function_selector("release(address,uint256)"),
+            function_selector("mint(address,uint256)"),
+            function_selector("outboundTransfer(address,address,uint256,bytes)"),
+        ];
+
+        let inbound_calls = calls_with_selectors(execution, &inbound_selectors);
+        let proof_calls = calls_with_selectors(execution, &proof_selectors);
+        let outbound_calls = calls_with_selectors(execution, &outbound_selectors);
+        if outbound_calls.is_empty() {
+            return;
+        }
+
+        for call in &outbound_calls {
+            if !call.success {
+                continue;
+            }
+            let has_prior_lock_or_burn = inbound_calls
+                .iter()
+                .any(|prior| prior.target == call.target && prior.tx_index < call.tx_index);
+            let has_prior_proof = proof_calls
+                .iter()
+                .any(|prior| prior.target == call.target && prior.tx_index < call.tx_index);
+            let writes = writes_for_target(execution, call.target, call.tx_index);
+            if !has_prior_lock_or_burn && writes.iter().any(|diff| abs_delta(diff) >= U256::from(1))
+            {
+                findings.push(ProtocolInvariantFinding {
+                    family: ProtocolInvariantFamily::BridgeReplay,
+                    severity_hint: ProtocolSeverity::Critical,
+                    confidence: 86,
+                    affected_contracts: vec![call.target],
+                    evidence: format!(
+                        "bridge outbound selector {} succeeded without prior lock/burn on target and wrote {} slots",
+                        selector_hex(call),
+                        writes.len()
+                    ),
+                    recommended_reproduction_sequence: vec![selector_hex(call)],
+                    false_positive_caveats: vec![
+                        "proofs may encode a valid inbound event outside the fuzzed sequence; replay with decoded bridge proof metadata"
+                            .to_string(),
+                    ],
+                });
+            }
+
+            if !has_prior_proof && selector(call) != Some(function_selector("claim()")) {
+                findings.push(ProtocolInvariantFinding {
+                    family: ProtocolInvariantFamily::BridgeReplay,
+                    severity_hint: ProtocolSeverity::High,
+                    confidence: 78,
+                    affected_contracts: vec![call.target],
+                    evidence: format!(
+                        "bridge finalization selector {} succeeded without prior prove/relay step",
+                        selector_hex(call)
+                    ),
+                    recommended_reproduction_sequence: vec![selector_hex(call)],
+                    false_positive_caveats: vec![
+                        "some bridges verify proofs inside finalize instead of a separate prove step"
+                            .to_string(),
+                    ],
+                });
+            }
+
+            if writes.is_empty() {
+                findings.push(ProtocolInvariantFinding {
+                    family: ProtocolInvariantFamily::BridgeReplay,
+                    severity_hint: ProtocolSeverity::High,
+                    confidence: 80,
+                    affected_contracts: vec![call.target],
+                    evidence: format!(
+                        "bridge terminal selector {} succeeded without nonce/replay-protection storage write",
+                        selector_hex(call)
+                    ),
+                    recommended_reproduction_sequence: vec![selector_hex(call)],
+                    false_positive_caveats: vec![
+                        "nonce may be tracked in an external messenger contract not captured as target storage"
+                            .to_string(),
+                    ],
+                });
+            }
+        }
+
+        for first in outbound_calls.iter().filter(|call| call.success) {
+            if outbound_calls.iter().any(|second| {
+                second.success
+                    && second.tx_index > first.tx_index
+                    && second.target == first.target
+                    && second.input == first.input
+            }) {
+                findings.push(ProtocolInvariantFinding {
+                    family: ProtocolInvariantFamily::BridgeReplay,
+                    severity_hint: ProtocolSeverity::Critical,
+                    confidence: 90,
+                    affected_contracts: vec![first.target],
+                    evidence: format!(
+                        "same bridge terminal message {} succeeded more than once",
+                        selector_hex(first)
+                    ),
+                    recommended_reproduction_sequence: vec![
+                        selector_hex(first),
+                        selector_hex(first),
+                    ],
+                    false_positive_caveats: vec![
+                        "duplicate calldata may be valid for idempotent no-op paths; require replay storage diff review"
+                            .to_string(),
+                    ],
+                });
+                break;
+            }
+        }
+    }
 }
 
 fn protocol_invariant_to_finding(finding: ProtocolInvariantFinding) -> ProtocolFinding {
@@ -309,6 +444,7 @@ fn protocol_invariant_to_finding(finding: ProtocolInvariantFinding) -> ProtocolF
         ProtocolInvariantFamily::AmmReserve => ProtocolOraclePackKind::Amm,
         ProtocolInvariantFamily::LendingHealth => ProtocolOraclePackKind::Lending,
         ProtocolInvariantFamily::GovernanceTimelock => ProtocolOraclePackKind::Governance,
+        ProtocolInvariantFamily::BridgeReplay => ProtocolOraclePackKind::Bridge,
         _ => ProtocolOraclePackKind::Governance,
     };
     let vuln = match finding.family {
@@ -322,7 +458,7 @@ fn protocol_invariant_to_finding(finding: ProtocolInvariantFinding) -> ProtocolF
         }
         ProtocolInvariantFamily::GovernanceTimelock => VulnType::GovernanceTakeover,
         ProtocolInvariantFamily::BridgeReplay => {
-            VulnType::InvariantViolation("bridge replay/finalize invariant".to_string())
+            VulnType::BridgeInvariantViolation
         }
         ProtocolInvariantFamily::LendingHealth => {
             VulnType::InvariantViolation("lending health invariant".to_string())
@@ -569,6 +705,47 @@ mod tests {
         assert!(findings
             .iter()
             .any(|finding| finding.family == ProtocolInvariantFamily::GenericAccounting));
+    }
+
+    #[test]
+    fn detects_bridge_outbound_without_prior_lock_or_burn() {
+        let target = Address::repeat_byte(0xf1);
+        let execution = execution_with_call_and_writes(
+            target,
+            function_selector("release(address,uint256)"),
+            0,
+            1,
+            U256::from(10u128.pow(18)),
+        );
+
+        let findings = ProtocolInvariantEvaluator::default().evaluate(&execution);
+
+        assert!(findings.iter().any(|finding| {
+            finding.family == ProtocolInvariantFamily::BridgeReplay
+                && finding.evidence.contains("without prior lock/burn")
+        }));
+    }
+
+    #[test]
+    fn detects_bridge_terminal_message_replay() {
+        let target = Address::repeat_byte(0xf2);
+        let mut execution = execution_with_call_and_writes(
+            target,
+            function_selector("finalize(bytes)"),
+            0,
+            1,
+            U256::from(1),
+        );
+        let mut replay = execution.call_trace[0].clone();
+        replay.tx_index = 1;
+        execution.call_trace.push(replay);
+
+        let findings = ProtocolInvariantEvaluator::default().evaluate(&execution);
+
+        assert!(findings.iter().any(|finding| {
+            finding.family == ProtocolInvariantFamily::BridgeReplay
+                && finding.evidence.contains("succeeded more than once")
+        }));
     }
 
     fn execution_with_call_and_writes(

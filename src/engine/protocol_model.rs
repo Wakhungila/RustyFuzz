@@ -707,9 +707,17 @@ fn template_selectors(protocol: &ProtocolType) -> Vec<[u8; 4]> {
             selector_from_sig("execute(uint256)"),
         ],
         ProtocolType::BridgeMessagePassing => vec![
+            selector_from_sig("lock(uint256)"),
+            selector_from_sig("lock(address,uint256)"),
+            selector_from_sig("burn(uint256)"),
+            selector_from_sig("burn(address,uint256)"),
             selector_from_sig("send(bytes)"),
             selector_from_sig("prove(bytes)"),
+            selector_from_sig("relayMessage(bytes)"),
             selector_from_sig("finalize(bytes)"),
+            selector_from_sig("finalizeMessage(bytes)"),
+            selector_from_sig("release(address,uint256)"),
+            selector_from_sig("mint(address,uint256)"),
             selector_from_sig("claim()"),
         ],
         ProtocolType::StakingRewards => vec![

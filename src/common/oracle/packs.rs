@@ -61,6 +61,7 @@ pub enum ProtocolOraclePackKind {
     Lending,
     Governance,
     ProxyUpgradeability,
+    Bridge,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +81,7 @@ impl Default for ProtocolOraclePack {
                 ProtocolOraclePackKind::Lending,
                 ProtocolOraclePackKind::Governance,
                 ProtocolOraclePackKind::ProxyUpgradeability,
+                ProtocolOraclePackKind::Bridge,
             ]
             .into_iter()
             .collect(),

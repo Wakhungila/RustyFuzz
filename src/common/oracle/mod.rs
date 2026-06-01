@@ -34,6 +34,7 @@ pub enum VulnType {
     RebalanceValueLoss,
     MevSandwichExploit,
     CrossContractDesync,
+    BridgeInvariantViolation,
     SvmPdaCollision,
     DifferentialDivergence(String),
     Other(String),

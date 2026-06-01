@@ -2856,7 +2856,8 @@ impl VulnerabilityClass {
                     || text.contains("reserve")
             }
             VulnerabilityClass::BridgeReplayFinalizationBug => {
-                text.contains("bridge")
+                matches!(finding.vuln, VulnType::BridgeInvariantViolation)
+                    || text.contains("bridge")
                     || text.contains("replay")
                     || text.contains("finalize")
                     || text.contains("proof")
