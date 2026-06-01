@@ -39,6 +39,7 @@ use revm::database_interface::DatabaseRef;
 use revm::primitives::{Address, U256};
 use revm::state::AccountInfo;
 use std::cell::UnsafeCell;
+use std::collections::BTreeMap;
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
@@ -70,6 +71,9 @@ struct CampaignTelemetry {
     executions: AtomicU64,
     artifacts: AtomicU64,
     oracle_findings: AtomicU64,
+    state_novelty: AtomicU64,
+    best_score: AtomicU64,
+    mutation_strategies: Mutex<BTreeMap<String, u64>>,
     last_report: Mutex<(Instant, u64)>,
 }
 
@@ -81,6 +85,9 @@ impl CampaignTelemetry {
             executions: AtomicU64::new(0),
             artifacts: AtomicU64::new(0),
             oracle_findings: AtomicU64::new(0),
+            state_novelty: AtomicU64::new(0),
+            best_score: AtomicU64::new(0),
+            mutation_strategies: Mutex::new(BTreeMap::new()),
             last_report: Mutex::new((now, 0)),
         }
     }
@@ -91,11 +98,26 @@ impl CampaignTelemetry {
         tx_count: usize,
         findings: usize,
         campaign_score: u64,
+        corpus_size: usize,
+        coverage_edges: usize,
+        state_novelty_score: u64,
+        mutation_strategies: &[String],
     ) {
         let total = self.executions.fetch_add(1, Ordering::Relaxed) + 1;
         if findings > 0 {
             self.oracle_findings
                 .fetch_add(findings as u64, Ordering::Relaxed);
+        }
+        if state_novelty_score > 0 {
+            self.state_novelty
+                .fetch_add(state_novelty_score, Ordering::Relaxed);
+        }
+        self.best_score.fetch_max(campaign_score, Ordering::Relaxed);
+        if !mutation_strategies.is_empty() {
+            let mut counts = self.mutation_strategies.lock();
+            for strategy in mutation_strategies {
+                *counts.entry(strategy.clone()).or_default() += 1;
+            }
         }
 
         let now = Instant::now();
@@ -109,16 +131,29 @@ impl CampaignTelemetry {
         let interval_execs_per_sec = delta_execs as f64 / elapsed.as_secs_f64().max(0.001);
         let total_execs_per_sec =
             total as f64 / now.duration_since(self.start).as_secs_f64().max(0.001);
+        let mutation_mix = {
+            let counts = self.mutation_strategies.lock();
+            counts
+                .iter()
+                .map(|(strategy, count)| format!("{strategy}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         log::info!(
-            "RustyFuzz telemetry: core={}, execs={}, exec_sec_30s={:.3}, exec_sec_avg={:.3}, artifacts={}, oracle_findings={}, txs_last={}, score_last={}",
+            "RustyFuzz telemetry: core={}, executions={}, execs_per_sec_30s={:.3}, execs_per_sec_avg={:.3}, corpus_size={}, coverage_edges_last={}, state_novelty_count={}, oracle_findings={}, persisted_artifacts={}, best_score={}, txs_last={}, score_last={}, mutation_strategy_mix=[{}]",
             core_id,
             total,
             interval_execs_per_sec,
             total_execs_per_sec,
-            self.artifacts.load(Ordering::Relaxed),
+            corpus_size,
+            coverage_edges,
+            self.state_novelty.load(Ordering::Relaxed),
             self.oracle_findings.load(Ordering::Relaxed),
+            self.artifacts.load(Ordering::Relaxed),
+            self.best_score.load(Ordering::Relaxed),
             tx_count,
-            campaign_score
+            campaign_score,
+            mutation_mix
         );
         *last = (now, total);
     }
@@ -159,6 +194,11 @@ pub struct Config {
     pub hardened_defi: HardenedDefiConfig,
     pub target_invariant_manifest: Option<String>,
     pub abi_path: Option<String>,
+    pub max_execs: Option<u64>,
+    pub duration_secs: Option<u64>,
+    pub artifact_limit: Option<u64>,
+    pub campaign_id: Option<String>,
+    pub min_finding_confidence: u64,
 }
 
 pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
@@ -666,6 +706,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                             Err(err) => log::warn!("Failed to load target invariant manifest: {err:#}"),
                         }
                     }
+                    apply_min_finding_confidence(&mut findings, config.min_finding_confidence);
 
                     let mut campaign_score =
                         campaign_scorer.score(input, &execution, &report, &findings);
@@ -743,11 +784,21 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     });
 
                     account_registry.write().observe_execution(&execution);
+                    let mutation_strategies = mutation_strategies(input);
+                    let coverage_edges = execution
+                        .tx_results
+                        .iter()
+                        .map(|result| result.coverage_edges)
+                        .sum();
                     telemetry.record_execution(
                         core_id.0,
                         input.txs.len(),
                         findings.len(),
                         campaign_score.total,
+                        0,
+                        coverage_edges,
+                        report.novelty_score(),
+                        &mutation_strategies,
                     );
 
                     if report.interesting {
@@ -801,16 +852,19 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                         }
                     }
 
-                    if let Some(reason) =
-                        campaign_artifact_reason(
-                            synthetic_fork_mode,
-                            &execution,
-                            &report,
-                            &campaign_score,
-                            &findings,
-                            exploit_candidate.as_ref(),
-                        )
-                    {
+                    if artifact_limit_reached(&telemetry, config.artifact_limit) {
+                        log::debug!(
+                            "Artifact limit reached; skipping persistence (limit={:?})",
+                            config.artifact_limit
+                        );
+                    } else if let Some(reason) = campaign_artifact_reason(
+                        synthetic_fork_mode,
+                        &execution,
+                        &report,
+                        &campaign_score,
+                        &findings,
+                        exploit_candidate.as_ref(),
+                    ) {
                         let persisted = unsafe {
                             let map_ptr = (COVERAGE_MAP.0).get() as *mut u8;
                             let map_slice = std::slice::from_raw_parts(map_ptr, MAP_SIZE);
@@ -874,7 +928,31 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     execution_timeout,
                 )?;
 
-                fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
+                if let Some(max_execs) = config.max_execs {
+                    log::info!("Running bounded brokered campaign for {max_execs} stage iterations");
+                    let _ = fuzzer.fuzz_loop_for(
+                        &mut stages,
+                        &mut executor,
+                        &mut state,
+                        &mut manager,
+                        max_execs,
+                    )?;
+                } else if let Some(duration_secs) = config.duration_secs {
+                    log::info!(
+                        "Running duration-bounded brokered campaign for {duration_secs}s"
+                    );
+                    let deadline = Instant::now() + Duration::from_secs(duration_secs);
+                    while Instant::now() < deadline {
+                        let _ = fuzzer.fuzz_one(
+                            &mut stages,
+                            &mut executor,
+                            &mut state,
+                            &mut manager,
+                        )?;
+                    }
+                } else {
+                    fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
+                }
 
                 Ok(())
             },
@@ -1279,6 +1357,7 @@ async fn run_single_process_campaign(
                 Err(err) => log::warn!("Failed to load target invariant manifest: {err:#}"),
             }
         }
+        apply_min_finding_confidence(&mut findings, config.min_finding_confidence);
 
         let mut campaign_score = campaign_scorer.score(input, &execution, &report, &findings);
         if let Some(economic_delta) = economic_delta {
@@ -1349,11 +1428,21 @@ async fn run_single_process_campaign(
         });
 
         account_registry.write().observe_execution(&execution);
+        let mutation_strategies = mutation_strategies(input);
+        let coverage_edges = execution
+            .tx_results
+            .iter()
+            .map(|result| result.coverage_edges)
+            .sum();
         telemetry.record_execution(
             core_id,
             input.txs.len(),
             findings.len(),
             campaign_score.total,
+            0,
+            coverage_edges,
+            report.novelty_score(),
+            &mutation_strategies,
         );
 
         if report.interesting {
@@ -1372,7 +1461,12 @@ async fn run_single_process_campaign(
             }
         }
 
-        if let Some(reason) = campaign_artifact_reason(
+        if artifact_limit_reached(&telemetry, config.artifact_limit) {
+            log::debug!(
+                "Artifact limit reached; skipping persistence (limit={:?})",
+                config.artifact_limit
+            );
+        } else if let Some(reason) = campaign_artifact_reason(
             synthetic_fork_mode,
             &execution,
             &report,
@@ -1424,6 +1518,23 @@ async fn run_single_process_campaign(
         ExitKind::Ok
     };
 
+    if let Some(max_execs) = config.max_execs {
+        log::info!("Running direct bounded single-process campaign for {max_execs} executions");
+        let corpus_ids = state.corpus().ids().collect::<Vec<_>>();
+        if corpus_ids.is_empty() {
+            anyhow::bail!("cannot run bounded campaign with an empty corpus");
+        }
+        for iteration in 0..max_execs {
+            let id = corpus_ids[iteration as usize % corpus_ids.len()];
+            let input = state
+                .corpus()
+                .cloned_input_for_id(id)
+                .map_err(|err| anyhow::anyhow!("failed to clone bounded input: {err}"))?;
+            let _ = harness(&input);
+        }
+        return Ok(());
+    }
+
     let mut executor = InProcessExecutor::with_timeout::<()>(
         &mut harness,
         tuple_list!(observer),
@@ -1433,7 +1544,24 @@ async fn run_single_process_campaign(
         execution_timeout,
     )?;
 
-    fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
+    if let Some(max_execs) = config.max_execs {
+        log::info!("Running bounded single-process campaign for {max_execs} stage iterations");
+        let _ = fuzzer.fuzz_loop_for(
+            &mut stages,
+            &mut executor,
+            &mut state,
+            &mut manager,
+            max_execs,
+        )?;
+    } else if let Some(duration_secs) = config.duration_secs {
+        log::info!("Running duration-bounded single-process campaign for {duration_secs}s");
+        let deadline = Instant::now() + Duration::from_secs(duration_secs);
+        while Instant::now() < deadline {
+            let _ = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
+        }
+    } else {
+        fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
+    }
 
     Ok(())
 }
@@ -1591,6 +1719,12 @@ fn campaign_artifact_reason(
     exploit_candidate: Option<&crate::engine::exploit_path::ExploitPathCandidate>,
 ) -> Option<&'static str> {
     if synthetic_fork_mode {
+        if !findings.is_empty() {
+            return Some("synthetic-non-production-protocol-oracle-finding");
+        }
+        if campaign_score.total >= 250 {
+            return Some("synthetic-non-production-campaign-pressure");
+        }
         return None;
     }
 
@@ -1649,6 +1783,42 @@ fn campaign_artifact_reason(
     }
 
     None
+}
+
+fn mutation_strategies(input: &EvmInput) -> Vec<String> {
+    if input.mutation_provenance.is_empty() {
+        return vec!["seed_or_imported".to_string()];
+    }
+    input
+        .mutation_provenance
+        .iter()
+        .map(|mutation| mutation.strategy.clone())
+        .collect()
+}
+
+fn apply_min_finding_confidence(
+    findings: &mut Vec<crate::common::oracle::ProtocolFinding>,
+    min_confidence: u64,
+) {
+    if min_confidence == 0 {
+        return;
+    }
+    findings.retain(|finding| protocol_finding_confidence(finding) >= min_confidence);
+}
+
+fn protocol_finding_confidence(finding: &crate::common::oracle::ProtocolFinding) -> u64 {
+    use crate::common::oracle::ProtocolSeverity;
+    match &finding.severity {
+        ProtocolSeverity::Info => 20,
+        ProtocolSeverity::Low => 35,
+        ProtocolSeverity::Medium => 55,
+        ProtocolSeverity::High => 75,
+        ProtocolSeverity::Critical => 90,
+    }
+}
+
+fn artifact_limit_reached(telemetry: &CampaignTelemetry, artifact_limit: Option<u64>) -> bool {
+    artifact_limit.is_some_and(|limit| telemetry.artifacts.load(Ordering::Relaxed) >= limit)
 }
 
 fn sequence_result_from_tx_results(

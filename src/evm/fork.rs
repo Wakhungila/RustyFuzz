@@ -187,14 +187,14 @@ pub fn offline_fallback_runtime_bytecode() -> Vec<u8> {
         0x60, 0x01, 0x01, // PUSH1 0x01; ADD
         0x80, // DUP1
         0x60, 0x00, 0x55, // PUSH1 0x00; SSTORE
-        0x60, 0x01, 0x60, 0x01, 0x55, // PUSH1 0x01; PUSH1 0x01; SSTORE
-        0x61, 0x03, 0xe8, 0x60, 0x02, 0x55, // PUSH2 1000; PUSH1 0x02; SSTORE
     ];
-    code.push(0x7f);
-    code.extend_from_slice(&U256::from(10u128.pow(18)).to_be_bytes::<32>());
-    code.extend_from_slice(&[0x60, 0x03, 0x55]); // PUSH1 0x03; SSTORE
+    let large_value = U256::from(10u128.pow(18)).to_be_bytes::<32>();
+    for slot in 1u8..7 {
+        code.push(0x7f); // PUSH32
+        code.extend_from_slice(&large_value);
+        code.extend_from_slice(&[0x60, slot, 0x55]); // PUSH1 slot; SSTORE
+    }
     code.extend_from_slice(&[
-        0x61, 0x01, 0x00, 0x60, 0x04, 0x55, // PUSH2 256; PUSH1 0x04; SSTORE
         0x60, 0x00, 0x52, // PUSH1 0x00; MSTORE
         0x60, 0x20, 0x60, 0x00, 0xf3, // PUSH1 0x20; PUSH1 0x00; RETURN
     ]);

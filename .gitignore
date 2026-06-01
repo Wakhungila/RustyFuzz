@@ -26,6 +26,7 @@
 !/benchmarks/live/
 !/benchmarks/live/**
 /seeds/
+/tests/
 /docs/*
 !/docs/SATORI.md
 /crashes/

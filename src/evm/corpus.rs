@@ -777,10 +777,10 @@ fn triage_summary(input: TriageSummaryInput<'_>) -> CampaignArtifactTriageSummar
         .map(|finding| severity_confidence(&finding.severity))
         .max()
         .unwrap_or(0);
-    let confidence = max_severity
+    let mut confidence = max_severity
         .saturating_add((input.score.total / 100).min(25))
         .min(100);
-    let false_positive_risks = if input.findings.is_empty() {
+    let mut false_positive_risks = if input.findings.is_empty() {
         vec![
             "score-only artifact; replay before treating as vulnerability evidence".to_string(),
             "state novelty or economic pressure may be benign protocol behavior".to_string(),
@@ -801,6 +801,13 @@ fn triage_summary(input: TriageSummaryInput<'_>) -> CampaignArtifactTriageSummar
             })
             .collect()
     };
+    if input.reason.starts_with("synthetic-non-production") {
+        confidence = confidence.min(35);
+        false_positive_risks.push(
+            "synthetic fallback artifact; non-production evidence until replayed on a real fork"
+                .to_string(),
+        );
+    }
     let suggested_next_command = match input.target {
         Some(address) => {
             format!("cargo run --release -- fuzz --chain evm --contract {address}")

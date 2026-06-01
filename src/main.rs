@@ -58,6 +58,18 @@ enum Command {
         allow_synthetic_fallback: bool,
         #[arg(long)]
         abi: Option<String>,
+        #[arg(long)]
+        max_execs: Option<u64>,
+        #[arg(long)]
+        duration_secs: Option<u64>,
+        #[arg(long)]
+        artifact_limit: Option<u64>,
+        #[arg(long)]
+        campaign_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        no_synthetic_fallback: bool,
+        #[arg(long, default_value_t = 0)]
+        min_finding_confidence: u64,
     },
     AbiIngest {
         #[arg(long)]
@@ -219,6 +231,12 @@ async fn main() -> anyhow::Result<()> {
             require_rpc_fork,
             allow_synthetic_fallback,
             abi,
+            max_execs,
+            duration_secs,
+            artifact_limit,
+            campaign_id,
+            no_synthetic_fallback,
+            min_finding_confidence,
         } => {
             let raw_target = match contract.as_deref() {
                 Some(target) if target.trim().is_empty() => {
@@ -267,12 +285,21 @@ async fn main() -> anyhow::Result<()> {
             if seed_file.is_some() {
                 hardened_defi_config.historical_seed_file = seed_file;
             }
+            let sanitized_campaign_id = campaign_id.as_deref().map(sanitize_campaign_id);
+            let campaign_corpus_dir = sanitized_campaign_id
+                .as_ref()
+                .map(|id| format!("{}/{}", config.corpus_dir, id))
+                .unwrap_or_else(|| config.corpus_dir.clone());
+            let campaign_report_dir = sanitized_campaign_id
+                .as_ref()
+                .map(|id| format!("{}/{}", config.report_dir, id))
+                .unwrap_or_else(|| config.report_dir.clone());
             let fuzz_config = rusty_fuzz::engine::fuzz_engine::Config {
                 rpc_url: config.rpc_url.clone(),
                 fork_block: config.fork_block.unwrap_or(0),
                 target_contract,
-                corpus_dir: config.corpus_dir.clone(),
-                report_dir: config.report_dir.clone(),
+                corpus_dir: campaign_corpus_dir,
+                report_dir: campaign_report_dir,
                 foundry_harness: config
                     .foundry_project
                     .as_deref()
@@ -281,11 +308,16 @@ async fn main() -> anyhow::Result<()> {
                 mainnet_seed_bundle: config.mainnet_seed_bundle.clone(),
                 require_seed_bundle: config.require_seed_bundle || require_seed_bundle,
                 require_rpc_fork: config.require_rpc_fork || require_rpc_fork,
-                allow_synthetic_fallback: config.allow_synthetic_fallback
-                    || allow_synthetic_fallback,
+                allow_synthetic_fallback: !no_synthetic_fallback
+                    && (config.allow_synthetic_fallback || allow_synthetic_fallback),
                 hardened_defi: hardened_defi_config,
                 target_invariant_manifest: config.target_invariant_manifest.clone(),
                 abi_path: abi.or(config.target_abi.clone()),
+                max_execs,
+                duration_secs,
+                artifact_limit,
+                campaign_id: sanitized_campaign_id,
+                min_finding_confidence,
             };
             rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await?;
         }
@@ -652,6 +684,11 @@ async fn main() -> anyhow::Result<()> {
                     },
                     target_invariant_manifest: Some(invariant_path),
                     abi_path: abi.or(config.target_abi.clone()),
+                    max_execs: None,
+                    duration_secs: None,
+                    artifact_limit: None,
+                    campaign_id: Some(job.job_id.clone()),
+                    min_finding_confidence: 0,
                 };
                 rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await?;
             }
@@ -857,6 +894,24 @@ fn ensure_evm_chain(config: &Config) -> anyhow::Result<()> {
         config.chain
     );
     Ok(())
+}
+
+fn sanitize_campaign_id(id: &str) -> String {
+    let sanitized = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "campaign".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn target_address(cli_target: Option<&str>, config: &Config) -> anyhow::Result<Address> {
