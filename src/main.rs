@@ -14,9 +14,11 @@ use rusty_fuzz::engine::fork_setup::ForkSetupDiscoverer;
 use rusty_fuzz::engine::foundry_ingest::FoundryHarnessManifest;
 use rusty_fuzz::engine::invariant_manifest::TargetInvariantManifest;
 use rusty_fuzz::engine::minimizer::Minimizer;
-use rusty_fuzz::engine::promotion::PromotionConfig;
+use rusty_fuzz::engine::promotion::{
+    promote_finding_artifact, PromotionConfig, PromotionRequest,
+};
 use rusty_fuzz::engine::seed_intelligence::SeedIntelligence;
-use rusty_fuzz::evm::corpus::PersistentCorpus;
+use rusty_fuzz::evm::corpus::{CampaignArtifactRecord, PersistentCorpus};
 use rusty_fuzz::evm::executor::EvmExecutor;
 use rusty_fuzz::evm::fork::create_fork_block_env;
 use rusty_fuzz::evm::fork_db::ForkDb;
@@ -205,6 +207,14 @@ enum Command {
         fork_cache_id: Option<String>,
         #[arg(long)]
         reason: Option<String>,
+    },
+    Promote {
+        #[arg(long)]
+        input_id: String,
+        #[arg(long)]
+        fork_cache_id: Option<String>,
+        #[arg(long)]
+        campaign_id: Option<String>,
     },
     Validate {
         #[arg(long)]
@@ -941,6 +951,48 @@ async fn main() -> anyhow::Result<()> {
             };
             let report = corpus.write_reproduction_report(&input, &execution, crash.as_ref())?;
             println!("Report written: {}", report.display());
+        }
+        Command::Promote {
+            input_id,
+            fork_cache_id,
+            campaign_id,
+        } => {
+            ensure_evm_chain(&config)?;
+            let corpus = PersistentCorpus::new(&config.corpus_dir)?;
+            let artifact_path = std::path::Path::new(&config.corpus_dir)
+                .join("campaign_artifacts")
+                .join(format!("{input_id}.json"));
+            let mut artifact: CampaignArtifactRecord =
+                serde_json::from_slice(&std::fs::read(&artifact_path)?)?;
+            if let Some(fork_cache_id) = fork_cache_id {
+                artifact.fork_cache_id = fork_cache_id;
+            }
+            let block_env = campaign_block_env(&config).await?;
+            let promotion_config = PromotionConfig {
+                enabled: true,
+                require_replay_for_report: true,
+                require_poc_for_confirmed: true,
+                promotion_limit: None,
+            };
+            let record = promote_finding_artifact(PromotionRequest {
+                corpus: &corpus,
+                artifact: &artifact,
+                block_env: &block_env,
+                report_dir: std::path::Path::new(&config.report_dir),
+                campaign_id: campaign_id.as_deref().unwrap_or("manual-promote"),
+                fork_block: config.fork_block.unwrap_or(0),
+                rpc_url: &config.rpc_url,
+                synthetic_mode: false,
+                config: &promotion_config,
+            })?;
+            println!(
+                "Promoted finding {}: stage={:?}, confidence={}, replay={}, poc={}",
+                record.finding_id,
+                record.lifecycle_stage,
+                record.confidence,
+                record.replay_status,
+                record.poc_status
+            );
         }
         Command::Validate {
             benchmarks,

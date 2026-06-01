@@ -1,5 +1,7 @@
 use crate::common::oracle::{ProtocolFinding, ProtocolOraclePack, ProtocolSeverity, VulnType};
-use crate::common::types::{ChainState, ExecutionStatus, SequenceExecutionResult, Snapshot};
+use crate::common::types::{
+    CallObservation, ChainState, ExecutionStatus, SequenceExecutionResult, Snapshot, StorageDiff,
+};
 use crate::common::verifier::ReplayVerifier;
 use crate::engine::exploit_synthesizer::synthesize_foundry_poc_with_findings;
 use crate::engine::minimizer::Minimizer;
@@ -8,6 +10,7 @@ use crate::evm::executor::EvmExecutor;
 use crate::evm::fork_db::EvmCacheDb;
 use crate::evm::fuzz::EvmInput;
 use crate::evm::inspector::MAP_SIZE;
+use crate::engine::economic_delta::TokenBalanceView;
 use revm::context::BlockEnv;
 use revm::database::CacheDB;
 use revm::primitives::Address;
@@ -76,7 +79,10 @@ pub struct ReplayPromotionReport {
     pub tx_statuses: Vec<ExecutionStatus>,
     pub oracle_findings: Vec<ProtocolFinding>,
     pub storage_diff_count: usize,
+    pub storage_diffs: Vec<StorageDiff>,
     pub call_trace_shape: Vec<String>,
+    pub call_trace: Vec<CallObservation>,
+    pub final_balances: Vec<TokenBalanceView>,
     pub mismatches: Vec<String>,
 }
 
@@ -245,8 +251,18 @@ pub fn promote_finding_artifact(
 
     match replay_result {
         Ok(execution) => {
+            let final_balances = verifier
+                .replay_with_economic_views(
+                    &ChainState::Evm(base_db.clone()),
+                    request.block_env,
+                    &input,
+                    request.artifact.target,
+                )
+                .ok()
+                .map(|result| result.after.token_balances)
+                .unwrap_or_default();
             let replay_findings = ProtocolOraclePack::default().evaluate(&execution);
-            let replay_report = replay_report(&input, &execution, &replay_findings);
+            let replay_report = replay_report(&input, &execution, &replay_findings, final_balances);
             let replay_path = finding_dir.join("replay.json");
             write_json(&replay_path, &replay_report)?;
             artifact_paths.insert("replay".to_string(), replay_path.display().to_string());
@@ -469,6 +485,7 @@ fn replay_report(
     input: &EvmInput,
     execution: &SequenceExecutionResult,
     findings: &[ProtocolFinding],
+    final_balances: Vec<TokenBalanceView>,
 ) -> ReplayPromotionReport {
     let mut mismatches = Vec::new();
     if input.txs.len() != execution.tx_results.len() {
@@ -490,6 +507,7 @@ fn replay_report(
             .collect(),
         oracle_findings: findings.to_vec(),
         storage_diff_count: execution.storage_diffs.len(),
+        storage_diffs: execution.storage_diffs.iter().take(128).cloned().collect(),
         call_trace_shape: execution
             .call_trace
             .iter()
@@ -501,6 +519,8 @@ fn replay_report(
                 )
             })
             .collect(),
+        call_trace: execution.call_trace.iter().take(128).cloned().collect(),
+        final_balances,
         mismatches,
     }
 }

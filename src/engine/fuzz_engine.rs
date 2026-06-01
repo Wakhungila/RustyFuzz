@@ -2132,9 +2132,6 @@ fn maybe_promote_artifact(
     promotion_stats: &PromotionCampaignStats,
     telemetry: &CampaignTelemetry,
 ) {
-    if !config.promotion.enabled {
-        return;
-    }
     if artifact.findings.is_empty() {
         log::debug!(
             "Skipping promotion for score-only artifact input_id={} reason={} score={}; no oracle/protocol finding evidence",
@@ -2142,6 +2139,16 @@ fn maybe_promote_artifact(
             artifact.reason,
             artifact.score.total
         );
+        return;
+    }
+    let high_confidence = artifact
+        .findings
+        .iter()
+        .map(|finding| protocol_finding_confidence(finding))
+        .max()
+        .unwrap_or_default()
+        >= 80;
+    if !config.promotion.enabled && !high_confidence {
         return;
     }
     if config
