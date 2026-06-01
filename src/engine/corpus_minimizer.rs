@@ -4,9 +4,6 @@ use libafl::{
     prelude::*,
     stages::Stage,
     state::HasCorpus,
-    // TODO: These traits moved in libafl
-    // state::UsesInput,
-    // executors::hooks::UsesState,
 };
 use parking_lot::RwLock;
 use revm::context::BlockEnv;
@@ -34,7 +31,6 @@ pub struct CorpusMinimizationStage<S> {
 impl<S> CorpusMinimizationStage<S>
 where
     S: HasCorpus<EvmInput>,
-    // S: UsesInput<Input = EvmInput>, // TODO: UsesInput trait moved in libafl
 {
     pub fn new(
         corpus: Arc<RwLock<SnapshotCorpus>>,
@@ -88,16 +84,14 @@ where
     }
 }
 
-impl<S, EM, Z> Stage<EvmInput, EM, S, Z> for CorpusMinimizationStage<S>
+impl<E, EM, S, Z> Stage<E, EM, S, Z> for CorpusMinimizationStage<S>
 where
     S: HasCorpus<EvmInput>,
-    // TODO: Reintroduce UsesInput/UsesState bounds when this stage is wired to the
-    // active LibAFL API.
 {
     fn perform(
         &mut self,
         _fuzzer: &mut Z,
-        _executor: &mut EvmInput,
+        _executor: &mut E,
         _state: &mut S,
         _manager: &mut EM,
     ) -> Result<(), libafl::Error> {
