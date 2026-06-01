@@ -722,7 +722,7 @@ impl ScoringEngine {
         // B. Privilege Escalation (0-100): Weighted heavily for Pashov's triage workflow.
         // Access control bypasses are the highest-priority findings.
         let privilege = match vuln {
-            VulnType::PrivilegeEscalation => 100,
+            VulnType::PrivilegeEscalation | VulnType::ProxyUpgradeabilityViolation => 100,
             VulnType::GovernanceParameterManipulation => 90,
             _ => {
                 if trace.calls.iter().any(|c| c.is_delegate) {
@@ -756,6 +756,7 @@ impl ScoringEngine {
         let boost: u32 = match vuln {
             VulnType::InvariantViolation(_) | VulnType::UniswapV3LiquidityAsymmetry => 4000, // 40.0 * 100
             VulnType::MevSandwichExploit | VulnType::VaultDonationAttack => 3000,
+            VulnType::ProxyUpgradeabilityViolation => 2500,
             _ => 0,
         };
 

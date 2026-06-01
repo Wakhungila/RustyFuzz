@@ -186,6 +186,7 @@ fn protocol_finding_is_invariant_or_economic(finding: &ProtocolFinding) -> bool 
             | VulnType::RebalanceValueLoss
             | VulnType::SystemicStateCorruption
             | VulnType::PrivilegeEscalation
+            | VulnType::ProxyUpgradeabilityViolation
     )
 }
 

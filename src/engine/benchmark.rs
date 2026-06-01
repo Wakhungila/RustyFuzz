@@ -2833,9 +2833,13 @@ impl VulnerabilityClass {
             VulnerabilityClass::AccessControlBypass => {
                 matches!(
                     finding.vuln,
-                    VulnType::PrivilegeEscalation | VulnType::MissingSignerCheck
+                    VulnType::PrivilegeEscalation
+                        | VulnType::MissingSignerCheck
+                        | VulnType::ProxyUpgradeabilityViolation
                 ) || text.contains("access")
                     || text.contains("role")
+                    || text.contains("proxy")
+                    || text.contains("upgrade")
             }
             VulnerabilityClass::GovernanceTimelockBypass => {
                 matches!(

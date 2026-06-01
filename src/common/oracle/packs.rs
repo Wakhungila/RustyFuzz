@@ -2,7 +2,7 @@ use crate::common::oracle::{ProtocolInvariantEvaluator, VulnType};
 use crate::common::types::{
     CallKind, CallObservation, CallPhase, OracleObservation, SequenceExecutionResult, StorageDiff,
 };
-use revm::primitives::{Address, U256};
+use revm::primitives::{keccak256, Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -60,6 +60,7 @@ pub enum ProtocolOraclePackKind {
     Amm,
     Lending,
     Governance,
+    ProxyUpgradeability,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +79,7 @@ impl Default for ProtocolOraclePack {
                 ProtocolOraclePackKind::Amm,
                 ProtocolOraclePackKind::Lending,
                 ProtocolOraclePackKind::Governance,
+                ProtocolOraclePackKind::ProxyUpgradeability,
             ]
             .into_iter()
             .collect(),
@@ -104,6 +106,12 @@ impl ProtocolOraclePack {
         }
         if self.enabled.contains(&ProtocolOraclePackKind::Governance) {
             self.evaluate_governance(execution, &mut findings);
+        }
+        if self
+            .enabled
+            .contains(&ProtocolOraclePackKind::ProxyUpgradeability)
+        {
+            self.evaluate_proxy_upgradeability(execution, &mut findings);
         }
         findings.extend(
             ProtocolInvariantEvaluator {
@@ -465,6 +473,115 @@ impl ProtocolOraclePack {
             });
         }
     }
+
+    fn evaluate_proxy_upgradeability(
+        &self,
+        execution: &SequenceExecutionResult,
+        findings: &mut Vec<ProtocolFinding>,
+    ) {
+        let initializer_selectors = [
+            sig("initialize()"),
+            sig("initialize(address)"),
+            sig("initialize(address,address)"),
+            sig("initialize(bytes)"),
+            sig("reinitialize(uint8)"),
+        ];
+        let upgrade_selectors = [
+            sig("upgradeTo(address)"),
+            sig("upgradeToAndCall(address,bytes)"),
+        ];
+        let implementation_slot = eip1967_slot("eip1967.proxy.implementation");
+        let admin_slot = eip1967_slot("eip1967.proxy.admin");
+
+        for call in calls_with_selectors(execution, &initializer_selectors) {
+            if !call.success {
+                continue;
+            }
+            let writes = writes_for_target(execution, call.target, call.tx_index);
+            if writes.is_empty() {
+                continue;
+            }
+            let eip1967_writes = writes
+                .iter()
+                .filter(|diff| diff.slot == implementation_slot || diff.slot == admin_slot)
+                .count();
+            findings.push(ProtocolFinding {
+                pack: ProtocolOraclePackKind::ProxyUpgradeability,
+                vuln: VulnType::ProxyUpgradeabilityViolation,
+                severity: if eip1967_writes > 0 {
+                    ProtocolSeverity::Critical
+                } else {
+                    ProtocolSeverity::High
+                },
+                tx_index: Some(call.tx_index),
+                target: Some(call.target),
+                evidence: format!(
+                    "successful external initializer {} wrote {} storage slots after fork/deployment state; eip1967_writes={}",
+                    selector_hex(call),
+                    writes.len(),
+                    eip1967_writes
+                ),
+            });
+        }
+
+        for diff in execution.storage_diffs.iter().filter(|diff| {
+            diff.old_value != diff.new_value
+                && (diff.slot == implementation_slot || diff.slot == admin_slot)
+        }) {
+            let role = if diff.slot == implementation_slot {
+                "implementation"
+            } else {
+                "admin"
+            };
+            let selector_context = execution
+                .call_trace
+                .iter()
+                .find(|call| {
+                    call.tx_index == diff.tx_index
+                        && call.target == diff.address
+                        && call.phase == CallPhase::End
+                })
+                .and_then(selector);
+            let upgrade_like = selector_context.is_some_and(|sel| {
+                upgrade_selectors.contains(&sel) || initializer_selectors.contains(&sel)
+            });
+            findings.push(ProtocolFinding {
+                pack: ProtocolOraclePackKind::ProxyUpgradeability,
+                vuln: VulnType::ProxyUpgradeabilityViolation,
+                severity: if role == "admin" || upgrade_like {
+                    ProtocolSeverity::Critical
+                } else {
+                    ProtocolSeverity::High
+                },
+                tx_index: Some(diff.tx_index),
+                target: Some(diff.address),
+                evidence: format!(
+                    "EIP-1967 {role} slot mutated old={} new={} selector={} upgrade_like={upgrade_like}",
+                    diff.old_value,
+                    diff.new_value,
+                    selector_context
+                        .map(hex::encode)
+                        .unwrap_or_else(|| "none".to_string())
+                ),
+            });
+        }
+
+        for call in calls_with_selectors(execution, &upgrade_selectors) {
+            if call.success {
+                findings.push(ProtocolFinding {
+                    pack: ProtocolOraclePackKind::ProxyUpgradeability,
+                    vuln: VulnType::ProxyUpgradeabilityViolation,
+                    severity: ProtocolSeverity::High,
+                    tx_index: Some(call.tx_index),
+                    target: Some(call.target),
+                    evidence: format!(
+                        "successful upgrade entrypoint {} reached through fuzzed input",
+                        selector_hex(call)
+                    ),
+                });
+            }
+        }
+    }
 }
 
 fn calls_with_selectors<'a>(
@@ -523,6 +640,16 @@ fn output_u256(call: &CallObservation) -> Option<U256> {
     (call.output.len() >= 32).then(|| U256::from_be_slice(&call.output[..32]))
 }
 
+fn eip1967_slot(label: &str) -> B256 {
+    let value = U256::from_be_bytes(keccak256(label.as_bytes()).0).saturating_sub(U256::from(1));
+    B256::from(value.to_be_bytes::<32>())
+}
+
+fn sig(signature: &str) -> [u8; 4] {
+    let hash = keccak256(signature.as_bytes());
+    [hash[0], hash[1], hash[2], hash[3]]
+}
+
 pub fn summarize_findings_by_pack(
     findings: &[ProtocolFinding],
 ) -> BTreeMap<ProtocolOraclePackKind, usize> {
@@ -531,4 +658,102 @@ pub fn summarize_findings_by_pack(
         *out.entry(finding.pack.clone()).or_insert(0) += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::{CallKind, ExecutionStatus, TxExecutionResult};
+
+    fn addr(byte: u8) -> Address {
+        Address::repeat_byte(byte)
+    }
+
+    fn call(selector: [u8; 4]) -> CallObservation {
+        CallObservation {
+            tx_index: 0,
+            depth: 0,
+            caller: addr(0x01),
+            target: addr(0xaa),
+            value: U256::ZERO,
+            input: selector.to_vec(),
+            output: Vec::new(),
+            gas_limit: 100_000,
+            gas_used: 21_000,
+            success: true,
+            kind: CallKind::Transaction,
+            phase: CallPhase::End,
+            created_address: None,
+            result: None,
+        }
+    }
+
+    fn execution(
+        call_trace: Vec<CallObservation>,
+        storage_diffs: Vec<StorageDiff>,
+    ) -> SequenceExecutionResult {
+        SequenceExecutionResult {
+            tx_results: vec![TxExecutionResult {
+                tx_index: 0,
+                status: ExecutionStatus::Success,
+                gas_used: 21_000,
+                output: Vec::new(),
+                coverage_hash: 0,
+                coverage_edges: 0,
+                storage_reads: Vec::new(),
+                storage_writes: Vec::new(),
+                storage_diffs: storage_diffs.clone(),
+                call_trace: call_trace.clone(),
+                waypoints: Vec::new(),
+            }],
+            total_gas_used: 21_000,
+            final_coverage_hash: 0,
+            storage_reads: Vec::new(),
+            storage_writes: Vec::new(),
+            storage_diffs,
+            call_trace,
+            oracle_observations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn flags_successful_initializer_with_storage_writes() {
+        let diff = StorageDiff {
+            tx_index: 0,
+            address: addr(0xaa),
+            slot: B256::from(U256::from(7).to_be_bytes::<32>()),
+            old_value: U256::ZERO,
+            new_value: U256::from(1),
+            pc: 0,
+        };
+        let findings = ProtocolOraclePack::default()
+            .evaluate(&execution(vec![call(sig("initialize()"))], vec![diff]));
+
+        assert!(findings.iter().any(|finding| {
+            finding.pack == ProtocolOraclePackKind::ProxyUpgradeability
+                && finding.vuln == VulnType::ProxyUpgradeabilityViolation
+        }));
+    }
+
+    #[test]
+    fn flags_eip1967_implementation_slot_mutation() {
+        let diff = StorageDiff {
+            tx_index: 0,
+            address: addr(0xaa),
+            slot: eip1967_slot("eip1967.proxy.implementation"),
+            old_value: U256::ZERO,
+            new_value: U256::from(0xbb),
+            pc: 0,
+        };
+        let findings = ProtocolOraclePack::default().evaluate(&execution(
+            vec![call(sig("upgradeTo(address)"))],
+            vec![diff],
+        ));
+
+        assert!(findings.iter().any(|finding| {
+            finding.pack == ProtocolOraclePackKind::ProxyUpgradeability
+                && finding.severity == ProtocolSeverity::Critical
+                && finding.evidence.contains("implementation slot mutated")
+        }));
+    }
 }

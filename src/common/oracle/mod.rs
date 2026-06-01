@@ -29,6 +29,7 @@ pub enum VulnType {
     InvariantViolation(String),
     UnintendedPanic(u64),
     GovernanceParameterManipulation,
+    ProxyUpgradeabilityViolation,
     PersistenceFailure,
     RebalanceValueLoss,
     MevSandwichExploit,
