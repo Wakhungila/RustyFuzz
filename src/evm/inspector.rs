@@ -233,6 +233,26 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                     );
                 }
             }
+            0x37 => {
+                if let (Ok(dest), Ok(src), Ok(len)) = (
+                    interp.stack.peek(0),
+                    interp.stack.peek(1),
+                    interp.stack.peek(2),
+                ) {
+                    let dest: usize = dest.saturating_to();
+                    let src: usize = src.saturating_to();
+                    let len: usize = len.saturating_to();
+                    for i in 0..len {
+                        self.memory_taint
+                            .insert(dest + i, TaintSource::Calldata(src + i));
+                        self.memory_expression.insert(
+                            dest + i,
+                            SymbolicExpression::Source(TaintSource::Calldata(src + i)),
+                        );
+                    }
+                    self.pop_symbolic_operands(3);
+                }
+            }
             0x3C => {
                 if let (Ok(dest), Ok(src), Ok(len)) = (
                     interp.stack.peek(0),
