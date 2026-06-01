@@ -42,7 +42,6 @@ use parking_lot::{Mutex, RwLock};
 use revm::database::CacheDB;
 use revm::primitives::{Address, U256};
 use revm::state::AccountInfo;
-use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,10 +49,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-
-// Sync wrapper for UnsafeCell to allow thread-safe static usage.
-struct SyncUnsafeCell<T>(UnsafeCell<T>);
-unsafe impl<T: Send> Sync for SyncUnsafeCell<T> {}
 
 fn campaign_rng_seed(config: &Config, core_id: usize) -> u64 {
     if config.hardened_defi.deterministic {
@@ -182,6 +177,7 @@ use libafl::prelude::{
     StdFuzzer, StdMapObserver, StdMutationalStage, StdState,
 };
 use libafl_bolts::prelude::*;
+use libafl_bolts::ownedref::OwnedMutSlice;
 use libafl_bolts::shmem::{ShMemProvider, StdShMemProvider};
 use libafl_bolts::tuples::tuple_list;
 
@@ -676,16 +672,13 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     objective,
                 );
 
-                static COVERAGE_MAP: SyncUnsafeCell<[u8; MAP_SIZE]> =
-                    SyncUnsafeCell(UnsafeCell::new([0u8; MAP_SIZE]));
-
-                let observer = unsafe {
-                    StdMapObserver::from_mut_ptr(
-                        "edges",
-                        (COVERAGE_MAP.0).get() as *mut u8,
-                        MAP_SIZE,
-                    )
-                };
+                let mut shmem_provider = StdShMemProvider::new()?;
+                let mut shmem = shmem_provider.new_shmem(MAP_SIZE)?;
+                let coverage_map_ptr = shmem.as_mut_ptr();
+                let observer = StdMapObserver::from_mut_slice(
+                    "edges",
+                    unsafe { OwnedMutSlice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE) },
+                );
 
                 let mut harness = |input: &EvmInput| {
                     let snap_id = input.base_snapshot_id;
@@ -710,9 +703,8 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                         let mut df = dataflow_registry.write();
 
                         let exec_result = unsafe {
-                            let map_ptr = (COVERAGE_MAP.0).get() as *mut u8;
-                            let map_slice = std::slice::from_raw_parts_mut(map_ptr, MAP_SIZE);
-
+                            let map_slice =
+                                std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE);
                             evm_executor.execute_with_result(
                                 &mut current_state,
                                 &mut current_env,
@@ -847,8 +839,8 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
                     if report.interesting {
                         unsafe {
-                            let map_ptr = (COVERAGE_MAP.0).get() as *mut u8;
-                            let map_slice = std::slice::from_raw_parts_mut(map_ptr, MAP_SIZE);
+                            let map_slice =
+                                std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE);
                             reward_state_novelty(map_slice, &report);
                         }
 
@@ -865,8 +857,8 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
                     if campaign_score.is_interesting() {
                         unsafe {
-                            let map_ptr = (COVERAGE_MAP.0).get() as *mut u8;
-                            let map_slice = std::slice::from_raw_parts_mut(map_ptr, MAP_SIZE);
+                            let map_slice =
+                                std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE);
                             reward_campaign_score(map_slice, &campaign_score);
                         }
 
@@ -910,8 +902,8 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                         exploit_candidate.as_ref(),
                     ) {
                         let persisted = unsafe {
-                            let map_ptr = (COVERAGE_MAP.0).get() as *mut u8;
-                            let map_slice = std::slice::from_raw_parts(map_ptr, MAP_SIZE);
+                            let map_slice =
+                                std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE);
 
                             persistent_corpus.persist_campaign_artifact(CampaignArtifactRequest {
                                 input,
@@ -1354,11 +1346,13 @@ async fn run_single_process_campaign(
         objective,
     );
 
-    static COVERAGE_MAP: SyncUnsafeCell<[u8; MAP_SIZE]> =
-        SyncUnsafeCell(UnsafeCell::new([0u8; MAP_SIZE]));
-    let observer = unsafe {
-        StdMapObserver::from_mut_ptr("edges", (COVERAGE_MAP.0).get() as *mut u8, MAP_SIZE)
-    };
+    let mut shmem_provider = StdShMemProvider::new()?;
+    let mut shmem = shmem_provider.new_shmem(MAP_SIZE)?;
+    let coverage_map_ptr = shmem.as_mut_ptr();
+    let observer = StdMapObserver::from_mut_slice(
+        "edges",
+        unsafe { OwnedMutSlice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE) },
+    );
 
     let mut harness = |input: &EvmInput| {
         let snap_id = input.base_snapshot_id;
@@ -1379,8 +1373,7 @@ async fn run_single_process_campaign(
             let mut waypoints = Vec::new();
             let mut df = dataflow_registry.write();
             let exec_result = unsafe {
-                let map_ptr = (COVERAGE_MAP.0).get() as *mut u8;
-                let map_slice = std::slice::from_raw_parts_mut(map_ptr, MAP_SIZE);
+                let map_slice = std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE);
                 evm_executor.execute_with_result(
                     &mut current_state,
                     &mut current_env,
@@ -1503,16 +1496,14 @@ async fn run_single_process_campaign(
 
         if report.interesting {
             unsafe {
-                let map_ptr = (COVERAGE_MAP.0).get() as *mut u8;
-                let map_slice = std::slice::from_raw_parts_mut(map_ptr, MAP_SIZE);
+                let map_slice = std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE);
                 reward_state_novelty(map_slice, &report);
             }
         }
 
         if campaign_score.is_interesting() {
             unsafe {
-                let map_ptr = (COVERAGE_MAP.0).get() as *mut u8;
-                let map_slice = std::slice::from_raw_parts_mut(map_ptr, MAP_SIZE);
+                let map_slice = std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE);
                 reward_campaign_score(map_slice, &campaign_score);
             }
         }
@@ -1531,8 +1522,7 @@ async fn run_single_process_campaign(
             exploit_candidate.as_ref(),
         ) {
             let persisted = unsafe {
-                let map_ptr = (COVERAGE_MAP.0).get() as *mut u8;
-                let map_slice = std::slice::from_raw_parts(map_ptr, MAP_SIZE);
+                let map_slice = std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE);
                 persistent_corpus.persist_campaign_artifact(CampaignArtifactRequest {
                     input,
                     execution: &execution,
