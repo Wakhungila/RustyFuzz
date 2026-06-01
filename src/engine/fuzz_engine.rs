@@ -8,7 +8,7 @@ use crate::engine::actors::{ActorModel, ActorModelConfig, ActorSet};
 use crate::engine::bounded_search::{
     BoundedSearchBounds, BoundedSearchEngine, BoundedSearchRequest,
 };
-use crate::engine::concolic::{ConcolicHint, ConcolicSolver};
+use crate::engine::concolic::{ConcolicHint, ConcolicHintStats, ConcolicSolver, ConcolicStrategy};
 use crate::engine::bytecode_analysis::{analyze_bytecode, BytecodeAnalysisReport};
 use crate::engine::dependency::generate_flow_template_inputs;
 use crate::engine::economic_delta::{EconomicDeltaEngine, EconomicDeltaReport};
@@ -43,7 +43,7 @@ use parking_lot::{Mutex, RwLock};
 use revm::database::CacheDB;
 use revm::primitives::{Address, U256};
 use revm::state::AccountInfo;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
@@ -74,6 +74,7 @@ struct CampaignTelemetry {
     state_novelty: AtomicU64,
     best_score: AtomicU64,
     mutation_strategies: Mutex<BTreeMap<String, u64>>,
+    concolic_hint_stats: Arc<ConcolicHintStats>,
     last_report: Mutex<(Instant, u64)>,
 }
 
@@ -88,6 +89,7 @@ impl CampaignTelemetry {
             state_novelty: AtomicU64::new(0),
             best_score: AtomicU64::new(0),
             mutation_strategies: Mutex::new(BTreeMap::new()),
+            concolic_hint_stats: Arc::new(ConcolicHintStats::default()),
             last_report: Mutex::new((now, 0)),
         }
     }
@@ -139,8 +141,9 @@ impl CampaignTelemetry {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        let concolic = self.concolic_hint_stats.snapshot();
         log::info!(
-            "RustyFuzz telemetry: core={}, executions={}, execs_per_sec_30s={:.3}, execs_per_sec_avg={:.3}, corpus_size={}, coverage_edges_last={}, state_novelty_count={}, oracle_findings={}, persisted_artifacts={}, best_score={}, txs_last={}, score_last={}, mutation_strategy_mix=[{}]",
+            "RustyFuzz telemetry: core={}, executions={}, execs_per_sec_30s={:.3}, execs_per_sec_avg={:.3}, corpus_size={}, coverage_edges_last={}, state_novelty_count={}, oracle_findings={}, persisted_artifacts={}, best_score={}, txs_last={}, score_last={}, mutation_strategy_mix=[{}], concolic_hints={{generated:{},deduplicated:{},applied:{},successful:{}}}",
             core_id,
             total,
             interval_execs_per_sec,
@@ -153,7 +156,11 @@ impl CampaignTelemetry {
             self.best_score.load(Ordering::Relaxed),
             tx_count,
             campaign_score,
-            mutation_mix
+            mutation_mix,
+            concolic.generated,
+            concolic.deduplicated,
+            concolic.applied,
+            concolic.successful
         );
         *last = (now, total);
     }
@@ -679,10 +686,11 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 }
 
                 let concolic_hints = Arc::new(Mutex::new(Vec::new()));
-                let mutator = EvmMutator::with_concolic_hints(
+                let mutator = EvmMutator::with_concolic_hints_and_stats(
                     abi_registry,
                     account_registry.clone(),
                     concolic_hints.clone(),
+                    telemetry.concolic_hint_stats.clone(),
                 );
                 let mut stages = tuple_list!(StdMutationalStage::new(mutator),);
 
@@ -743,7 +751,12 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                                 return ExitKind::Crash;
                             }
                         };
-                        enqueue_concolic_hints(&concolic_hints, tx_idx, &waypoints);
+                        enqueue_concolic_hints(
+                            &concolic_hints,
+                            telemetry.concolic_hint_stats.as_ref(),
+                            tx_idx,
+                            &waypoints,
+                        );
 
                         tx_results.push(result);
                     }
@@ -842,6 +855,13 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
                     account_registry.write().observe_execution(&execution);
                     let mutation_strategies = mutation_strategies(input);
+                    record_successful_concolic_mutation(
+                        telemetry.concolic_hint_stats.as_ref(),
+                        &mutation_strategies,
+                        findings.len(),
+                        report.interesting,
+                        campaign_score.total,
+                    );
                     let coverage_edges = execution
                         .tx_results
                         .iter()
@@ -1360,10 +1380,11 @@ async fn run_single_process_campaign(
     }
 
     let concolic_hints = Arc::new(Mutex::new(Vec::new()));
-    let mutator = EvmMutator::with_concolic_hints(
+    let mutator = EvmMutator::with_concolic_hints_and_stats(
         abi_registry,
         account_registry.clone(),
         concolic_hints.clone(),
+        telemetry.concolic_hint_stats.clone(),
     );
     let mut stages = tuple_list!(StdMutationalStage::new(mutator),);
     let mut fuzzer = StdFuzzer::new(
@@ -1418,7 +1439,12 @@ async fn run_single_process_campaign(
                     return ExitKind::Crash;
                 }
             };
-            enqueue_concolic_hints(&concolic_hints, tx_idx, &waypoints);
+            enqueue_concolic_hints(
+                &concolic_hints,
+                telemetry.concolic_hint_stats.as_ref(),
+                tx_idx,
+                &waypoints,
+            );
             tx_results.push(result);
         }
 
@@ -1505,6 +1531,13 @@ async fn run_single_process_campaign(
 
         account_registry.write().observe_execution(&execution);
         let mutation_strategies = mutation_strategies(input);
+        record_successful_concolic_mutation(
+            telemetry.concolic_hint_stats.as_ref(),
+            &mutation_strategies,
+            findings.len(),
+            report.interesting,
+            campaign_score.total,
+        );
         let coverage_edges = execution
             .tx_results
             .iter()
@@ -1897,28 +1930,122 @@ fn mutation_strategies(input: &EvmInput) -> Vec<String> {
         .collect()
 }
 
+fn record_successful_concolic_mutation(
+    stats: &ConcolicHintStats,
+    mutation_strategies: &[String],
+    findings: usize,
+    state_interesting: bool,
+    campaign_score: u64,
+) {
+    if !mutation_strategies
+        .iter()
+        .any(|strategy| strategy.starts_with("concolic"))
+    {
+        return;
+    }
+    if findings > 0 || state_interesting || campaign_score > 0 {
+        stats.record_successful();
+    }
+}
+
 fn enqueue_concolic_hints(
     hint_queue: &Arc<Mutex<Vec<ConcolicHint>>>,
+    stats: &ConcolicHintStats,
     tx_idx: usize,
     waypoints: &[crate::common::types::Waypoint],
 ) {
     const MAX_PENDING_CONCOLIC_HINTS: usize = 1024;
 
     let solver = ConcolicSolver::new();
-    let new_hints = waypoints
+    let mut new_hints = waypoints
         .iter()
         .filter_map(|waypoint| solver.solve_hint(tx_idx, waypoint))
         .collect::<Vec<_>>();
     if new_hints.is_empty() {
         return;
     }
+    stats.record_generated(new_hints.len() as u64);
+    new_hints.sort_by_key(|hint| concolic_hint_priority(hint, waypoints));
 
     let mut queue = hint_queue.lock();
     queue.extend(new_hints);
+    queue.sort_by_key(|hint| concolic_hint_priority(hint, waypoints));
+    let before_dedup = queue.len();
+    let mut seen = HashSet::new();
+    queue.retain(|hint| seen.insert((hint.tx_index, hint.calldata_offset, hint.word)));
+    let deduplicated = before_dedup.saturating_sub(queue.len());
     if queue.len() > MAX_PENDING_CONCOLIC_HINTS {
-        let excess = queue.len() - MAX_PENDING_CONCOLIC_HINTS;
-        queue.drain(0..excess);
+        queue.truncate(MAX_PENDING_CONCOLIC_HINTS);
     }
+    if deduplicated > 0 {
+        stats.record_deduplicated(deduplicated as u64);
+    }
+}
+
+fn concolic_hint_priority(
+    hint: &ConcolicHint,
+    waypoints: &[crate::common::types::Waypoint],
+) -> (u64, usize, usize, usize) {
+    let mut priority: u64 = match &hint.strategy {
+        ConcolicStrategy::FlipBranch { .. } => 0,
+        ConcolicStrategy::FlipComparison { .. } => 1_000,
+        ConcolicStrategy::ArithmeticBoundary { .. } => 2_000,
+    };
+    priority = priority.saturating_add(branch_distance_priority(hint.pc, waypoints));
+    if oracle_adjacent_pc(hint.pc, waypoints) {
+        priority = priority.saturating_sub(500);
+    }
+    (
+        priority,
+        hint.tx_index,
+        hint.calldata_offset,
+        hint.pc,
+    )
+}
+
+fn branch_distance_priority(
+    pc: usize,
+    waypoints: &[crate::common::types::Waypoint],
+) -> u64 {
+    waypoints
+        .iter()
+        .filter_map(|waypoint| match waypoint {
+            crate::common::types::Waypoint::Comparison {
+                pc: cmp_pc,
+                branch_distance,
+                ..
+            } if *cmp_pc == pc => branch_distance.map(|distance| distance.saturating_to::<u64>()),
+            crate::common::types::Waypoint::BranchPath { pc: branch_pc, constraint, .. }
+                if *branch_pc == pc =>
+            {
+                if let crate::common::types::Waypoint::Comparison {
+                    branch_distance, ..
+                } = constraint.as_ref()
+                {
+                    branch_distance.map(|distance| distance.saturating_to::<u64>())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .min()
+        .unwrap_or(0)
+        .min(10_000)
+}
+
+fn oracle_adjacent_pc(pc: usize, waypoints: &[crate::common::types::Waypoint]) -> bool {
+    waypoints.iter().any(|waypoint| {
+        let candidate = match waypoint {
+            crate::common::types::Waypoint::StorageRead { pc, .. }
+            | crate::common::types::Waypoint::StorageWrite { pc, .. }
+            | crate::common::types::Waypoint::TransientStorageRead { pc, .. }
+            | crate::common::types::Waypoint::TransientStorageWrite { pc, .. } => Some(*pc),
+            crate::common::types::Waypoint::Dataflow { influenced: true, .. } => Some(pc),
+            _ => None,
+        };
+        candidate.is_some_and(|other_pc| pc.abs_diff(other_pc) <= 16)
+    })
 }
 
 fn apply_min_finding_confidence(

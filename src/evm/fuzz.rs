@@ -1,5 +1,7 @@
 use crate::common::types::{SingletonTx, Waypoint};
-use crate::engine::concolic::{ConcolicHint, ConcolicRepairTarget, ConcolicSolver};
+use crate::engine::concolic::{
+    ConcolicHint, ConcolicHintStats, ConcolicRepairTarget, ConcolicSolver,
+};
 use crate::engine::flashloan::{FlashLoanTemplate, EIP3156_FLASHLOAN_SELECTOR};
 use crate::evm::registry::GlobalAccountRegistry;
 use alloy_dyn_abi::{DynSolType, DynSolValue};
@@ -70,6 +72,7 @@ pub struct EvmMutator {
     pub abi_registry: Arc<AbiRegistry>,
     pub account_registry: Arc<RwLock<GlobalAccountRegistry>>,
     pub concolic_hints: Arc<Mutex<Vec<ConcolicHint>>>,
+    pub concolic_hint_stats: Arc<ConcolicHintStats>,
     pub type_cache: RwLock<HashMap<[u8; 4], DynSolType>>,
     pub decode_cache: RwLock<LruCache<Vec<u8>, DynSolValue>>,
 }
@@ -125,6 +128,7 @@ impl EvmMutator {
             abi_registry,
             account_registry,
             concolic_hints: Arc::new(Mutex::new(Vec::new())),
+            concolic_hint_stats: Arc::new(ConcolicHintStats::default()),
             type_cache: RwLock::new(HashMap::new()),
             decode_cache: RwLock::new(LruCache::new(MAX_DECODE_CACHE_SIZE)),
         }
@@ -135,10 +139,25 @@ impl EvmMutator {
         account_registry: Arc<RwLock<GlobalAccountRegistry>>,
         concolic_hints: Arc<Mutex<Vec<ConcolicHint>>>,
     ) -> Self {
+        Self::with_concolic_hints_and_stats(
+            abi_registry,
+            account_registry,
+            concolic_hints,
+            Arc::new(ConcolicHintStats::default()),
+        )
+    }
+
+    pub fn with_concolic_hints_and_stats(
+        abi_registry: Arc<AbiRegistry>,
+        account_registry: Arc<RwLock<GlobalAccountRegistry>>,
+        concolic_hints: Arc<Mutex<Vec<ConcolicHint>>>,
+        concolic_hint_stats: Arc<ConcolicHintStats>,
+    ) -> Self {
         Self {
             abi_registry,
             account_registry,
             concolic_hints,
+            concolic_hint_stats,
             type_cache: RwLock::new(HashMap::new()),
             decode_cache: RwLock::new(LruCache::new(MAX_DECODE_CACHE_SIZE)),
         }
@@ -163,6 +182,7 @@ impl EvmMutator {
             selector,
             &format!("applied queued hint from pc {} into {}", hint.pc, placement),
         );
+        self.concolic_hint_stats.record_applied();
         MutationResult::Mutated
     }
 
