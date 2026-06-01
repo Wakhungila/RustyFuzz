@@ -1,4 +1,4 @@
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{Provider, ProviderBuilder};
 use clap::Parser;
 use revm::database::CacheDB;
 use revm::primitives::Address;
@@ -102,6 +102,18 @@ enum Command {
         output: Option<String>,
     },
     Seed {
+        #[arg(long)]
+        contract: Option<String>,
+        #[arg(long)]
+        rpc_url: Option<String>,
+        #[arg(long, default_value = "evm")]
+        chain: String,
+        #[arg(long)]
+        output: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        abi: Option<String>,
         #[arg(long)]
         target: Option<String>,
         #[arg(long, default_value_t = 32)]
@@ -443,6 +455,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Seed {
             target,
+            contract,
+            rpc_url,
+            chain,
+            output,
+            limit,
+            abi,
             max_seeds,
             bundle_id,
             start_block,
@@ -456,6 +474,62 @@ async fn main() -> anyhow::Result<()> {
             seed_output_manifest,
         } => {
             ensure_evm_chain(&config)?;
+            if contract.is_some() || rpc_url.is_some() || output.is_some() {
+                let contract = contract
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("rustyfuzz seed requires --contract"))?;
+                let rpc_url = rpc_url
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("rustyfuzz seed requires --rpc-url"))?;
+                let output = output
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("rustyfuzz seed requires --output"))?;
+                let target = Address::from_str(contract)?;
+                if let Some(abi_path) = abi.as_deref() {
+                    let _ = ingest_abi_file(abi_path, Some(target))?;
+                }
+
+                let url: reqwest::Url = rpc_url.parse()?;
+                let provider = ProviderBuilder::new().connect_http(url);
+                let latest_block = provider.get_block_number().await?;
+                let fork_block = config.fork_block.unwrap_or(latest_block);
+                let fork_db = ForkDb::new(rpc_url.to_string(), fork_block);
+                let ingester = SeedIngester::new(provider);
+                let mut seed_config = MainnetSeedConfig::new(fork_block, target, limit);
+                seed_config.search_depth = search_depth.max(limit as u64);
+                seed_config.start_block = start_block;
+                seed_config.include_address_hints = include_address_hints;
+                seed_config.max_blocks_per_second = if seed_max_blocks_per_second > 0.0 {
+                    Some(seed_max_blocks_per_second)
+                } else {
+                    None
+                };
+                seed_config.max_retries = seed_rpc_retry_count;
+                seed_config.retry_backoff_ms = seed_rpc_backoff_ms;
+                seed_config.resume_cursor = seed_resume_cursor.or_else(|| {
+                    resume.then(|| format!("{output}/seed-cursor.json"))
+                });
+                let mut bundle = ingester
+                    .ingest_bundle_from_target(&seed_config, &fork_db)
+                    .await?;
+                if let Some(scan) = bundle.scan.as_mut() {
+                    scan.chain_id = match chain.as_str() {
+                        "bsc" => Some(56),
+                        "evm" => None,
+                        other => anyhow::bail!("unsupported --chain `{other}`; expected evm or bsc"),
+                    };
+                }
+                std::fs::create_dir_all(output)?;
+                let manifest_path = std::path::Path::new(output).join("manifest.json");
+                std::fs::write(&manifest_path, serde_json::to_vec_pretty(&bundle)?)?;
+                println!(
+                    "Ingested {} transactions. Wrote seed bundle to {}.",
+                    bundle.seeds.len(),
+                    manifest_path.display()
+                );
+                return Ok(());
+            }
+
             let target = target_address(target.as_deref(), &config)?;
             let fork_block = config.fork_block.unwrap_or(0);
             let url: reqwest::Url = config.rpc_url.parse()?;
