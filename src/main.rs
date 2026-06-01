@@ -1,5 +1,6 @@
 use alloy::providers::{Provider, ProviderBuilder};
 use clap::Parser;
+use libafl_bolts::core_affinity::Cores;
 use revm::database::CacheDB;
 use revm::primitives::Address;
 use rusty_fuzz::chain::mempool::MempoolScanner;
@@ -42,8 +43,10 @@ enum Command {
         contract: Option<String>,
         #[arg(long, default_value_t = false)]
         hardened_defi: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = false)]
         single_process: bool,
+        #[arg(long)]
+        cores: Option<String>,
         #[arg(long, default_value_t = false)]
         deterministic: bool,
         #[arg(long)]
@@ -249,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
             contract,
             hardened_defi,
             single_process,
+            cores,
             deterministic,
             rng_seed,
             bounded_search,
@@ -304,6 +308,11 @@ async fn main() -> anyhow::Result<()> {
             if single_process {
                 hardened_defi_config.single_process = true;
             }
+            let cores = cores
+                .as_deref()
+                .map(Cores::from_cmdline)
+                .transpose()
+                .map_err(|err| anyhow::anyhow!("invalid --cores value: {err}"))?;
             if deterministic {
                 hardened_defi_config.deterministic = true;
             }
@@ -358,6 +367,7 @@ async fn main() -> anyhow::Result<()> {
                     .transpose()?,
                 mainnet_seed_bundle: config.mainnet_seed_bundle.clone(),
                 in_memory_bytecode: None,
+                cores,
                 require_seed_bundle: config.require_seed_bundle || require_seed_bundle,
                 require_rpc_fork: config.require_rpc_fork || require_rpc_fork,
                 allow_synthetic_fallback: !no_synthetic_fallback
@@ -794,6 +804,7 @@ async fn main() -> anyhow::Result<()> {
                     foundry_harness: None,
                     mainnet_seed_bundle: seed_bundle.or(config.mainnet_seed_bundle.clone()),
                     in_memory_bytecode: None,
+                    cores: None,
                     require_seed_bundle: config.require_seed_bundle || require_seed_bundle,
                     require_rpc_fork: true,
                     allow_synthetic_fallback: false,

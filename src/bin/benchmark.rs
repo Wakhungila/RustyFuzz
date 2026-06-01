@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
             foundry_harness: None,
             mainnet_seed_bundle: None,
             in_memory_bytecode: Some(artifact.runtime_bytecode.clone()),
+            cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,
             allow_synthetic_fallback: true,

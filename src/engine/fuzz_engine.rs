@@ -197,6 +197,7 @@ pub struct Config {
     pub foundry_harness: Option<FoundryHarnessManifest>,
     pub mainnet_seed_bundle: Option<String>,
     pub in_memory_bytecode: Option<Vec<u8>>,
+    pub cores: Option<Cores>,
     pub require_seed_bundle: bool,
     pub require_rpc_fork: bool,
     pub allow_synthetic_fallback: bool,
@@ -369,7 +370,9 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
     let launcher_fallback_bytecode_selectors = bytecode_selectors.clone();
     let launcher_fallback_bytecode_analysis = bytecode_analysis.clone();
 
-    if config.hardened_defi.single_process {
+    let cores = campaign_cores(config.cores.as_ref())?;
+    let use_launcher = !config.hardened_defi.single_process && cores.ids.len() > 1;
+    if !use_launcher {
         return run_single_process_campaign(
             launcher_fallback_config,
             launcher_fallback_db,
@@ -382,7 +385,6 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
         .await;
     }
 
-    let cores = campaign_cores()?;
     let execution_timeout = campaign_execution_timeout();
     log::info!(
         "Launching brokered fuzz campaign on cores `{}` with per-input timeout {:?}",
@@ -1652,12 +1654,15 @@ fn broker_launcher_error_was_shutdown(message: &str) -> bool {
     message.contains("Shutting down")
 }
 
-fn campaign_cores() -> anyhow::Result<Cores> {
+fn campaign_cores(configured: Option<&Cores>) -> anyhow::Result<Cores> {
+    if let Some(cores) = configured {
+        return Ok(cores.clone());
+    }
     let requested = std::env::var("RUSTYFUZZ_CORES")
         .ok()
         .or_else(|| std::env::var("LIBAFL_CORES").ok())
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "all".to_string());
+        .unwrap_or_else(|| "0".to_string());
     Cores::from_cmdline(&requested)
         .map_err(|err| anyhow::anyhow!("invalid core selection `{requested}`: {err}"))
 }
@@ -2388,7 +2393,7 @@ mod tests {
     fn campaign_cores_respects_libafl_env_alias() {
         std::env::set_var("LIBAFL_CORES", "0-1");
         std::env::remove_var("RUSTYFUZZ_CORES");
-        let cores = campaign_cores().unwrap();
+        let cores = campaign_cores(None).unwrap();
         assert_eq!(cores.cmdline, "0-1");
         assert_eq!(cores.ids.len(), 2);
         std::env::remove_var("LIBAFL_CORES");
