@@ -8,6 +8,7 @@ use crate::engine::actors::{ActorModel, ActorModelConfig, ActorSet};
 use crate::engine::bounded_search::{
     BoundedSearchBounds, BoundedSearchEngine, BoundedSearchRequest,
 };
+use crate::engine::concolic::{ConcolicHint, ConcolicSolver};
 use crate::engine::bytecode_analysis::{analyze_bytecode, BytecodeAnalysisReport};
 use crate::engine::dependency::generate_flow_template_inputs;
 use crate::engine::economic_delta::{EconomicDeltaEngine, EconomicDeltaReport};
@@ -675,7 +676,12 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     }
                 }
 
-                let mutator = EvmMutator::new(abi_registry, account_registry.clone());
+                let concolic_hints = Arc::new(Mutex::new(Vec::new()));
+                let mutator = EvmMutator::with_concolic_hints(
+                    abi_registry,
+                    account_registry.clone(),
+                    concolic_hints.clone(),
+                );
                 let mut stages = tuple_list!(StdMutationalStage::new(mutator),);
 
                 let mut fuzzer = StdFuzzer::new(
@@ -735,6 +741,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                                 return ExitKind::Crash;
                             }
                         };
+                        enqueue_concolic_hints(&concolic_hints, tx_idx, &waypoints);
 
                         tx_results.push(result);
                     }
@@ -1350,7 +1357,12 @@ async fn run_single_process_campaign(
         }
     }
 
-    let mutator = EvmMutator::new(abi_registry, account_registry.clone());
+    let concolic_hints = Arc::new(Mutex::new(Vec::new()));
+    let mutator = EvmMutator::with_concolic_hints(
+        abi_registry,
+        account_registry.clone(),
+        concolic_hints.clone(),
+    );
     let mut stages = tuple_list!(StdMutationalStage::new(mutator),);
     let mut fuzzer = StdFuzzer::new(
         RustyFuzzScheduler::with_pending_score(pending_campaign_score.clone()),
@@ -1404,6 +1416,7 @@ async fn run_single_process_campaign(
                     return ExitKind::Crash;
                 }
             };
+            enqueue_concolic_hints(&concolic_hints, tx_idx, &waypoints);
             tx_results.push(result);
         }
 
@@ -1877,6 +1890,30 @@ fn mutation_strategies(input: &EvmInput) -> Vec<String> {
         .iter()
         .map(|mutation| mutation.strategy.clone())
         .collect()
+}
+
+fn enqueue_concolic_hints(
+    hint_queue: &Arc<Mutex<Vec<ConcolicHint>>>,
+    tx_idx: usize,
+    waypoints: &[crate::common::types::Waypoint],
+) {
+    const MAX_PENDING_CONCOLIC_HINTS: usize = 1024;
+
+    let solver = ConcolicSolver::new();
+    let new_hints = waypoints
+        .iter()
+        .filter_map(|waypoint| solver.solve_hint(tx_idx, waypoint))
+        .collect::<Vec<_>>();
+    if new_hints.is_empty() {
+        return;
+    }
+
+    let mut queue = hint_queue.lock();
+    queue.extend(new_hints);
+    if queue.len() > MAX_PENDING_CONCOLIC_HINTS {
+        let excess = queue.len() - MAX_PENDING_CONCOLIC_HINTS;
+        queue.drain(0..excess);
+    }
 }
 
 fn apply_min_finding_confidence(

@@ -1,5 +1,5 @@
 use crate::common::types::{SingletonTx, Waypoint};
-use crate::engine::concolic::{ConcolicRepairTarget, ConcolicSolver};
+use crate::engine::concolic::{ConcolicHint, ConcolicRepairTarget, ConcolicSolver};
 use crate::engine::flashloan::{FlashLoanTemplate, EIP3156_FLASHLOAN_SELECTOR};
 use crate::evm::registry::GlobalAccountRegistry;
 use alloy_dyn_abi::{DynSolType, DynSolValue};
@@ -12,7 +12,7 @@ use libafl::{
     Error,
 };
 use libafl_bolts::{rands::Rand, HasLen, Named};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use revm::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 use std::num::NonZero;
@@ -69,6 +69,7 @@ impl Named for EvmMutator {
 pub struct EvmMutator {
     pub abi_registry: Arc<AbiRegistry>,
     pub account_registry: Arc<RwLock<GlobalAccountRegistry>>,
+    pub concolic_hints: Arc<Mutex<Vec<ConcolicHint>>>,
     pub type_cache: RwLock<HashMap<[u8; 4], DynSolType>>,
     pub decode_cache: RwLock<LruCache<Vec<u8>, DynSolValue>>,
 }
@@ -79,6 +80,17 @@ where
 {
     fn mutate(&mut self, state: &mut S, input: &mut EvmInput) -> Result<MutationResult, Error> {
         let rand = state.rand_mut();
+        let has_concolic_hints = { !self.concolic_hints.lock().is_empty() };
+        if has_concolic_hints
+            && rand.below(NonZero::new(100).unwrap()) < 15
+            && matches!(
+                self.apply_queued_concolic_hint(input),
+                MutationResult::Mutated
+            )
+        {
+            return Ok(MutationResult::Mutated);
+        }
+
         let bucket = rand.below(NonZero::new(100).unwrap());
 
         let result = match bucket {
@@ -112,9 +124,46 @@ impl EvmMutator {
         Self {
             abi_registry,
             account_registry,
+            concolic_hints: Arc::new(Mutex::new(Vec::new())),
             type_cache: RwLock::new(HashMap::new()),
             decode_cache: RwLock::new(LruCache::new(MAX_DECODE_CACHE_SIZE)),
         }
+    }
+
+    pub fn with_concolic_hints(
+        abi_registry: Arc<AbiRegistry>,
+        account_registry: Arc<RwLock<GlobalAccountRegistry>>,
+        concolic_hints: Arc<Mutex<Vec<ConcolicHint>>>,
+    ) -> Self {
+        Self {
+            abi_registry,
+            account_registry,
+            concolic_hints,
+            type_cache: RwLock::new(HashMap::new()),
+            decode_cache: RwLock::new(LruCache::new(MAX_DECODE_CACHE_SIZE)),
+        }
+    }
+
+    fn apply_queued_concolic_hint(&self, input: &mut EvmInput) -> MutationResult {
+        let Some(hint) = self.concolic_hints.lock().pop() else {
+            return MutationResult::Skipped;
+        };
+        let Some(tx) = input.txs.get_mut(hint.tx_index) else {
+            return MutationResult::Skipped;
+        };
+        let parameter_types = selector_for_calldata(&tx.input)
+            .and_then(|selector| self.abi_registry.functions.get(&selector))
+            .cloned();
+        let placement = apply_concolic_hint(tx, &hint, parameter_types.as_deref());
+        let selector = selector_for_calldata(&tx.input);
+        self.record_mutation(
+            input,
+            "concolic_hint",
+            Some(hint.tx_index),
+            selector,
+            &format!("applied queued hint from pc {} into {}", hint.pc, placement),
+        );
+        MutationResult::Mutated
     }
 
     fn concolic_mutation<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
