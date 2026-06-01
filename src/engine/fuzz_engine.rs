@@ -684,6 +684,12 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                             .add(Testcase::new(seed_input(target_contract, fuzzer_address)))?;
                     }
                 }
+                log_worker_corpus_sync(
+                    core_id.0,
+                    state.corpus().count(),
+                    &config.corpus_dir,
+                    "brokered",
+                );
 
                 let concolic_hints = Arc::new(Mutex::new(Vec::new()));
                 let mutator = EvmMutator::with_concolic_hints_and_stats(
@@ -1378,6 +1384,7 @@ async fn run_single_process_campaign(
             )))?;
         }
     }
+    log_worker_corpus_sync(core_id, state.corpus().count(), &config.corpus_dir, "single");
 
     let concolic_hints = Arc::new(Mutex::new(Vec::new()));
     let mutator = EvmMutator::with_concolic_hints_and_stats(
@@ -1928,6 +1935,17 @@ fn mutation_strategies(input: &EvmInput) -> Vec<String> {
         .iter()
         .map(|mutation| mutation.strategy.clone())
         .collect()
+}
+
+fn log_worker_corpus_sync(core_id: usize, corpus_count: usize, corpus_dir: &str, mode: &str) {
+    log::info!(
+        "Worker corpus sync sanity: mode={}, core={}, local_corpus_count={}, shared_coverage_map_bytes={}, persistent_corpus_dir={}",
+        mode,
+        core_id,
+        corpus_count,
+        MAP_SIZE,
+        corpus_dir
+    );
 }
 
 fn record_successful_concolic_mutation(
