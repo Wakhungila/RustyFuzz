@@ -40,6 +40,8 @@
 /minimized/
 /coverage/
 /.runs/
+formal_spec.toml
+PoolFactory.json
 
 # Runtime campaign databases / generated state
 *.cache

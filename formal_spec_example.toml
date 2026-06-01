@@ -1,0 +1,268 @@
+# Example Formal Specification for RustyFuzz
+# This file demonstrates all the architectural constraint types
+
+contract = "0x1111111111111111111111111111111111111111"
+
+# ============================================================================
+# ARCHITECTURAL INVARIANTS
+# ============================================================================
+# These define properties that must ALWAYS hold true during execution
+
+[[architectural_invariants]]
+id = "admin-cannot-steal"
+description = "Admin role cannot transfer user funds"
+kind = "admin_cannot_transfer_user_funds"
+severity = "critical"
+params = { max_admin_withdrawal = "0" }
+
+[[architectural_invariants]]
+id = "only-governance-upgrades"
+description = "Only governance multisig can upgrade"
+kind = "only_governance_can_upgrade"
+severity = "critical"
+
+[[architectural_invariants]]
+id = "reserves-always-increase"
+description = "Protocol reserves should never decrease (except for withdrawals)"
+kind = "reserves_always_increasing"
+severity = "high"
+
+[[architectural_invariants]]
+id = "fees-bounded"
+description = "Protocol fees never exceed 5%"
+kind = "fees_never_exceed"
+severity = "medium"
+params = { max_fee_bps = "500" }  # 500 basis points = 5%
+
+[[architectural_invariants]]
+id = "slippage-required"
+description = "All AMM operations require slippage protection"
+kind = "slippage_protection_exists"
+severity = "high"
+
+[[architectural_invariants]]
+id = "circuit-breaker"
+description = "Emergency pause mechanism must exist"
+kind = "circuit_breaker_exists"
+severity = "medium"
+
+# ============================================================================
+# STATE MACHINE SPECIFICATION
+# ============================================================================
+# Defines valid state transitions
+
+[state_machine]
+initial_state = "Uninitialized"
+
+# All possible states
+states = [
+    "Uninitialized",    # 0 - Not yet initialized
+    "Initialized",      # 1 - Parameters set but not live
+    "Active",           # 2 - Protocol actively processing
+    "Paused",           # 3 - Temporarily paused (can resume)
+    "Liquidating",      # 4 - Emergency liquidation in progress
+    "Closed"            # 5 - Permanently closed
+]
+
+# Valid state transitions
+[[state_machine.transitions]]
+from = "Uninitialized"
+to = "Initialized"
+trigger_selector = "initialize(uint256,address)"
+guard_conditions = ["msg.sender == owner", "!already_initialized"]
+
+[[state_machine.transitions]]
+from = "Initialized"
+to = "Active"
+trigger_selector = "startProtocol()"
+guard_conditions = ["msg.sender == owner"]
+
+[[state_machine.transitions]]
+from = "Active"
+to = "Paused"
+trigger_selector = "pause()"
+guard_conditions = ["msg.sender == owner", "!paused"]
+
+[[state_machine.transitions]]
+from = "Paused"
+to = "Active"
+trigger_selector = "resume()"
+guard_conditions = ["msg.sender == owner"]
+
+[[state_machine.transitions]]
+from = "Active"
+to = "Liquidating"
+trigger_selector = "triggerLiquidation()"
+guard_conditions = ["health_factor < MIN_HEALTH"]
+
+[[state_machine.transitions]]
+from = "Liquidating"
+to = "Closed"
+trigger_selector = "finalizeLiquidation()"
+guard_conditions = ["all_debts_repaid"]
+
+# Forbidden transitions (attacker should not be able to reach these)
+[[state_machine.forbidden_transitions]]
+from = "Closed"
+to = "Active"  # Cannot resurrect closed protocol
+
+[[state_machine.forbidden_transitions]]
+from = "Paused"
+to = "Liquidating"  # Cannot liquidate while paused
+
+# ============================================================================
+# PERMISSION MODEL
+# ============================================================================
+# Defines roles and their allowed actions
+
+[permission_model]
+
+[[permission_model.roles]]
+name = "Owner"
+allowed_functions = [
+    "initialize",
+    "upgradeProxy",
+    "setFee",
+    "pause",
+    "resume",
+    "emergencyWithdraw",
+    "triggerLiquidation"
+]
+max_privileges = "all_protocol_functions"
+
+[[permission_model.roles]]
+name = "Governance"
+allowed_functions = [
+    "upgradeProxy",
+    "setFee",
+    "pause",
+    "resume"
+]
+max_privileges = "governance_functions"
+
+[[permission_model.roles]]
+name = "Liquidator"
+allowed_functions = [
+    "liquidate",
+    "claim_liquidation_reward"
+]
+max_privileges = "liquidation_functions"
+
+[[permission_model.roles]]
+name = "User"
+allowed_functions = [
+    "deposit",
+    "withdraw",
+    "borrow",
+    "repay",
+    "claim_rewards"
+]
+max_privileges = "user_functions"
+
+# Function-level permission requirements
+[[permission_model.function_permissions]]
+selector = "initialize(uint256,address)"
+required_roles = ["Owner"]
+mutually_exclusive_roles = []
+
+[[permission_model.function_permissions]]
+selector = "upgradeProxy(address)"
+required_roles = ["Owner", "Governance"]
+mutually_exclusive_roles = []
+
+[[permission_model.function_permissions]]
+selector = "setFee(uint256)"
+required_roles = ["Owner"]
+mutually_exclusive_roles = []
+
+[[permission_model.function_permissions]]
+selector = "pause()"
+required_roles = ["Owner"]
+mutually_exclusive_roles = []
+
+[[permission_model.function_permissions]]
+selector = "liquidate(address)"
+required_roles = ["Liquidator", "User"]  # Anyone can liquidate
+mutually_exclusive_roles = []
+
+[[permission_model.function_permissions]]
+selector = "deposit(uint256)"
+required_roles = ["User"]
+mutually_exclusive_roles = ["Owner", "Governance"]  # Admin cannot deposit as user
+
+[[permission_model.function_permissions]]
+selector = "emergencyWithdraw(address[])"
+required_roles = ["Owner"]
+mutually_exclusive_roles = []
+
+# ============================================================================
+# TEMPORAL CONSTRAINTS
+# ============================================================================
+# Defines ordering and timing requirements
+
+[[temporal_constraints]]
+id = "initialize-first"
+kind = "must_precede"
+functions = ["initialize(uint256,address)", "deposit(uint256)"]
+# Description: initialize() must be called before any deposit()
+
+[[temporal_constraints]]
+id = "no-double-init"
+kind = "one_time_only"
+functions = ["initialize(uint256,address)"]
+# Description: initialize() can only be called once in the entire sequence
+
+[[temporal_constraints]]
+id = "start-before-operations"
+kind = "must_precede"
+functions = ["startProtocol()", "deposit(uint256)"]
+# Description: Protocol must be started before users can deposit
+
+[[temporal_constraints]]
+id = "cannot-resume-without-pause"
+kind = "cannot_follow"
+functions = ["pause()", "resume()"]
+# Description: resume() cannot be called unless pause() was called first
+# (This is actually enforced by state machine, but listed here for clarity)
+
+[[temporal_constraints]]
+id = "liquidation-cooldown"
+kind = "require_interval"
+functions = ["liquidate(address)", "liquidate(address)"]
+max_gap_blocks = 10
+# Description: Can't liquidate the same account twice within 10 blocks
+
+[[temporal_constraints]]
+id = "fee-change-notice"
+kind = "require_interval"
+functions = ["setFee(uint256)", "deposit(uint256)"]
+max_gap_blocks = 100
+# Description: At least 100 blocks between fee change and next deposit
+# (allows users to adapt)
+
+[[temporal_constraints]]
+id = "pause-minimum-duration"
+kind = "require_interval"
+functions = ["pause()", "resume()"]
+max_gap_blocks = 1
+# Description: Must wait at least 1 block after pause before resume
+
+# ============================================================================
+# DEX-SPECIFIC: Slippage Requirements
+# ============================================================================
+# (Extension for DEX/AMM protocols)
+
+[dex_config]
+require_slippage_checks = true
+min_slippage_bps = 50  # At least 0.5% slippage protection required
+support_flashloans = false  # Flash loans not allowed for this DEX
+
+# ============================================================================
+# LENDING-SPECIFIC: Collateral Requirements
+# ============================================================================
+# (Extension for lending protocols)
+
+[lending_config]
+min_collateral_ratio_bps = 15000  # 150% minimum
+liquidation_threshold_bps = 12000  # 120% liquidation threshold
+max_borrow_per_deposit = 0.8  # Can borrow max 80% of collateral

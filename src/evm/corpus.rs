@@ -359,6 +359,21 @@ impl PersistentCorpus {
             request.coverage,
             request.state_novelty_score,
         )?;
+        let record_path = self
+            .root
+            .join("campaign_artifacts")
+            .join(format!("{}.json", metadata.id));
+        if let Ok(bytes) = fs::read(&record_path) {
+            if let Ok(existing) = serde_json::from_slice::<CampaignArtifactRecord>(&bytes) {
+                if existing.score.total >= request.score.total {
+                    let _ = fs::remove_file(&lock_path);
+                    return Ok(CampaignArtifactOutcome {
+                        record: existing,
+                        created_new: false,
+                    });
+                }
+            }
+        }
         let fork_cache_id = metadata.id.clone();
         self.persist_cache_db_fork_state(&fork_cache_id, request.base_fork_state)?;
         let proof = request.exploit_candidate.map(|candidate| {
@@ -394,12 +409,7 @@ impl PersistentCorpus {
         };
         let record_bytes = serde_json::to_vec_pretty(&record)?;
         let tmp_index_path = index_path.with_extension("json.tmp");
-        fs::write(
-            self.root
-                .join("campaign_artifacts")
-                .join(format!("{}.json", record.input_id)),
-            &record_bytes,
-        )?;
+        fs::write(&record_path, &record_bytes)?;
         fs::write(&tmp_index_path, &record_bytes)?;
         fs::rename(&tmp_index_path, &index_path)?;
         fs::write(
@@ -997,6 +1007,96 @@ mod artifact_tests {
             serde_json::to_vec(&left).unwrap(),
             serde_json::to_vec(&right).unwrap()
         );
+    }
+
+    #[test]
+    fn persist_campaign_artifact_deduplicates_same_input_id() {
+        let root = temp_corpus_root("artifact-input-dedupe");
+        let corpus = PersistentCorpus::new(&root).expect("corpus");
+        let target = Address::repeat_byte(0xaa);
+        let input = EvmInput {
+            txs: vec![SingletonTx {
+                input: vec![0xde, 0xad, 0xbe, 0xef],
+                caller: Address::repeat_byte(0x13),
+                to: target,
+                value: U256::ZERO,
+                is_victim: false,
+            }],
+            base_snapshot_id: 0,
+            waypoints: Vec::new(),
+            mutation_provenance: Vec::new(),
+        };
+        let execution = SequenceExecutionResult {
+            tx_results: vec![TxExecutionResult {
+                tx_index: 0,
+                status: ExecutionStatus::Revert,
+                gas_used: 21_000,
+                output: Vec::new(),
+                coverage_hash: 7,
+                coverage_edges: 1,
+                storage_reads: Vec::new(),
+                storage_writes: Vec::new(),
+                storage_diffs: Vec::new(),
+                call_trace: Vec::new(),
+                waypoints: Vec::new(),
+            }],
+            total_gas_used: 21_000,
+            final_coverage_hash: 7,
+            storage_reads: Vec::new(),
+            storage_writes: Vec::new(),
+            storage_diffs: Vec::new(),
+            call_trace: Vec::new(),
+            oracle_observations: Vec::new(),
+        };
+        let score = CampaignScore {
+            total: 100,
+            economic_pressure: 0,
+            invariant_pressure: 0,
+            counterexample_pressure: 0,
+            oracle_pressure: 0,
+            state_pressure: 0,
+            exploration_pressure: 0,
+            explanation: vec!["test".to_string()],
+        };
+        let base = EvmCacheDb::new(ForkDb::empty());
+        let coverage = vec![1u8; 8];
+
+        let first = corpus
+            .persist_campaign_artifact(CampaignArtifactRequest {
+                input: &input,
+                execution: &execution,
+                coverage: &coverage,
+                state_novelty_score: 1,
+                base_fork_state: &base,
+                score: &score,
+                findings: &[],
+                exploit_candidate: None,
+                block_number: 1,
+                target: Some(target),
+                reason: "high-score-non-success-status",
+            })
+            .expect("first artifact");
+        let second = corpus
+            .persist_campaign_artifact(CampaignArtifactRequest {
+                input: &input,
+                execution: &execution,
+                coverage: &coverage,
+                state_novelty_score: 1,
+                base_fork_state: &base,
+                score: &score,
+                findings: &[],
+                exploit_candidate: None,
+                block_number: 1,
+                target: Some(target),
+                reason: "economic-or-invariant-pressure",
+            })
+            .expect("second artifact");
+
+        assert!(first.created_new);
+        assert!(!second.created_new);
+        assert_eq!(first.record.input_id, second.record.input_id);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

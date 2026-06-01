@@ -13,6 +13,7 @@ use rusty_fuzz::engine::fork_setup::ForkSetupDiscoverer;
 use rusty_fuzz::engine::foundry_ingest::FoundryHarnessManifest;
 use rusty_fuzz::engine::invariant_manifest::TargetInvariantManifest;
 use rusty_fuzz::engine::minimizer::Minimizer;
+use rusty_fuzz::engine::promotion::PromotionConfig;
 use rusty_fuzz::engine::seed_intelligence::SeedIntelligence;
 use rusty_fuzz::evm::corpus::PersistentCorpus;
 use rusty_fuzz::evm::executor::EvmExecutor;
@@ -62,6 +63,8 @@ enum Command {
         max_execs: Option<u64>,
         #[arg(long)]
         duration_secs: Option<u64>,
+        #[arg(long, default_value_t = false)]
+        unbounded: bool,
         #[arg(long)]
         artifact_limit: Option<u64>,
         #[arg(long)]
@@ -70,6 +73,16 @@ enum Command {
         no_synthetic_fallback: bool,
         #[arg(long, default_value_t = 0)]
         min_finding_confidence: u64,
+        #[arg(long, default_value_t = false)]
+        promote_findings: bool,
+        #[arg(long, default_value_t = false)]
+        no_promote_findings: bool,
+        #[arg(long, default_value_t = true)]
+        require_replay_for_report: bool,
+        #[arg(long, default_value_t = true)]
+        require_poc_for_confirmed: bool,
+        #[arg(long)]
+        promotion_limit: Option<u64>,
     },
     AbiIngest {
         #[arg(long)]
@@ -233,10 +246,16 @@ async fn main() -> anyhow::Result<()> {
             abi,
             max_execs,
             duration_secs,
+            unbounded,
             artifact_limit,
             campaign_id,
             no_synthetic_fallback,
             min_finding_confidence,
+            promote_findings,
+            no_promote_findings,
+            require_replay_for_report,
+            require_poc_for_confirmed,
+            promotion_limit,
         } => {
             let raw_target = match contract.as_deref() {
                 Some(target) if target.trim().is_empty() => {
@@ -285,6 +304,25 @@ async fn main() -> anyhow::Result<()> {
             if seed_file.is_some() {
                 hardened_defi_config.historical_seed_file = seed_file;
             }
+            let (max_execs, duration_secs) =
+                resolve_campaign_bounds(max_execs, duration_secs, unbounded)?;
+            let promotion_enabled = if no_promote_findings {
+                false
+            } else {
+                promote_findings
+                    || hardened_defi_config.single_process
+                    || max_execs.is_some()
+                    || duration_secs.is_some()
+            };
+            println!(
+                "Campaign controls: mode={}, max_execs={:?}, duration_secs={:?}, single_process={}, synthetic_fallback={}, promotion={}",
+                if unbounded { "unbounded" } else { "bounded" },
+                max_execs,
+                duration_secs,
+                hardened_defi_config.single_process,
+                !no_synthetic_fallback && (config.allow_synthetic_fallback || allow_synthetic_fallback),
+                promotion_enabled
+            );
             let sanitized_campaign_id = campaign_id.as_deref().map(sanitize_campaign_id);
             let campaign_corpus_dir = sanitized_campaign_id
                 .as_ref()
@@ -318,6 +356,12 @@ async fn main() -> anyhow::Result<()> {
                 artifact_limit,
                 campaign_id: sanitized_campaign_id,
                 min_finding_confidence,
+                promotion: PromotionConfig {
+                    enabled: promotion_enabled,
+                    require_replay_for_report,
+                    require_poc_for_confirmed,
+                    promotion_limit,
+                },
             };
             rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await?;
         }
@@ -689,6 +733,12 @@ async fn main() -> anyhow::Result<()> {
                     artifact_limit: None,
                     campaign_id: Some(job.job_id.clone()),
                     min_finding_confidence: 0,
+                    promotion: PromotionConfig {
+                        enabled: true,
+                        require_replay_for_report: true,
+                        require_poc_for_confirmed: true,
+                        promotion_limit: Some(8),
+                    },
                 };
                 rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await?;
             }
@@ -914,6 +964,19 @@ fn sanitize_campaign_id(id: &str) -> String {
     }
 }
 
+fn resolve_campaign_bounds(
+    max_execs: Option<u64>,
+    duration_secs: Option<u64>,
+    unbounded: bool,
+) -> anyhow::Result<(Option<u64>, Option<u64>)> {
+    if unbounded || max_execs.is_some() || duration_secs.is_some() {
+        return Ok((max_execs, duration_secs));
+    }
+    anyhow::bail!(
+        "refusing to start an unbounded fuzz campaign without an explicit opt-in; pass --max-execs, --duration-secs, or --unbounded"
+    );
+}
+
 fn target_address(cli_target: Option<&str>, config: &Config) -> anyhow::Result<Address> {
     cli_target
         .or(config.target_contract.as_deref())
@@ -941,4 +1004,26 @@ fn execution_coverage_material(
         material.extend_from_slice(&execution.final_coverage_hash.to_be_bytes());
     }
     material
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_campaign_bounds;
+
+    #[test]
+    fn fuzz_requires_bounds_unless_unbounded() {
+        assert!(resolve_campaign_bounds(None, None, false).is_err());
+        assert_eq!(
+            resolve_campaign_bounds(Some(100), None, false).unwrap(),
+            (Some(100), None)
+        );
+        assert_eq!(
+            resolve_campaign_bounds(None, Some(60), false).unwrap(),
+            (None, Some(60))
+        );
+        assert_eq!(
+            resolve_campaign_bounds(None, None, true).unwrap(),
+            (None, None)
+        );
+    }
 }

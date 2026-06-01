@@ -3,7 +3,11 @@ use crate::engine::abi_ingest::{AbiIngestReport, SelectorClassification};
 use crate::engine::bytecode_analysis::BytecodeAnalysisReport;
 use crate::engine::economic_delta::EconomicDeltaReport;
 use crate::engine::fork_setup::ForkSetupReport;
+use crate::engine::formal_spec::FormalSpecification;
+use crate::engine::permission_model::PermissionModelAnalyzer;
+use crate::engine::state_transition_checker::StateTransitionChecker;
 use crate::engine::target_profile::ProtocolType;
+use crate::engine::temporal_constraints::TemporalConstraintChecker;
 use crate::satori::types::RustyFuzzJobSpec;
 use anyhow::Context;
 use revm::primitives::{Address, U256};
@@ -11,12 +15,24 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetInvariantManifest {
     #[serde(default)]
     pub target: Option<Address>,
     #[serde(default)]
     pub invariants: Vec<TargetInvariantRule>,
+    #[serde(skip)]
+    #[serde(default)]
+    pub formal_spec: Option<FormalSpecification>,
+    #[serde(skip)]
+    #[serde(default)]
+    pub state_transition_checker: Option<StateTransitionChecker>,
+    #[serde(skip)]
+    #[serde(default)]
+    pub permission_analyzer: Option<PermissionModelAnalyzer>,
+    #[serde(skip)]
+    #[serde(default)]
+    pub temporal_checker: Option<TemporalConstraintChecker>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,6 +67,10 @@ impl TargetInvariantManifest {
         let mut manifest = TargetInvariantManifest {
             target,
             invariants: Vec::new(),
+            formal_spec: None,
+            state_transition_checker: None,
+            permission_analyzer: None,
+            temporal_checker: None,
         };
         manifest.push_rule(
             "generic-accounting-anomaly",
@@ -237,6 +257,68 @@ impl TargetInvariantManifest {
             .with_context(|| format!("parse target invariant manifest {}", path.display()))
     }
 
+    pub fn load_with_formal_spec(
+        path: impl AsRef<Path>,
+        spec_path: Option<impl AsRef<Path>>,
+    ) -> anyhow::Result<Self> {
+        let mut manifest = Self::load(path)?;
+
+        if let Some(spec_path) = spec_path {
+            let formal_spec = FormalSpecification::load(&spec_path)?;
+            manifest.initialize_checkers(&formal_spec);
+        }
+
+        Ok(manifest)
+    }
+
+    pub fn initialize_checkers(&mut self, spec: &FormalSpecification) {
+        self.formal_spec = Some(spec.clone());
+        self.state_transition_checker = Some(StateTransitionChecker::new(Some(spec)));
+        self.permission_analyzer = Some(PermissionModelAnalyzer::new(Some(spec)));
+        self.temporal_checker = Some(TemporalConstraintChecker::new(Some(spec)));
+    }
+
+    pub fn check_temporal_constraints(&self) -> Vec<String> {
+        self.temporal_checker
+            .as_ref()
+            .map(|tc| {
+                tc.violations()
+                    .iter()
+                    .map(|v| format!("{}: {}", v.constraint_id, v.reason))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn check_permission_model(&self) -> Vec<String> {
+        self.permission_analyzer
+            .as_ref()
+            .map(|pa| {
+                pa.get_anomalies()
+                    .iter()
+                    .map(|a| format!("{:?}: {}", a.kind, a.evidence))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn check_state_transitions(&self) -> Vec<String> {
+        self.state_transition_checker
+            .as_ref()
+            .map(|stc| {
+                stc.violations()
+                    .iter()
+                    .map(|v| {
+                        format!(
+                            "{}: {} -> {} ({})",
+                            v.tx_index, v.from_state, v.to_state, v.reason
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn evaluate(&self, report: &EconomicDeltaReport) -> Vec<ProtocolFinding> {
         self.invariants
             .iter()
@@ -316,6 +398,10 @@ mod tests {
                 min_profit: None,
                 severity: Some(ProtocolSeverity::Critical),
             }],
+            formal_spec: None,
+            state_transition_checker: None,
+            permission_analyzer: None,
+            temporal_checker: None,
         };
         let report = EconomicDeltaReport {
             share_price_pressure: true,

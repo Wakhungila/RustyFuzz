@@ -3,22 +3,26 @@ use crate::common::types::{
     ChainState, EvmInput, ExecutionStatus, SequenceExecutionResult, SingletonTx,
 };
 use crate::config::HardenedDefiConfig;
-use crate::engine::abi_ingest::{ingest_abi_file, merge_abi_registry};
+use crate::engine::abi_ingest::{ingest_abi_file, merge_abi_registry, AbiIngestReport};
 use crate::engine::actors::{ActorModel, ActorModelConfig, ActorSet};
 use crate::engine::bounded_search::{
     BoundedSearchBounds, BoundedSearchEngine, BoundedSearchRequest,
 };
 use crate::engine::bytecode_analysis::{analyze_bytecode, BytecodeAnalysisReport};
 use crate::engine::dependency::generate_flow_template_inputs;
-use crate::engine::economic_delta::EconomicDeltaEngine;
+use crate::engine::economic_delta::{EconomicDeltaEngine, EconomicDeltaReport};
 use crate::engine::exploit_path::ExploitPathBuilder;
 use crate::engine::foundry_ingest::FoundryHarnessManifest;
 use crate::engine::invariant_manifest::TargetInvariantManifest;
+use crate::engine::promotion::{
+    promote_finding_artifact, write_campaign_summary, PromotionCampaignStats, PromotionConfig,
+    PromotionRequest,
+};
 use crate::engine::protocol_model::CounterexampleSearchEngine;
 use crate::engine::scheduler::RustyFuzzScheduler;
 use crate::engine::scoring::{CampaignScore, CampaignScorer};
 use crate::engine::seed_intelligence::{SeedCandidate, SeedIntelligence, SeedIntelligenceConfig};
-use crate::engine::target_profile::{ProtocolType, TargetProfiler};
+use crate::engine::target_profile::{ProtocolType, TargetProfile, TargetProfiler};
 use crate::evm::corpus::{
     CampaignArtifactRequest, PersistentCorpus, SeedBundleStatus, SnapshotCorpus,
 };
@@ -35,7 +39,6 @@ use libafl::events::NopEventManager;
 use libafl::state::HasCorpus;
 use parking_lot::{Mutex, RwLock};
 use revm::database::CacheDB;
-use revm::database_interface::DatabaseRef;
 use revm::primitives::{Address, U256};
 use revm::state::AccountInfo;
 use std::cell::UnsafeCell;
@@ -161,6 +164,14 @@ impl CampaignTelemetry {
     fn record_artifact(&self) {
         self.artifacts.fetch_add(1, Ordering::Relaxed);
     }
+
+    fn execution_count(&self) -> u64 {
+        self.executions.load(Ordering::Relaxed)
+    }
+
+    fn artifact_count(&self) -> u64 {
+        self.artifacts.load(Ordering::Relaxed)
+    }
 }
 
 // LibAFL 0.15.4 imports.
@@ -199,6 +210,7 @@ pub struct Config {
     pub artifact_limit: Option<u64>,
     pub campaign_id: Option<String>,
     pub min_finding_confidence: u64,
+    pub promotion: PromotionConfig,
 }
 
 pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
@@ -216,13 +228,24 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
     let (mut initial_db, initial_env, synthetic_fork_mode) = {
         let mut synthetic_fork_mode = false;
         let require_rpc_fork = config.require_rpc_fork || campaign_requires_rpc_fork();
-        let db = match crate::evm::fork::create_fork_db(
-            &config.rpc_url,
-            config.fork_block,
-            config.target_contract,
+        let startup_timeout = startup_rpc_timeout();
+        let db_attempt = match tokio::time::timeout(
+            startup_timeout,
+            crate::evm::fork::create_fork_db(
+                &config.rpc_url,
+                config.fork_block,
+                config.target_contract,
+            ),
         )
         .await
         {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "RPC fork DB setup timed out after {}s",
+                startup_timeout.as_secs()
+            )),
+        };
+        let db = match db_attempt {
             Ok(db) => db,
             Err(err) => {
                 if require_rpc_fork || !config.allow_synthetic_fallback {
@@ -244,9 +267,19 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
             }
         };
 
-        let env = match crate::evm::fork::create_fork_block_env(&config.rpc_url, config.fork_block)
-            .await
+        let env_attempt = match tokio::time::timeout(
+            startup_timeout,
+            crate::evm::fork::create_fork_block_env(&config.rpc_url, config.fork_block),
+        )
+        .await
         {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "RPC fork block env setup timed out after {}s",
+                startup_timeout.as_secs()
+            )),
+        };
+        let env = match env_attempt {
             Ok(env) => env,
             Err(err) => {
                 if require_rpc_fork || !config.allow_synthetic_fallback {
@@ -382,6 +415,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 let state_novelty_feedback =
                     Arc::new(RwLock::new(EvmStateNoveltyFeedback::new()));
                 let telemetry = Arc::new(CampaignTelemetry::new());
+                let promotion_stats = Arc::new(PromotionCampaignStats::default());
                 let pending_campaign_score = Arc::new(RwLock::new(None));
                 let campaign_scorer = Arc::new(CampaignScorer::default());
                 let protocol_oracles = Arc::new(ProtocolOraclePack::default());
@@ -394,6 +428,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     initial_abi.functions.entry(*selector).or_default();
                 }
                 let mut abi_loaded = false;
+                let mut abi_report = None;
                 if let Some(path) = &config.abi_path {
                     match ingest_abi_file(path, config.target_contract) {
                         Ok((_abi, abi_registry, report)) => {
@@ -405,8 +440,13 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                                 report.event_count,
                                 report.classified_selectors
                             );
+                            abi_report = Some(report);
                         }
-                        Err(err) => log::warn!("Failed to load ABI `{}`: {err:#}", path),
+                        Err(err) => {
+                            return Err(libafl::Error::unknown(format!(
+                                "failed to load required ABI `{path}`: {err:#}"
+                            )));
+                        }
                     }
                 }
 
@@ -490,6 +530,8 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     } else {
                         TargetProfiler::profile_from_selectors([])
                     };
+                    let profile =
+                        merge_bytecode_profile(profile, bytecode_analysis.as_ref(), abi_loaded);
                     log::info!(
                         "Hardened DeFi target profile: types={:?}, confidence={}, risky_selectors={}, templates={:?}",
                         profile.protocol_types,
@@ -503,6 +545,11 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 };
 
                 let abi_registry = Arc::new(initial_abi);
+                let target_invariant_manifest = build_runtime_invariant_manifest(
+                    &config,
+                    abi_report.as_ref(),
+                    bytecode_analysis.as_ref(),
+                );
 
                 let core_id = description.core_id();
 
@@ -698,14 +745,11 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     let economic_delta = (config.hardened_defi.enabled
                         && config.hardened_defi.enable_economic_delta)
                         .then(|| EconomicDeltaEngine::from_execution(input, &execution));
-                    if let (Some(path), Some(delta)) =
-                        (config.target_invariant_manifest.as_deref(), economic_delta.as_ref())
-                    {
-                        match TargetInvariantManifest::load(path) {
-                            Ok(manifest) => findings.extend(manifest.evaluate(delta)),
-                            Err(err) => log::warn!("Failed to load target invariant manifest: {err:#}"),
-                        }
-                    }
+                    findings.extend(evaluate_runtime_invariants(
+                        &config,
+                        target_invariant_manifest.as_ref(),
+                        economic_delta.as_ref(),
+                    ));
                     apply_min_finding_confidence(&mut findings, config.min_finding_confidence);
 
                     let mut campaign_score =
@@ -896,6 +940,15 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                                         outcome.record.score.total,
                                         outcome.record.findings.len()
                                     );
+                                    maybe_promote_artifact(
+                                        &config,
+                                        persistent_corpus.as_ref(),
+                                        &outcome.record,
+                                        &initial_env,
+                                        synthetic_fork_mode,
+                                        &promotion_stats,
+                                        &telemetry,
+                                    );
                                 } else {
                                     log::debug!(
                                         "Reused campaign artifact: input_id={}, fork_cache_id={}, reason={}, score={}, findings={}",
@@ -954,6 +1007,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
                 }
 
+                write_final_campaign_summary(&config, &promotion_stats, &telemetry);
                 Ok(())
             },
         )
@@ -1026,6 +1080,7 @@ async fn run_single_process_campaign(
     let dataflow_registry = Arc::new(RwLock::new(DataflowRegistry::new()));
     let state_novelty_feedback = Arc::new(RwLock::new(EvmStateNoveltyFeedback::new()));
     let telemetry = Arc::new(CampaignTelemetry::new());
+    let promotion_stats = Arc::new(PromotionCampaignStats::default());
     let pending_campaign_score = Arc::new(RwLock::new(None));
     let campaign_scorer = Arc::new(CampaignScorer::default());
     let protocol_oracles = Arc::new(ProtocolOraclePack::default());
@@ -1038,6 +1093,7 @@ async fn run_single_process_campaign(
         initial_abi.functions.entry(*selector).or_default();
     }
     let mut abi_loaded = false;
+    let mut abi_report = None;
     if let Some(path) = &config.abi_path {
         match ingest_abi_file(path, config.target_contract) {
             Ok((_abi, abi_registry, report)) => {
@@ -1049,8 +1105,9 @@ async fn run_single_process_campaign(
                     report.event_count,
                     report.classified_selectors
                 );
+                abi_report = Some(report);
             }
-            Err(err) => log::warn!("Failed to load ABI `{}`: {err:#}", path),
+            Err(err) => anyhow::bail!("failed to load required ABI `{}`: {err:#}", path),
         }
     }
 
@@ -1134,6 +1191,7 @@ async fn run_single_process_campaign(
         } else {
             TargetProfiler::profile_from_selectors([])
         };
+        let profile = merge_bytecode_profile(profile, bytecode_analysis.as_ref(), abi_loaded);
         log::info!(
             "Hardened DeFi target profile: types={:?}, confidence={}, risky_selectors={}, templates={:?}",
             profile.protocol_types,
@@ -1147,6 +1205,8 @@ async fn run_single_process_campaign(
     };
 
     let abi_registry = Arc::new(initial_abi);
+    let target_invariant_manifest =
+        build_runtime_invariant_manifest(&config, abi_report.as_ref(), bytecode_analysis.as_ref());
     let core_id = 0usize;
     let mut feedback = EvmCoverageFeedback::new();
     let mut objective = ();
@@ -1348,15 +1408,11 @@ async fn run_single_process_campaign(
         let economic_delta = (config.hardened_defi.enabled
             && config.hardened_defi.enable_economic_delta)
             .then(|| EconomicDeltaEngine::from_execution(input, &execution));
-        if let (Some(path), Some(delta)) = (
-            config.target_invariant_manifest.as_deref(),
+        findings.extend(evaluate_runtime_invariants(
+            &config,
+            target_invariant_manifest.as_ref(),
             economic_delta.as_ref(),
-        ) {
-            match TargetInvariantManifest::load(path) {
-                Ok(manifest) => findings.extend(manifest.evaluate(delta)),
-                Err(err) => log::warn!("Failed to load target invariant manifest: {err:#}"),
-            }
-        }
+        ));
         apply_min_finding_confidence(&mut findings, config.min_finding_confidence);
 
         let mut campaign_score = campaign_scorer.score(input, &execution, &report, &findings);
@@ -1504,6 +1560,15 @@ async fn run_single_process_campaign(
                             outcome.record.score.total,
                             outcome.record.findings.len()
                         );
+                        maybe_promote_artifact(
+                            &config,
+                            persistent_corpus.as_ref(),
+                            &outcome.record,
+                            &initial_env,
+                            synthetic_fork_mode,
+                            &promotion_stats,
+                            &telemetry,
+                        );
                     }
                 }
                 Err(err) => log::error!(
@@ -1532,6 +1597,7 @@ async fn run_single_process_campaign(
                 .map_err(|err| anyhow::anyhow!("failed to clone bounded input: {err}"))?;
             let _ = harness(&input);
         }
+        write_final_campaign_summary(&config, &promotion_stats, &telemetry);
         return Ok(());
     }
 
@@ -1563,6 +1629,7 @@ async fn run_single_process_campaign(
         fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
     }
 
+    write_final_campaign_summary(&config, &promotion_stats, &telemetry);
     Ok(())
 }
 
@@ -1589,6 +1656,15 @@ fn campaign_execution_timeout() -> Duration {
         .unwrap_or(DEFAULT_EXECUTION_TIMEOUT)
 }
 
+fn startup_rpc_timeout() -> Duration {
+    std::env::var("RUSTYFUZZ_STARTUP_RPC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(60))
+}
+
 fn campaign_requires_rpc_fork() -> bool {
     std::env::var("RUSTYFUZZ_REQUIRE_RPC_FORK")
         .ok()
@@ -1609,7 +1685,12 @@ fn discover_target_bytecode_analysis(
     let Some(target) = target else {
         return None;
     };
-    let Ok(Some(account)) = db.db.basic_ref(target) else {
+    let account = db
+        .cache
+        .accounts
+        .get(&target)
+        .and_then(|account| account.info());
+    let Some(account) = account else {
         return None;
     };
     let Some(code) = account.code else {
@@ -1819,6 +1900,270 @@ fn protocol_finding_confidence(finding: &crate::common::oracle::ProtocolFinding)
 
 fn artifact_limit_reached(telemetry: &CampaignTelemetry, artifact_limit: Option<u64>) -> bool {
     artifact_limit.is_some_and(|limit| telemetry.artifacts.load(Ordering::Relaxed) >= limit)
+}
+
+fn merge_bytecode_profile(
+    mut profile: TargetProfile,
+    bytecode_analysis: Option<&BytecodeAnalysisReport>,
+    abi_loaded: bool,
+) -> TargetProfile {
+    let Some(analysis) = bytecode_analysis else {
+        return profile;
+    };
+    let bytecode_profile = &analysis.target_profile;
+    let has_strong_bytecode_protocol = bytecode_profile.protocol_types.iter().any(|protocol| {
+        matches!(
+            protocol,
+            ProtocolType::ProxyUpgradeable
+                | ProtocolType::AccessControlHeavy
+                | ProtocolType::AccountingHeavy
+                | ProtocolType::LendingBorrowing
+                | ProtocolType::AmmDexPool
+                | ProtocolType::OraclePriceFeed
+                | ProtocolType::GovernanceTimelock
+        )
+    });
+    if !abi_loaded
+        && has_strong_bytecode_protocol
+        && profile.protocol_types.len() == 1
+        && profile.protocol_types.contains(&ProtocolType::Erc20Token)
+    {
+        profile.protocol_types.clear();
+        profile
+            .explanation
+            .push("bytecode evidence overrode weak ERC20-only seed classification".to_string());
+    }
+    for protocol in &bytecode_profile.protocol_types {
+        if *protocol != ProtocolType::Unknown && !profile.protocol_types.contains(protocol) {
+            profile.protocol_types.push(protocol.clone());
+        }
+    }
+    if profile.protocol_types.len() > 1 {
+        profile
+            .protocol_types
+            .retain(|p| *p != ProtocolType::Unknown);
+    }
+    profile.confidence = profile.confidence.max(bytecode_profile.confidence);
+    extend_unique(
+        &mut profile.relevant_selectors,
+        &bytecode_profile.relevant_selectors,
+    );
+    extend_unique(
+        &mut profile.risky_selectors,
+        &bytecode_profile.risky_selectors,
+    );
+    extend_unique(
+        &mut profile.state_changing_functions,
+        &bytecode_profile.state_changing_functions,
+    );
+    extend_unique(
+        &mut profile.role_sensitive_functions,
+        &bytecode_profile.role_sensitive_functions,
+    );
+    extend_unique(
+        &mut profile.value_sensitive_functions,
+        &bytecode_profile.value_sensitive_functions,
+    );
+    extend_unique_strings(
+        &mut profile.recommended_seed_templates,
+        &bytecode_profile.recommended_seed_templates,
+    );
+    extend_unique_strings(
+        &mut profile.recommended_invariant_families,
+        &bytecode_profile.recommended_invariant_families,
+    );
+    if analysis.proxy_patterns.iter().any(|pattern| {
+        matches!(
+            pattern,
+            crate::engine::bytecode_analysis::ProxyPattern::Eip1967AdminSlot
+                | crate::engine::bytecode_analysis::ProxyPattern::Eip1967ImplementationSlot
+                | crate::engine::bytecode_analysis::ProxyPattern::DelegateCallDispatch
+        )
+    }) {
+        push_unique_string(
+            &mut profile.recommended_invariant_families,
+            "access-control",
+        );
+        push_unique_string(
+            &mut profile.recommended_seed_templates,
+            "access-control-sensitive-call",
+        );
+    }
+    if analysis.risk_flags.iter().any(|flag| {
+        matches!(
+            flag,
+            crate::engine::bytecode_analysis::BytecodeRiskFlag::HasSstore
+        )
+    }) {
+        push_unique_string(
+            &mut profile.recommended_invariant_families,
+            "generic-accounting",
+        );
+    }
+    profile.protocol_types.sort();
+    profile.protocol_types.dedup();
+    profile.recommended_seed_templates.sort();
+    profile.recommended_seed_templates.dedup();
+    profile.recommended_invariant_families.sort();
+    profile.recommended_invariant_families.dedup();
+    profile
+}
+
+fn build_runtime_invariant_manifest(
+    config: &Config,
+    abi_report: Option<&AbiIngestReport>,
+    bytecode_analysis: Option<&BytecodeAnalysisReport>,
+) -> Option<TargetInvariantManifest> {
+    if let Some(path) = config.target_invariant_manifest.as_deref() {
+        match TargetInvariantManifest::load(path) {
+            Ok(manifest) => {
+                log::info!(
+                    "Loaded target invariant manifest `{}` with {} rules",
+                    path,
+                    manifest.invariants.len()
+                );
+                return Some(manifest);
+            }
+            Err(err) => log::warn!("Failed to load target invariant manifest `{path}`: {err:#}"),
+        }
+    }
+    if abi_report.is_none() && bytecode_analysis.is_none() {
+        return None;
+    }
+    let mut manifest =
+        TargetInvariantManifest::generate(config.target_contract, abi_report, None, None);
+    if let Some(report) = bytecode_analysis {
+        manifest.apply_bytecode_report(report);
+    }
+    log::info!(
+        "Generated runtime invariant manifest from ABI/bytecode evidence: rules={}",
+        manifest.invariants.len()
+    );
+    Some(manifest)
+}
+
+fn evaluate_runtime_invariants(
+    config: &Config,
+    manifest: Option<&TargetInvariantManifest>,
+    delta: Option<&EconomicDeltaReport>,
+) -> Vec<crate::common::oracle::ProtocolFinding> {
+    let Some(delta) = delta else {
+        return Vec::new();
+    };
+    if let Some(path) = config.target_invariant_manifest.as_deref() {
+        match TargetInvariantManifest::load(path) {
+            Ok(manifest) => return manifest.evaluate(delta),
+            Err(err) => log::warn!("Failed to load target invariant manifest `{path}`: {err:#}"),
+        }
+    }
+    manifest
+        .map(|manifest| manifest.evaluate(delta))
+        .unwrap_or_default()
+}
+
+fn extend_unique<T: Clone + Ord>(dst: &mut Vec<T>, src: &[T]) {
+    dst.extend_from_slice(src);
+    dst.sort();
+    dst.dedup();
+}
+
+fn extend_unique_strings(dst: &mut Vec<String>, src: &[String]) {
+    dst.extend(src.iter().cloned());
+    dst.sort();
+    dst.dedup();
+}
+
+fn push_unique_string(dst: &mut Vec<String>, value: &str) {
+    if !dst.iter().any(|candidate| candidate == value) {
+        dst.push(value.to_string());
+    }
+}
+
+fn maybe_promote_artifact(
+    config: &Config,
+    corpus: &PersistentCorpus,
+    artifact: &crate::evm::corpus::CampaignArtifactRecord,
+    block_env: &revm::context::BlockEnv,
+    synthetic_fork_mode: bool,
+    promotion_stats: &PromotionCampaignStats,
+    telemetry: &CampaignTelemetry,
+) {
+    if !config.promotion.enabled {
+        return;
+    }
+    if artifact.findings.is_empty() {
+        log::debug!(
+            "Skipping promotion for score-only artifact input_id={} reason={} score={}; no oracle/protocol finding evidence",
+            artifact.input_id,
+            artifact.reason,
+            artifact.score.total
+        );
+        return;
+    }
+    if config
+        .promotion
+        .promotion_limit
+        .is_some_and(|limit| promotion_stats.promoted_count() >= limit)
+    {
+        log::debug!(
+            "Promotion limit reached; skipping artifact promotion (limit={:?})",
+            config.promotion.promotion_limit
+        );
+        return;
+    }
+    let campaign_id = config.campaign_id.as_deref().unwrap_or("default-campaign");
+    let promotion_id = format!("{campaign_id}-{}", artifact.input_id);
+    if !promotion_stats.reserve_promotion(&promotion_id) {
+        log::debug!(
+            "Skipping duplicate promotion for artifact input_id={}",
+            artifact.input_id
+        );
+        return;
+    }
+    let report_dir = std::path::Path::new(&config.report_dir);
+    match promote_finding_artifact(PromotionRequest {
+        corpus,
+        artifact,
+        block_env,
+        report_dir,
+        campaign_id,
+        fork_block: config.fork_block,
+        rpc_url: &config.rpc_url,
+        synthetic_mode: synthetic_fork_mode,
+        config: &config.promotion,
+    }) {
+        Ok(record) => {
+            promotion_stats.record(&record);
+            let summary = promotion_stats.summary(
+                campaign_id,
+                telemetry.execution_count(),
+                telemetry.artifact_count(),
+            );
+            if let Err(err) = write_campaign_summary(report_dir, &summary) {
+                log::warn!("Failed to write campaign promotion summary: {err:#}");
+            }
+        }
+        Err(err) => log::warn!(
+            "Failed to promote campaign artifact input_id={}: {err:#}",
+            artifact.input_id
+        ),
+    }
+}
+
+fn write_final_campaign_summary(
+    config: &Config,
+    promotion_stats: &PromotionCampaignStats,
+    telemetry: &CampaignTelemetry,
+) {
+    let campaign_id = config.campaign_id.as_deref().unwrap_or("default-campaign");
+    let summary = promotion_stats.summary(
+        campaign_id,
+        telemetry.execution_count(),
+        telemetry.artifact_count(),
+    );
+    if let Err(err) = write_campaign_summary(std::path::Path::new(&config.report_dir), &summary) {
+        log::warn!("Failed to write final campaign summary: {err:#}");
+    }
 }
 
 fn sequence_result_from_tx_results(
@@ -2056,5 +2401,56 @@ mod tests {
 
         assert!(log_seed_bundle_status(&status, false).is_ok());
         assert!(log_seed_bundle_status(&status, true).is_err());
+    }
+
+    #[test]
+    fn bytecode_profile_overrides_weak_erc20_seed_profile_without_abi() {
+        use crate::engine::bytecode_analysis::{
+            BytecodeRiskFlag, FunctionSliceSummary, ProxyPattern, SymbolicBytecodeSummary,
+        };
+        use std::collections::BTreeMap;
+
+        let mut seed_profile = TargetProfile::default();
+        seed_profile.protocol_types = vec![ProtocolType::Erc20Token];
+        seed_profile.confidence = 95;
+
+        let mut bytecode_profile = TargetProfile::default();
+        bytecode_profile.protocol_types = vec![
+            ProtocolType::ProxyUpgradeable,
+            ProtocolType::AccessControlHeavy,
+            ProtocolType::AccountingHeavy,
+        ];
+        bytecode_profile.confidence = 88;
+        bytecode_profile.recommended_invariant_families = vec![
+            "access-control".to_string(),
+            "generic-accounting".to_string(),
+        ];
+
+        let report = BytecodeAnalysisReport {
+            code_len: 32,
+            push4_selectors: Vec::new(),
+            dispatch_selectors: Vec::new(),
+            function_summaries: Vec::<FunctionSliceSummary>::new(),
+            known_selectors: Vec::new(),
+            proxy_patterns: vec![ProxyPattern::Eip1967ImplementationSlot],
+            risk_flags: vec![BytecodeRiskFlag::HasSstore],
+            storage_slots: Vec::new(),
+            symbolic_summary: SymbolicBytecodeSummary::default(),
+            opcode_counts: BTreeMap::new(),
+            target_profile: bytecode_profile,
+            explanation: Vec::new(),
+        };
+
+        let merged = merge_bytecode_profile(seed_profile, Some(&report), false);
+        assert!(!merged.protocol_types.contains(&ProtocolType::Erc20Token));
+        assert!(merged
+            .protocol_types
+            .contains(&ProtocolType::ProxyUpgradeable));
+        assert!(merged
+            .protocol_types
+            .contains(&ProtocolType::AccessControlHeavy));
+        assert!(merged
+            .recommended_invariant_families
+            .contains(&"access-control".to_string()));
     }
 }

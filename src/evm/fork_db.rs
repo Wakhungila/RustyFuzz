@@ -7,7 +7,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -252,11 +252,33 @@ impl ForkDb {
             "method": method,
             "params": params,
         });
+        let response = rpc_on_blocking_thread(rpc_url.clone(), request)?;
+        if let Some(error) = response.get("error") {
+            return Err(ForkDbError::Rpc(error.to_string()));
+        }
+
+        serde_json::from_value(
+            response
+                .get("result")
+                .cloned()
+                .ok_or_else(|| ForkDbError::Decode("missing JSON-RPC result".to_string()))?,
+        )
+        .map_err(|err| ForkDbError::Decode(err.to_string()))
+    }
+}
+
+fn rpc_on_blocking_thread(rpc_url: String, request: Value) -> Result<Value, ForkDbError> {
+    thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(0)
+            .user_agent("rusty-fuzz-fork-db/0.1")
+            .build()
+            .map_err(|err| ForkDbError::Rpc(sanitize_rpc_error(&err.to_string())))?;
         let mut last_rpc_error = None;
         for attempt in 0..4 {
-            let result = self
-                .blocking_client()
-                .post(rpc_url)
+            let result = client
+                .post(&rpc_url)
                 .json(&request)
                 .send()
                 .map_err(|err| ForkDbError::Rpc(sanitize_rpc_error(&err.to_string())))
@@ -268,18 +290,9 @@ impl ForkDb {
 
             match result {
                 Ok(response) => {
-                    let response: Value = response
+                    return response
                         .json()
-                        .map_err(|err| ForkDbError::Decode(err.to_string()))?;
-
-                    if let Some(error) = response.get("error") {
-                        return Err(ForkDbError::Rpc(error.to_string()));
-                    }
-
-                    return serde_json::from_value(response.get("result").cloned().ok_or_else(
-                        || ForkDbError::Decode("missing JSON-RPC result".to_string()),
-                    )?)
-                    .map_err(|err| ForkDbError::Decode(err.to_string()));
+                        .map_err(|err| ForkDbError::Decode(err.to_string()));
                 }
                 Err(error) => {
                     last_rpc_error = Some(error);
@@ -292,19 +305,9 @@ impl ForkDb {
 
         Err(last_rpc_error
             .unwrap_or_else(|| ForkDbError::Rpc("request failed without error".to_string())))
-    }
-
-    fn blocking_client(&self) -> &'static reqwest::blocking::Client {
-        static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-        CLIENT.get_or_init(|| {
-            reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .pool_max_idle_per_host(0)
-                .user_agent("rusty-fuzz-fork-db/0.1")
-                .build()
-                .expect("valid reqwest client")
-        })
-    }
+    })
+    .join()
+    .map_err(|_| ForkDbError::Rpc("fork RPC worker thread panicked".to_string()))?
 }
 
 fn sanitize_rpc_error(message: &str) -> String {
