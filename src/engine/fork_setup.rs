@@ -878,6 +878,7 @@ mod tests {
                 match_kind: Some("test".to_string()),
                 confidence: None,
                 provenance: None,
+                decoded: None,
             },
         }
     }

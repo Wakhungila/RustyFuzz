@@ -1,8 +1,9 @@
 use crate::common::types::{EvmInput, SingletonTx};
+use crate::engine::abi_ingest::{AbiFunctionSummary, SelectorClassification};
 use crate::evm::fork_db::{ForkDb, ForkDbCacheSnapshot};
 use alloy::consensus::Transaction;
 use alloy::providers::Provider;
-use alloy::rpc::types::eth::BlockTransactions;
+use alloy::rpc::types::eth::{BlockTransactions, Filter};
 use anyhow::Context;
 use revm::database_interface::DatabaseRef;
 use revm::primitives::{keccak256, Address, B256, U256};
@@ -36,6 +37,10 @@ pub struct MainnetSeedConfig {
     pub resume_cursor: Option<String>,
     #[serde(default)]
     pub output_manifest: Option<String>,
+    #[serde(default)]
+    pub scan_mode: SeedScanMode,
+    #[serde(default)]
+    pub abi_functions: BTreeMap<[u8; 4], SeedAbiFunction>,
 }
 
 impl MainnetSeedConfig {
@@ -52,8 +57,28 @@ impl MainnetSeedConfig {
             max_blocks_per_second: None,
             resume_cursor: None,
             output_manifest: None,
+            scan_mode: SeedScanMode::BlockScan,
+            abi_functions: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedScanMode {
+    #[default]
+    BlockScan,
+    Logs,
+    DebugTrace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SeedAbiFunction {
+    pub name: String,
+    pub signature: String,
+    pub selector: [u8; 4],
+    pub inputs: Vec<String>,
+    pub classification: SelectorClassification,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -80,6 +105,8 @@ pub struct SeedScanManifest {
     pub search_depth: u64,
     pub include_address_hints: bool,
     pub max_blocks_per_second: Option<f64>,
+    pub scan_mode: SeedScanMode,
+    pub decoded_abi: bool,
     pub seed_count: usize,
     pub discovered_selectors: Vec<[u8; 4]>,
 }
@@ -110,6 +137,17 @@ pub struct SeedMetadata {
     pub confidence: Option<u64>,
     #[serde(default)]
     pub provenance: Option<String>,
+    #[serde(default)]
+    pub decoded: Option<DecodedCalldataMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DecodedCalldataMetadata {
+    pub function_name: String,
+    pub signature: String,
+    pub selector: [u8; 4],
+    pub inputs: Vec<String>,
+    pub classification: SelectorClassification,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -179,74 +217,18 @@ impl<P: Provider> SeedIngester<P> {
         let mut candidates = Vec::new();
         let mut last_fetch = None::<Instant>;
 
-        for offset in 0..config.search_depth {
-            if candidates.len() >= config.max_seeds {
-                break;
+        match config.scan_mode {
+            SeedScanMode::BlockScan | SeedScanMode::DebugTrace => {
+                self.ingest_block_scan(
+                    config,
+                    start_block,
+                    &mut candidates,
+                    &mut last_fetch,
+                )
+                .await?;
             }
-            let block_num = start_block.saturating_sub(offset);
-            rate_limit_block_fetch(config, &mut last_fetch).await;
-            let Some(block) = self.fetch_block_with_retries(block_num, config).await? else {
-                write_seed_scan_cursor(config, block_num)?;
-                continue;
-            };
-            write_seed_scan_cursor(config, block_num)?;
-
-            let BlockTransactions::Full(txs) = block.transactions else {
-                continue;
-            };
-
-            for (transaction_ordinal, tx) in txs.into_iter().enumerate() {
-                let envelope = &*tx.inner;
-                let Some(to) = envelope.to() else {
-                    continue;
-                };
-                let input_bytes = envelope.input().to_vec();
-                let Some(match_kind) = seed_match_kind(
-                    to,
-                    config.target,
-                    &input_bytes,
-                    config.include_address_hints,
-                ) else {
-                    continue;
-                };
-
-                let caller = Address::from(*tx.inner.signer());
-                let seed_input = EvmInput {
-                    txs: vec![SingletonTx {
-                        input: input_bytes.clone(),
-                        caller,
-                        to,
-                        value: envelope.value(),
-                        is_victim: false,
-                    }],
-                    base_snapshot_id: 0,
-                    waypoints: Vec::new(),
-                    mutation_provenance: Vec::new(),
-                };
-                let metadata = SeedMetadata {
-                    source_block: block_num,
-                    block_offset: offset,
-                    transaction_ordinal,
-                    caller,
-                    target: to,
-                    value: envelope.value(),
-                    selector: selector(&input_bytes),
-                    calldata_len: input_bytes.len(),
-                    discovered_address_hints: extract_address_hints(&input_bytes),
-                    matched_target: Some(config.target),
-                    match_kind: Some(match_kind.to_string()),
-                    confidence: Some(if match_kind == DIRECT_MATCH { 95 } else { 75 }),
-                    provenance: Some("rpc-block-scan".to_string()),
-                };
-                candidates.push(MainnetSeed {
-                    id: stable_seed_id(&seed_input, &metadata),
-                    input: seed_input,
-                    metadata,
-                });
-
-                if candidates.len() >= config.max_seeds {
-                    break;
-                }
+            SeedScanMode::Logs => {
+                self.ingest_logs_scan(config, start_block, &mut candidates).await?;
             }
         }
 
@@ -260,6 +242,8 @@ impl<P: Provider> SeedIngester<P> {
             search_depth: config.search_depth,
             include_address_hints: config.include_address_hints,
             max_blocks_per_second: config.max_blocks_per_second,
+            scan_mode: config.scan_mode,
+            decoded_abi: !config.abi_functions.is_empty(),
             seed_count: seeds.len(),
             discovered_selectors: seeds
                 .iter()
@@ -292,6 +276,146 @@ impl<P: Provider> SeedIngester<P> {
             fork_cache,
             scan: Some(scan),
         })
+    }
+
+    async fn ingest_block_scan(
+        &self,
+        config: &MainnetSeedConfig,
+        start_block: u64,
+        candidates: &mut Vec<MainnetSeed>,
+        last_fetch: &mut Option<Instant>,
+    ) -> anyhow::Result<()> {
+        for offset in 0..config.search_depth {
+            if candidates.len() >= config.max_seeds {
+                break;
+            }
+            let block_num = start_block.saturating_sub(offset);
+            if config.scan_mode == SeedScanMode::DebugTrace {
+                self.debug_trace_block(config, block_num).await;
+            }
+            rate_limit_block_fetch(config, last_fetch).await;
+            let Some(block) = self.fetch_block_with_retries(block_num, config).await? else {
+                write_seed_scan_cursor(config, block_num)?;
+                continue;
+            };
+            write_seed_scan_cursor(config, block_num)?;
+
+            let BlockTransactions::Full(txs) = block.transactions else {
+                continue;
+            };
+
+            for (transaction_ordinal, tx) in txs.into_iter().enumerate() {
+                let envelope = &*tx.inner;
+                let Some(to) = envelope.to() else {
+                    continue;
+                };
+                let input_bytes = envelope.input().to_vec();
+                let Some(match_kind) = seed_match_kind(
+                    to,
+                    config.target,
+                    &input_bytes,
+                    config.include_address_hints,
+                ) else {
+                    continue;
+                };
+
+                candidates.push(seed_from_parts(
+                    config,
+                    block_num,
+                    offset,
+                    transaction_ordinal,
+                    Address::from(*tx.inner.signer()),
+                    to,
+                    envelope.value(),
+                    input_bytes,
+                    match_kind,
+                    match config.scan_mode {
+                        SeedScanMode::DebugTrace => "rpc-debug-trace-block-scan",
+                        _ => "rpc-block-scan",
+                    },
+                ));
+
+                if candidates.len() >= config.max_seeds {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn ingest_logs_scan(
+        &self,
+        config: &MainnetSeedConfig,
+        start_block: u64,
+        candidates: &mut Vec<MainnetSeed>,
+    ) -> anyhow::Result<()> {
+        let end_block = start_block.saturating_sub(config.search_depth.saturating_sub(1));
+        let filter = Filter::new()
+            .from_block(end_block)
+            .to_block(start_block)
+            .address(config.target);
+        let logs = self
+            .provider
+            .get_logs(&filter)
+            .await
+            .context("failed to fetch target logs with eth_getLogs")?;
+        for log in logs {
+            if candidates.len() >= config.max_seeds {
+                break;
+            }
+            let Some(hash) = log.transaction_hash else {
+                continue;
+            };
+            let Some(tx) = self.provider.get_transaction_by_hash(hash).await? else {
+                continue;
+            };
+            let envelope = &*tx.inner;
+            let Some(to) = envelope.to() else {
+                continue;
+            };
+            let input_bytes = envelope.input().to_vec();
+            let Some(match_kind) = seed_match_kind(
+                to,
+                config.target,
+                &input_bytes,
+                true,
+            ) else {
+                continue;
+            };
+            candidates.push(seed_from_parts(
+                config,
+                log.block_number.unwrap_or(start_block),
+                start_block.saturating_sub(log.block_number.unwrap_or(start_block)),
+                log.transaction_index.unwrap_or(0) as usize,
+                Address::from(*tx.inner.signer()),
+                to,
+                envelope.value(),
+                input_bytes,
+                match_kind,
+                "rpc-log-scan",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn debug_trace_block(&self, config: &MainnetSeedConfig, block_num: u64) {
+        let params = (
+            format!("0x{block_num:x}"),
+            serde_json::json!({ "tracer": "callTracer", "timeout": "10s" }),
+        );
+        if let Err(err) = self
+            .provider
+            .client()
+            .request::<_, serde_json::Value>("debug_traceBlockByNumber", params)
+            .await
+        {
+            log::warn!(
+                "debug_traceBlockByNumber unavailable for seed scan block {} target {}: {}",
+                block_num,
+                config.target,
+                err
+            );
+        }
     }
 
     async fn fetch_block_with_retries(
@@ -335,6 +459,83 @@ pub fn normalize_seeds(mut seeds: Vec<MainnetSeed>) -> Vec<MainnetSeed> {
     });
     seeds.dedup_by(|a, b| a.id == b.id);
     seeds
+}
+
+pub fn seed_abi_functions(
+    functions: impl IntoIterator<Item = AbiFunctionSummary>,
+) -> BTreeMap<[u8; 4], SeedAbiFunction> {
+    functions
+        .into_iter()
+        .map(|function| {
+            (
+                function.selector,
+                SeedAbiFunction {
+                    name: function.name,
+                    signature: function.signature,
+                    selector: function.selector,
+                    inputs: function.inputs,
+                    classification: function.classification,
+                },
+            )
+        })
+        .collect()
+}
+
+fn seed_from_parts(
+    config: &MainnetSeedConfig,
+    source_block: u64,
+    block_offset: u64,
+    transaction_ordinal: usize,
+    caller: Address,
+    to: Address,
+    value: U256,
+    input_bytes: Vec<u8>,
+    match_kind: &str,
+    provenance: &str,
+) -> MainnetSeed {
+    let selector = selector(&input_bytes);
+    let decoded = selector
+        .and_then(|selector| config.abi_functions.get(&selector))
+        .map(|function| DecodedCalldataMetadata {
+            function_name: function.name.clone(),
+            signature: function.signature.clone(),
+            selector: function.selector,
+            inputs: function.inputs.clone(),
+            classification: function.classification.clone(),
+        });
+    let seed_input = EvmInput {
+        txs: vec![SingletonTx {
+            input: input_bytes.clone(),
+            caller,
+            to,
+            value,
+            is_victim: false,
+        }],
+        base_snapshot_id: 0,
+        waypoints: Vec::new(),
+        mutation_provenance: Vec::new(),
+    };
+    let metadata = SeedMetadata {
+        source_block,
+        block_offset,
+        transaction_ordinal,
+        caller,
+        target: to,
+        value,
+        selector,
+        calldata_len: input_bytes.len(),
+        discovered_address_hints: extract_address_hints(&input_bytes),
+        matched_target: Some(config.target),
+        match_kind: Some(match_kind.to_string()),
+        confidence: Some(if match_kind == DIRECT_MATCH { 95 } else { 75 }),
+        provenance: Some(provenance.to_string()),
+        decoded,
+    };
+    MainnetSeed {
+        id: stable_seed_id(&seed_input, &metadata),
+        input: seed_input,
+        metadata,
+    }
 }
 
 pub fn discover_accounts_from_seeds(

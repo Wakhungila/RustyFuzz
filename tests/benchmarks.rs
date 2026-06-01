@@ -1215,6 +1215,7 @@ fn mainnet_seed_ingestion_normalizes_and_discovers_accounts() {
             match_kind: Some("direct".to_string()),
             confidence: None,
             provenance: None,
+            decoded: None,
         },
     };
     let duplicate = MainnetSeed {
@@ -1333,6 +1334,7 @@ fn persistent_corpus_round_trips_mainnet_seed_bundle() {
             match_kind: Some("direct".to_string()),
             confidence: None,
             provenance: None,
+            decoded: None,
         },
     };
     let bundle = MainnetSeedBundle {

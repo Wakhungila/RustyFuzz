@@ -939,6 +939,7 @@ mod artifact_tests {
                 match_kind: Some("direct".to_string()),
                 confidence: Some(95),
                 provenance: Some("test".to_string()),
+                decoded: None,
             },
         }
     }

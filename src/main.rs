@@ -24,7 +24,8 @@ use rusty_fuzz::evm::fork::create_fork_block_env;
 use rusty_fuzz::evm::fork_db::ForkDb;
 use rusty_fuzz::evm::inspector::MAP_SIZE;
 use rusty_fuzz::evm::seed_ingester::{
-    MainnetSeed, MainnetSeedBundle, MainnetSeedConfig, SeedIngester, SeedMetadata,
+    seed_abi_functions, MainnetSeed, MainnetSeedBundle, MainnetSeedConfig, SeedIngester,
+    SeedMetadata, SeedScanMode,
 };
 use rusty_fuzz::satori::cli::SatoriCommand;
 use std::str::FromStr;
@@ -143,6 +144,8 @@ enum Command {
         seed_resume_cursor: Option<String>,
         #[arg(long)]
         seed_output_manifest: Option<String>,
+        #[arg(long, default_value = "block-scan")]
+        seed_mode: String,
     },
     SeedIngest {
         #[arg(long)]
@@ -492,6 +495,7 @@ async fn main() -> anyhow::Result<()> {
             resume,
             seed_resume_cursor,
             seed_output_manifest,
+            seed_mode,
         } => {
             ensure_evm_chain(&config)?;
             if contract.is_some() || rpc_url.is_some() || output.is_some() {
@@ -505,9 +509,12 @@ async fn main() -> anyhow::Result<()> {
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("rustyfuzz seed requires --output"))?;
                 let target = Address::from_str(contract)?;
-                if let Some(abi_path) = abi.as_deref() {
-                    let _ = ingest_abi_file(abi_path, Some(target))?;
-                }
+                let abi_functions = if let Some(abi_path) = abi.as_deref() {
+                    let (_abi, _registry, report) = ingest_abi_file(abi_path, Some(target))?;
+                    seed_abi_functions(report.functions)
+                } else {
+                    Default::default()
+                };
 
                 let url: reqwest::Url = rpc_url.parse()?;
                 let provider = ProviderBuilder::new().connect_http(url);
@@ -526,6 +533,8 @@ async fn main() -> anyhow::Result<()> {
                 };
                 seed_config.max_retries = seed_rpc_retry_count;
                 seed_config.retry_backoff_ms = seed_rpc_backoff_ms;
+                seed_config.scan_mode = parse_seed_scan_mode(&seed_mode)?;
+                seed_config.abi_functions = abi_functions;
                 seed_config.resume_cursor = seed_resume_cursor.or_else(|| {
                     resume.then(|| format!("{output}/seed-cursor.json"))
                 });
@@ -567,6 +576,11 @@ async fn main() -> anyhow::Result<()> {
             };
             seed_config.max_retries = seed_rpc_retry_count;
             seed_config.retry_backoff_ms = seed_rpc_backoff_ms;
+            seed_config.scan_mode = parse_seed_scan_mode(&seed_mode)?;
+            if let Some(abi_path) = abi.as_deref().or(config.target_abi.as_deref()) {
+                let (_abi, _registry, report) = ingest_abi_file(abi_path, Some(target))?;
+                seed_config.abi_functions = seed_abi_functions(report.functions);
+            }
             seed_config.resume_cursor = seed_resume_cursor.or_else(|| {
                 resume.then(|| format!("{}/seed_cursors/{bundle_id}.json", config.corpus_dir))
             });
@@ -647,6 +661,7 @@ async fn main() -> anyhow::Result<()> {
                             match_kind: Some("historical-json".to_string()),
                             confidence: None,
                             provenance: Some("historical-json-ingest".to_string()),
+                            decoded: None,
                         },
                         input,
                     }
@@ -665,6 +680,8 @@ async fn main() -> anyhow::Result<()> {
                     search_depth: 0,
                     include_address_hints: false,
                     max_blocks_per_second: None,
+                    scan_mode: SeedScanMode::BlockScan,
+                    decoded_abi: false,
                     seed_count: candidates.len(),
                     discovered_selectors: candidates
                         .iter()
@@ -1122,6 +1139,17 @@ fn target_address(cli_target: Option<&str>, config: &Config) -> anyhow::Result<A
         .or(config.target_contract.as_deref())
         .ok_or_else(|| anyhow::anyhow!("target contract is required"))
         .and_then(|target| Address::from_str(target).map_err(Into::into))
+}
+
+fn parse_seed_scan_mode(value: &str) -> anyhow::Result<SeedScanMode> {
+    match value {
+        "block-scan" | "block_scan" | "blocks" => Ok(SeedScanMode::BlockScan),
+        "logs" | "eth-getlogs" | "eth_getlogs" => Ok(SeedScanMode::Logs),
+        "debug-trace" | "debug_trace" | "debug-trace-block" => Ok(SeedScanMode::DebugTrace),
+        other => anyhow::bail!(
+            "unsupported --seed-mode `{other}`; expected block-scan, logs, or debug-trace"
+        ),
+    }
 }
 
 async fn campaign_block_env(config: &Config) -> anyhow::Result<revm::context::BlockEnv> {
