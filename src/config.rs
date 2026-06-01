@@ -24,6 +24,10 @@ pub struct Config {
     pub hardened_defi: HardenedDefiConfig,
     #[serde(default)]
     pub target_invariant_manifest: Option<String>,
+    #[serde(default)]
+    pub target_abi: Option<String>,
+    #[serde(default = "default_abi_cache_dir")]
+    pub abi_cache_dir: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,6 +104,10 @@ fn default_max_tx_depth() -> usize {
 
 fn default_min_persist_confidence() -> f64 {
     0.70
+}
+
+fn default_abi_cache_dir() -> String {
+    "corpus/abi".to_string()
 }
 
 impl Config {

@@ -9,6 +9,8 @@ timeout_secs = 60
 corpus_dir = "corpus"
 report_dir = "reports"
 mainnet_seed_bundle = "target-mainnet"
+target_abi = "abi/Target.json"
+abi_cache_dir = "corpus/abi"
 llm_enabled = false
 
 [hardened_defi]

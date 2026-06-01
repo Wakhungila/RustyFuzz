@@ -1,5 +1,7 @@
 use crate::common::types::SingletonTx;
+use crate::engine::bytecode_analysis::FunctionSliceSummary;
 use crate::engine::foundry_ingest::FoundryHarnessManifest;
+use crate::engine::target_profile::ProtocolType;
 use crate::evm::fuzz::{AbiRegistry, EvmInput, MutationProvenance};
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use revm::primitives::{keccak256, Address, B256, U256};
@@ -15,6 +17,7 @@ pub enum SeedSourceType {
     Foundry,
     Manual,
     Historical,
+    Bytecode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -213,6 +216,73 @@ impl SeedIntelligence {
         candidates
     }
 
+    pub fn generate_bytecode_candidates(
+        &self,
+        target: Address,
+        caller: Address,
+        function_summaries: &[FunctionSliceSummary],
+    ) -> Vec<SeedCandidate> {
+        let mut candidates = function_summaries
+            .iter()
+            .map(|summary| {
+                let mut tags = summary
+                    .protocol_type_hint
+                    .as_ref()
+                    .map(seed_tags_for_protocol)
+                    .unwrap_or_else(|| BTreeSet::from([SeedTag::Unknown]));
+                if summary.behavior.uses_caller
+                    || summary.behavior.uses_origin
+                    || summary.behavior.makes_delegate_call
+                {
+                    tags.insert(SeedTag::AccessControl);
+                }
+                let value = if summary.behavior.uses_call_value {
+                    U256::from(10u128.pow(15))
+                } else {
+                    U256::ZERO
+                };
+                let mut prerequisites = summary.seed_hints.clone();
+                prerequisites.extend(summary.invariant_hints.iter().map(|hint| {
+                    format!("monitor-invariant-family:{hint}")
+                }));
+                prerequisites.sort();
+                prerequisites.dedup();
+                SeedCandidate {
+                    target,
+                    caller,
+                    calldata: summary.selector.to_vec(),
+                    selector: Some(summary.selector),
+                    value,
+                    source_type: SeedSourceType::Bytecode,
+                    confidence_score: bytecode_slice_confidence(summary),
+                    reason: format!(
+                        "bytecode function slice selector 0x{} entry_pc={} signature_hint={} writes_storage={} external_call={} delegate_call={} value_sensitive={} caller_sensitive={}",
+                        hex::encode(summary.selector),
+                        summary.entry_pc,
+                        summary.signature_hint.as_deref().unwrap_or("unknown"),
+                        summary.behavior.writes_storage,
+                        summary.behavior.makes_external_call,
+                        summary.behavior.makes_delegate_call,
+                        summary.behavior.uses_call_value,
+                        summary.behavior.uses_caller || summary.behavior.uses_origin
+                    ),
+                    touched_addresses: vec![target],
+                    touched_slots: Vec::new(),
+                    prerequisites,
+                    tags,
+                }
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| {
+            b.confidence_score
+                .cmp(&a.confidence_score)
+                .then_with(|| a.selector.cmp(&b.selector))
+        });
+        candidates.dedup_by(|a, b| a.target == b.target && a.calldata == b.calldata);
+        candidates.truncate(self.config.max_candidates);
+        candidates
+    }
+
     pub fn parse_trace_seed_bundle_json(&self, json: &str) -> anyhow::Result<Vec<SeedCandidate>> {
         let bundle: TraceSeedBundle = serde_json::from_str(json)?;
         let mut out = Vec::new();
@@ -251,6 +321,49 @@ impl SeedIntelligence {
         out.sort_by(|a, b| b.confidence_score.cmp(&a.confidence_score));
         out.truncate(self.config.max_candidates);
         Ok(out)
+    }
+}
+
+fn bytecode_slice_confidence(summary: &FunctionSliceSummary) -> u64 {
+    let mut score = if summary.signature_hint.is_some() {
+        58
+    } else {
+        42
+    };
+    if summary.behavior.writes_storage {
+        score += 14;
+    }
+    if summary.behavior.uses_call_value {
+        score += 10;
+    }
+    if summary.behavior.uses_caller || summary.behavior.uses_origin {
+        score += 10;
+    }
+    if summary.behavior.makes_external_call {
+        score += 8;
+    }
+    if summary.behavior.makes_delegate_call {
+        score += 12;
+    }
+    if summary.protocol_type_hint.is_some() {
+        score += 8;
+    }
+    score.min(92)
+}
+
+fn seed_tags_for_protocol(protocol: &ProtocolType) -> BTreeSet<SeedTag> {
+    match protocol {
+        ProtocolType::Erc20Token => BTreeSet::from([SeedTag::Erc20]),
+        ProtocolType::Erc4626Vault => BTreeSet::from([SeedTag::Erc4626]),
+        ProtocolType::AmmDexPool => BTreeSet::from([SeedTag::Amm]),
+        ProtocolType::LendingBorrowing => BTreeSet::from([SeedTag::Lending]),
+        ProtocolType::OraclePriceFeed => BTreeSet::from([SeedTag::Oracle]),
+        ProtocolType::GovernanceTimelock => BTreeSet::from([SeedTag::Governance]),
+        ProtocolType::BridgeMessagePassing => BTreeSet::from([SeedTag::Bridge]),
+        ProtocolType::AccessControlHeavy | ProtocolType::ProxyUpgradeable => {
+            BTreeSet::from([SeedTag::AccessControl])
+        }
+        _ => BTreeSet::from([SeedTag::Unknown]),
     }
 }
 
@@ -1097,5 +1210,37 @@ mod tests {
 
         assert_eq!(seeds.len(), 1);
         assert_eq!(seeds[0].selector, Some(approve));
+    }
+
+    #[test]
+    fn bytecode_function_summaries_generate_actionable_seeds() {
+        let target = Address::repeat_byte(0xaa);
+        let caller = Address::repeat_byte(0x13);
+        let selector = function_selector("deposit(uint256,address)");
+        let summaries = vec![FunctionSliceSummary {
+            selector,
+            entry_pc: 0x40,
+            signature_hint: Some("deposit(uint256,address)".to_string()),
+            protocol_type_hint: Some(ProtocolType::Erc4626Vault),
+            symbolic_summary: crate::engine::bytecode_analysis::SymbolicBytecodeSummary::default(),
+            behavior: crate::engine::bytecode_analysis::FunctionBehavior {
+                writes_storage: true,
+                uses_call_value: true,
+                ..Default::default()
+            },
+            seed_hints: vec!["vary-msg-value".to_string()],
+            invariant_hints: vec!["erc4626-share-price-bound".to_string()],
+        }];
+
+        let seeds =
+            SeedIntelligence::default().generate_bytecode_candidates(target, caller, &summaries);
+
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].source_type, SeedSourceType::Bytecode);
+        assert_eq!(seeds[0].selector, Some(selector));
+        assert_eq!(seeds[0].calldata, selector.to_vec());
+        assert!(seeds[0].value > U256::ZERO);
+        assert!(seeds[0].tags.contains(&SeedTag::Erc4626));
+        assert!(seeds[0].confidence_score >= 80);
     }
 }

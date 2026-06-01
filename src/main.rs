@@ -6,9 +6,12 @@ use rusty_fuzz::chain::mempool::MempoolScanner;
 use rusty_fuzz::common::oracle::{ProtocolOraclePack, ReentrancyOracle, VulnType};
 use rusty_fuzz::common::verifier::ReplayVerifier;
 use rusty_fuzz::config::Config;
+use rusty_fuzz::engine::abi_ingest::{ingest_abi_file, write_abi_cache};
 use rusty_fuzz::engine::benchmark::ValidationRunner;
+use rusty_fuzz::engine::bytecode_analysis::analyze_bytecode;
 use rusty_fuzz::engine::fork_setup::ForkSetupDiscoverer;
 use rusty_fuzz::engine::foundry_ingest::FoundryHarnessManifest;
+use rusty_fuzz::engine::invariant_manifest::TargetInvariantManifest;
 use rusty_fuzz::engine::minimizer::Minimizer;
 use rusty_fuzz::engine::seed_intelligence::SeedIntelligence;
 use rusty_fuzz::evm::corpus::PersistentCorpus;
@@ -53,6 +56,24 @@ enum Command {
         require_rpc_fork: bool,
         #[arg(long, default_value_t = false)]
         allow_synthetic_fallback: bool,
+        #[arg(long)]
+        abi: Option<String>,
+    },
+    AbiIngest {
+        #[arg(long)]
+        file: String,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, default_value = "default")]
+        bundle_id: String,
+        #[arg(long)]
+        output: Option<String>,
+    },
+    BytecodeAnalyze {
+        #[arg(long)]
+        file: String,
+        #[arg(long)]
+        output: Option<String>,
     },
     Seed {
         #[arg(long)]
@@ -99,6 +120,26 @@ enum Command {
         target: Option<String>,
         #[arg(long)]
         output: Option<String>,
+        #[arg(long)]
+        abi: Option<String>,
+    },
+    Invariants {
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        abi_report: Option<String>,
+        #[arg(long)]
+        setup_report: Option<String>,
+        #[arg(long)]
+        bytecode_report: Option<String>,
+        #[arg(long)]
+        satori_job: Option<String>,
+        #[arg(long)]
+        output: Option<String>,
+    },
+    Job {
+        #[command(subcommand)]
+        command: JobCommand,
     },
     Replay {
         #[arg(long, alias = "input_id")]
@@ -139,6 +180,19 @@ enum Command {
     },
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum JobCommand {
+    Run {
+        file: String,
+        #[arg(long)]
+        abi: Option<String>,
+        #[arg(long)]
+        seed_bundle: Option<String>,
+        #[arg(long, default_value_t = false)]
+        require_seed_bundle: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -164,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
             require_seed_bundle,
             require_rpc_fork,
             allow_synthetic_fallback,
+            abi,
         } => {
             let raw_target = match contract.as_deref() {
                 Some(target) if target.trim().is_empty() => {
@@ -230,8 +285,83 @@ async fn main() -> anyhow::Result<()> {
                     || allow_synthetic_fallback,
                 hardened_defi: hardened_defi_config,
                 target_invariant_manifest: config.target_invariant_manifest.clone(),
+                abi_path: abi.or(config.target_abi.clone()),
             };
             rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await?;
+        }
+        Command::AbiIngest {
+            file,
+            target,
+            bundle_id,
+            output,
+        } => {
+            ensure_evm_chain(&config)?;
+            let target = target
+                .as_deref()
+                .map(Address::from_str)
+                .transpose()?
+                .or_else(|| {
+                    config
+                        .target_contract
+                        .as_deref()
+                        .and_then(|value| Address::from_str(value).ok())
+                });
+            let (abi, _registry, report) = ingest_abi_file(&file, target)?;
+            let (abi_path, report_path) =
+                write_abi_cache(&config.abi_cache_dir, &bundle_id, &abi, &report)?;
+            if let Some(output) = output {
+                if let Some(parent) = std::path::Path::new(&output).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                }
+                std::fs::write(&output, serde_json::to_vec_pretty(&report)?)?;
+            }
+            println!(
+                "ABI loaded: function_count={}, event_count={}, classified_selectors={}, cache={}, report={}",
+                report.function_count,
+                report.event_count,
+                report.classified_selectors,
+                abi_path.display(),
+                report_path.display()
+            );
+        }
+        Command::BytecodeAnalyze { file, output } => {
+            let bytecode = match std::fs::read_to_string(&file) {
+                Ok(text) => {
+                    let raw = text.trim();
+                    if !raw.is_empty()
+                        && (raw.starts_with("0x") || raw.chars().all(|ch| ch.is_ascii_hexdigit()))
+                    {
+                        hex::decode(raw.strip_prefix("0x").unwrap_or(raw))?
+                    } else {
+                        std::fs::read(&file)?
+                    }
+                }
+                Err(_) => std::fs::read(&file)?,
+            };
+            let report = analyze_bytecode(&bytecode);
+            let rendered = serde_json::to_string_pretty(&report)?;
+            if let Some(output) = output {
+                if let Some(parent) = std::path::Path::new(&output).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                }
+                std::fs::write(&output, rendered)?;
+                println!(
+                    "Bytecode analysis written: {} (push4_selectors={}, dispatch_selectors={}, proxy_patterns={}, risk_flags={}, profile={:?}, confidence={})",
+                    output,
+                    report.push4_selectors.len(),
+                    report.dispatch_selectors.len(),
+                    report.proxy_patterns.len(),
+                    report.risk_flags.len(),
+                    report.target_profile.protocol_types,
+                    report.target_profile.confidence
+                );
+            } else {
+                println!("{rendered}");
+            }
         }
         Command::Seed {
             target,
@@ -382,6 +512,7 @@ async fn main() -> anyhow::Result<()> {
             bundle_id,
             target,
             output,
+            abi,
         } => {
             ensure_evm_chain(&config)?;
             let corpus = PersistentCorpus::new(&config.corpus_dir)?;
@@ -391,11 +522,20 @@ async fn main() -> anyhow::Result<()> {
                 .map(Address::from_str)
                 .transpose()?
                 .unwrap_or(bundle.target);
-            let report = ForkSetupDiscoverer::discover_from_seed_bundle(
+            let mut report = ForkSetupDiscoverer::discover_from_seed_bundle(
                 target,
                 &bundle.seeds,
                 &bundle.discovered_accounts,
             );
+            if let Some(path) = abi.or(config.target_abi.clone()) {
+                let (_abi, _registry, abi_report) = ingest_abi_file(&path, Some(target))?;
+                report = ForkSetupDiscoverer::discover_with_abi_report(
+                    target,
+                    &bundle.seeds,
+                    &bundle.discovered_accounts,
+                    &abi_report,
+                );
+            }
             let report_json = serde_json::to_string_pretty(&report)?;
             if let Some(output) = output {
                 if let Some(parent) = std::path::Path::new(&output).parent() {
@@ -419,6 +559,103 @@ async fn main() -> anyhow::Result<()> {
                 println!("{report_json}");
             }
         }
+        Command::Invariants {
+            target,
+            abi_report,
+            setup_report,
+            bytecode_report,
+            satori_job,
+            output,
+        } => {
+            ensure_evm_chain(&config)?;
+            let target = target
+                .as_deref()
+                .map(Address::from_str)
+                .transpose()?
+                .or_else(|| {
+                    config
+                        .target_contract
+                        .as_deref()
+                        .and_then(|value| Address::from_str(value).ok())
+                });
+            let abi_report = abi_report.as_deref().map(read_json_file).transpose()?;
+            let setup_report = setup_report.as_deref().map(read_json_file).transpose()?;
+            let bytecode_report = bytecode_report.as_deref().map(read_json_file).transpose()?;
+            let satori_job = satori_job.as_deref().map(read_json_file).transpose()?;
+            let mut manifest = TargetInvariantManifest::generate(
+                target,
+                abi_report.as_ref(),
+                setup_report.as_ref(),
+                satori_job.as_ref(),
+            );
+            if let Some(report) = bytecode_report.as_ref() {
+                manifest.apply_bytecode_report(report);
+            }
+            let rendered = toml::to_string_pretty(&manifest)?;
+            if let Some(output) = output {
+                if let Some(parent) = std::path::Path::new(&output).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                }
+                std::fs::write(&output, rendered)?;
+                println!(
+                    "Invariant manifest written: {} (rules={})",
+                    output,
+                    manifest.invariants.len()
+                );
+            } else {
+                println!("{rendered}");
+            }
+        }
+        Command::Job { command } => match command {
+            JobCommand::Run {
+                file,
+                abi,
+                seed_bundle,
+                require_seed_bundle,
+            } => {
+                ensure_evm_chain(&config)?;
+                let job: rusty_fuzz::satori::types::RustyFuzzJobSpec =
+                    serde_json::from_str(&std::fs::read_to_string(&file)?)?;
+                let target_contract = job
+                    .target_contract
+                    .as_deref()
+                    .or(config.target_contract.as_deref())
+                    .map(Address::from_str)
+                    .transpose()?;
+                let job_report_dir = format!("{}/jobs/{}", config.report_dir, job.job_id);
+                std::fs::create_dir_all(&job_report_dir)?;
+                let invariant_manifest =
+                    TargetInvariantManifest::generate(target_contract, None, None, Some(&job));
+                let invariant_path = format!("{job_report_dir}/invariants.toml");
+                std::fs::write(
+                    &invariant_path,
+                    toml::to_string_pretty(&invariant_manifest)?,
+                )?;
+                let fuzz_config = rusty_fuzz::engine::fuzz_engine::Config {
+                    rpc_url: job.fork_rpc_url.unwrap_or_else(|| config.rpc_url.clone()),
+                    fork_block: job.fork_block.or(config.fork_block).unwrap_or(0),
+                    target_contract,
+                    corpus_dir: config.corpus_dir.clone(),
+                    report_dir: job_report_dir,
+                    foundry_harness: None,
+                    mainnet_seed_bundle: seed_bundle.or(config.mainnet_seed_bundle.clone()),
+                    require_seed_bundle: config.require_seed_bundle || require_seed_bundle,
+                    require_rpc_fork: true,
+                    allow_synthetic_fallback: false,
+                    hardened_defi: {
+                        let mut hardened = config.hardened_defi.clone();
+                        hardened.enabled = true;
+                        hardened.max_tx_depth = job.max_depth.max(1);
+                        hardened
+                    },
+                    target_invariant_manifest: Some(invariant_path),
+                    abi_path: abi.or(config.target_abi.clone()),
+                };
+                rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await?;
+            }
+        },
         Command::Replay {
             input,
             fork_cache_id,
@@ -597,6 +834,10 @@ fn load_replay_input(
 fn load_json_replay_input(path: &str) -> anyhow::Result<rusty_fuzz::evm::fuzz::EvmInput> {
     let raw = std::fs::read_to_string(path)?;
     Ok(serde_json::from_str(&raw)?)
+}
+
+fn read_json_file<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T> {
+    Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
 }
 
 fn replay_base_state(

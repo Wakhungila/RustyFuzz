@@ -1,6 +1,8 @@
+pub mod abi_ingest;
 pub mod actors;
 pub mod benchmark;
 pub mod bounded_search;
+pub mod bytecode_analysis;
 pub mod concolic;
 pub mod confirmation;
 pub mod corpus_minimizer;

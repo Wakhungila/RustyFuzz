@@ -197,6 +197,48 @@ impl TargetProfiler {
         TargetProfiler.profile(&abi, None, &[])
     }
 
+    pub fn profile_from_selector_names<'a>(
+        selectors: impl IntoIterator<Item = [u8; 4]>,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> TargetProfile {
+        let mut abi = AbiRegistry::default();
+        for selector in selectors {
+            abi.functions.entry(selector).or_default();
+        }
+        let mut profile = TargetProfiler.profile(&abi, None, &[]);
+        let mut name_scores: BTreeMap<ProtocolType, u64> = BTreeMap::new();
+        for name in names {
+            let lowered = name.to_ascii_lowercase();
+            for spec in name_specs()
+                .iter()
+                .filter(|spec| lowered.contains(spec.needle))
+            {
+                *name_scores.entry(spec.protocol.clone()).or_default() += spec.weight;
+                profile.explanation.push(format!(
+                    "ABI function `{}` matched {:?}: {}",
+                    name, spec.protocol, spec.reason
+                ));
+            }
+        }
+        if !name_scores.is_empty() {
+            for (protocol, score) in name_scores {
+                if score >= 20 && !profile.protocol_types.contains(&protocol) {
+                    if profile.protocol_types == [ProtocolType::Unknown] {
+                        profile.protocol_types.clear();
+                    }
+                    profile.protocol_types.push(protocol);
+                }
+                profile.confidence = profile.confidence.saturating_add(score / 2).min(95);
+            }
+            profile.protocol_types.sort();
+            profile.protocol_types.dedup();
+            profile.recommended_seed_templates = recommended_templates(&profile.protocol_types);
+            profile.recommended_invariant_families =
+                recommended_invariants(&profile.protocol_types);
+        }
+        profile
+    }
+
     pub fn profile_from_bytecode(bytecode: &[u8]) -> TargetProfile {
         Self::profile_from_selectors(extract_push4_selectors(bytecode))
     }

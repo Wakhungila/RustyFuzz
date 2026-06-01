@@ -261,7 +261,119 @@ Historical direct calls are high-confidence seeds; routed target references are 
 
 ### Bytecode-Only Profiling
 
-When ABI/source metadata is unavailable, RustyFuzz extracts `PUSH4` selectors from runtime bytecode and feeds known selectors into target profiling, seed intelligence, mutation dictionaries, and scoring. This improves profiles beyond `Unknown` when selector evidence is meaningful. `Unknown` remains valid when bytecode evidence is weak.
+When ABI/source metadata is unavailable, RustyFuzz statically analyzes runtime bytecode. It decodes opcodes without treating `PUSHn` immediates as opcodes, extracts `PUSH4` constants, identifies dispatcher selectors, matches known protocol signatures, detects EIP-1167/EIP-1967/proxy/delegatecall patterns, records risky opcodes, and feeds the result into target profiling, seed intelligence, mutation dictionaries, and scoring. This improves profiles beyond `Unknown` when selector or proxy evidence is meaningful. `Unknown` remains valid when bytecode evidence is weak.
+
+Standalone bytecode report:
+
+```bash
+cargo run --release -- bytecode-analyze \
+  --file runtime-bytecode.hex \
+  --output reports/bytecode/${TARGET}.json
+```
+
+### ABI Ingestion and Target-Aware Setup
+
+ABI metadata is the fastest way to move a real target from `Unknown` to actionable. Ingest an ABI into the local cache:
+
+```bash
+cargo run --release -- abi-ingest \
+  --file abi/PoolFactory.json \
+  --target "$TARGET" \
+  --bundle-id dexe-poolfactory-bsc
+```
+
+Or pass it directly to fuzzing:
+
+```bash
+RUST_LOG=info \
+LIBAFL_CORES=0-1 \
+RUSTYFUZZ_EXEC_TIMEOUT_SECS=60 \
+RUSTYFUZZ_REQUIRE_RPC_FORK=1 \
+timeout -k 60s 10m cargo run --release -- fuzz \
+  --chain evm \
+  --contract "$TARGET" \
+  --abi abi/PoolFactory.json \
+  --require-rpc-fork
+```
+
+Startup logs include loaded function count, event count, and classified selectors. Classifications feed target profiling, seed intelligence, mutation dictionaries, scoring, and invariant selection.
+
+Build a bounded setup report from seeds plus ABI:
+
+```bash
+cargo run --release -- setup \
+  --bundle-id dexe-poolfactory-bsc \
+  --abi abi/PoolFactory.json \
+  --output reports/fork_setup/${TARGET}.json
+```
+
+Setup discovery is bounded and read-only by default. It records proxy/admin slots to probe, ABI-derived read-only probe plans, candidate tokens, pools, registries, oracle feeds, holders, whales, and confidence/evidence. It does not broadcast transactions or mutate live-chain state.
+
+Generate target-specific invariants:
+
+```bash
+cargo run --release -- invariants \
+  --target "$TARGET" \
+  --abi-report corpus/abi/dexe-poolfactory-bsc/report.json \
+  --setup-report reports/fork_setup/${TARGET}.json \
+  --output reports/invariants/${TARGET}.toml
+```
+
+Generated invariant manifests are goal guidance. A finding remains heuristic until replay, minimization, proof, or PoC evidence promotes it.
+
+Example invariant manifest shape:
+
+```toml
+target = "0x85f86ef7E72e86BdEAb5F65e2B76A2c551f22109"
+
+[[invariants]]
+id = "attacker-profit-bound"
+kind = "require_attacker_profit_below"
+max_bps = 500
+min_profit = 1
+severity = "high"
+```
+
+### RustyFuzz Job Execution
+
+Satori can emit RustyFuzz job JSON. Run a job directly:
+
+```bash
+cargo run --release -- job run satori/runs/<run_id>/jobs/<job>.rustyfuzz.json \
+  --abi abi/PoolFactory.json
+```
+
+Job execution is fork-required and fail-closed. The adapter loads ABI, seed bundle configuration, generated hypotheses, and invariants, then starts a bounded campaign under `reports/jobs/<job_id>/`. Satori hypotheses are preserved as references; RustyFuzz proves, rejects, or leaves them heuristic based on local replay evidence.
+
+Minimal job shape:
+
+```json
+{
+  "job_id": "dexe-poolfactory-001",
+  "hypothesis_id": "hyp-001",
+  "job_type": "fork_campaign",
+  "target_contract": "0x85f86ef7E72e86BdEAb5F65e2B76A2c551f22109",
+  "bug_class": "factory_registry",
+  "actors": ["attacker", "governance", "keeper"],
+  "preconditions": ["BSC archive RPC is configured"],
+  "sequence_template": [],
+  "mutation_focus": ["register", "create", "setPool"],
+  "invariants": [
+    {
+      "id": "inv-001",
+      "description": "unauthorized pool registration should not succeed",
+      "check": "registry ownership and pool pointer remain authorized",
+      "expected_signal": "accounting or registry mutation without authorized caller"
+    }
+  ],
+  "objective": "prove or reject unauthorized pool registration hypothesis",
+  "success_condition": "replayed/minimized/proof-carrying evidence only",
+  "max_depth": 3,
+  "fork_block": 100600727,
+  "fork_rpc_url": "https://bsc-rpc.example",
+  "abi_hints": ["PoolFactory.json"]
+}
+```
 
 ### Satori AI Audit Harness
 
@@ -343,6 +455,8 @@ report_dir = "reports"
 llm_enabled = false
 foundry_project = "."
 mainnet_seed_bundle = "target-mainnet"
+target_abi = "abi/Target.json"
+abi_cache_dir = "corpus/abi"
 
 [hardened_defi]
 enabled = false

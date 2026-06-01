@@ -1,55 +1,12 @@
 use crate::common::oracle::{VulnType, VulnerabilityOracle};
-use crate::common::types::Snapshot;
+use crate::common::types::{SequenceExecutionResult, Snapshot};
+use crate::engine::economic_delta::{
+    EconomicDeltaEngine, EconomicDeltaReport, EconomicViewSnapshot,
+};
+use crate::evm::economic::{EconomicState, PriceAnalyzer};
+use crate::evm::fuzz::EvmInput;
 use alloy_primitives::{Address, U256};
 use std::collections::{HashMap, HashSet};
-// TODO: Missing module - stub or implement
-// use super::economic::{EconomicState, PriceAnalyzer};
-
-// Stub types for missing economic module
-#[allow(dead_code)]
-#[derive(Debug, Clone, Default)]
-pub struct EconomicState {
-    // token_address -> borrower_address -> balance
-    pub balances: HashMap<Address, HashMap<Address, U256>>,
-}
-
-impl EconomicState {
-    pub fn calculate_profit(
-        &self,
-        _attacker: Address,
-        _initial: &EconomicState,
-    ) -> crate::engine::scoring::ProfitReport {
-        crate::engine::scoring::ProfitReport::default()
-    }
-}
-
-#[allow(dead_code)]
-pub struct PriceAnalyzer;
-
-impl PriceAnalyzer {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn record_initial_price(&mut self, _oracle: Address, _price: U256) {
-        // Stub
-    }
-
-    pub fn check_manipulation(
-        &self,
-        _oracle: Address,
-        _current_price: U256,
-        _threshold_bps: u64,
-    ) -> bool {
-        false
-    }
-}
-
-impl Default for PriceAnalyzer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Detects flashloan attacks by analyzing profitability without collateral
 pub struct FlashLoanOracle {
@@ -106,7 +63,7 @@ impl FlashLoanOracle {
         // Threshold: 0.1 ETH profit (adjustable)
         let threshold = U256::from(100_000_000_000_000_000u128);
 
-        if report.is_significant(threshold.to::<u64>()) {
+        if report.is_significant(threshold) {
             return Some(VulnType::FlashLoanProfit);
         }
         None
@@ -282,5 +239,122 @@ impl EconomicOracleBundle {
         }
 
         vulns
+    }
+
+    /// Convert concrete execution traces into heuristic oracle signals. These are not reportable
+    /// confirmed findings by themselves; replay/proof promotion happens later in the evidence
+    /// pipeline.
+    pub fn findings_from_execution(
+        &self,
+        input: &EvmInput,
+        execution: &SequenceExecutionResult,
+    ) -> Vec<VulnType> {
+        let report = EconomicDeltaEngine::from_execution(input, execution);
+        findings_from_delta(&report)
+    }
+
+    /// Convert pre/post read-only economic snapshots into heuristic oracle signals.
+    pub fn findings_from_view_snapshots(
+        &self,
+        before: &EconomicViewSnapshot,
+        after: &EconomicViewSnapshot,
+    ) -> Vec<VulnType> {
+        let report = EconomicDeltaEngine::from_view_snapshots(before, after);
+        findings_from_delta(&report)
+    }
+}
+
+pub fn findings_from_delta(report: &EconomicDeltaReport) -> Vec<VulnType> {
+    let mut findings = Vec::new();
+
+    if report.flashloan_pressure {
+        findings.push(VulnType::FlashLoanAttack);
+        if report.estimated_profit > U256::ZERO {
+            findings.push(VulnType::FlashLoanProfit);
+        }
+    }
+
+    if report.price_impact_pressure {
+        findings.push(VulnType::PriceOracleManipulation);
+    }
+
+    if report.accounting_anomaly || report.debt_or_collateral_pressure {
+        findings.push(VulnType::AccountingDesync);
+    }
+
+    if report.share_price_pressure {
+        findings.push(VulnType::VaultInflation);
+    }
+
+    if report.suspicious_value_extraction && report.estimated_profit > U256::ZERO {
+        findings.push(VulnType::Other(format!(
+            "HeuristicEconomicProfit: profit={}, confidence={}",
+            report.estimated_profit, report.confidence
+        )));
+    }
+
+    findings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::economic_delta::{
+        AmmReserveView, EconomicViewSnapshot, ScalarView, TokenBalanceView,
+    };
+
+    #[test]
+    fn view_snapshot_delta_emits_profit_and_accounting_signals() {
+        let attacker = Address::from([0x11; 20]);
+        let token = Address::from([0x22; 20]);
+        let vault = Address::from([0x33; 20]);
+        let pool = Address::from([0x44; 20]);
+
+        let before = EconomicViewSnapshot {
+            actor: Some(attacker),
+            token_balances: vec![TokenBalanceView {
+                token,
+                owner: attacker,
+                value: U256::from(1_000u64),
+            }],
+            vault_share_prices_bps: vec![ScalarView {
+                contract: vault,
+                value: U256::from(10_000u64),
+            }],
+            amm_reserves: vec![AmmReserveView {
+                pool,
+                reserve0: U256::from(1_000_000u64),
+                reserve1: U256::from(1_000_000u64),
+            }],
+            ..EconomicViewSnapshot::default()
+        };
+        let after = EconomicViewSnapshot {
+            actor: Some(attacker),
+            token_balances: vec![TokenBalanceView {
+                token,
+                owner: attacker,
+                value: U256::from(1_500u64),
+            }],
+            vault_share_prices_bps: vec![ScalarView {
+                contract: vault,
+                value: U256::from(11_000u64),
+            }],
+            amm_reserves: vec![AmmReserveView {
+                pool,
+                reserve0: U256::from(500_000u64),
+                reserve1: U256::from(2_000_000u64),
+            }],
+            ..EconomicViewSnapshot::default()
+        };
+
+        let bundle = EconomicOracleBundle::new(EconomicState::new());
+        let findings = bundle.findings_from_view_snapshots(&before, &after);
+
+        assert!(findings.contains(&VulnType::PriceOracleManipulation));
+        assert!(findings.contains(&VulnType::AccountingDesync));
+        assert!(findings.contains(&VulnType::VaultInflation));
+        assert!(findings
+            .iter()
+            .any(|finding| matches!(finding, VulnType::Other(label) if label.contains("HeuristicEconomicProfit"))));
     }
 }

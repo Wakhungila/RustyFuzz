@@ -1,6 +1,7 @@
 // Core Fuzzing Logic
 pub mod corpus;
 pub mod dataflow;
+pub mod economic;
 pub mod economic_views;
 pub mod executor;
 pub mod feedback;

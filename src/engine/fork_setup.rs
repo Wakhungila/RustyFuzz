@@ -1,4 +1,5 @@
 use crate::common::types::{CallKind, CallPhase, SequenceExecutionResult, StorageAccess};
+use crate::engine::abi_ingest::{AbiIngestReport, SelectorClassification};
 use crate::engine::target_profile::{ProtocolType, TargetProfile, TargetProfiler};
 use crate::evm::fuzz::AbiRegistry;
 use crate::evm::seed_ingester::{extract_address_hints, selector, DiscoveredAccount, MainnetSeed};
@@ -20,7 +21,25 @@ pub struct ForkSetupReport {
     pub timelock_or_governance: Vec<SetupAddressFinding>,
     pub proxy_slots: Vec<SetupSlotFinding>,
     pub recent_valid_flows: Vec<RecentValidFlow>,
+    #[serde(default)]
+    pub probe_plan: ProbePlan,
     pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProbePlan {
+    pub read_only: bool,
+    pub probes: Vec<ProbeSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProbeSpec {
+    pub target: Address,
+    pub selector: [u8; 4],
+    pub name: String,
+    pub reason: String,
+    pub gas_cap: u64,
+    pub confidence: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,6 +112,51 @@ impl ForkSetupDiscoverer {
         discovered_accounts: &[DiscoveredAccount],
     ) -> ForkSetupReport {
         Self::discover(target, seeds, discovered_accounts, &[])
+    }
+
+    pub fn discover_with_abi_report(
+        target: Address,
+        seeds: &[MainnetSeed],
+        discovered_accounts: &[DiscoveredAccount],
+        abi_report: &AbiIngestReport,
+    ) -> ForkSetupReport {
+        let mut report = Self::discover(target, seeds, discovered_accounts, &[]);
+        report.target_profile = abi_report.target_profile.clone();
+        let mut has_oracle = false;
+        let mut has_pool = false;
+        let mut has_governance = false;
+        let mut has_token = false;
+        for function in &abi_report.functions {
+            match function.classification {
+                SelectorClassification::OraclePrice => has_oracle = true,
+                SelectorClassification::FactoryOrPoolCreation
+                | SelectorClassification::PoolEconomic => has_pool = true,
+                SelectorClassification::Governance => has_governance = true,
+                SelectorClassification::Erc20Like
+                | SelectorClassification::Erc721Like
+                | SelectorClassification::Erc4626Like => has_token = true,
+                _ => {}
+            }
+        }
+        if has_oracle {
+            report.oracle_feeds =
+                merge_report_vec(report.oracle_feeds, target, SetupRole::OracleFeed);
+        }
+        if has_pool {
+            report.pools = merge_report_vec(report.pools, target, SetupRole::Pool);
+        }
+        if has_governance {
+            report.timelock_or_governance = merge_report_vec(
+                report.timelock_or_governance,
+                target,
+                SetupRole::GovernanceOrTimelock,
+            );
+        }
+        if has_token {
+            report.tokens = merge_report_vec(report.tokens, target, SetupRole::Token);
+        }
+        report.probe_plan = probe_plan_from_abi(target, abi_report);
+        report
     }
 
     pub fn discover(
@@ -352,8 +416,105 @@ impl ForkSetupDiscoverer {
                 .cloned()
                 .collect(),
             recent_valid_flows,
+            probe_plan: ProbePlan {
+                read_only: true,
+                probes: conservative_default_probes(target),
+            },
             evidence,
         }
+    }
+}
+
+fn report_vec_map(
+    findings: &[SetupAddressFinding],
+) -> BTreeMap<(SetupRole, Address), SetupAddressFinding> {
+    findings
+        .iter()
+        .cloned()
+        .map(|finding| ((finding.role.clone(), finding.address), finding))
+        .collect()
+}
+
+fn merge_report_vec(
+    findings: Vec<SetupAddressFinding>,
+    target: Address,
+    role: SetupRole,
+) -> Vec<SetupAddressFinding> {
+    let mut map = report_vec_map(&findings);
+    let evidence = match role {
+        SetupRole::OracleFeed => "ABI selector heuristic identified oracle-like target",
+        SetupRole::Pool => "ABI selector heuristic identified pool/factory-like target",
+        SetupRole::GovernanceOrTimelock => {
+            "ABI selector heuristic identified governance/timelock-like target"
+        }
+        SetupRole::Token => "ABI selector heuristic identified token-like target",
+        _ => "ABI selector heuristic identified target role",
+    };
+    upsert_address(
+        &mut map,
+        target,
+        role,
+        65,
+        SetupSource::SelectorHeuristic,
+        evidence.to_string(),
+    );
+    map.into_values().collect()
+}
+
+fn conservative_default_probes(target: Address) -> Vec<ProbeSpec> {
+    [
+        ("owner()", "owner/admin discovery"),
+        ("admin()", "admin discovery"),
+        ("implementation()", "proxy implementation discovery"),
+        ("getImplementation()", "proxy implementation discovery"),
+        ("paused()", "pause state discovery"),
+        ("totalSupply()", "token/accounting discovery"),
+        ("decimals()", "token/oracle metadata"),
+        ("name()", "token metadata"),
+        ("symbol()", "token metadata"),
+    ]
+    .into_iter()
+    .map(|(signature, reason)| ProbeSpec {
+        target,
+        selector: sig(signature),
+        name: signature.trim_end_matches("()").to_string(),
+        reason: reason.to_string(),
+        gas_cap: 150_000,
+        confidence: 50,
+    })
+    .collect()
+}
+
+fn probe_plan_from_abi(target: Address, abi_report: &AbiIngestReport) -> ProbePlan {
+    let mut probes = conservative_default_probes(target);
+    for function in &abi_report.functions {
+        if matches!(
+            function.classification,
+            SelectorClassification::ViewProbe
+                | SelectorClassification::OraclePrice
+                | SelectorClassification::Erc20Like
+                | SelectorClassification::Erc4626Like
+        ) && function.inputs.is_empty()
+        {
+            probes.push(ProbeSpec {
+                target,
+                selector: function.selector,
+                name: function.name.clone(),
+                reason: format!("read-only ABI probe for {}", function.signature),
+                gas_cap: 150_000,
+                confidence: 75,
+            });
+        }
+    }
+    probes.sort_by(|a, b| {
+        a.selector
+            .cmp(&b.selector)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    probes.dedup_by(|a, b| a.selector == b.selector && a.target == b.target);
+    ProbePlan {
+        read_only: true,
+        probes,
     }
 }
 
@@ -842,5 +1003,36 @@ mod tests {
             .proxy_slots
             .iter()
             .any(|finding| finding.slot == slot));
+    }
+
+    #[test]
+    fn abi_report_adds_read_only_probe_plan_and_profile() {
+        let target = addr(0xaa);
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(
+            r#"[
+              {"type":"function","name":"latestRoundData","stateMutability":"view","inputs":[],"outputs":[]},
+              {"type":"function","name":"setPrice","stateMutability":"nonpayable","inputs":[{"name":"price","type":"uint256"}],"outputs":[]}
+            ]"#,
+        )
+        .unwrap();
+        let (_registry, abi_report) =
+            crate::engine::abi_ingest::ingest_abi(&abi, Some(target), None);
+
+        let report = ForkSetupDiscoverer::discover_with_abi_report(target, &[], &[], &abi_report);
+
+        assert!(report.probe_plan.read_only);
+        assert!(report
+            .probe_plan
+            .probes
+            .iter()
+            .any(|probe| probe.name == "latestRoundData"));
+        assert!(report
+            .oracle_feeds
+            .iter()
+            .any(|finding| finding.address == target));
+        assert!(report
+            .target_profile
+            .protocol_types
+            .contains(&ProtocolType::OraclePriceFeed));
     }
 }

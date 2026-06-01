@@ -3,10 +3,12 @@ use crate::common::types::{
     ChainState, EvmInput, ExecutionStatus, SequenceExecutionResult, SingletonTx,
 };
 use crate::config::HardenedDefiConfig;
+use crate::engine::abi_ingest::{ingest_abi_file, merge_abi_registry};
 use crate::engine::actors::{ActorModel, ActorModelConfig, ActorSet};
 use crate::engine::bounded_search::{
     BoundedSearchBounds, BoundedSearchEngine, BoundedSearchRequest,
 };
+use crate::engine::bytecode_analysis::{analyze_bytecode, BytecodeAnalysisReport};
 use crate::engine::dependency::generate_flow_template_inputs;
 use crate::engine::economic_delta::EconomicDeltaEngine;
 use crate::engine::exploit_path::ExploitPathBuilder;
@@ -16,7 +18,7 @@ use crate::engine::protocol_model::CounterexampleSearchEngine;
 use crate::engine::scheduler::RustyFuzzScheduler;
 use crate::engine::scoring::{CampaignScore, CampaignScorer};
 use crate::engine::seed_intelligence::{SeedCandidate, SeedIntelligence, SeedIntelligenceConfig};
-use crate::engine::target_profile::{extract_push4_selectors, ProtocolType, TargetProfiler};
+use crate::engine::target_profile::{ProtocolType, TargetProfiler};
 use crate::evm::corpus::{
     CampaignArtifactRequest, PersistentCorpus, SeedBundleStatus, SnapshotCorpus,
 };
@@ -156,6 +158,7 @@ pub struct Config {
     pub allow_synthetic_fallback: bool,
     pub hardened_defi: HardenedDefiConfig,
     pub target_invariant_manifest: Option<String>,
+    pub abi_path: Option<String>,
 }
 
 pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
@@ -257,15 +260,32 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
     let launcher_fallback_env = initial_env.clone();
     let launcher_fallback_actor_set = hardened_actor_set.clone();
     let launcher_fallback_synthetic_fork_mode = synthetic_fork_mode;
-    let bytecode_selectors =
-        discover_target_bytecode_selectors(&initial_db, config.target_contract);
+    let bytecode_analysis = discover_target_bytecode_analysis(&initial_db, config.target_contract);
+    let bytecode_selectors = bytecode_analysis
+        .as_ref()
+        .map(|analysis| {
+            if analysis.dispatch_selectors.is_empty() {
+                analysis.push4_selectors.clone()
+            } else {
+                analysis.dispatch_selectors.clone()
+            }
+        })
+        .unwrap_or_default();
     if !bytecode_selectors.is_empty() {
         log::info!(
-            "Bytecode target profiling extracted {} PUSH4 selectors",
-            bytecode_selectors.len()
+            "Bytecode analysis: code_len={}, push4_selectors={}, dispatch_selectors={}, known_selectors={}, proxy_patterns={}, risk_flags={}, profile={:?}, confidence={}",
+            bytecode_analysis.as_ref().map(|analysis| analysis.code_len).unwrap_or_default(),
+            bytecode_analysis.as_ref().map(|analysis| analysis.push4_selectors.len()).unwrap_or_default(),
+            bytecode_analysis.as_ref().map(|analysis| analysis.dispatch_selectors.len()).unwrap_or_default(),
+            bytecode_analysis.as_ref().map(|analysis| analysis.known_selectors.len()).unwrap_or_default(),
+            bytecode_analysis.as_ref().map(|analysis| analysis.proxy_patterns.len()).unwrap_or_default(),
+            bytecode_analysis.as_ref().map(|analysis| analysis.risk_flags.len()).unwrap_or_default(),
+            bytecode_analysis.as_ref().map(|analysis| analysis.target_profile.protocol_types.clone()).unwrap_or_default(),
+            bytecode_analysis.as_ref().map(|analysis| analysis.target_profile.confidence).unwrap_or_default()
         );
     }
     let launcher_fallback_bytecode_selectors = bytecode_selectors.clone();
+    let launcher_fallback_bytecode_analysis = bytecode_analysis.clone();
 
     if config.hardened_defi.single_process {
         return run_single_process_campaign(
@@ -275,6 +295,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
             launcher_fallback_actor_set,
             launcher_fallback_synthetic_fork_mode,
             launcher_fallback_bytecode_selectors,
+            launcher_fallback_bytecode_analysis,
         )
         .await;
     }
@@ -332,6 +353,22 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 for selector in &bytecode_selectors {
                     initial_abi.functions.entry(*selector).or_default();
                 }
+                let mut abi_loaded = false;
+                if let Some(path) = &config.abi_path {
+                    match ingest_abi_file(path, config.target_contract) {
+                        Ok((_abi, abi_registry, report)) => {
+                            merge_abi_registry(&mut initial_abi, &abi_registry);
+                            abi_loaded = true;
+                            log::info!(
+                                "ABI loaded: function_count={}, event_count={}, classified_selectors={}",
+                                report.function_count,
+                                report.event_count,
+                                report.classified_selectors
+                            );
+                        }
+                        Err(err) => log::warn!("Failed to load ABI `{}`: {err:#}", path),
+                    }
+                }
 
                 if let Some(harness) = &config.foundry_harness {
                     log::info!(
@@ -351,7 +388,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     conservative_startup_only: false,
                 });
                 let has_trusted_abi_source =
-                    config.foundry_harness.is_some() || !bytecode_selectors.is_empty();
+                    config.foundry_harness.is_some() || abi_loaded || !bytecode_selectors.is_empty();
                 let mut hardened_seed_candidates = Vec::<SeedCandidate>::new();
                 if has_trusted_abi_source {
                     hardened_seed_candidates.extend(seed_intelligence.generate_candidates(
@@ -360,6 +397,20 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                         &initial_abi,
                         config.foundry_harness.as_ref(),
                     ));
+                    if let Some(analysis) = bytecode_analysis.as_ref() {
+                        let bytecode_candidates = seed_intelligence.generate_bytecode_candidates(
+                            target_contract,
+                            fuzzer_address,
+                            &analysis.function_summaries,
+                        );
+                        if !bytecode_candidates.is_empty() {
+                            log::info!(
+                                "Generated {} bytecode function-slice seed candidates",
+                                bytecode_candidates.len()
+                            );
+                            hardened_seed_candidates.extend(bytecode_candidates);
+                        }
+                    }
                 }
                 if config.hardened_defi.enabled {
                     if let Some(seed_file) = &config.hardened_defi.historical_seed_file {
@@ -850,6 +901,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 launcher_fallback_actor_set,
                 launcher_fallback_synthetic_fork_mode,
                 launcher_fallback_bytecode_selectors,
+                launcher_fallback_bytecode_analysis,
             )
             .await
         }
@@ -863,6 +915,7 @@ async fn run_single_process_campaign(
     hardened_actor_set: Option<ActorSet>,
     synthetic_fork_mode: bool,
     bytecode_selectors: Vec<[u8; 4]>,
+    bytecode_analysis: Option<BytecodeAnalysisReport>,
 ) -> anyhow::Result<()> {
     let start_time = Instant::now();
     let execution_timeout = campaign_execution_timeout();
@@ -906,6 +959,22 @@ async fn run_single_process_campaign(
     for selector in &bytecode_selectors {
         initial_abi.functions.entry(*selector).or_default();
     }
+    let mut abi_loaded = false;
+    if let Some(path) = &config.abi_path {
+        match ingest_abi_file(path, config.target_contract) {
+            Ok((_abi, abi_registry, report)) => {
+                merge_abi_registry(&mut initial_abi, &abi_registry);
+                abi_loaded = true;
+                log::info!(
+                    "ABI loaded: function_count={}, event_count={}, classified_selectors={}",
+                    report.function_count,
+                    report.event_count,
+                    report.classified_selectors
+                );
+            }
+            Err(err) => log::warn!("Failed to load ABI `{}`: {err:#}", path),
+        }
+    }
 
     if let Some(harness) = &config.foundry_harness {
         log::info!(
@@ -923,7 +992,8 @@ async fn run_single_process_campaign(
         include_low_confidence_fallbacks: false,
         conservative_startup_only: false,
     });
-    let has_trusted_abi_source = config.foundry_harness.is_some() || !bytecode_selectors.is_empty();
+    let has_trusted_abi_source =
+        config.foundry_harness.is_some() || abi_loaded || !bytecode_selectors.is_empty();
     let mut hardened_seed_candidates = Vec::<SeedCandidate>::new();
     if has_trusted_abi_source {
         hardened_seed_candidates.extend(seed_intelligence.generate_candidates(
@@ -932,6 +1002,20 @@ async fn run_single_process_campaign(
             &initial_abi,
             config.foundry_harness.as_ref(),
         ));
+        if let Some(analysis) = bytecode_analysis.as_ref() {
+            let bytecode_candidates = seed_intelligence.generate_bytecode_candidates(
+                target_contract,
+                Address::repeat_byte(0x13),
+                &analysis.function_summaries,
+            );
+            if !bytecode_candidates.is_empty() {
+                log::info!(
+                    "Generated {} bytecode function-slice seed candidates",
+                    bytecode_candidates.len()
+                );
+                hardened_seed_candidates.extend(bytecode_candidates);
+            }
+        }
     }
     if config.hardened_defi.enabled {
         if let Some(seed_file) = &config.hardened_defi.historical_seed_file {
@@ -1390,20 +1474,20 @@ fn sanitize_rpc_host(rpc_url: &str) -> String {
         .unwrap_or_else(|| "<invalid-rpc-url>".to_string())
 }
 
-fn discover_target_bytecode_selectors(
+fn discover_target_bytecode_analysis(
     db: &CacheDB<ForkDb>,
     target: Option<Address>,
-) -> Vec<[u8; 4]> {
+) -> Option<BytecodeAnalysisReport> {
     let Some(target) = target else {
-        return Vec::new();
+        return None;
     };
     let Ok(Some(account)) = db.db.basic_ref(target) else {
-        return Vec::new();
+        return None;
     };
     let Some(code) = account.code else {
-        return Vec::new();
+        return None;
     };
-    extract_push4_selectors(code.original_byte_slice())
+    Some(analyze_bytecode(code.original_byte_slice()))
 }
 
 fn log_seed_bundle_status(status: &SeedBundleStatus, required: bool) -> anyhow::Result<()> {
