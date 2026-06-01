@@ -165,6 +165,15 @@ pub fn create_offline_fallback_fork_db(target_contract: Option<Address>) -> EvmC
     db
 }
 
+pub fn create_in_memory_fork_db(target_contract: Address, runtime_bytecode: Vec<u8>) -> EvmCacheDb {
+    let db = CacheDB::new(ForkDb::empty());
+    db.db.cache_account(
+        target_contract,
+        AccountInfo::default().with_code(Bytecode::new_raw(runtime_bytecode.into())),
+    );
+    db
+}
+
 pub fn create_offline_fallback_block_env(block_number: u64) -> BlockEnv {
     let mut block_env = BlockEnv {
         number: U256::from(block_number),

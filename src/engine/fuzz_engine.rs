@@ -195,6 +195,7 @@ pub struct Config {
     pub report_dir: String,
     pub foundry_harness: Option<FoundryHarnessManifest>,
     pub mainnet_seed_bundle: Option<String>,
+    pub in_memory_bytecode: Option<Vec<u8>>,
     pub require_seed_bundle: bool,
     pub require_rpc_fork: bool,
     pub allow_synthetic_fallback: bool,
@@ -221,7 +222,18 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
     log::info!("Initializing RustyFuzz v0.15.4 Campaign...");
 
-    let (mut initial_db, initial_env, synthetic_fork_mode) = {
+    let (mut initial_db, initial_env, synthetic_fork_mode) = if let Some(bytecode) =
+        config.in_memory_bytecode.as_ref()
+    {
+        let target = config
+            .target_contract
+            .ok_or_else(|| anyhow::anyhow!("in-memory fuzz campaigns require a target contract"))?;
+        (
+            crate::evm::fork::create_in_memory_fork_db(target, bytecode.clone()),
+            crate::evm::fork::create_offline_fallback_block_env(config.fork_block),
+            true,
+        )
+    } else {
         let mut synthetic_fork_mode = false;
         let require_rpc_fork = config.require_rpc_fork || campaign_requires_rpc_fork();
         let startup_timeout = startup_rpc_timeout();

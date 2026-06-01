@@ -345,6 +345,7 @@ async fn main() -> anyhow::Result<()> {
                     .map(FoundryHarnessManifest::ingest)
                     .transpose()?,
                 mainnet_seed_bundle: config.mainnet_seed_bundle.clone(),
+                in_memory_bytecode: None,
                 require_seed_bundle: config.require_seed_bundle || require_seed_bundle,
                 require_rpc_fork: config.require_rpc_fork || require_rpc_fork,
                 allow_synthetic_fallback: !no_synthetic_fallback
@@ -718,6 +719,7 @@ async fn main() -> anyhow::Result<()> {
                     report_dir: job_report_dir,
                     foundry_harness: None,
                     mainnet_seed_bundle: seed_bundle.or(config.mainnet_seed_bundle.clone()),
+                    in_memory_bytecode: None,
                     require_seed_bundle: config.require_seed_bundle || require_seed_bundle,
                     require_rpc_fork: true,
                     allow_synthetic_fallback: false,
