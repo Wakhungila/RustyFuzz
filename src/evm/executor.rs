@@ -324,6 +324,7 @@ use revm::database::CacheDB;
 use revm::primitives::{Address, TxKind, B256, U256};
 use revm::state::AccountInfo;
 use revm::{Context, InspectCommitEvm, MainBuilder, MainContext};
+use std::collections::HashSet;
 
 const TX_GAS_LIMIT: u64 = 10_000_000;
 const TX_GAS_PRICE_WEI: u128 = 1_000_000_000;
@@ -407,14 +408,20 @@ impl EvmExecutor {
         let (result, final_db, storage_diffs) = {
             let execution_db = std::mem::replace(db, CacheDB::new(ForkDb::empty()));
             let pre_execution_db = execution_db.clone();
+            let initialized_slots = initialized_storage_slots(&pre_execution_db);
 
             let ctx = Context::mainnet()
                 .with_db(execution_db)
                 .with_block(block_env.clone());
 
-            let mut evm = ctx.build_mainnet_with_inspector(CoverageInspector::new(
-                coverage, dataflow, waypoints, tx_idx,
-            ));
+            let mut evm =
+                ctx.build_mainnet_with_inspector(CoverageInspector::with_initialized_slots(
+                    coverage,
+                    dataflow,
+                    waypoints,
+                    tx_idx,
+                    initialized_slots,
+                ));
 
             let result = evm.inspect_tx_commit(tx_env)?;
             let final_db = evm.ctx.journaled_state.database;
@@ -514,6 +521,16 @@ fn bounded_tx_value(value: U256) -> U256 {
     } else {
         value
     }
+}
+
+fn initialized_storage_slots(db: &CacheDB<ForkDb>) -> HashSet<(Address, B256)> {
+    let mut slots = HashSet::new();
+    for (address, account) in &db.cache.accounts {
+        for slot in account.storage.keys() {
+            slots.insert((*address, B256::from(*slot)));
+        }
+    }
+    slots
 }
 
 fn storage_reads_from_waypoints(waypoints: &[Waypoint]) -> Vec<StorageAccess> {

@@ -60,6 +60,22 @@ impl<'a> CoverageInspector<'a> {
         waypoints: &'a mut Vec<Waypoint>,
         current_tx_idx: usize,
     ) -> Self {
+        Self::with_initialized_slots(
+            coverage,
+            dataflow,
+            waypoints,
+            current_tx_idx,
+            HashSet::new(),
+        )
+    }
+
+    pub fn with_initialized_slots(
+        coverage: &'a mut [u8],
+        dataflow: &'a mut DataflowRegistry,
+        waypoints: &'a mut Vec<Waypoint>,
+        current_tx_idx: usize,
+        initial_slots: HashSet<(Address, B256)>,
+    ) -> Self {
         Self {
             coverage,
             dataflow,
@@ -77,7 +93,7 @@ impl<'a> CoverageInspector<'a> {
             transient_taint_map: HashMap::new(),
             memory_taint: HashMap::new(),
             memory_expression: HashMap::new(),
-            known_initialized_slots: HashSet::new(),
+            known_initialized_slots: initial_slots,
             call_depth: 0,
             pending_sload: None,
         }
