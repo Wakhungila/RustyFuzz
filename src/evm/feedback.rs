@@ -5,14 +5,13 @@
 
 use crate::common::types::{CallPhase, SequenceExecutionResult, StorageDiff};
 use crate::evm::fuzz::EvmInput;
+use crate::evm::inspector::MAP_SIZE;
 use libafl::observers::StdMapObserver;
 use libafl::prelude::*;
 use libafl_bolts::{tuples::MatchName, AsSlice};
 use revm::primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
-
-const DEFAULT_MAP_SIZE: usize = 65_536;
 
 fn bucket_hitcount(hit: u8) -> u8 {
     match hit {
@@ -284,7 +283,7 @@ impl EvmCoverageFeedback {
     pub fn new() -> Self {
         Self {
             touched_addresses: HashSet::new(),
-            virgin: vec![0; DEFAULT_MAP_SIZE],
+            virgin: vec![0; MAP_SIZE],
             observer_name: "edges",
         }
     }
@@ -333,7 +332,7 @@ impl Default for EvmCoverageFeedback {
     fn default() -> Self {
         Self {
             touched_addresses: HashSet::new(),
-            virgin: vec![0; DEFAULT_MAP_SIZE],
+            virgin: vec![0; MAP_SIZE],
             observer_name: "edges",
         }
     }

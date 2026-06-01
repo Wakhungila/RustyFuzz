@@ -1,4 +1,5 @@
 use crate::common::types::{SvmState, VulnType, Snapshot};
+use crate::evm::inspector::MAP_SIZE;
 use crate::svm::executor::SvmExecutor;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::transaction::Transaction;
@@ -25,7 +26,7 @@ impl SvmDifferentialFuzzer {
         transaction: &Transaction,
     ) -> Result<Option<VulnType>> {
         // 1. Execute locally via Mollusk
-        let mut local_coverage = bitvec![u8, Lsb0; 0; 65536];
+        let mut local_coverage = bitvec![u8, Lsb0; 0; MAP_SIZE];
         let mut local_waypoints = Vec::new();
         
         SvmExecutor::execute_transaction(

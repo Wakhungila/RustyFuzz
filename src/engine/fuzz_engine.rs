@@ -31,6 +31,7 @@ use crate::evm::executor::EvmExecutor;
 use crate::evm::feedback::{EvmCoverageFeedback, EvmStateNoveltyFeedback, StateNoveltyReport};
 use crate::evm::fork_db::ForkDb;
 use crate::evm::fuzz::{AbiRegistry, EvmMutator};
+use crate::evm::inspector::MAP_SIZE;
 use crate::evm::registry::GlobalAccountRegistry;
 use crate::evm::snapshot::new_evm_snapshot;
 
@@ -184,7 +185,6 @@ use libafl_bolts::prelude::*;
 use libafl_bolts::shmem::{ShMemProvider, StdShMemProvider};
 use libafl_bolts::tuples::tuple_list;
 
-const MAP_SIZE: usize = 65_536;
 const STATE_NOVELTY_MAP_SLOTS: usize = 2_048;
 const CAMPAIGN_SCORE_MAP_SLOTS: usize = 1_024;
 const CAMPAIGN_TELEMETRY_INTERVAL: Duration = Duration::from_secs(30);

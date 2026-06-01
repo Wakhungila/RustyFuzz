@@ -26,6 +26,7 @@ use crate::engine::target_profile::TargetProfiler;
 use crate::evm::feedback::StateNoveltyReport;
 use crate::evm::fork_db::{ForkDb, ForkDbCacheSnapshot};
 use crate::evm::fuzz::{AbiRegistry, EvmInput};
+use crate::evm::inspector::MAP_SIZE;
 use anyhow::{Context, Result};
 use revm::context::BlockEnv;
 use revm::database::CacheDB;
@@ -1393,7 +1394,7 @@ impl ValidationRunner {
         let input = select_best_live_input(inputs);
 
         let started = std::time::Instant::now();
-        let replay_verifier = ReplayVerifier::new(65_536);
+        let replay_verifier = ReplayVerifier::new(MAP_SIZE);
         let explicit_fork_cache = live_fixture.fork_cache.or_else(|| {
             live_fixture
                 .fork_cache_profile
@@ -1697,7 +1698,7 @@ fn execute_blind_rediscovery_benchmark(
             .fork_cache_profile
             .map(|profile| explicit_profile_fork_cache(manifest, profile).cache_snapshot())
     });
-    let replay_verifier = ReplayVerifier::new(65_536);
+    let replay_verifier = ReplayVerifier::new(MAP_SIZE);
     let block_env = context.block_env.clone().unwrap_or_default();
     let (execution, replay_backend, replay_economic_delta) = if let Some(snapshot) =
         explicit_fork_cache
@@ -2341,7 +2342,7 @@ fn live_minimized_status(
         return MinimizedSequenceStatus::Minimized;
     }
 
-    let verifier = ReplayVerifier::new(65_536);
+    let verifier = ReplayVerifier::new(MAP_SIZE);
     for idx in 0..input.txs.len() {
         let mut reduced = input.clone();
         reduced.txs.remove(idx);

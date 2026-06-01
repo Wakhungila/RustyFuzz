@@ -19,6 +19,7 @@ use rusty_fuzz::evm::corpus::PersistentCorpus;
 use rusty_fuzz::evm::executor::EvmExecutor;
 use rusty_fuzz::evm::fork::create_fork_block_env;
 use rusty_fuzz::evm::fork_db::ForkDb;
+use rusty_fuzz::evm::inspector::MAP_SIZE;
 use rusty_fuzz::evm::seed_ingester::{
     MainnetSeed, MainnetSeedBundle, MainnetSeedConfig, SeedIngester, SeedMetadata,
 };
@@ -752,7 +753,7 @@ async fn main() -> anyhow::Result<()> {
             let fork_cache_id = fork_cache_id.unwrap_or_else(|| input.clone());
             let corpus = PersistentCorpus::new(&config.corpus_dir)?;
             let block_env = campaign_block_env(&config).await?;
-            let verifier = ReplayVerifier::new(65_536);
+            let verifier = ReplayVerifier::new(MAP_SIZE);
             let execution = if live {
                 let input = load_replay_input(&corpus, &input)?;
                 let (execution, report) = verifier.compare_cached_vs_live(
@@ -835,7 +836,7 @@ async fn main() -> anyhow::Result<()> {
             let corpus = PersistentCorpus::new(&config.corpus_dir)?;
             let input = corpus.load_input(&input_id)?;
             let block_env = campaign_block_env(&config).await?;
-            let execution = ReplayVerifier::new(65_536).verify_persisted_input(
+            let execution = ReplayVerifier::new(MAP_SIZE).verify_persisted_input(
                 &corpus,
                 &input_id,
                 &fork_cache_id,

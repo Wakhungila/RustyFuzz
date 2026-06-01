@@ -7,6 +7,7 @@ use crate::evm::corpus::{CampaignArtifactRecord, PersistentCorpus};
 use crate::evm::executor::EvmExecutor;
 use crate::evm::fork_db::EvmCacheDb;
 use crate::evm::fuzz::EvmInput;
+use crate::evm::inspector::MAP_SIZE;
 use revm::context::BlockEnv;
 use revm::database::CacheDB;
 use revm::primitives::Address;
@@ -228,7 +229,7 @@ pub fn promote_finding_artifact(
         .corpus
         .load_offline_fork_db(&request.artifact.fork_cache_id)?;
     let base_db: EvmCacheDb = CacheDB::new(fork_db.clone());
-    let verifier = ReplayVerifier::new(65_536);
+    let verifier = ReplayVerifier::new(MAP_SIZE);
     let replay_result = verifier.verify_deterministic(
         &ChainState::Evm(CacheDB::new(fork_db)),
         request.block_env,

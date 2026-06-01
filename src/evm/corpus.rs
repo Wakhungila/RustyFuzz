@@ -8,6 +8,7 @@ use crate::engine::scoring::CampaignScore;
 use crate::evm::feedback::EvmCoverageFeedback;
 use crate::evm::fork_db::{EvmCacheDb, ForkDb, ForkDbCacheSnapshot};
 use crate::evm::fuzz::EvmInput;
+use crate::evm::inspector::MAP_SIZE;
 use crate::evm::seed_ingester::MainnetSeedBundle;
 use anyhow::Context;
 use libafl_bolts::rands::Rand;
@@ -1167,7 +1168,7 @@ impl SnapshotCorpus {
             children_map: HashMap::new(),
             metadata: HashMap::new(),
             global_read_hotspots: HashMap::new(),
-            priority_gap_map: bitvec::bitvec![u8, Lsb0; 0; 65536],
+            priority_gap_map: bitvec::bitvec![u8, Lsb0; 0; MAP_SIZE],
         }
     }
 

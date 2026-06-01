@@ -10,6 +10,7 @@ use crate::evm::executor::EvmExecutor;
 use crate::evm::feedback::EvmStateNoveltyFeedback;
 use crate::evm::fork_db::EvmCacheDb;
 use crate::evm::fuzz::EvmInput;
+use crate::evm::inspector::MAP_SIZE;
 use crate::evm::snapshot::new_evm_snapshot;
 use bitvec::prelude::*;
 use parking_lot::RwLock;
@@ -139,7 +140,7 @@ impl<'a> Minimizer<'a> {
         let mut current_db = self.initial_db.clone();
         let mut block_env = self.initial_block_env.clone();
         let mut dataflow = DataflowRegistry::new();
-        let mut coverage = vec![0u8; 65_536];
+        let mut coverage = vec![0u8; MAP_SIZE];
         let mut tx_results = Vec::with_capacity(input.txs.len());
 
         for (idx, tx) in input.txs.iter().enumerate() {
@@ -313,7 +314,7 @@ impl<'a> Minimizer<'a> {
 
         // v38: Executors now require dataflow and waypoint tracking even during minimization
         let mut dataflow = DataflowRegistry::new();
-        let mut coverage_vec = vec![0u8; 65536];
+        let mut coverage_vec = vec![0u8; MAP_SIZE];
 
         let mut prev_snapshot = new_evm_snapshot(0, current_db.clone());
 
