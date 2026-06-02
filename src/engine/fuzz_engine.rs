@@ -47,11 +47,14 @@ use revm::primitives::{Address, U256};
 use revm::state::AccountInfo;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+
+const DEFAULT_MUTATIONAL_STAGE_MAX_ITERATIONS: usize = 128;
 
 fn campaign_rng_seed(config: &Config, core_id: usize) -> u64 {
     if config.hardened_defi.deterministic {
@@ -68,6 +71,14 @@ fn campaign_rng_seed(config: &Config, core_id: usize) -> u64 {
         .unwrap_or(core_id as u64)
 }
 
+fn mutational_stage_iterations(config: &Config) -> NonZeroUsize {
+    if config.max_execs.is_some() || config.duration_secs.is_some() {
+        NonZeroUsize::new(1).expect("one is non-zero")
+    } else {
+        NonZeroUsize::new(DEFAULT_MUTATIONAL_STAGE_MAX_ITERATIONS).expect("default is non-zero")
+    }
+}
+
 struct CampaignTelemetry {
     start: Instant,
     executions: AtomicU64,
@@ -79,6 +90,64 @@ struct CampaignTelemetry {
     mutation_strategies: Mutex<BTreeMap<String, u64>>,
     concolic_hint_stats: Arc<ConcolicHintStats>,
     last_report: Mutex<(Instant, u64)>,
+}
+
+struct CampaignBudget {
+    max_execs: Option<u64>,
+    deadline: Option<Instant>,
+    reserved_execs: AtomicU64,
+}
+
+impl CampaignBudget {
+    fn new(max_execs: Option<u64>, duration_secs: Option<u64>, workers: usize) -> Self {
+        let max_execs = max_execs.map(|execs| {
+            let workers = workers.max(1) as u64;
+            execs.div_ceil(workers).max(1)
+        });
+        Self {
+            max_execs,
+            deadline: duration_secs.map(|secs| Instant::now() + Duration::from_secs(secs)),
+            reserved_execs: AtomicU64::new(0),
+        }
+    }
+
+    fn reserve_execution(&self) -> bool {
+        if self.time_exhausted() {
+            return false;
+        }
+        let Some(max_execs) = self.max_execs else {
+            return true;
+        };
+        loop {
+            let current = self.reserved_execs.load(Ordering::Relaxed);
+            if current >= max_execs {
+                return false;
+            }
+            if self
+                .reserved_execs
+                .compare_exchange_weak(
+                    current,
+                    current + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.time_exhausted()
+            || self
+                .max_execs
+                .is_some_and(|max_execs| self.reserved_execs.load(Ordering::Relaxed) >= max_execs)
+    }
+
+    fn time_exhausted(&self) -> bool {
+        self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+    }
 }
 
 impl CampaignTelemetry {
@@ -393,6 +462,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
     let launcher_fallback_bytecode_analysis = bytecode_analysis.clone();
 
     let cores = campaign_cores(config.cores.as_ref())?;
+    let broker_worker_count = cores.ids.len().max(1);
     let use_launcher = !config.hardened_defi.single_process && cores.ids.len() > 1;
     if !use_launcher {
         return run_single_process_campaign(
@@ -715,7 +785,10 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     concolic_hints.clone(),
                     telemetry.concolic_hint_stats.clone(),
                 );
-                let mut stages = tuple_list!(StdMutationalStage::new(mutator),);
+                let mut stages = tuple_list!(StdMutationalStage::with_max_iterations(
+                    mutator,
+                    mutational_stage_iterations(&config),
+                ),);
 
                 let mut fuzzer = StdFuzzer::new(
                     RustyFuzzScheduler::with_pending_score(pending_campaign_score.clone()),
@@ -730,8 +803,16 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     "edges",
                     unsafe { OwnedMutSlice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE) },
                 );
+                let budget = Arc::new(CampaignBudget::new(
+                    config.max_execs,
+                    config.duration_secs,
+                    broker_worker_count,
+                ));
 
                 let mut harness = |input: &EvmInput| {
+                    if !budget.reserve_execution() {
+                        return ExitKind::Ok;
+                    }
                     let snap_id = input.base_snapshot_id;
                     let snapshot_corpus_guard = snapshot_corpus.read();
 
@@ -1037,29 +1118,16 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     execution_timeout,
                 )?;
 
-                if let Some(max_execs) = config.max_execs {
-                    log::info!("Running bounded brokered campaign for {max_execs} stage iterations");
-                    let _ = fuzzer.fuzz_loop_for(
-                        &mut stages,
-                        &mut executor,
-                        &mut state,
-                        &mut manager,
-                        max_execs,
-                    )?;
-                    manager.on_restart(&mut state)?;
-                    manager.on_shutdown()?;
-                } else if let Some(duration_secs) = config.duration_secs {
+                if config.max_execs.is_some() || config.duration_secs.is_some() {
                     log::info!(
-                        "Running duration-bounded brokered campaign for {duration_secs}s"
+                        "Running hard-bounded brokered campaign: max_execs={:?}, duration_secs={:?}, worker_budget={:?}",
+                        config.max_execs,
+                        config.duration_secs,
+                        budget.max_execs
                     );
-                    let deadline = Instant::now() + Duration::from_secs(duration_secs);
-                    while Instant::now() < deadline {
-                        let _ = fuzzer.fuzz_one(
-                            &mut stages,
-                            &mut executor,
-                            &mut state,
-                            &mut manager,
-                        )?;
+                    while !budget.exhausted() {
+                        let _ =
+                            fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
                     }
                     manager.on_restart(&mut state)?;
                     manager.on_shutdown()?;
@@ -1414,7 +1482,10 @@ async fn run_single_process_campaign(
         concolic_hints.clone(),
         telemetry.concolic_hint_stats.clone(),
     );
-    let mut stages = tuple_list!(StdMutationalStage::new(mutator),);
+    let mut stages = tuple_list!(StdMutationalStage::with_max_iterations(
+        mutator,
+        mutational_stage_iterations(&config),
+    ),);
     let mut fuzzer = StdFuzzer::new(
         RustyFuzzScheduler::with_pending_score(pending_campaign_score.clone()),
         feedback,
@@ -1428,8 +1499,12 @@ async fn run_single_process_campaign(
         "edges",
         unsafe { OwnedMutSlice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE) },
     );
+    let budget = Arc::new(CampaignBudget::new(config.max_execs, config.duration_secs, 1));
 
     let mut harness = |input: &EvmInput| {
+        if !budget.reserve_execution() {
+            return ExitKind::Ok;
+        }
         let snap_id = input.base_snapshot_id;
         let snapshot_corpus_guard = snapshot_corpus.read();
         let Some(base_snap_arc) = snapshot_corpus_guard.get_snapshot(snap_id) else {
@@ -1670,19 +1745,13 @@ async fn run_single_process_campaign(
         execution_timeout,
     )?;
 
-    if let Some(max_execs) = config.max_execs {
-        log::info!("Running bounded single-process campaign for {max_execs} stage iterations");
-        let _ = fuzzer.fuzz_loop_for(
-            &mut stages,
-            &mut executor,
-            &mut state,
-            &mut manager,
-            max_execs,
-        )?;
-    } else if let Some(duration_secs) = config.duration_secs {
-        log::info!("Running duration-bounded single-process campaign for {duration_secs}s");
-        let deadline = Instant::now() + Duration::from_secs(duration_secs);
-        while Instant::now() < deadline {
+    if config.max_execs.is_some() || config.duration_secs.is_some() {
+        log::info!(
+            "Running hard-bounded single-process campaign: max_execs={:?}, duration_secs={:?}",
+            config.max_execs,
+            config.duration_secs
+        );
+        while !budget.exhausted() {
             let _ = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
         }
     } else {
