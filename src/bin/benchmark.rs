@@ -2,18 +2,19 @@ use clap::Parser;
 use revm::primitives::Address;
 use rusty_fuzz::config::HardenedDefiConfig;
 use rusty_fuzz::engine::fuzz_engine::{run_fuzz_campaign, Config as FuzzConfig};
-use rusty_fuzz::engine::promotion::PromotionConfig;
+use rusty_fuzz::engine::promotion::{PromotionCampaignSummary, PromotionConfig};
 use rusty_fuzz::evm::corpus::CampaignArtifactRecord;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser, Debug)]
 struct Args {
-    /// Directory containing Daedaluzz-style JSON artifacts.
+    /// Directory containing Daedaluzz-style JSON artifacts or Solidity sources.
     artifacts_dir: PathBuf,
     /// Maximum executions per contract.
     #[arg(long, default_value_t = 50_000)]
@@ -21,12 +22,16 @@ struct Args {
     /// Directory where benchmark markdown and JSON reports are written.
     #[arg(long, default_value = "reports/benchmarks")]
     output_dir: PathBuf,
+    /// Per-contract wall-clock timeout in seconds.
+    #[arg(long, default_value_t = 300)]
+    timeout_secs: u64,
 }
 
 #[derive(Debug)]
 struct ContractArtifact {
     name: String,
     runtime_bytecode: Vec<u8>,
+    abi: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -34,11 +39,13 @@ struct BenchmarkRow {
     contract: String,
     bugs_found: usize,
     coverage_edges: usize,
+    executions: u64,
     seconds: f64,
     execs_per_sec: f64,
     crashes: usize,
     oracle_classes: BTreeMap<String, usize>,
     artifact_ids: Vec<String>,
+    timed_out: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,13 +73,20 @@ async fn main() -> anyhow::Result<()> {
         let report_dir = work_dir.join("reports");
         fs::create_dir_all(&corpus_dir)?;
         fs::create_dir_all(&report_dir)?;
+        let abi_path = if let Some(abi) = &artifact.abi {
+            let path = work_dir.join("abi.json");
+            fs::write(&path, serde_json::to_vec_pretty(abi)?)?;
+            Some(path)
+        } else {
+            None
+        };
 
         let mut hardened_defi = HardenedDefiConfig::default();
         hardened_defi.enabled = false;
         hardened_defi.single_process = true;
 
         let started = Instant::now();
-        run_fuzz_campaign(FuzzConfig {
+        let campaign = run_fuzz_campaign(FuzzConfig {
             rpc_url: "http://127.0.0.1:0".to_string(),
             fork_block: 0,
             target_contract: Some(target),
@@ -87,27 +101,34 @@ async fn main() -> anyhow::Result<()> {
             allow_synthetic_fallback: true,
             hardened_defi,
             target_invariant_manifest: None,
-            abi_path: None,
+            abi_path: abi_path.as_ref().map(|path| path.display().to_string()),
             max_execs: Some(args.max_execs),
             duration_secs: None,
             artifact_limit: Some(100),
             campaign_id: Some(format!("daedaluzz-{}", sanitize_name(&artifact.name))),
             min_finding_confidence: 0,
             promotion: PromotionConfig::default(),
-        })
-        .await?;
+        });
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_secs(args.timeout_secs),
+            campaign,
+        )
+        .await
+        .map_or(true, |result| result.is_err());
 
-        let metrics = collect_campaign_metrics(&corpus_dir)?;
+        let metrics = collect_campaign_metrics(&corpus_dir, &report_dir)?;
         let seconds = started.elapsed().as_secs_f64();
         rows.push(BenchmarkRow {
             contract: artifact.name.clone(),
             bugs_found: metrics.bugs_found,
             coverage_edges: metrics.coverage_edges,
+            executions: metrics.executions,
             seconds,
-            execs_per_sec: args.max_execs as f64 / seconds.max(0.001),
+            execs_per_sec: metrics.executions as f64 / seconds.max(0.001),
             crashes: metrics.crashes,
             oracle_classes: metrics.oracle_classes,
             artifact_ids: metrics.artifact_ids,
+            timed_out,
         });
     }
 
@@ -121,32 +142,109 @@ async fn main() -> anyhow::Result<()> {
 
 fn load_artifacts(dir: &Path) -> anyhow::Result<Vec<ContractArtifact>> {
     let mut artifacts = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
+    for path in artifact_paths(dir)? {
+        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            if let Some(artifact) = load_json_artifact(&path)? {
+                artifacts.push(artifact);
+            }
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("sol")
+            && !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".foundry.sol"))
+        {
+            artifacts.extend(compile_solidity_artifacts(&path)?);
         }
-        let value: Value = serde_json::from_slice(&fs::read(&path)?)?;
-        let Some(runtime_bytecode) = artifact_runtime_bytecode(&value) else {
-            continue;
-        };
-        let name = value
-            .get("contractName")
-            .or_else(|| value.get("name"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| {
-                path.file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or("contract")
-                    .to_string()
-            });
-        artifacts.push(ContractArtifact {
-            name,
-            runtime_bytecode,
-        });
     }
     artifacts.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(artifacts)
+}
+
+fn artifact_paths(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            for nested in fs::read_dir(&path)? {
+                let nested = nested?.path();
+                if nested.is_file() {
+                    paths.push(nested);
+                }
+            }
+        } else if path.is_file() {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn load_json_artifact(path: &Path) -> anyhow::Result<Option<ContractArtifact>> {
+    let value: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let Some(runtime_bytecode) = artifact_runtime_bytecode(&value) else {
+        return Ok(None);
+    };
+    let name = value
+        .get("contractName")
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("contract")
+                .to_string()
+        });
+    Ok(Some(ContractArtifact {
+        name,
+        runtime_bytecode,
+        abi: value.get("abi").cloned(),
+    }))
+}
+
+fn compile_solidity_artifacts(path: &Path) -> anyhow::Result<Vec<ContractArtifact>> {
+    let output = Command::new("solc")
+        .arg("--optimize")
+        .arg("--combined-json")
+        .arg("abi,bin-runtime")
+        .arg(path)
+        .output()
+        .map_err(|err| anyhow::anyhow!("failed to start solc for {}: {err:#}", path.display()))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "solc failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout)?;
+    let mut artifacts = Vec::new();
+    if let Some(contracts) = value.get("contracts").and_then(Value::as_object) {
+        for (name, contract) in contracts {
+            if let Some(runtime_bytecode) = artifact_runtime_bytecode(contract) {
+                let contract_name = name
+                    .rsplit(':')
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| {
+                        path.file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .unwrap_or("contract")
+                    })
+                    .to_string();
+                artifacts.push(ContractArtifact {
+                    name: format!(
+                        "{}::{}",
+                        path.file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .unwrap_or("source"),
+                        contract_name
+                    ),
+                    runtime_bytecode,
+                    abi: contract.get("abi").cloned(),
+                });
+            }
+        }
+    }
     Ok(artifacts)
 }
 
@@ -154,8 +252,10 @@ fn artifact_runtime_bytecode(value: &Value) -> Option<Vec<u8>> {
     let candidates = [
         &value["deployedBytecode"]["object"],
         &value["deployedBytecode"],
+        &value["bin-runtime"],
         &value["bytecode"]["object"],
         &value["bytecode"],
+        &value["bin"],
     ];
     candidates
         .iter()
@@ -179,13 +279,21 @@ fn decode_hex_bytecode(raw: &str) -> Option<Vec<u8>> {
 struct CampaignMetrics {
     bugs_found: usize,
     coverage_edges: usize,
+    executions: u64,
     crashes: usize,
     oracle_classes: BTreeMap<String, usize>,
     artifact_ids: Vec<String>,
 }
 
-fn collect_campaign_metrics(corpus_dir: &Path) -> anyhow::Result<CampaignMetrics> {
+fn collect_campaign_metrics(corpus_dir: &Path, report_dir: &Path) -> anyhow::Result<CampaignMetrics> {
     let mut metrics = CampaignMetrics::default();
+    let summary_path = report_dir.join("campaign_summary.json");
+    if summary_path.exists() {
+        let summary: PromotionCampaignSummary =
+            serde_json::from_slice(&fs::read(&summary_path)?)?;
+        metrics.executions = summary.total_executions;
+        metrics.coverage_edges = summary.coverage_edges as usize;
+    }
     let crashes_dir = corpus_dir.join("crashes");
     if crashes_dir.exists() {
         metrics.crashes = fs::read_dir(crashes_dir)?
@@ -222,12 +330,12 @@ fn collect_campaign_metrics(corpus_dir: &Path) -> anyhow::Result<CampaignMetrics
 }
 
 fn print_markdown_table(rows: &[BenchmarkRow]) {
-    println!("| contract name | bugs found | coverage edges | exec/sec | crashes | time |");
-    println!("|---|---:|---:|---:|---:|---:|");
+    println!("| contract name | bugs found | coverage edges | executions | exec/sec | crashes | timed out | time |");
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|");
     for row in rows {
         println!(
-            "| {} | {} | {} | {:.2} | {} | {:.2}s |",
-            row.contract, row.bugs_found, row.coverage_edges, row.execs_per_sec, row.crashes, row.seconds
+            "| {} | {} | {} | {} | {:.2} | {} | {} | {:.2}s |",
+            row.contract, row.bugs_found, row.coverage_edges, row.executions, row.execs_per_sec, row.crashes, row.timed_out, row.seconds
         );
     }
 }
@@ -248,12 +356,12 @@ fn write_reports(args: &Args, rows: &[BenchmarkRow]) -> anyhow::Result<()> {
 
     let markdown_path = args.output_dir.join(format!("daedaluzz-{run_id}.md"));
     let mut markdown = String::new();
-    markdown.push_str("| contract name | bugs found | coverage edges | exec/sec | crashes | time |\n");
-    markdown.push_str("|---|---:|---:|---:|---:|---:|\n");
+    markdown.push_str("| contract name | bugs found | coverage edges | executions | exec/sec | crashes | timed out | time |\n");
+    markdown.push_str("|---|---:|---:|---:|---:|---:|---:|---:|\n");
     for row in rows {
         markdown.push_str(&format!(
-            "| {} | {} | {} | {:.2} | {} | {:.2}s |\n",
-            row.contract, row.bugs_found, row.coverage_edges, row.execs_per_sec, row.crashes, row.seconds
+            "| {} | {} | {} | {} | {:.2} | {} | {} | {:.2}s |\n",
+            row.contract, row.bugs_found, row.coverage_edges, row.executions, row.execs_per_sec, row.crashes, row.timed_out, row.seconds
         ));
     }
     fs::write(&markdown_path, markdown)?;

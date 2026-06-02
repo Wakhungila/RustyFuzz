@@ -1,6 +1,7 @@
 use crate::common::oracle::{ProtocolInvariantEvaluator, VulnType};
 use crate::common::types::{
-    CallKind, CallObservation, CallPhase, OracleObservation, SequenceExecutionResult, StorageDiff,
+    CallKind, CallObservation, CallPhase, ExecutionStatus, OracleObservation,
+    SequenceExecutionResult, StorageDiff,
 };
 use revm::primitives::{keccak256, Address, B256, U256};
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,7 @@ pub enum ProtocolOraclePackKind {
     Governance,
     ProxyUpgradeability,
     Bridge,
+    RuntimePanic,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +84,7 @@ impl Default for ProtocolOraclePack {
                 ProtocolOraclePackKind::Governance,
                 ProtocolOraclePackKind::ProxyUpgradeability,
                 ProtocolOraclePackKind::Bridge,
+                ProtocolOraclePackKind::RuntimePanic,
             ]
             .into_iter()
             .collect(),
@@ -108,6 +111,9 @@ impl ProtocolOraclePack {
         }
         if self.enabled.contains(&ProtocolOraclePackKind::Governance) {
             self.evaluate_governance(execution, &mut findings);
+        }
+        if self.enabled.contains(&ProtocolOraclePackKind::RuntimePanic) {
+            self.evaluate_runtime_panics(execution, &mut findings);
         }
         if self
             .enabled
@@ -138,6 +144,36 @@ impl ProtocolOraclePack {
                 && a.evidence == b.evidence
         });
         findings
+    }
+
+    fn evaluate_runtime_panics(
+        &self,
+        execution: &SequenceExecutionResult,
+        findings: &mut Vec<ProtocolFinding>,
+    ) {
+        for tx in &execution.tx_results {
+            if tx.status != ExecutionStatus::Revert || tx.output.len() < 36 {
+                continue;
+            }
+            if tx.output[0..4] != [0x4e, 0x48, 0x7b, 0x71] {
+                continue;
+            }
+            let code = U256::from_be_slice(&tx.output[4..36]).to::<u64>();
+            findings.push(ProtocolFinding {
+                pack: ProtocolOraclePackKind::RuntimePanic,
+                vuln: VulnType::UnintendedPanic(code),
+                severity: if code == 0x01 {
+                    ProtocolSeverity::High
+                } else {
+                    ProtocolSeverity::Medium
+                },
+                tx_index: Some(tx.tx_index),
+                target: tx.call_trace.first().map(|call| call.target),
+                evidence: format!(
+                    "transaction reverted with Solidity Panic(0x{code:x}); code 0x01 is an assert/invariant failure"
+                ),
+            });
+        }
     }
 
     pub fn evaluate_as_observations(

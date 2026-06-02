@@ -105,7 +105,9 @@ pub struct SeedScanManifest {
     pub search_depth: u64,
     pub include_address_hints: bool,
     pub max_blocks_per_second: Option<f64>,
+    #[serde(default)]
     pub scan_mode: SeedScanMode,
+    #[serde(default)]
     pub decoded_abi: bool,
     pub seed_count: usize,
     pub discovered_selectors: Vec<[u8; 4]>,

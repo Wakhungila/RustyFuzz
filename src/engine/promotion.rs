@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -94,11 +95,26 @@ pub struct MinimizationPromotionReport {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PocValidationReport {
+    pub success: bool,
+    pub static_assertions_present: bool,
+    pub transaction_replay_assertions_present: bool,
+    pub invariant_hook_present: bool,
+    pub forge_status: String,
+    pub forge_command: Option<String>,
+    pub stdout_snippet: String,
+    pub stderr_snippet: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromotionCampaignSummary {
     pub campaign_id: String,
     pub total_executions: u64,
     pub total_artifacts: u64,
+    #[serde(default)]
+    pub coverage_edges: u64,
     pub promoted_findings: u64,
     pub confirmed_findings: u64,
     pub rejected_candidates: u64,
@@ -155,7 +171,7 @@ impl PromotionCampaignStats {
         if record.replay_status != "success" {
             self.replay_failure_count.fetch_add(1, Ordering::Relaxed);
         }
-        if record.poc_status == "generated" {
+        if record.poc_status == "validated" {
             self.poc_count.fetch_add(1, Ordering::Relaxed);
         }
         match record.minimize_status.as_str() {
@@ -180,11 +196,13 @@ impl PromotionCampaignStats {
         campaign_id: impl Into<String>,
         total_executions: u64,
         total_artifacts: u64,
+        coverage_edges: u64,
     ) -> PromotionCampaignSummary {
         PromotionCampaignSummary {
             campaign_id: campaign_id.into(),
             total_executions,
             total_artifacts,
+            coverage_edges,
             promoted_findings: self.promoted_findings.load(Ordering::Relaxed),
             confirmed_findings: self.confirmed_findings.load(Ordering::Relaxed),
             rejected_candidates: self.rejected_candidates.load(Ordering::Relaxed),
@@ -330,8 +348,27 @@ pub fn promote_finding_artifact(
                         request.fork_block,
                     ) {
                         Ok(path) => {
-                            poc_status = "generated".to_string();
-                            lifecycle_stage = FindingLifecycleStage::PocGenerated;
+                            let validation = validate_foundry_poc(
+                                Path::new(&path),
+                                &request.artifact.findings,
+                                request.report_dir,
+                            );
+                            let validation_path = finding_dir.join("poc_validation.json");
+                            write_json(&validation_path, &validation)?;
+                            artifact_paths.insert(
+                                "poc_validation".to_string(),
+                                validation_path.display().to_string(),
+                            );
+                            if validation.success {
+                                poc_status = "validated".to_string();
+                                lifecycle_stage = FindingLifecycleStage::PocGenerated;
+                            } else {
+                                poc_status = "generated_unvalidated".to_string();
+                                caveats.push(format!(
+                                    "Foundry PoC scaffold generated but not accepted as proof: {}",
+                                    validation.reason
+                                ));
+                            }
                             artifact_paths.insert("poc".to_string(), path);
                         }
                         Err(err) => {
@@ -367,7 +404,7 @@ pub fn promote_finding_artifact(
 
     if lifecycle_stage == FindingLifecycleStage::PocGenerated
         && !request.synthetic_mode
-        && (!request.config.require_poc_for_confirmed || poc_status == "generated")
+        && (!request.config.require_poc_for_confirmed || poc_status == "validated")
         && replay_status == "success"
     {
         lifecycle_stage = FindingLifecycleStage::Confirmed;
@@ -382,7 +419,7 @@ pub fn promote_finding_artifact(
         request.synthetic_mode,
         replay_status == "success",
         minimize_status == "reduced" || minimize_status == "not_reducible",
-        poc_status == "generated",
+        poc_status == "validated",
     );
 
     let record = FindingPromotionRecord {
@@ -425,6 +462,138 @@ pub fn promote_finding_artifact(
         finding_json.display()
     );
     Ok(record)
+}
+
+fn validate_foundry_poc(
+    poc_path: &Path,
+    findings: &[ProtocolFinding],
+    project_root: &Path,
+) -> PocValidationReport {
+    let contents = match fs::read_to_string(poc_path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            return PocValidationReport {
+                success: false,
+                static_assertions_present: false,
+                transaction_replay_assertions_present: false,
+                invariant_hook_present: false,
+                forge_status: "not_run".to_string(),
+                forge_command: None,
+                stdout_snippet: String::new(),
+                stderr_snippet: String::new(),
+                reason: format!("could not read generated PoC: {err:#}"),
+            };
+        }
+    };
+
+    let static_assertions_present =
+        findings.is_empty() || contents.contains("assertRustyFuzzProtocolEvidence()");
+    let transaction_replay_assertions_present =
+        findings.iter().all(|finding| {
+            finding
+                .tx_index
+                .map(|idx| contents.contains(&format!("assertTrue(ok{idx}")))
+                .unwrap_or(true)
+        });
+    let invariant_hook_present = contents.contains("assertRustyFuzzInvariant()");
+    let static_success =
+        static_assertions_present && transaction_replay_assertions_present && invariant_hook_present;
+    if !static_success {
+        return PocValidationReport {
+            success: false,
+            static_assertions_present,
+            transaction_replay_assertions_present,
+            invariant_hook_present,
+            forge_status: "not_run".to_string(),
+            forge_command: None,
+            stdout_snippet: String::new(),
+            stderr_snippet: String::new(),
+            reason: "generated PoC is missing replay, protocol, or invariant assertions".to_string(),
+        };
+    }
+
+    if Command::new("forge").arg("--version").output().is_err() {
+        return PocValidationReport {
+            success: false,
+            static_assertions_present,
+            transaction_replay_assertions_present,
+            invariant_hook_present,
+            forge_status: "unavailable".to_string(),
+            forge_command: None,
+            stdout_snippet: String::new(),
+            stderr_snippet: "forge is not installed or not on PATH".to_string(),
+            reason: "static PoC validation passed; forge runtime validation was unavailable"
+                .to_string(),
+        };
+    }
+
+    if std::env::var("ETH_RPC_URL").unwrap_or_default().is_empty() {
+        return PocValidationReport {
+            success: false,
+            static_assertions_present,
+            transaction_replay_assertions_present,
+            invariant_hook_present,
+            forge_status: "skipped_missing_eth_rpc_url".to_string(),
+            forge_command: None,
+            stdout_snippet: String::new(),
+            stderr_snippet: "ETH_RPC_URL is required by generated fork-replay PoCs".to_string(),
+            reason: "static PoC validation passed; forge runtime validation needs ETH_RPC_URL"
+                .to_string(),
+        };
+    }
+
+    let command = format!("forge test --match-path {}", poc_path.display());
+    match Command::new("forge")
+        .arg("test")
+        .arg("--match-path")
+        .arg(poc_path)
+        .current_dir(project_root)
+        .output()
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            PocValidationReport {
+                success: output.status.success(),
+                static_assertions_present,
+                transaction_replay_assertions_present,
+                invariant_hook_present,
+                forge_status: if output.status.success() {
+                    "passed".to_string()
+                } else {
+                    "failed".to_string()
+                },
+                forge_command: Some(command),
+                stdout_snippet: snippet(&stdout),
+                stderr_snippet: snippet(&stderr),
+                reason: if output.status.success() {
+                    "static and forge runtime validation passed".to_string()
+                } else {
+                    "static validation passed, but forge runtime validation failed".to_string()
+                },
+            }
+        }
+        Err(err) => PocValidationReport {
+            success: false,
+            static_assertions_present,
+            transaction_replay_assertions_present,
+            invariant_hook_present,
+            forge_status: "failed_to_start".to_string(),
+            forge_command: Some(command),
+            stdout_snippet: String::new(),
+            stderr_snippet: err.to_string(),
+            reason: "could not start forge runtime validation".to_string(),
+        },
+    }
+}
+
+fn snippet(value: &str) -> String {
+    const LIMIT: usize = 800;
+    if value.len() <= LIMIT {
+        value.to_string()
+    } else {
+        value.chars().take(LIMIT).collect()
+    }
 }
 
 pub fn write_campaign_summary(
@@ -610,10 +779,11 @@ fn finding_markdown(
 
 fn campaign_summary_markdown(summary: &PromotionCampaignSummary) -> String {
     format!(
-        "# RustyFuzz Campaign Summary\n\n- campaign_id: `{}`\n- total_executions: `{}`\n- total_artifacts: `{}`\n- promoted_findings: `{}`\n- confirmed_findings: `{}`\n- rejected_candidates: `{}`\n- synthetic_non_production_findings: `{}`\n- highest_confidence: `{}`\n- poc_count: `{}`\n- replay_failure_count: `{}`\n- minimization_attempts: `{}`\n- minimization_reduced: `{}`\n- minimization_not_reducible: `{}`\n",
+        "# RustyFuzz Campaign Summary\n\n- campaign_id: `{}`\n- total_executions: `{}`\n- total_artifacts: `{}`\n- coverage_edges: `{}`\n- promoted_findings: `{}`\n- confirmed_findings: `{}`\n- rejected_candidates: `{}`\n- synthetic_non_production_findings: `{}`\n- highest_confidence: `{}`\n- poc_count: `{}`\n- replay_failure_count: `{}`\n- minimization_attempts: `{}`\n- minimization_reduced: `{}`\n- minimization_not_reducible: `{}`\n",
         summary.campaign_id,
         summary.total_executions,
         summary.total_artifacts,
+        summary.coverage_edges,
         summary.promoted_findings,
         summary.confirmed_findings,
         summary.rejected_candidates,

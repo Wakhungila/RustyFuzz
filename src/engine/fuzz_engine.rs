@@ -37,7 +37,9 @@ use crate::evm::registry::GlobalAccountRegistry;
 use crate::evm::snapshot::new_evm_snapshot;
 
 use libafl::corpus::{Corpus, Testcase};
-use libafl::events::NopEventManager;
+use libafl::events::{
+    llmp::LlmpRestartingEventManager, EventRestarter, NopEventManager, SendExiting,
+};
 use libafl::state::HasCorpus;
 use parking_lot::{Mutex, RwLock};
 use revm::database::CacheDB;
@@ -73,6 +75,7 @@ struct CampaignTelemetry {
     oracle_findings: AtomicU64,
     state_novelty: AtomicU64,
     best_score: AtomicU64,
+    max_coverage_edges: AtomicU64,
     mutation_strategies: Mutex<BTreeMap<String, u64>>,
     concolic_hint_stats: Arc<ConcolicHintStats>,
     last_report: Mutex<(Instant, u64)>,
@@ -88,6 +91,7 @@ impl CampaignTelemetry {
             oracle_findings: AtomicU64::new(0),
             state_novelty: AtomicU64::new(0),
             best_score: AtomicU64::new(0),
+            max_coverage_edges: AtomicU64::new(0),
             mutation_strategies: Mutex::new(BTreeMap::new()),
             concolic_hint_stats: Arc::new(ConcolicHintStats::default()),
             last_report: Mutex::new((now, 0)),
@@ -115,6 +119,8 @@ impl CampaignTelemetry {
                 .fetch_add(state_novelty_score, Ordering::Relaxed);
         }
         self.best_score.fetch_max(campaign_score, Ordering::Relaxed);
+        self.max_coverage_edges
+            .fetch_max(coverage_edges as u64, Ordering::Relaxed);
         if !mutation_strategies.is_empty() {
             let mut counts = self.mutation_strategies.lock();
             for strategy in mutation_strategies {
@@ -176,6 +182,10 @@ impl CampaignTelemetry {
     fn artifact_count(&self) -> u64 {
         self.artifacts.load(Ordering::Relaxed)
     }
+
+    fn coverage_edges(&self) -> u64 {
+        self.max_coverage_edges.load(Ordering::Relaxed)
+    }
 }
 
 // LibAFL 0.15.4 imports.
@@ -186,8 +196,13 @@ use libafl::prelude::{
 };
 use libafl_bolts::prelude::*;
 use libafl_bolts::ownedref::OwnedMutSlice;
-use libafl_bolts::shmem::{ShMemProvider, StdShMemProvider};
+use libafl_bolts::shmem::{ShMemProvider, StdShMem, StdShMemProvider};
 use libafl_bolts::tuples::tuple_list;
+
+type EvmCampaignState =
+    StdState<InMemoryCorpus<EvmInput>, EvmInput, StdRand, InMemoryCorpus<EvmInput>>;
+type EvmLauncherManager =
+    LlmpRestartingEventManager<(), EvmInput, EvmCampaignState, StdShMem, StdShMemProvider>;
 
 const STATE_NOVELTY_MAP_SLOTS: usize = 2_048;
 const CAMPAIGN_SCORE_MAP_SLOTS: usize = 1_024;
@@ -404,7 +419,9 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
         .monitor(monitor)
         .configuration(EventConfig::AlwaysUnique)
         .run_client(
-            |state: Option<StdState<_, _, _, _>>, mut manager, description: ClientDescription| {
+            |state: Option<EvmCampaignState>,
+             mut manager: EvmLauncherManager,
+             description: ClientDescription| {
                 let mut initial_registry = GlobalAccountRegistry::default();
                 initial_registry.discover_from_state(&ChainState::Evm(initial_db.clone()));
 
@@ -1029,6 +1046,8 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                         &mut manager,
                         max_execs,
                     )?;
+                    manager.on_restart(&mut state)?;
+                    manager.on_shutdown()?;
                 } else if let Some(duration_secs) = config.duration_secs {
                     log::info!(
                         "Running duration-bounded brokered campaign for {duration_secs}s"
@@ -1042,6 +1061,8 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                             &mut manager,
                         )?;
                     }
+                    manager.on_restart(&mut state)?;
+                    manager.on_shutdown()?;
                 } else {
                     fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
                 }
@@ -1640,24 +1661,6 @@ async fn run_single_process_campaign(
         ExitKind::Ok
     };
 
-    if let Some(max_execs) = config.max_execs {
-        log::info!("Running direct bounded single-process campaign for {max_execs} executions");
-        let corpus_ids = state.corpus().ids().collect::<Vec<_>>();
-        if corpus_ids.is_empty() {
-            anyhow::bail!("cannot run bounded campaign with an empty corpus");
-        }
-        for iteration in 0..max_execs {
-            let id = corpus_ids[iteration as usize % corpus_ids.len()];
-            let input = state
-                .corpus()
-                .cloned_input_for_id(id)
-                .map_err(|err| anyhow::anyhow!("failed to clone bounded input: {err}"))?;
-            let _ = harness(&input);
-        }
-        write_final_campaign_summary(&config, &promotion_stats, &telemetry);
-        return Ok(());
-    }
-
     let mut executor = InProcessExecutor::with_timeout::<()>(
         &mut harness,
         tuple_list!(observer),
@@ -1860,12 +1863,7 @@ fn campaign_artifact_reason(
     exploit_candidate: Option<&crate::engine::exploit_path::ExploitPathCandidate>,
 ) -> Option<&'static str> {
     if synthetic_fork_mode {
-        if !findings.is_empty() {
-            return Some("synthetic-non-production-protocol-oracle-finding");
-        }
-        if campaign_score.total >= 250 {
-            return Some("synthetic-non-production-campaign-pressure");
-        }
+        let _ = (findings, campaign_score);
         return None;
     }
 
@@ -2286,6 +2284,14 @@ fn maybe_promote_artifact(
         );
         return;
     }
+    if synthetic_fork_mode {
+        log::debug!(
+            "Skipping promotion for synthetic fallback artifact input_id={} reason={}; synthetic executions are smoke evidence only",
+            artifact.input_id,
+            artifact.reason
+        );
+        return;
+    }
     let high_confidence = artifact
         .findings
         .iter()
@@ -2334,6 +2340,7 @@ fn maybe_promote_artifact(
                 campaign_id,
                 telemetry.execution_count(),
                 telemetry.artifact_count(),
+                telemetry.coverage_edges(),
             );
             if let Err(err) = write_campaign_summary(report_dir, &summary) {
                 log::warn!("Failed to write campaign promotion summary: {err:#}");
@@ -2356,6 +2363,7 @@ fn write_final_campaign_summary(
         campaign_id,
         telemetry.execution_count(),
         telemetry.artifact_count(),
+        telemetry.coverage_edges(),
     );
     if let Err(err) = write_campaign_summary(std::path::Path::new(&config.report_dir), &summary) {
         log::warn!("Failed to write final campaign summary: {err:#}");
