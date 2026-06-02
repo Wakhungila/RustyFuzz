@@ -28,7 +28,13 @@ use rusty_fuzz::evm::seed_ingester::{
     SeedMetadata, SeedScanMode,
 };
 use rusty_fuzz::satori::cli::SatoriCommand;
+use std::io::Write;
 use std::str::FromStr;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -70,6 +76,9 @@ enum Command {
         max_execs: Option<u64>,
         #[arg(long)]
         duration_secs: Option<u64>,
+        /// Hard wall-clock timeout for the fuzz process. Defaults to an auto bound for bounded runs.
+        #[arg(long)]
+        wall_timeout_secs: Option<u64>,
         #[arg(long, default_value_t = false)]
         unbounded: bool,
         #[arg(long)]
@@ -276,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
             abi,
             max_execs,
             duration_secs,
+            wall_timeout_secs,
             unbounded,
             artifact_limit,
             campaign_id,
@@ -314,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
                 chain,
                 target_contract.map(|address| address.to_string())
             );
+            std::io::stdout().flush()?;
             let mut hardened_defi_config = config.hardened_defi.clone();
             if hardened_defi {
                 hardened_defi_config.enabled = true;
@@ -358,6 +369,7 @@ async fn main() -> anyhow::Result<()> {
                 !no_synthetic_fallback && (config.allow_synthetic_fallback || allow_synthetic_fallback),
                 promotion_enabled
             );
+            std::io::stdout().flush()?;
             let sanitized_campaign_id = campaign_id.as_deref().map(sanitize_campaign_id);
             let campaign_corpus_dir = sanitized_campaign_id
                 .as_ref()
@@ -400,7 +412,13 @@ async fn main() -> anyhow::Result<()> {
                     promotion_limit,
                 },
             };
-            rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await?;
+            let watchdog_done =
+                install_campaign_watchdog(wall_timeout_secs, max_execs, duration_secs, unbounded);
+            let result = rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await;
+            if let Some(done) = watchdog_done {
+                done.store(true, Ordering::SeqCst);
+            }
+            result?;
         }
         Command::AbiIngest {
             file,
@@ -1132,6 +1150,43 @@ fn resolve_campaign_bounds(
     anyhow::bail!(
         "refusing to start an unbounded fuzz campaign without an explicit opt-in; pass --max-execs, --duration-secs, or --unbounded"
     );
+}
+
+fn install_campaign_watchdog(
+    wall_timeout_secs: Option<u64>,
+    max_execs: Option<u64>,
+    duration_secs: Option<u64>,
+    unbounded: bool,
+) -> Option<Arc<AtomicBool>> {
+    let timeout_secs = wall_timeout_secs.or_else(|| {
+        if unbounded {
+            None
+        } else if let Some(duration_secs) = duration_secs {
+            Some(duration_secs.saturating_add(60).max(90))
+        } else {
+            max_execs.map(|execs| {
+                let execution_scaled = execs.saturating_div(100).saturating_mul(2);
+                execution_scaled.max(90).min(3600)
+            })
+        }
+    })?;
+    if timeout_secs == 0 {
+        return None;
+    }
+
+    let done = Arc::new(AtomicBool::new(false));
+    let watchdog_done = Arc::clone(&done);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(timeout_secs));
+        if !watchdog_done.load(Ordering::SeqCst) {
+            eprintln!(
+                "fuzz campaign exceeded wall-clock timeout of {timeout_secs}s; exiting with code 124"
+            );
+            let _ = std::io::stderr().flush();
+            std::process::exit(124);
+        }
+    });
+    Some(done)
 }
 
 fn target_address(cli_target: Option<&str>, config: &Config) -> anyhow::Result<Address> {
