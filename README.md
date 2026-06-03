@@ -879,6 +879,15 @@ cargo run --release -- validate --benchmarks benchmarks/live --output reports/li
 cargo run --release -- validate --benchmarks benchmarks/forked --output reports/forked_validation_report.json
 ```
 
+**Run the strict known-vulnerable validation gate**:
+```bash
+cargo run --release --bin rusty-fuzz -- validate \
+  --benchmarks benchmarks/historical/known_vulnerable \
+  --output reports/known_vulnerable_validation_report.json
+```
+
+This pack requires every case to produce a finding, replay confirmation, minimized path, and Foundry PoC. A case without a generated PoC is reported as not found.
+
 **Run blind rediscovery benchmarks**:
 ```bash
 cargo run --release -- validate --benchmarks benchmarks/blind --output reports/blind_validation_report.json

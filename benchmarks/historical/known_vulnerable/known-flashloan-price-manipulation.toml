@@ -1,0 +1,17 @@
+id = "known-flashloan-price-manipulation"
+class = "amm_invariant_violation"
+mode = "local_fixture"
+target = "0x6200000000000000000000000000000000000004"
+fixture = "benchmarks/historical/known_vulnerable/fixtures/known-flashloan-price-manipulation.json"
+setup_requirements = ["flashloan provider", "AMM pool", "price-dependent victim action", "loan repayment"]
+expected_invariant = "flashloan-backed swap manipulates reserve product and leaves attacker profit after repayment"
+target_profile_expectation = ["amm/dex/pool", "flash-loan"]
+exploit_template_expectation = "flashloan-price-manipulation"
+expected_exploit_shape = ["flashLoan", "swap", "dependent action", "reverse swap", "repay"]
+expected_selectors = ["flashLoan(uint256)", "swap(uint256,uint256,address,bytes)", "getReserves()"]
+expected_attacker = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+success_criteria = ["expected_finding", "reserve_manipulation", "invariant_violation", "replayable_artifact", "minimized_path", "foundry_poc_generated"]
+poc_generation = "required"
+max_duration_secs = 120
+seed_hints = ["flashLoan(uint256)", "swap(uint256,uint256,address,bytes)", "getReserves()"]
+notes = "Known-vulnerable local validation fixture for flashloan-assisted AMM price manipulation."

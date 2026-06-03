@@ -1,0 +1,17 @@
+id = "known-uninitialized-proxy-takeover"
+class = "access_control_bypass"
+mode = "local_fixture"
+target = "0x6200000000000000000000000000000000000002"
+fixture = "benchmarks/historical/known_vulnerable/fixtures/known-uninitialized-proxy-takeover.json"
+setup_requirements = ["EIP-1967 proxy", "uninitialized implementation", "non-admin attacker"]
+expected_invariant = "externally callable initializer grants attacker upgrade authority"
+target_profile_expectation = ["proxy/upgradeable", "access-control-heavy"]
+exploit_template_expectation = "access-control-sensitive-call"
+expected_exploit_shape = ["initialize", "upgradeTo", "privileged state mutation"]
+expected_selectors = ["initialize(address)", "upgradeTo(address)", "owner()"]
+expected_attacker = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+success_criteria = ["expected_finding", "access_control_bypass", "invariant_violation", "replayable_artifact", "minimized_path", "foundry_poc_generated"]
+poc_generation = "required"
+max_duration_secs = 120
+seed_hints = ["initialize(address)", "upgradeTo(address)", "0x8129fc1c", "0x3659cfe6"]
+notes = "Known-vulnerable local validation fixture for uninitialized proxy/implementation takeover."

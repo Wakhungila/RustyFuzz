@@ -1,0 +1,9 @@
+{
+  "outcome": "found",
+  "time_to_signal_secs": 1.1,
+  "executions_to_signal": 112,
+  "replayable": true,
+  "foundry_poc_generated": true,
+  "false_positive_notes": ["known-vulnerable validation fixture"],
+  "notes": "models callback-driven read-only reentrancy evidence"
+}

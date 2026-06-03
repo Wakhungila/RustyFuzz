@@ -3,6 +3,7 @@ use crate::common::types::{
     CallObservation, ChainState, ExecutionStatus, SequenceExecutionResult, Snapshot, StorageDiff,
 };
 use crate::common::verifier::ReplayVerifier;
+use crate::engine::economic_delta::TokenBalanceView;
 use crate::engine::exploit_synthesizer::synthesize_foundry_poc_with_findings;
 use crate::engine::minimizer::Minimizer;
 use crate::evm::corpus::{CampaignArtifactRecord, PersistentCorpus};
@@ -10,7 +11,6 @@ use crate::evm::executor::EvmExecutor;
 use crate::evm::fork_db::EvmCacheDb;
 use crate::evm::fuzz::EvmInput;
 use crate::evm::inspector::MAP_SIZE;
-use crate::engine::economic_delta::TokenBalanceView;
 use revm::context::BlockEnv;
 use revm::database::CacheDB;
 use revm::primitives::Address;
@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FindingLifecycleStage {
@@ -115,6 +115,12 @@ pub struct PromotionCampaignSummary {
     pub total_artifacts: u64,
     #[serde(default)]
     pub coverage_edges: u64,
+    #[serde(default)]
+    pub interesting_candidates: u64,
+    #[serde(default)]
+    pub unproven_candidates: u64,
+    #[serde(default)]
+    pub missing_poc_for_promoted: u64,
     pub promoted_findings: u64,
     pub confirmed_findings: u64,
     pub rejected_candidates: u64,
@@ -198,19 +204,25 @@ impl PromotionCampaignStats {
         total_artifacts: u64,
         coverage_edges: u64,
     ) -> PromotionCampaignSummary {
+        let promoted_findings = self.promoted_findings.load(Ordering::Relaxed);
+        let confirmed_findings = self.confirmed_findings.load(Ordering::Relaxed);
+        let poc_count = self.poc_count.load(Ordering::Relaxed);
         PromotionCampaignSummary {
             campaign_id: campaign_id.into(),
             total_executions,
             total_artifacts,
             coverage_edges,
-            promoted_findings: self.promoted_findings.load(Ordering::Relaxed),
-            confirmed_findings: self.confirmed_findings.load(Ordering::Relaxed),
+            interesting_candidates: total_artifacts.saturating_sub(confirmed_findings),
+            unproven_candidates: total_artifacts.saturating_sub(confirmed_findings),
+            missing_poc_for_promoted: promoted_findings.saturating_sub(poc_count),
+            promoted_findings,
+            confirmed_findings,
             rejected_candidates: self.rejected_candidates.load(Ordering::Relaxed),
             synthetic_non_production_findings: self
                 .synthetic_non_production_findings
                 .load(Ordering::Relaxed),
             highest_confidence: self.highest_confidence.load(Ordering::Relaxed),
-            poc_count: self.poc_count.load(Ordering::Relaxed),
+            poc_count,
             replay_failure_count: self.replay_failure_count.load(Ordering::Relaxed),
             minimization_attempts: self.minimization_attempts.load(Ordering::Relaxed),
             minimization_reduced: self.minimization_reduced.load(Ordering::Relaxed),
@@ -488,16 +500,16 @@ fn validate_foundry_poc(
 
     let static_assertions_present =
         findings.is_empty() || contents.contains("assertRustyFuzzProtocolEvidence()");
-    let transaction_replay_assertions_present =
-        findings.iter().all(|finding| {
-            finding
-                .tx_index
-                .map(|idx| contents.contains(&format!("assertTrue(ok{idx}")))
-                .unwrap_or(true)
-        });
+    let transaction_replay_assertions_present = findings.iter().all(|finding| {
+        finding
+            .tx_index
+            .map(|idx| contents.contains(&format!("assertTrue(ok{idx}")))
+            .unwrap_or(true)
+    });
     let invariant_hook_present = contents.contains("assertRustyFuzzInvariant()");
-    let static_success =
-        static_assertions_present && transaction_replay_assertions_present && invariant_hook_present;
+    let static_success = static_assertions_present
+        && transaction_replay_assertions_present
+        && invariant_hook_present;
     if !static_success {
         return PocValidationReport {
             success: false,
@@ -508,7 +520,8 @@ fn validate_foundry_poc(
             forge_command: None,
             stdout_snippet: String::new(),
             stderr_snippet: String::new(),
-            reason: "generated PoC is missing replay, protocol, or invariant assertions".to_string(),
+            reason: "generated PoC is missing replay, protocol, or invariant assertions"
+                .to_string(),
         };
     }
 
@@ -779,18 +792,22 @@ fn finding_markdown(
 
 fn campaign_summary_markdown(summary: &PromotionCampaignSummary) -> String {
     format!(
-        "# RustyFuzz Campaign Summary\n\n- campaign_id: `{}`\n- total_executions: `{}`\n- total_artifacts: `{}`\n- coverage_edges: `{}`\n- promoted_findings: `{}`\n- confirmed_findings: `{}`\n- rejected_candidates: `{}`\n- synthetic_non_production_findings: `{}`\n- highest_confidence: `{}`\n- poc_count: `{}`\n- replay_failure_count: `{}`\n- minimization_attempts: `{}`\n- minimization_reduced: `{}`\n- minimization_not_reducible: `{}`\n",
+        "# RustyFuzz Campaign Summary\n\n- campaign_id: `{}`\n- total_executions: `{}`\n- total_artifacts: `{}`\n- coverage_edges: `{}`\n- confirmed_vulnerabilities: `{}`\n- interesting_candidates: `{}`\n- promoted_findings: `{}`\n- confirmed_findings: `{}`\n- rejected_candidates: `{}`\n- unproven_candidates: `{}`\n- poc_count: `{}`\n- missing_poc_for_promoted: `{}`\n- replay_failure_count: `{}`\n- synthetic_non_production_findings: `{}`\n- highest_confidence: `{}`\n- minimization_attempts: `{}`\n- minimization_reduced: `{}`\n- minimization_not_reducible: `{}`\n\nSuccess definition: no replay-confirmed finding means no confirmed vulnerability; no passing PoC means the issue is not bounty-grade confirmed.\n",
         summary.campaign_id,
         summary.total_executions,
         summary.total_artifacts,
         summary.coverage_edges,
+        summary.confirmed_findings,
+        summary.interesting_candidates,
         summary.promoted_findings,
         summary.confirmed_findings,
         summary.rejected_candidates,
+        summary.unproven_candidates,
+        summary.poc_count,
+        summary.missing_poc_for_promoted,
+        summary.replay_failure_count,
         summary.synthetic_non_production_findings,
         summary.highest_confidence,
-        summary.poc_count,
-        summary.replay_failure_count,
         summary.minimization_attempts,
         summary.minimization_reduced,
         summary.minimization_not_reducible

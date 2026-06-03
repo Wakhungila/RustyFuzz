@@ -1,0 +1,17 @@
+id = "known-erc20-bad-mint-inflation"
+class = "erc20_mint_inflation"
+mode = "local_fixture"
+target = "0x6200000000000000000000000000000000000001"
+fixture = "benchmarks/historical/known_vulnerable/fixtures/known-erc20-bad-mint-inflation.json"
+setup_requirements = ["vulnerable ERC20", "non-minter attacker", "supply accounting"]
+expected_invariant = "unauthorized mint increases attacker balance and total supply"
+target_profile_expectation = ["erc20/token", "supply-accounting"]
+exploit_template_expectation = "erc20-mint-inflation"
+expected_exploit_shape = ["mint", "balanceOf", "totalSupply"]
+expected_selectors = ["mint(address,uint256)", "balanceOf(address)", "totalSupply()"]
+expected_attacker = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+success_criteria = ["expected_finding", "invariant_violation", "replayable_artifact", "minimized_path", "foundry_poc_generated"]
+poc_generation = "required"
+max_duration_secs = 120
+seed_hints = ["mint(address,uint256)", "0x40c10f19"]
+notes = "Known-vulnerable local validation fixture for ERC20 bad mint / supply inflation."

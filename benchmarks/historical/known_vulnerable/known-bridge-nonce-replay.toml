@@ -1,0 +1,17 @@
+id = "known-bridge-nonce-replay"
+class = "bridge_replay_finalization_bug"
+mode = "local_fixture"
+target = "0x6200000000000000000000000000000000000005"
+fixture = "benchmarks/historical/known_vulnerable/fixtures/known-bridge-nonce-replay.json"
+setup_requirements = ["bridge inbox", "message nonce storage", "already finalized message"]
+expected_invariant = "same bridge message nonce can finalize twice"
+target_profile_expectation = ["bridge/message-passing"]
+exploit_template_expectation = "bridge-nonce-replay"
+expected_exploit_shape = ["finalize", "finalize same nonce", "release funds twice"]
+expected_selectors = ["finalize(bytes32)", "claim(bytes32)", "processed(bytes32)"]
+expected_attacker = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+success_criteria = ["expected_finding", "invariant_violation", "replayable_artifact", "minimized_path", "foundry_poc_generated"]
+poc_generation = "required"
+max_duration_secs = 120
+seed_hints = ["finalize(bytes32)", "claim(bytes32)", "processed(bytes32)"]
+notes = "Known-vulnerable local validation fixture for bridge nonce replay/finalization bugs."

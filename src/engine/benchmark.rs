@@ -44,6 +44,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[serde(rename_all = "snake_case")]
 pub enum VulnerabilityClass {
     Reentrancy,
+    Erc20MintInflation,
     #[serde(alias = "share_inflation")]
     Erc4626ShareInflation,
     StaleAccounting,
@@ -112,6 +113,7 @@ fn synthetic_input(manifest: &BenchmarkManifest, fixture: &SyntheticBenchmarkFix
         .cloned()
         .or_else(|| manifest.seed_hints.first().cloned())
         .unwrap_or_else(|| match manifest.vulnerability_class {
+            VulnerabilityClass::Erc20MintInflation => "mint(address,uint256)".to_string(),
             VulnerabilityClass::Erc4626ShareInflation => "deposit(uint256,address)".to_string(),
             VulnerabilityClass::StaleAccounting => "transfer(address,uint256)".to_string(),
             VulnerabilityClass::AccessControlBypass => "upgradeTo(address)".to_string(),
@@ -169,6 +171,27 @@ fn synthetic_execution(
 
     let (selector_hint, writes, reads, output, call_success, _evidence_hint) =
         match manifest.vulnerability_class {
+            VulnerabilityClass::Erc20MintInflation => {
+                let selector = manifest
+                    .expected_selectors
+                    .iter()
+                    .find(|selector| selector.contains("mint"))
+                    .cloned()
+                    .unwrap_or_else(|| "mint(address,uint256)".to_string());
+                let writes = if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found) {
+                    4
+                } else {
+                    1
+                };
+                (
+                    selector,
+                    writes,
+                    1,
+                    Vec::new(),
+                    true,
+                    "erc20-mint".to_string(),
+                )
+            }
             VulnerabilityClass::Erc4626ShareInflation => {
                 let selector = manifest
                     .expected_selectors
@@ -442,6 +465,11 @@ fn synthetic_class_finding(
             ProtocolOraclePackKind::Governance,
             VulnType::Reentrancy,
             format!("reentrancy callback state transition | {evidence_suffix}"),
+        ),
+        VulnerabilityClass::Erc20MintInflation => (
+            ProtocolOraclePackKind::Erc20,
+            VulnType::Other("erc20 mint inflation".to_string()),
+            format!("erc20 bad mint / supply inflation | {evidence_suffix}"),
         ),
         VulnerabilityClass::Erc4626ShareInflation => (
             ProtocolOraclePackKind::Erc4626,
@@ -2239,6 +2267,11 @@ fn provider_side_historical_finding(
             VulnType::PrivilegeEscalation,
             ProtocolSeverity::High,
         ),
+        VulnerabilityClass::Erc20MintInflation => (
+            ProtocolOraclePackKind::Erc20,
+            VulnType::Other("erc20 mint inflation".to_string()),
+            ProtocolSeverity::High,
+        ),
         VulnerabilityClass::GovernanceTimelockBypass => (
             ProtocolOraclePackKind::Governance,
             VulnType::GovernanceTakeover,
@@ -2857,6 +2890,9 @@ fn validation_target_profile(
 fn target_profile_from_class(class: &VulnerabilityClass) -> Vec<String> {
     match class {
         VulnerabilityClass::Reentrancy => vec!["reentrancy".to_string()],
+        VulnerabilityClass::Erc20MintInflation => {
+            vec!["erc20/token".to_string(), "supply-accounting".to_string()]
+        }
         VulnerabilityClass::Erc4626ShareInflation | VulnerabilityClass::DonationInflationAttack => {
             vec!["erc4626".to_string(), "accounting-heavy".to_string()]
         }
@@ -2880,6 +2916,10 @@ fn target_profile_from_class(class: &VulnerabilityClass) -> Vec<String> {
 fn exploit_classes_for_vulnerability(class: &VulnerabilityClass) -> Vec<ExploitClass> {
     match class {
         VulnerabilityClass::Reentrancy => vec![ExploitClass::Reentrancy],
+        VulnerabilityClass::Erc20MintInflation => vec![
+            ExploitClass::LogicAccountingError,
+            ExploitClass::UnsafeTokenHandling,
+        ],
         VulnerabilityClass::Erc4626ShareInflation | VulnerabilityClass::DonationInflationAttack => {
             vec![
                 ExploitClass::LogicAccountingError,
@@ -2924,10 +2964,13 @@ fn exploit_classes_for_vulnerability(class: &VulnerabilityClass) -> Vec<ExploitC
 }
 
 fn is_required_criterion(manifest: &BenchmarkManifest, criterion: &SuccessCriterion) -> bool {
+    if manifest.poc_generation == PocGenerationExpectation::Required {
+        return true;
+    }
     matches!(
         criterion,
         SuccessCriterion::ReplayableArtifact | SuccessCriterion::FoundryPocGenerated
-    ) && manifest.poc_generation == PocGenerationExpectation::Required
+    )
 }
 
 fn severity_rank(severity: &ProtocolSeverity) -> u64 {
@@ -2950,6 +2993,12 @@ impl VulnerabilityClass {
                     | VulnType::ReadOnlyReentrancy
                     | VulnType::TokenCallbackReentrancy
             ),
+            VulnerabilityClass::Erc20MintInflation => {
+                text.contains("mint")
+                    || text.contains("supply")
+                    || text.contains("inflation")
+                    || all_words(&text, &["erc20", "mint"])
+            }
             VulnerabilityClass::Erc4626ShareInflation => {
                 matches!(
                     finding.vuln,
@@ -3066,6 +3115,7 @@ fn selector_from_hint(hint: &str) -> Option<[u8; 4]> {
 
 fn vulnerability_tags(class: &VulnerabilityClass) -> BTreeSet<SeedTag> {
     match class {
+        VulnerabilityClass::Erc20MintInflation => BTreeSet::from([SeedTag::Erc20]),
         VulnerabilityClass::Erc4626ShareInflation
         | VulnerabilityClass::DonationInflationAttack
         | VulnerabilityClass::RoundingPrecisionLoss => BTreeSet::from([SeedTag::Erc4626]),
@@ -3300,6 +3350,7 @@ mod tests {
     fn class_name(class: &VulnerabilityClass) -> &'static str {
         match class {
             VulnerabilityClass::Reentrancy => "reentrancy",
+            VulnerabilityClass::Erc20MintInflation => "erc20-mint-inflation",
             VulnerabilityClass::Erc4626ShareInflation => "erc4626",
             VulnerabilityClass::StaleAccounting => "stale-accounting",
             VulnerabilityClass::OracleManipulation => "oracle",

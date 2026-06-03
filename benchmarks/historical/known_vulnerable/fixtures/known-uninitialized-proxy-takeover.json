@@ -1,0 +1,9 @@
+{
+  "outcome": "found",
+  "time_to_signal_secs": 1.0,
+  "executions_to_signal": 96,
+  "replayable": true,
+  "foundry_poc_generated": true,
+  "false_positive_notes": ["known-vulnerable validation fixture"],
+  "notes": "models attacker initialize and privileged upgrade path"
+}

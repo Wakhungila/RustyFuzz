@@ -1,0 +1,9 @@
+{
+  "outcome": "found",
+  "time_to_signal_secs": 0.8,
+  "executions_to_signal": 64,
+  "replayable": true,
+  "foundry_poc_generated": true,
+  "false_positive_notes": ["known-vulnerable validation fixture"],
+  "notes": "models unauthorized ERC20 mint and total supply inflation"
+}
