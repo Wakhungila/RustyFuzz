@@ -730,7 +730,11 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     if let Some(bundle_id) = &config.mainnet_seed_bundle {
                         let status = persistent_corpus
                             .inspect_mainnet_seed_bundle(Some(bundle_id), target_contract);
-                        log_seed_bundle_status(&status, config.require_seed_bundle)
+                        log_seed_bundle_status(
+                            &status,
+                            config.require_seed_bundle,
+                            config.allow_synthetic_fallback,
+                        )
                             .map_err(|err| libafl::Error::unknown(err.to_string()))?;
                         if let SeedBundleStatus::Loaded { .. } = status {
                             let bundle = persistent_corpus
@@ -809,19 +813,26 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                                 inserted_seed_count
                             );
                         }
-                    } else {
+                    } else if config.allow_synthetic_fallback {
                         log::info!(
                             "No trusted ABI/Foundry seed source configured; starting from synthetic seed and preserving generic ABI registry for mutations"
                         );
                     }
 
                     if inserted_seed_count == 0 {
-                        log::info!(
-                            "Seed startup mode: synthetic-seed-start (fallback_allowed=true, inserted_seed_count=0)"
-                        );
-                        state
-                            .corpus_mut()
-                            .add(Testcase::new(seed_input(target_contract, fuzzer_address)))?;
+                        if config.allow_synthetic_fallback {
+                            log::info!(
+                                "Seed startup mode: synthetic-seed-start (fallback_allowed=true, inserted_seed_count=0)"
+                            );
+                            state
+                                .corpus_mut()
+                                .add(Testcase::new(seed_input(target_contract, fuzzer_address)))?;
+                        } else {
+                            return Err(libafl::Error::unknown(
+                                "no trusted seed inputs available and synthetic fallback is disabled; ingest a non-empty mainnet seed bundle, provide --abi/Foundry seeds, or pass --allow-synthetic-fallback for smoke testing"
+                                    .to_string(),
+                            ));
+                        }
                     }
                 }
                 log_worker_corpus_sync(
@@ -1411,7 +1422,11 @@ async fn run_single_process_campaign(
         if let Some(bundle_id) = &config.mainnet_seed_bundle {
             let status =
                 persistent_corpus.inspect_mainnet_seed_bundle(Some(bundle_id), target_contract);
-            log_seed_bundle_status(&status, config.require_seed_bundle)?;
+            log_seed_bundle_status(
+                &status,
+                config.require_seed_bundle,
+                config.allow_synthetic_fallback,
+            )?;
             if let SeedBundleStatus::Loaded { .. } = status {
                 let bundle = persistent_corpus.load_mainnet_seed_bundle(bundle_id)?;
                 {
@@ -1517,20 +1532,26 @@ async fn run_single_process_campaign(
                     inserted_seed_count
                 );
             }
-        } else {
+        } else if config.allow_synthetic_fallback {
             log::info!(
                 "No trusted ABI/Foundry seed source configured; starting from synthetic seed and preserving generic ABI registry for mutations"
             );
         }
 
         if inserted_seed_count == 0 {
-            log::info!(
-                "Seed startup mode: synthetic-seed-start (fallback_allowed=true, inserted_seed_count=0)"
-            );
-            state.corpus_mut().add(Testcase::new(seed_input(
-                target_contract,
-                Address::repeat_byte(0x13),
-            )))?;
+            if config.allow_synthetic_fallback {
+                log::info!(
+                    "Seed startup mode: synthetic-seed-start (fallback_allowed=true, inserted_seed_count=0)"
+                );
+                state.corpus_mut().add(Testcase::new(seed_input(
+                    target_contract,
+                    Address::repeat_byte(0x13),
+                )))?;
+            } else {
+                anyhow::bail!(
+                    "no trusted seed inputs available and synthetic fallback is disabled; ingest a non-empty mainnet seed bundle, provide --abi/Foundry seeds, or pass --allow-synthetic-fallback for smoke testing"
+                );
+            }
         }
     }
     log_worker_corpus_sync(
@@ -1906,10 +1927,22 @@ fn discover_target_bytecode_analysis(
     Some(analyze_bytecode(code.original_byte_slice()))
 }
 
-fn log_seed_bundle_status(status: &SeedBundleStatus, required: bool) -> anyhow::Result<()> {
+fn log_seed_bundle_status(
+    status: &SeedBundleStatus,
+    required: bool,
+    allow_synthetic_fallback: bool,
+) -> anyhow::Result<()> {
     match status {
         SeedBundleStatus::Disabled => {
-            log::info!("Mainnet seed bundle: disabled; seed startup may use synthetic fallback");
+            if allow_synthetic_fallback {
+                log::info!(
+                    "Mainnet seed bundle: disabled; seed startup may use synthetic fallback"
+                );
+            } else {
+                log::info!(
+                    "Mainnet seed bundle: disabled; synthetic fallback is disabled, so another trusted seed source is required"
+                );
+            }
         }
         SeedBundleStatus::Loaded {
             bundle_id,
@@ -1934,9 +1967,15 @@ fn log_seed_bundle_status(status: &SeedBundleStatus, required: bool) -> anyhow::
             if required {
                 anyhow::bail!("{msg}; require_seed_bundle=true");
             }
-            log::warn!(
-                "{msg}; continuing with synthetic-seed-start because require_seed_bundle=false"
-            );
+            if allow_synthetic_fallback {
+                log::warn!(
+                    "{msg}; continuing with synthetic-seed-start because require_seed_bundle=false"
+                );
+            } else {
+                log::warn!(
+                    "{msg}; synthetic fallback is disabled, so another trusted seed source is required"
+                );
+            }
         }
         SeedBundleStatus::Empty {
             bundle_id,
@@ -1952,9 +1991,15 @@ fn log_seed_bundle_status(status: &SeedBundleStatus, required: bool) -> anyhow::
             if required {
                 anyhow::bail!("{msg}; require_seed_bundle=true");
             }
-            log::warn!(
-                "{msg}; continuing with synthetic-seed-start because require_seed_bundle=false"
-            );
+            if allow_synthetic_fallback {
+                log::warn!(
+                    "{msg}; continuing with synthetic-seed-start because require_seed_bundle=false"
+                );
+            } else {
+                log::warn!(
+                    "{msg}; synthetic fallback is disabled, so another trusted seed source is required"
+                );
+            }
         }
         SeedBundleStatus::TargetMismatch {
             bundle_id,
@@ -1990,9 +2035,15 @@ fn log_seed_bundle_status(status: &SeedBundleStatus, required: bool) -> anyhow::
             if required {
                 anyhow::bail!("{msg}; require_seed_bundle=true");
             }
-            log::warn!(
-                "{msg}; continuing with synthetic-seed-start because require_seed_bundle=false"
-            );
+            if allow_synthetic_fallback {
+                log::warn!(
+                    "{msg}; continuing with synthetic-seed-start because require_seed_bundle=false"
+                );
+            } else {
+                log::warn!(
+                    "{msg}; synthetic fallback is disabled, so another trusted seed source is required"
+                );
+            }
         }
     }
     Ok(())
@@ -2743,8 +2794,9 @@ mod tests {
             path: std::path::PathBuf::from("corpus/mainnet_seeds/bundle/manifest.json"),
         };
 
-        assert!(log_seed_bundle_status(&status, false).is_ok());
-        assert!(log_seed_bundle_status(&status, true).is_err());
+        assert!(log_seed_bundle_status(&status, false, true).is_ok());
+        assert!(log_seed_bundle_status(&status, false, false).is_ok());
+        assert!(log_seed_bundle_status(&status, true, false).is_err());
     }
 
     #[test]
