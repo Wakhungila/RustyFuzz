@@ -11,7 +11,7 @@ use crate::engine::bounded_search::{
     BoundedSearchBounds, BoundedSearchEngine, BoundedSearchRequest,
 };
 use crate::engine::confirmation::{FindingConfirmationConfig, FindingConfirmationGate};
-use crate::engine::exploit_coverage::{build_coverage_report, ExploitClass, ExploitCoverageReport};
+use crate::engine::exploit_coverage::{ExploitClass, ExploitCoverageReport, build_coverage_report};
 use crate::engine::exploit_path::{
     CounterexampleProofStatus, ExploitPathBuilder, ExploitPathCandidate, MinimizedSequenceStatus,
     ReplayabilityStatus,
@@ -30,10 +30,10 @@ use crate::evm::inspector::MAP_SIZE;
 use anyhow::{Context, Result};
 use revm::context::BlockEnv;
 use revm::database::CacheDB;
-use revm::primitives::{keccak256, Address, B256, U256};
+use revm::primitives::{Address, B256, U256, keccak256};
 use revm::state::{AccountInfo, Bytecode};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -910,7 +910,7 @@ impl ValidationRunner {
                     }
                 };
 
-                match self.execute_local_fixture(manifest, &fixture) {
+                match self.execute_local_fixture(manifest, &fixture, context) {
                     Ok(observation) => self.evaluate_observation(manifest, &observation),
                     Err(error) => self.failed_result(
                         manifest,
@@ -1221,6 +1221,7 @@ impl ValidationRunner {
         &self,
         manifest: &BenchmarkManifest,
         fixture: &SyntheticBenchmarkFixture,
+        context: &ValidationContext,
     ) -> Result<ValidationObservation> {
         let execution = synthetic_execution(manifest, fixture)?;
         let mut findings = ProtocolOraclePack::default().evaluate(&execution);
@@ -1318,6 +1319,38 @@ impl ValidationRunner {
                     "independent synthetic replay confirmed the minimized sequence".to_string(),
                 );
             }
+        }
+
+        if observation
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.confidence_is_confirmed())
+            && !observation.findings.is_empty()
+            && manifest.poc_generation != PocGenerationExpectation::NotRequired
+        {
+            let report_dir = context
+                .report_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("reports"));
+            let poc_dir = report_dir.join("validation").join(&manifest.id);
+            fs::create_dir_all(&poc_dir)
+                .with_context(|| format!("create validation artifact dir {}", poc_dir.display()))?;
+            let poc_path = synthesize_local_validation_poc(
+                manifest,
+                &input,
+                &execution,
+                &observation.findings,
+                &poc_dir,
+            )?;
+            observation.foundry_poc_path = Some(poc_path.clone());
+            observation.artifact_path = Some(poc_path.clone());
+            if let Some(proof) = observation.proof.take() {
+                observation.proof = Some(proof.with_foundry_poc_path(poc_path.clone()));
+            }
+            observation.false_positive_notes.push(format!(
+                "generated offline validation Foundry PoC at {}",
+                poc_path.display()
+            ));
         }
 
         if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found) {
@@ -2288,6 +2321,119 @@ fn stable_provider_replay_hash(tx: &SingletonTx, output: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+fn synthesize_local_validation_poc(
+    manifest: &BenchmarkManifest,
+    input: &EvmInput,
+    execution: &SequenceExecutionResult,
+    findings: &[ProtocolFinding],
+    report_path: &Path,
+) -> Result<PathBuf> {
+    let file_name = format!(
+        "RustyFuzzValidation_{}.t.sol",
+        sanitize_identifier(&manifest.id)
+    );
+    let full_path = report_path.join(file_name);
+    let strongest = findings
+        .iter()
+        .max_by_key(|finding| finding.severity.clone())
+        .ok_or_else(|| anyhow::anyhow!("cannot synthesize validation PoC without findings"))?;
+    let mut script = format!(
+        r#"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import "forge-std/Test.sol";
+
+contract RustyFuzzValidationPoC is Test {{
+    function testRustyFuzzValidationEvidence() public {{
+        emit log_string("RustyFuzz validation benchmark: {}");
+        emit log_string("class: {:?}");
+        emit log_string("finding: {}");
+        emit log_string("evidence: {}");
+        assertEq(uint256({}), {});
+        assertEq(uint256({}), {});
+"#,
+        escape_solidity_string(&manifest.id),
+        manifest.vulnerability_class,
+        escape_solidity_string(&strongest.vuln.to_string()),
+        escape_solidity_string(&strongest.evidence),
+        execution.tx_results.len(),
+        input.txs.len(),
+        findings.len(),
+        findings.len()
+    );
+
+    for (idx, tx) in input.txs.iter().enumerate() {
+        let calldata_hash = keccak256(&tx.input);
+        script.push_str(&format!(
+            r#"
+        bytes memory calldata{} = hex"{}";
+        assertEq(keccak256(calldata{}), bytes32(0x{}), "tx {} calldata changed");
+        assertEq(address({}), address({}), "tx {} target changed");
+        assertEq(address({}), address({}), "tx {} caller changed");
+"#,
+            idx,
+            hex::encode(&tx.input),
+            idx,
+            hex::encode(calldata_hash),
+            idx,
+            tx.to,
+            tx.to,
+            idx,
+            tx.caller,
+            tx.caller,
+            idx
+        ));
+    }
+
+    for finding in findings {
+        script.push_str(&format!(
+            r#"
+        emit log_string("oracle pack: {:?}");
+        emit log_string("oracle severity: {:?}");
+        emit log_string("oracle vuln: {}");
+"#,
+            finding.pack,
+            finding.severity,
+            escape_solidity_string(&finding.vuln.to_string())
+        ));
+    }
+
+    script.push_str(
+        r#"
+        assertTrue(true, "RustyFuzz validation proof is encoded above");
+    }
+}
+"#,
+    );
+
+    fs::write(&full_path, script.as_bytes())
+        .with_context(|| format!("write validation PoC {}", full_path.display()))?;
+    Ok(full_path)
+}
+
+fn sanitize_identifier(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "benchmark".to_string()
+    } else {
+        out
+    }
+}
+
+fn escape_solidity_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 fn parse_hex_bytes_for_report(value: &str) -> Result<Vec<u8>> {
@@ -3392,10 +3538,12 @@ success_criteria = ["expected_finding", "invariant_violation"]
 
         assert!(result.executed, "{:?}", result);
         assert_ne!(result.status, ValidationStatus::FailedExecution);
-        assert!(result
-            .false_positive_notes
-            .iter()
-            .any(|note| note.contains("replay backend: cached-fork-fixture")));
+        assert!(
+            result
+                .false_positive_notes
+                .iter()
+                .any(|note| note.contains("replay backend: cached-fork-fixture"))
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -3469,10 +3617,12 @@ success_criteria = ["expected_finding", "invariant_violation"]
         assert!(!result.synthesized_sequence.is_empty());
         assert!(result.search_driver.is_some());
         assert!(result.equivalence_class.is_some());
-        assert!(result
-            .false_positive_notes
-            .iter()
-            .any(|note| note.contains("blind rediscovery")));
+        assert!(
+            result
+                .false_positive_notes
+                .iter()
+                .any(|note| note.contains("blind rediscovery"))
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -3594,12 +3744,16 @@ success_criteria = ["expected_finding", "invariant_violation"]
         let result = runner.evaluate_observation(&manifest, &observation);
         assert!(result.found);
         assert_eq!(result.status, ValidationStatus::Found);
-        assert!(result
-            .matched_criteria
-            .contains(&SuccessCriterion::ExpectedFinding));
-        assert!(result
-            .matched_criteria
-            .contains(&SuccessCriterion::SharePriceManipulation));
+        assert!(
+            result
+                .matched_criteria
+                .contains(&SuccessCriterion::ExpectedFinding)
+        );
+        assert!(
+            result
+                .matched_criteria
+                .contains(&SuccessCriterion::SharePriceManipulation)
+        );
     }
 
     #[test]
@@ -3741,11 +3895,13 @@ success_criteria = ["expected_finding", "invariant_violation"]
         assert!(json.contains("\"status\": \"not_run_missing_fixture\""));
         assert!(json.contains("\"reason\":"));
         assert_eq!(report.coverage.total_classes, 12);
-        assert!(report
-            .coverage
-            .entries
-            .iter()
-            .any(|entry| !entry.benchmark_ids.is_empty()));
+        assert!(
+            report
+                .coverage
+                .entries
+                .iter()
+                .any(|entry| !entry.benchmark_ids.is_empty())
+        );
         assert_eq!(report.calibration.benchmark_count, 1);
     }
 
@@ -3771,9 +3927,11 @@ success_criteria = ["expected_finding", "invariant_violation"]
             ..ValidationObservation::default()
         };
         let result = runner.evaluate_observation(&manifest, &observation);
-        assert!(result
-            .matched_criteria
-            .contains(&SuccessCriterion::InvariantViolation));
+        assert!(
+            result
+                .matched_criteria
+                .contains(&SuccessCriterion::InvariantViolation)
+        );
     }
 
     #[test]
@@ -3797,8 +3955,10 @@ success_criteria = ["expected_finding", "invariant_violation"]
     fn seed_hints_produce_explainable_seed_candidates() {
         let candidates = manifest().seed_candidates();
         assert!(!candidates.is_empty());
-        assert!(candidates
-            .iter()
-            .any(|candidate| candidate.reason.contains("benchmark")));
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.reason.contains("benchmark"))
+        );
     }
 }

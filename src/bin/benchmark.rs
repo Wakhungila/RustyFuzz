@@ -1,7 +1,7 @@
 use clap::Parser;
 use revm::primitives::Address;
 use rusty_fuzz::config::HardenedDefiConfig;
-use rusty_fuzz::engine::fuzz_engine::{run_fuzz_campaign, Config as FuzzConfig};
+use rusty_fuzz::engine::fuzz_engine::{Config as FuzzConfig, run_fuzz_campaign};
 use rusty_fuzz::engine::promotion::{PromotionCampaignSummary, PromotionConfig};
 use rusty_fuzz::evm::corpus::CampaignArtifactRecord;
 use serde::Serialize;
@@ -162,12 +162,7 @@ async fn run_benchmark_contract(
     idx: usize,
     artifact: &ContractArtifact,
 ) -> anyhow::Result<()> {
-    println!(
-        "[child {}/{}] running {}",
-        idx + 1,
-        total,
-        artifact.name
-    );
+    println!("[child {}/{}] running {}", idx + 1, total, artifact.name);
     std::io::stdout().flush()?;
 
     let target = benchmark_address(idx);
@@ -406,12 +401,14 @@ struct CampaignMetrics {
     poc_count: u64,
 }
 
-fn collect_campaign_metrics(corpus_dir: &Path, report_dir: &Path) -> anyhow::Result<CampaignMetrics> {
+fn collect_campaign_metrics(
+    corpus_dir: &Path,
+    report_dir: &Path,
+) -> anyhow::Result<CampaignMetrics> {
     let mut metrics = CampaignMetrics::default();
     let summary_path = report_dir.join("campaign_summary.json");
     if summary_path.exists() {
-        let summary: PromotionCampaignSummary =
-            serde_json::from_slice(&fs::read(&summary_path)?)?;
+        let summary: PromotionCampaignSummary = serde_json::from_slice(&fs::read(&summary_path)?)?;
         metrics.executions = summary.total_executions;
         metrics.coverage_edges = summary.coverage_edges as usize;
         metrics.promoted_findings = summary.promoted_findings;
@@ -455,7 +452,9 @@ fn collect_campaign_metrics(corpus_dir: &Path, report_dir: &Path) -> anyhow::Res
 }
 
 fn print_markdown_table(rows: &[BenchmarkRow]) {
-    println!("| contract name | bugs found | confirmed | PoCs | coverage edges | executions | exec/sec | crashes | timed out | first signal <= | replay FP rate | time |");
+    println!(
+        "| contract name | bugs found | confirmed | PoCs | coverage edges | executions | exec/sec | crashes | timed out | first signal <= | replay FP rate | time |"
+    );
     println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     for row in rows {
         let first_signal = row
@@ -521,7 +520,11 @@ fn write_reports(args: &Args, rows: &[BenchmarkRow]) -> anyhow::Result<()> {
     }
     fs::write(&markdown_path, markdown)?;
 
-    println!("Benchmark reports written: {}, {}", markdown_path.display(), json_path.display());
+    println!(
+        "Benchmark reports written: {}, {}",
+        markdown_path.display(),
+        json_path.display()
+    );
     std::io::stdout().flush()?;
     Ok(())
 }
