@@ -6,7 +6,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::eth::{BlockTransactions, Filter};
 use anyhow::Context;
 use revm::database_interface::DatabaseRef;
-use revm::primitives::{keccak256, Address, B256, U256};
+use revm::primitives::{Address, B256, U256, keccak256};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 const DEFAULT_SEARCH_DEPTH: u64 = 100;
 const DEFAULT_MAX_RETRIES: usize = 3;
 const DEFAULT_RETRY_BACKOFF_MS: u64 = 250;
+const LOG_SCAN_CHUNK_BLOCKS: u64 = 10;
 const DIRECT_MATCH: &str = "direct";
 const ADDRESS_HINT_MATCH: &str = "address-hint";
 
@@ -221,16 +222,12 @@ impl<P: Provider> SeedIngester<P> {
 
         match config.scan_mode {
             SeedScanMode::BlockScan | SeedScanMode::DebugTrace => {
-                self.ingest_block_scan(
-                    config,
-                    start_block,
-                    &mut candidates,
-                    &mut last_fetch,
-                )
-                .await?;
+                self.ingest_block_scan(config, start_block, &mut candidates, &mut last_fetch)
+                    .await?;
             }
             SeedScanMode::Logs => {
-                self.ingest_logs_scan(config, start_block, &mut candidates).await?;
+                self.ingest_logs_scan(config, start_block, &mut candidates)
+                    .await?;
             }
         }
 
@@ -352,50 +349,66 @@ impl<P: Provider> SeedIngester<P> {
         candidates: &mut Vec<MainnetSeed>,
     ) -> anyhow::Result<()> {
         let end_block = start_block.saturating_sub(config.search_depth.saturating_sub(1));
-        let filter = Filter::new()
-            .from_block(end_block)
-            .to_block(start_block)
-            .address(config.target);
-        let logs = self
-            .provider
-            .get_logs(&filter)
-            .await
-            .context("failed to fetch target logs with eth_getLogs")?;
-        for log in logs {
+        let mut chunk_to = start_block;
+        let mut last_fetch = None::<Instant>;
+        while chunk_to >= end_block {
             if candidates.len() >= config.max_seeds {
                 break;
             }
-            let Some(hash) = log.transaction_hash else {
-                continue;
-            };
-            let Some(tx) = self.provider.get_transaction_by_hash(hash).await? else {
-                continue;
-            };
-            let envelope = &*tx.inner;
-            let Some(to) = envelope.to() else {
-                continue;
-            };
-            let input_bytes = envelope.input().to_vec();
-            let Some(match_kind) = seed_match_kind(
-                to,
-                config.target,
-                &input_bytes,
-                true,
-            ) else {
-                continue;
-            };
-            candidates.push(seed_from_parts(
-                config,
-                log.block_number.unwrap_or(start_block),
-                start_block.saturating_sub(log.block_number.unwrap_or(start_block)),
-                log.transaction_index.unwrap_or(0) as usize,
-                Address::from(*tx.inner.signer()),
-                to,
-                envelope.value(),
-                input_bytes,
-                match_kind,
-                "rpc-log-scan",
-            ));
+            let chunk_from = chunk_to
+                .saturating_sub(LOG_SCAN_CHUNK_BLOCKS.saturating_sub(1))
+                .max(end_block);
+            rate_limit_block_fetch(config, &mut last_fetch).await;
+            let filter = Filter::new()
+                .from_block(chunk_from)
+                .to_block(chunk_to)
+                .address(config.target);
+            let logs = self
+                .provider
+                .get_logs(&filter)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to fetch target logs with eth_getLogs for block range [{chunk_from}, {chunk_to}]"
+                    )
+                })?;
+            write_seed_scan_cursor(config, chunk_from)?;
+            for log in logs {
+                if candidates.len() >= config.max_seeds {
+                    break;
+                }
+                let Some(hash) = log.transaction_hash else {
+                    continue;
+                };
+                let Some(tx) = self.provider.get_transaction_by_hash(hash).await? else {
+                    continue;
+                };
+                let envelope = &*tx.inner;
+                let Some(to) = envelope.to() else {
+                    continue;
+                };
+                let input_bytes = envelope.input().to_vec();
+                let Some(match_kind) = seed_match_kind(to, config.target, &input_bytes, true)
+                else {
+                    continue;
+                };
+                candidates.push(seed_from_parts(
+                    config,
+                    log.block_number.unwrap_or(chunk_to),
+                    start_block.saturating_sub(log.block_number.unwrap_or(chunk_to)),
+                    log.transaction_index.unwrap_or(0) as usize,
+                    Address::from(*tx.inner.signer()),
+                    to,
+                    envelope.value(),
+                    input_bytes,
+                    match_kind,
+                    "rpc-log-scan",
+                ));
+            }
+            if chunk_from == 0 {
+                break;
+            }
+            chunk_to = chunk_from - 1;
         }
         Ok(())
     }
