@@ -464,12 +464,10 @@ impl PersistentCorpus {
     }
 
     pub fn load_mainnet_seed_bundle(&self, id: &str) -> anyhow::Result<MainnetSeedBundle> {
-        let bytes = fs::read(
-            self.root
-                .join("mainnet_seeds")
-                .join(id)
-                .join("manifest.json"),
-        )?;
+        let path = self
+            .resolve_mainnet_seed_bundle_manifest_path(id)
+            .unwrap_or_else(|| self.mainnet_seed_bundle_manifest_path(id));
+        let bytes = fs::read(path)?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 
@@ -480,6 +478,23 @@ impl PersistentCorpus {
             .join("manifest.json")
     }
 
+    fn resolve_mainnet_seed_bundle_manifest_path(&self, id: &str) -> Option<PathBuf> {
+        let local = self.mainnet_seed_bundle_manifest_path(id);
+        if local.exists() {
+            return Some(local);
+        }
+
+        let global = self
+            .root
+            .parent()
+            .map(|parent| parent.join("mainnet_seeds").join(id).join("manifest.json"))?;
+        if global != local && global.exists() {
+            Some(global)
+        } else {
+            None
+        }
+    }
+
     pub fn inspect_mainnet_seed_bundle(
         &self,
         id: Option<&str>,
@@ -488,13 +503,13 @@ impl PersistentCorpus {
         let Some(id) = id else {
             return SeedBundleStatus::Disabled;
         };
-        let path = self.mainnet_seed_bundle_manifest_path(id);
-        if !path.exists() {
+        let local_path = self.mainnet_seed_bundle_manifest_path(id);
+        let Some(path) = self.resolve_mainnet_seed_bundle_manifest_path(id) else {
             return SeedBundleStatus::Missing {
                 bundle_id: id.to_string(),
-                path,
+                path: local_path,
             };
-        }
+        };
         match self.load_mainnet_seed_bundle(id) {
             Ok(bundle) if bundle.target != campaign_target => SeedBundleStatus::TargetMismatch {
                 bundle_id: id.to_string(),
@@ -1136,6 +1151,29 @@ mod artifact_tests {
             corpus.inspect_mainnet_seed_bundle(Some("mismatch"), target),
             SeedBundleStatus::TargetMismatch { .. }
         ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn campaign_corpus_falls_back_to_global_seed_bundle() {
+        let root = temp_corpus_root("seed-bundle-global-fallback");
+        let global = PersistentCorpus::new(&root).expect("global corpus");
+        let target = Address::repeat_byte(0xaa);
+        global
+            .persist_mainnet_seed_bundle("bundle", &seed_bundle(target, vec![seed(target)]))
+            .expect("persist global bundle");
+
+        let campaign = PersistentCorpus::new(root.join("campaign-a")).expect("campaign corpus");
+        let status = campaign.inspect_mainnet_seed_bundle(Some("bundle"), target);
+        assert!(matches!(
+            status,
+            SeedBundleStatus::Loaded { seed_count: 1, .. }
+        ));
+        let bundle = campaign
+            .load_mainnet_seed_bundle("bundle")
+            .expect("load global bundle through campaign corpus");
+        assert_eq!(bundle.seeds.len(), 1);
 
         let _ = std::fs::remove_dir_all(root);
     }

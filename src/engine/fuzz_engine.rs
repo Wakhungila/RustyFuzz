@@ -3,21 +3,21 @@ use crate::common::types::{
     ChainState, EvmInput, ExecutionStatus, SequenceExecutionResult, SingletonTx,
 };
 use crate::config::HardenedDefiConfig;
-use crate::engine::abi_ingest::{ingest_abi_file, merge_abi_registry, AbiIngestReport};
+use crate::engine::abi_ingest::{AbiIngestReport, ingest_abi_file, merge_abi_registry};
 use crate::engine::actors::{ActorModel, ActorModelConfig, ActorSet};
 use crate::engine::bounded_search::{
     BoundedSearchBounds, BoundedSearchEngine, BoundedSearchRequest,
 };
+use crate::engine::bytecode_analysis::{BytecodeAnalysisReport, analyze_bytecode};
 use crate::engine::concolic::{ConcolicHint, ConcolicHintStats, ConcolicSolver, ConcolicStrategy};
-use crate::engine::bytecode_analysis::{analyze_bytecode, BytecodeAnalysisReport};
 use crate::engine::dependency::generate_flow_template_inputs;
 use crate::engine::economic_delta::{EconomicDeltaEngine, EconomicDeltaReport};
 use crate::engine::exploit_path::ExploitPathBuilder;
 use crate::engine::foundry_ingest::FoundryHarnessManifest;
 use crate::engine::invariant_manifest::TargetInvariantManifest;
 use crate::engine::promotion::{
-    promote_finding_artifact, write_campaign_summary, PromotionCampaignStats, PromotionConfig,
-    PromotionRequest,
+    PromotionCampaignStats, PromotionConfig, PromotionRequest, promote_finding_artifact,
+    write_campaign_summary,
 };
 use crate::engine::protocol_model::CounterexampleSearchEngine;
 use crate::engine::scheduler::RustyFuzzScheduler;
@@ -38,7 +38,7 @@ use crate::evm::snapshot::new_evm_snapshot;
 
 use libafl::corpus::{Corpus, Testcase};
 use libafl::events::{
-    llmp::LlmpRestartingEventManager, EventRestarter, NopEventManager, SendExiting,
+    EventRestarter, NopEventManager, SendExiting, llmp::LlmpRestartingEventManager,
 };
 use libafl::state::HasCorpus;
 use parking_lot::{Mutex, RwLock};
@@ -125,12 +125,7 @@ impl CampaignBudget {
             }
             if self
                 .reserved_execs
-                .compare_exchange_weak(
-                    current,
-                    current + 1,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange_weak(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
                 return true;
@@ -145,8 +140,13 @@ impl CampaignBudget {
                 .is_some_and(|max_execs| self.reserved_execs.load(Ordering::Relaxed) >= max_execs)
     }
 
+    fn reserved(&self) -> u64 {
+        self.reserved_execs.load(Ordering::Relaxed)
+    }
+
     fn time_exhausted(&self) -> bool {
-        self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
     }
 }
 
@@ -255,6 +255,14 @@ impl CampaignTelemetry {
     fn coverage_edges(&self) -> u64 {
         self.max_coverage_edges.load(Ordering::Relaxed)
     }
+
+    fn executions(&self) -> u64 {
+        self.executions.load(Ordering::Relaxed)
+    }
+
+    fn artifacts(&self) -> u64 {
+        self.artifacts.load(Ordering::Relaxed)
+    }
 }
 
 // LibAFL 0.15.4 imports.
@@ -263,8 +271,8 @@ use libafl::prelude::{
     EventConfig, ExitKind, Fuzzer, InMemoryCorpus, InProcessExecutor, Launcher, SimpleMonitor,
     StdFuzzer, StdMapObserver, StdMutationalStage, StdState,
 };
-use libafl_bolts::prelude::*;
 use libafl_bolts::ownedref::OwnedMutSlice;
+use libafl_bolts::prelude::*;
 use libafl_bolts::shmem::{ShMemProvider, StdShMem, StdShMemProvider};
 use libafl_bolts::tuples::tuple_list;
 
@@ -277,6 +285,27 @@ const STATE_NOVELTY_MAP_SLOTS: usize = 2_048;
 const CAMPAIGN_SCORE_MAP_SLOTS: usize = 1_024;
 const CAMPAIGN_TELEMETRY_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn log_bounded_campaign_progress(
+    label: &str,
+    last_report: &mut Instant,
+    budget: &CampaignBudget,
+    telemetry: &CampaignTelemetry,
+) {
+    if last_report.elapsed() < CAMPAIGN_TELEMETRY_INTERVAL {
+        return;
+    }
+    log::info!(
+        "Hard-bounded campaign progress: mode={}, reserved_execs={}, completed_execs={}, max_execs={:?}, artifacts={}, coverage_edges={}",
+        label,
+        budget.reserved(),
+        telemetry.executions(),
+        budget.max_execs,
+        telemetry.artifacts(),
+        telemetry.coverage_edges()
+    );
+    *last_report = Instant::now();
+}
 
 #[derive(Clone)]
 pub struct Config {
@@ -448,14 +477,38 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
     if !bytecode_selectors.is_empty() {
         log::info!(
             "Bytecode analysis: code_len={}, push4_selectors={}, dispatch_selectors={}, known_selectors={}, proxy_patterns={}, risk_flags={}, profile={:?}, confidence={}",
-            bytecode_analysis.as_ref().map(|analysis| analysis.code_len).unwrap_or_default(),
-            bytecode_analysis.as_ref().map(|analysis| analysis.push4_selectors.len()).unwrap_or_default(),
-            bytecode_analysis.as_ref().map(|analysis| analysis.dispatch_selectors.len()).unwrap_or_default(),
-            bytecode_analysis.as_ref().map(|analysis| analysis.known_selectors.len()).unwrap_or_default(),
-            bytecode_analysis.as_ref().map(|analysis| analysis.proxy_patterns.len()).unwrap_or_default(),
-            bytecode_analysis.as_ref().map(|analysis| analysis.risk_flags.len()).unwrap_or_default(),
-            bytecode_analysis.as_ref().map(|analysis| analysis.target_profile.protocol_types.clone()).unwrap_or_default(),
-            bytecode_analysis.as_ref().map(|analysis| analysis.target_profile.confidence).unwrap_or_default()
+            bytecode_analysis
+                .as_ref()
+                .map(|analysis| analysis.code_len)
+                .unwrap_or_default(),
+            bytecode_analysis
+                .as_ref()
+                .map(|analysis| analysis.push4_selectors.len())
+                .unwrap_or_default(),
+            bytecode_analysis
+                .as_ref()
+                .map(|analysis| analysis.dispatch_selectors.len())
+                .unwrap_or_default(),
+            bytecode_analysis
+                .as_ref()
+                .map(|analysis| analysis.known_selectors.len())
+                .unwrap_or_default(),
+            bytecode_analysis
+                .as_ref()
+                .map(|analysis| analysis.proxy_patterns.len())
+                .unwrap_or_default(),
+            bytecode_analysis
+                .as_ref()
+                .map(|analysis| analysis.risk_flags.len())
+                .unwrap_or_default(),
+            bytecode_analysis
+                .as_ref()
+                .map(|analysis| analysis.target_profile.protocol_types.clone())
+                .unwrap_or_default(),
+            bytecode_analysis
+                .as_ref()
+                .map(|analysis| analysis.target_profile.confidence)
+                .unwrap_or_default()
         );
     }
     let launcher_fallback_bytecode_selectors = bytecode_selectors.clone();
@@ -1125,9 +1178,16 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                         config.duration_secs,
                         budget.max_execs
                     );
+                    let mut bounded_progress_report = Instant::now();
                     while !budget.exhausted() {
                         let _ =
                             fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
+                        log_bounded_campaign_progress(
+                            "brokered",
+                            &mut bounded_progress_report,
+                            &budget,
+                            &telemetry,
+                        );
                     }
                     manager.on_restart(&mut state)?;
                     manager.on_shutdown()?;
@@ -1473,7 +1533,12 @@ async fn run_single_process_campaign(
             )))?;
         }
     }
-    log_worker_corpus_sync(core_id, state.corpus().count(), &config.corpus_dir, "single");
+    log_worker_corpus_sync(
+        core_id,
+        state.corpus().count(),
+        &config.corpus_dir,
+        "single",
+    );
 
     let concolic_hints = Arc::new(Mutex::new(Vec::new()));
     let mutator = EvmMutator::with_concolic_hints_and_stats(
@@ -1495,11 +1560,14 @@ async fn run_single_process_campaign(
     let mut shmem_provider = StdShMemProvider::new()?;
     let mut shmem = shmem_provider.new_shmem(MAP_SIZE)?;
     let coverage_map_ptr = shmem.as_mut_ptr();
-    let observer = StdMapObserver::from_mut_slice(
-        "edges",
-        unsafe { OwnedMutSlice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE) },
-    );
-    let budget = Arc::new(CampaignBudget::new(config.max_execs, config.duration_secs, 1));
+    let observer = StdMapObserver::from_mut_slice("edges", unsafe {
+        OwnedMutSlice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE)
+    });
+    let budget = Arc::new(CampaignBudget::new(
+        config.max_execs,
+        config.duration_secs,
+        1,
+    ));
 
     let mut harness = |input: &EvmInput| {
         if !budget.reserve_execution() {
@@ -1751,8 +1819,15 @@ async fn run_single_process_campaign(
             config.max_execs,
             config.duration_secs
         );
+        let mut bounded_progress_report = Instant::now();
         while !budget.exhausted() {
             let _ = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
+            log_bounded_campaign_progress(
+                "single",
+                &mut bounded_progress_report,
+                &budget,
+                &telemetry,
+            );
         }
     } else {
         fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
@@ -2080,18 +2155,10 @@ fn concolic_hint_priority(
     if oracle_adjacent_pc(hint.pc, waypoints) {
         priority = priority.saturating_sub(500);
     }
-    (
-        priority,
-        hint.tx_index,
-        hint.calldata_offset,
-        hint.pc,
-    )
+    (priority, hint.tx_index, hint.calldata_offset, hint.pc)
 }
 
-fn branch_distance_priority(
-    pc: usize,
-    waypoints: &[crate::common::types::Waypoint],
-) -> u64 {
+fn branch_distance_priority(pc: usize, waypoints: &[crate::common::types::Waypoint]) -> u64 {
     waypoints
         .iter()
         .filter_map(|waypoint| match waypoint {
@@ -2100,9 +2167,11 @@ fn branch_distance_priority(
                 branch_distance,
                 ..
             } if *cmp_pc == pc => branch_distance.map(|distance| distance.saturating_to::<u64>()),
-            crate::common::types::Waypoint::BranchPath { pc: branch_pc, constraint, .. }
-                if *branch_pc == pc =>
-            {
+            crate::common::types::Waypoint::BranchPath {
+                pc: branch_pc,
+                constraint,
+                ..
+            } if *branch_pc == pc => {
                 if let crate::common::types::Waypoint::Comparison {
                     branch_distance, ..
                 } = constraint.as_ref()
@@ -2126,7 +2195,9 @@ fn oracle_adjacent_pc(pc: usize, waypoints: &[crate::common::types::Waypoint]) -
             | crate::common::types::Waypoint::StorageWrite { pc, .. }
             | crate::common::types::Waypoint::TransientStorageRead { pc, .. }
             | crate::common::types::Waypoint::TransientStorageWrite { pc, .. } => Some(*pc),
-            crate::common::types::Waypoint::Dataflow { influenced: true, .. } => Some(pc),
+            crate::common::types::Waypoint::Dataflow {
+                influenced: true, ..
+            } => Some(pc),
             _ => None,
         };
         candidate.is_some_and(|other_pc| pc.abs_diff(other_pc) <= 16)
@@ -2716,14 +2787,20 @@ mod tests {
 
         let merged = merge_bytecode_profile(seed_profile, Some(&report), false);
         assert!(!merged.protocol_types.contains(&ProtocolType::Erc20Token));
-        assert!(merged
-            .protocol_types
-            .contains(&ProtocolType::ProxyUpgradeable));
-        assert!(merged
-            .protocol_types
-            .contains(&ProtocolType::AccessControlHeavy));
-        assert!(merged
-            .recommended_invariant_families
-            .contains(&"access-control".to_string()));
+        assert!(
+            merged
+                .protocol_types
+                .contains(&ProtocolType::ProxyUpgradeable)
+        );
+        assert!(
+            merged
+                .protocol_types
+                .contains(&ProtocolType::AccessControlHeavy)
+        );
+        assert!(
+            merged
+                .recommended_invariant_families
+                .contains(&"access-control".to_string())
+        );
     }
 }
