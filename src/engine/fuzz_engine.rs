@@ -30,7 +30,7 @@ use crate::evm::corpus::{
 use crate::evm::dataflow::DataflowRegistry;
 use crate::evm::executor::EvmExecutor;
 use crate::evm::feedback::{EvmCoverageFeedback, EvmStateNoveltyFeedback, StateNoveltyReport};
-use crate::evm::fork_db::ForkDb;
+use crate::evm::fork_db::{ForkDb, execution_rpc_budget};
 use crate::evm::fuzz::{AbiRegistry, EvmMutator};
 use crate::evm::inspector::MAP_SIZE;
 use crate::evm::registry::GlobalAccountRegistry;
@@ -898,23 +898,33 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                         let mut waypoints = Vec::new();
                         let mut df = dataflow_registry.write();
 
-                        let exec_result = unsafe {
-                            let map_slice =
-                                std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE);
-                            evm_executor.execute_with_result(
-                                &mut current_state,
-                                &mut current_env,
-                                tx,
-                                map_slice,
-                                &mut df,
-                                &mut waypoints,
-                                tx_idx,
-                            )
-                        };
+                        let exec_result = ForkDb::with_thread_rpc_budget(
+                            Some(execution_rpc_budget()),
+                            || unsafe {
+                                let map_slice =
+                                    std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE);
+                                evm_executor.execute_with_result(
+                                    &mut current_state,
+                                    &mut current_env,
+                                    tx,
+                                    map_slice,
+                                    &mut df,
+                                    &mut waypoints,
+                                    tx_idx,
+                                )
+                            },
+                        );
 
                         let result = match exec_result {
                             Ok(result) => result,
                             Err(err) => {
+                                if err.to_string().contains("fork RPC budget exhausted") {
+                                    log::warn!(
+                                        "Skipping input after fork RPC budget exhaustion at tx {}; increase RUSTYFUZZ_EXEC_RPC_BUDGET for deeper live-fork exploration",
+                                        tx_idx
+                                    );
+                                    return ExitKind::Ok;
+                                }
                                 log::error!("EVM execution failed for tx {}: {err:#}", tx_idx);
                                 return ExitKind::Crash;
                             }
@@ -1417,6 +1427,7 @@ async fn run_single_process_campaign(
         &mut objective,
     )?;
 
+    let mut direct_seed_inputs = Vec::new();
     if state.corpus().count() == 0 {
         let mut inserted_seed_count = 0usize;
         if let Some(bundle_id) = &config.mainnet_seed_bundle {
@@ -1431,7 +1442,9 @@ async fn run_single_process_campaign(
                 let bundle = persistent_corpus.load_mainnet_seed_bundle(bundle_id)?;
                 {
                     for seed in bundle.seeds {
-                        state.corpus_mut().add(Testcase::new(seed.input))?;
+                        let input = seed.input;
+                        direct_seed_inputs.push(input.clone());
+                        state.corpus_mut().add(Testcase::new(input))?;
                         inserted_seed_count += 1;
                     }
                     log::info!(
@@ -1445,9 +1458,9 @@ async fn run_single_process_campaign(
 
         if !hardened_seed_candidates.is_empty() {
             for seed in hardened_seed_candidates.clone() {
-                state
-                    .corpus_mut()
-                    .add(Testcase::new(seed.into_evm_input(0)))?;
+                let input = seed.into_evm_input(0);
+                direct_seed_inputs.push(input.clone());
+                state.corpus_mut().add(Testcase::new(input))?;
                 inserted_seed_count += 1;
             }
             log::info!(
@@ -1478,6 +1491,7 @@ async fn run_single_process_campaign(
                     bounded_result.modeled_space_size
                 );
                 for outcome in bounded_result.candidates.into_iter() {
+                    direct_seed_inputs.push(outcome.candidate.input.clone());
                     state
                         .corpus_mut()
                         .add(Testcase::new(outcome.candidate.input))?;
@@ -1501,6 +1515,7 @@ async fn run_single_process_campaign(
                         if let Some(actor_set) = hardened_actor_set.as_ref() {
                             actor_set.apply_roles_to_sequence(&mut template.txs);
                         }
+                        direct_seed_inputs.push(template.clone());
                         state.corpus_mut().add(Testcase::new(template))?;
                         inserted_seed_count += 1;
                     }
@@ -1521,9 +1536,9 @@ async fn run_single_process_campaign(
                 config.foundry_harness.as_ref(),
             );
             for seed in intelligent_seeds {
-                state
-                    .corpus_mut()
-                    .add(Testcase::new(seed.into_evm_input(0)))?;
+                let input = seed.into_evm_input(0);
+                direct_seed_inputs.push(input.clone());
+                state.corpus_mut().add(Testcase::new(input))?;
                 inserted_seed_count += 1;
             }
             if inserted_seed_count > 0 {
@@ -1543,10 +1558,9 @@ async fn run_single_process_campaign(
                 log::info!(
                     "Seed startup mode: synthetic-seed-start (fallback_allowed=true, inserted_seed_count=0)"
                 );
-                state.corpus_mut().add(Testcase::new(seed_input(
-                    target_contract,
-                    Address::repeat_byte(0x13),
-                )))?;
+                let input = seed_input(target_contract, Address::repeat_byte(0x13));
+                direct_seed_inputs.push(input.clone());
+                state.corpus_mut().add(Testcase::new(input))?;
             } else {
                 anyhow::bail!(
                     "no trusted seed inputs available and synthetic fallback is disabled; ingest a non-empty mainnet seed bundle, provide --abi/Foundry seeds, or pass --allow-synthetic-fallback for smoke testing"
@@ -1611,22 +1625,30 @@ async fn run_single_process_campaign(
         for (tx_idx, tx) in input.txs.iter().enumerate() {
             let mut waypoints = Vec::new();
             let mut df = dataflow_registry.write();
-            let exec_result = unsafe {
-                let map_slice = std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE);
-                evm_executor.execute_with_result(
-                    &mut current_state,
-                    &mut current_env,
-                    tx,
-                    map_slice,
-                    &mut df,
-                    &mut waypoints,
-                    tx_idx,
-                )
-            };
+            let exec_result =
+                ForkDb::with_thread_rpc_budget(Some(execution_rpc_budget()), || unsafe {
+                    let map_slice = std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE);
+                    evm_executor.execute_with_result(
+                        &mut current_state,
+                        &mut current_env,
+                        tx,
+                        map_slice,
+                        &mut df,
+                        &mut waypoints,
+                        tx_idx,
+                    )
+                });
 
             let result = match exec_result {
                 Ok(result) => result,
                 Err(err) => {
+                    if err.to_string().contains("fork RPC budget exhausted") {
+                        log::warn!(
+                            "Skipping input after fork RPC budget exhaustion at tx {}; increase RUSTYFUZZ_EXEC_RPC_BUDGET for deeper live-fork exploration",
+                            tx_idx
+                        );
+                        return ExitKind::Ok;
+                    }
                     log::error!("EVM execution failed for tx {}: {err:#}", tx_idx);
                     return ExitKind::Crash;
                 }
@@ -1825,6 +1847,39 @@ async fn run_single_process_campaign(
         ExitKind::Ok
     };
 
+    if config.max_execs.is_some() || config.duration_secs.is_some() {
+        anyhow::ensure!(
+            !direct_seed_inputs.is_empty(),
+            "bounded single-process campaign has no direct seed inputs"
+        );
+        log::info!(
+            "Running direct hard-bounded single-process campaign: max_execs={:?}, duration_secs={:?}, seed_pool={}",
+            config.max_execs,
+            config.duration_secs,
+            direct_seed_inputs.len()
+        );
+        let mut bounded_progress_report = Instant::now();
+        let mut next_seed = 0usize;
+        while !budget.exhausted() {
+            let input = direct_seed_inputs[next_seed % direct_seed_inputs.len()].clone();
+            next_seed = next_seed.wrapping_add(1);
+            let exit = harness(&input);
+            if matches!(exit, ExitKind::Crash) {
+                log::warn!(
+                    "Direct bounded execution returned crash; continuing until budget is exhausted"
+                );
+            }
+            log_bounded_campaign_progress(
+                "single-direct",
+                &mut bounded_progress_report,
+                &budget,
+                &telemetry,
+            );
+        }
+        write_final_campaign_summary(&config, &promotion_stats, &telemetry);
+        return Ok(());
+    }
+
     let mut executor = InProcessExecutor::with_timeout::<()>(
         &mut harness,
         tuple_list!(observer),
@@ -1834,25 +1889,7 @@ async fn run_single_process_campaign(
         execution_timeout,
     )?;
 
-    if config.max_execs.is_some() || config.duration_secs.is_some() {
-        log::info!(
-            "Running hard-bounded single-process campaign: max_execs={:?}, duration_secs={:?}",
-            config.max_execs,
-            config.duration_secs
-        );
-        let mut bounded_progress_report = Instant::now();
-        while !budget.exhausted() {
-            let _ = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
-            log_bounded_campaign_progress(
-                "single",
-                &mut bounded_progress_report,
-                &budget,
-                &telemetry,
-            );
-        }
-    } else {
-        fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
-    }
+    fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
 
     write_final_campaign_summary(&config, &promotion_stats, &telemetry);
     Ok(())

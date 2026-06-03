@@ -1,15 +1,25 @@
 use parking_lot::Mutex;
 use revm::database::CacheDB;
 use revm::database_interface::{DBErrorMarker, DatabaseRef};
-use revm::primitives::{Address, StorageKey, StorageValue, B256, U256};
+use revm::primitives::{Address, B256, StorageKey, StorageValue, U256};
 use revm::state::{AccountInfo, Bytecode};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+const DEFAULT_FORK_RPC_TIMEOUT_SECS: u64 = 3;
+const DEFAULT_FORK_RPC_RETRIES: usize = 1;
+const DEFAULT_THREAD_RPC_BUDGET: usize = 16;
+const RPC_BUDGET_EXHAUSTED: &str = "fork RPC budget exhausted";
+
+thread_local! {
+    static THREAD_RPC_BUDGET: RefCell<Option<usize>> = const { RefCell::new(None) };
+}
 
 pub type EvmCacheDb = CacheDB<ForkDb>;
 
@@ -241,10 +251,27 @@ impl ForkDb {
         self.inner.block_hashes.lock().insert(number, hash);
     }
 
+    pub fn with_thread_rpc_budget<T>(budget: Option<usize>, f: impl FnOnce() -> T) -> T {
+        struct BudgetGuard(Option<usize>);
+        impl Drop for BudgetGuard {
+            fn drop(&mut self) {
+                let previous = self.0;
+                THREAD_RPC_BUDGET.with(|budget| {
+                    *budget.borrow_mut() = previous;
+                });
+            }
+        }
+
+        let previous = THREAD_RPC_BUDGET.with(|current| current.replace(budget));
+        let _guard = BudgetGuard(previous);
+        f()
+    }
+
     fn rpc<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T, ForkDbError> {
         let Some(rpc_url) = &self.inner.rpc_url else {
             return Err(ForkDbError::Rpc("offline fork database miss".to_string()));
         };
+        reserve_thread_rpc_call()?;
 
         let request = json!({
             "jsonrpc": "2.0",
@@ -269,14 +296,16 @@ impl ForkDb {
 
 fn rpc_on_blocking_thread(rpc_url: String, request: Value) -> Result<Value, ForkDbError> {
     thread::spawn(move || {
+        let timeout = fork_rpc_timeout();
+        let max_attempts = fork_rpc_retries();
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(timeout)
             .pool_max_idle_per_host(0)
             .user_agent("rusty-fuzz-fork-db/0.1")
             .build()
             .map_err(|err| ForkDbError::Rpc(sanitize_rpc_error(&err.to_string())))?;
         let mut last_rpc_error = None;
-        for attempt in 0..4 {
+        for attempt in 0..max_attempts {
             let result = client
                 .post(&rpc_url)
                 .json(&request)
@@ -296,7 +325,7 @@ fn rpc_on_blocking_thread(rpc_url: String, request: Value) -> Result<Value, Fork
                 }
                 Err(error) => {
                     last_rpc_error = Some(error);
-                    if attempt < 3 {
+                    if attempt + 1 < max_attempts {
                         thread::sleep(Duration::from_millis(100 * (attempt + 1) as u64));
                     }
                 }
@@ -308,6 +337,51 @@ fn rpc_on_blocking_thread(rpc_url: String, request: Value) -> Result<Value, Fork
     })
     .join()
     .map_err(|_| ForkDbError::Rpc("fork RPC worker thread panicked".to_string()))?
+}
+
+fn fork_rpc_timeout() -> Duration {
+    std::env::var("RUSTYFUZZ_FORK_RPC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_FORK_RPC_TIMEOUT_SECS))
+}
+
+fn fork_rpc_retries() -> usize {
+    std::env::var("RUSTYFUZZ_FORK_RPC_RETRIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_FORK_RPC_RETRIES)
+}
+
+pub fn fork_rpc_budget_exhausted(error: &ForkDbError) -> bool {
+    matches!(error, ForkDbError::Rpc(message) if message.contains(RPC_BUDGET_EXHAUSTED))
+}
+
+pub fn execution_rpc_budget() -> usize {
+    std::env::var("RUSTYFUZZ_EXEC_RPC_BUDGET")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_THREAD_RPC_BUDGET)
+}
+
+fn reserve_thread_rpc_call() -> Result<(), ForkDbError> {
+    THREAD_RPC_BUDGET.with(|budget| {
+        let mut budget = budget.borrow_mut();
+        match budget.as_mut() {
+            Some(remaining) if *remaining == 0 => Err(ForkDbError::Rpc(format!(
+                "{RPC_BUDGET_EXHAUSTED}; increase RUSTYFUZZ_EXEC_RPC_BUDGET for deeper live-fork exploration"
+            ))),
+            Some(remaining) => {
+                *remaining -= 1;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    })
 }
 
 fn sanitize_rpc_error(message: &str) -> String {
@@ -495,4 +569,48 @@ fn parse_b256(value: &str) -> Result<B256, ForkDbError> {
         return Err(ForkDbError::Decode(format!("invalid B256: {value}")));
     }
     Ok(B256::from_slice(&bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fork_rpc_timeout_and_retries_use_fail_fast_defaults_and_env_overrides() {
+        std::env::remove_var("RUSTYFUZZ_FORK_RPC_TIMEOUT_SECS");
+        std::env::remove_var("RUSTYFUZZ_FORK_RPC_RETRIES");
+        assert_eq!(
+            fork_rpc_timeout(),
+            Duration::from_secs(DEFAULT_FORK_RPC_TIMEOUT_SECS)
+        );
+        assert_eq!(fork_rpc_retries(), DEFAULT_FORK_RPC_RETRIES);
+
+        std::env::set_var("RUSTYFUZZ_FORK_RPC_TIMEOUT_SECS", "9");
+        std::env::set_var("RUSTYFUZZ_FORK_RPC_RETRIES", "3");
+        assert_eq!(fork_rpc_timeout(), Duration::from_secs(9));
+        assert_eq!(fork_rpc_retries(), 3);
+
+        std::env::set_var("RUSTYFUZZ_FORK_RPC_TIMEOUT_SECS", "0");
+        std::env::set_var("RUSTYFUZZ_FORK_RPC_RETRIES", "0");
+        assert_eq!(
+            fork_rpc_timeout(),
+            Duration::from_secs(DEFAULT_FORK_RPC_TIMEOUT_SECS)
+        );
+        assert_eq!(fork_rpc_retries(), DEFAULT_FORK_RPC_RETRIES);
+
+        std::env::remove_var("RUSTYFUZZ_FORK_RPC_TIMEOUT_SECS");
+        std::env::remove_var("RUSTYFUZZ_FORK_RPC_RETRIES");
+    }
+
+    #[test]
+    fn thread_rpc_budget_exhausts_and_restores() {
+        let db = ForkDb::new("http://127.0.0.1:1", 1);
+        let exhausted = ForkDb::with_thread_rpc_budget(Some(0), || {
+            db.basic_ref(Address::repeat_byte(0x11)).unwrap_err()
+        });
+        assert!(fork_rpc_budget_exhausted(&exhausted));
+
+        let unbudgeted = db.basic_ref(Address::repeat_byte(0x12)).unwrap_err();
+        assert!(!fork_rpc_budget_exhausted(&unbudgeted));
+    }
 }
