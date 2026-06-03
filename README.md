@@ -473,6 +473,266 @@ See `config.toml.example` for full reference.
 
 ## CLI Usage
 
+### Live Target Runbook
+
+This is the shortest complete path for running RustyFuzz against a live EVM target with fail-closed fork behavior. Use an archive-capable RPC endpoint; public free endpoints often fail on historical storage reads.
+
+**1. Set target variables**
+
+```bash
+export TARGET="0xYourTargetContract"
+export RPC_URL="https://your-archive-rpc"
+export FORK_BLOCK="22000000"
+export CAMPAIGN_ID="live-target-001"
+```
+
+For BSC, keep `--chain bsc` in the commands below and use a BSC archive RPC. For Ethereum mainnet, use `--chain evm`.
+
+**2. Build the release binaries**
+
+```bash
+cargo build --release --bin rusty-fuzz --bin benchmark
+```
+
+Optional Z3 build:
+
+```bash
+cargo build --release --features z3 --bin rusty-fuzz
+```
+
+**3. Create or update `config.toml`**
+
+```toml
+chain = "evm"
+rpc_url = "https://your-archive-rpc"
+fork_block = 22000000
+target_contract = "0xYourTargetContract"
+corpus_dir = "corpus"
+report_dir = "reports"
+foundry_project = "."
+mainnet_seed_bundle = "live-target-001"
+target_abi = "abi/Target.json"
+abi_cache_dir = "corpus/abi"
+
+[hardened_defi]
+enabled = true
+enable_actor_model = true
+enable_economic_delta = true
+enable_protocol_invariants = true
+enable_exploit_templates = true
+```
+
+`config.toml` is read by replay, promotion, setup, validation, and fuzz commands. Keep RPC credentials out of committed files.
+
+**4. Optional but recommended: add ABI knowledge**
+
+```bash
+target/release/rusty-fuzz abi-ingest \
+  --file abi/Target.json \
+  --target "$TARGET" \
+  --bundle-id "$CAMPAIGN_ID"
+```
+
+Or pass the ABI directly during fuzzing with `--abi abi/Target.json`.
+If you do not have an ABI, remove every `--abi abi/Target.json` flag below; RustyFuzz will fall back to bytecode selector discovery.
+
+**5. Optional but recommended: ingest recent mainnet seeds**
+
+```bash
+target/release/rusty-fuzz seed \
+  --contract "$TARGET" \
+  --rpc-url "$RPC_URL" \
+  --chain evm \
+  --output "corpus/mainnet_seeds/$CAMPAIGN_ID" \
+  --limit 100 \
+  --search-depth 10000 \
+  --include-address-hints \
+  --seed-mode block-scan \
+  --rate-limit-rps 2 \
+  --resume
+```
+
+With an ABI:
+
+```bash
+target/release/rusty-fuzz seed \
+  --contract "$TARGET" \
+  --rpc-url "$RPC_URL" \
+  --chain evm \
+  --output "corpus/mainnet_seeds/$CAMPAIGN_ID" \
+  --limit 100 \
+  --abi abi/Target.json \
+  --seed-mode block-scan \
+  --rate-limit-rps 2 \
+  --resume
+```
+
+This writes `corpus/mainnet_seeds/$CAMPAIGN_ID/manifest.json`. The bundle is loaded when `mainnet_seed_bundle = "$CAMPAIGN_ID"` in `config.toml`.
+
+Equivalent config-driven seed ingestion, which persists directly under `corpus/mainnet_seeds/<bundle-id>/`:
+
+```bash
+target/release/rusty-fuzz seed \
+  --target "$TARGET" \
+  --bundle-id "$CAMPAIGN_ID" \
+  --max-seeds 100 \
+  --search-depth 10000 \
+  --include-address-hints \
+  --seed-mode block-scan \
+  --rate-limit-rps 2 \
+  --resume
+```
+
+**6. Optional: discover setup context and invariants**
+
+```bash
+target/release/rusty-fuzz setup \
+  --bundle-id "$CAMPAIGN_ID" \
+  --target "$TARGET" \
+  --abi abi/Target.json \
+  --output "reports/$CAMPAIGN_ID/fork_setup.json"
+
+target/release/rusty-fuzz invariants \
+  --target "$TARGET" \
+  --abi-report "corpus/abi/$CAMPAIGN_ID/report.json" \
+  --setup-report "reports/$CAMPAIGN_ID/fork_setup.json" \
+  --output "reports/$CAMPAIGN_ID/invariants.json"
+```
+
+If you do not have ABI/setup reports yet, skip this step. Findings still require replay and PoC evidence.
+
+**7. Run a one-execution smoke proof**
+
+```bash
+RUST_LOG=info \
+RUSTYFUZZ_REQUIRE_RPC_FORK=1 \
+target/release/rusty-fuzz fuzz \
+  --chain evm \
+  --contract "$TARGET" \
+  --campaign-id "$CAMPAIGN_ID-smoke" \
+  --max-execs 1 \
+  --wall-timeout-secs 120 \
+  --artifact-limit 4 \
+  --require-rpc-fork \
+  --no-synthetic-fallback \
+  --abi abi/Target.json
+```
+
+Expected result: startup logs show bytecode analysis, seed startup mode, shared coverage size, and a campaign summary under `reports/$CAMPAIGN_ID-smoke/`. If RPC bytecode or storage fetch fails, the command should fail instead of silently fuzzing synthetic state.
+
+**8. Run the live campaign**
+
+Single-process, easiest to debug:
+
+```bash
+RUST_LOG=info \
+RUSTYFUZZ_REQUIRE_RPC_FORK=1 \
+target/release/rusty-fuzz fuzz \
+  --chain evm \
+  --contract "$TARGET" \
+  --campaign-id "$CAMPAIGN_ID" \
+  --max-execs 50000 \
+  --wall-timeout-secs 3600 \
+  --artifact-limit 100 \
+  --single-process \
+  --hardened-defi \
+  --bounded-search \
+  --require-rpc-fork \
+  --no-synthetic-fallback \
+  --promote-findings \
+  --min-finding-confidence 70 \
+  --abi abi/Target.json
+```
+
+Brokered multi-core run:
+
+```bash
+RUST_LOG=info \
+RUSTYFUZZ_REQUIRE_RPC_FORK=1 \
+target/release/rusty-fuzz fuzz \
+  --chain evm \
+  --contract "$TARGET" \
+  --campaign-id "$CAMPAIGN_ID-mc" \
+  --max-execs 200000 \
+  --wall-timeout-secs 7200 \
+  --artifact-limit 200 \
+  --cores 0-3 \
+  --single-process false \
+  --hardened-defi \
+  --bounded-search \
+  --require-rpc-fork \
+  --no-synthetic-fallback \
+  --promote-findings \
+  --min-finding-confidence 70 \
+  --abi abi/Target.json
+```
+
+Use `--allow-synthetic-fallback` only for smoke tests against dummy targets. Do not use it for vulnerability claims.
+
+**9. Inspect the outputs**
+
+Campaign summaries:
+
+```bash
+cat "reports/$CAMPAIGN_ID/campaign_summary.json"
+cat "reports/$CAMPAIGN_ID/campaign_summary.md"
+```
+
+Candidate artifacts:
+
+```bash
+find "corpus/$CAMPAIGN_ID/campaign_artifacts" -maxdepth 1 -type f -name '*.json'
+find "reports/$CAMPAIGN_ID/findings" -type f
+```
+
+Proof-quality indicators:
+- `confirmed_findings > 0`
+- `poc_count > 0`
+- `replay_failure_count = 0`
+- finding report includes oracle evidence, replay result, call trace, storage diffs, and PoC path
+- generated PoC exists under `reports/$CAMPAIGN_ID/findings/.../*.t.sol`
+
+Score-only artifacts are triage leads, not confirmed vulnerabilities.
+
+**10. Replay, minimize, or promote a candidate manually**
+
+For a campaign artifact `<input_id>.json`:
+
+```bash
+target/release/rusty-fuzz replay \
+  --input <input_id> \
+  --fork-cache-id <fork_cache_id>
+
+target/release/rusty-fuzz replay \
+  --input <input_id> \
+  --fork-cache-id <fork_cache_id> \
+  --live
+
+target/release/rusty-fuzz minimize \
+  --input-id <input_id> \
+  --fork-cache-id <fork_cache_id> \
+  --reason "oracle-preserving-minimization"
+
+target/release/rusty-fuzz promote \
+  --input-id <input_id> \
+  --fork-cache-id <fork_cache_id> \
+  --campaign-id "$CAMPAIGN_ID"
+```
+
+**11. Confirm the toolchain before a serious run**
+
+```bash
+cargo check
+cargo check --features z3
+cargo test benchmark --lib
+target/release/rusty-fuzz validate \
+  --benchmarks benchmarks/realistic \
+  --output reports/known_vulnerable_validation_report.json
+cat reports/scoring_calibration.json
+```
+
+For the current validation pack, the expected calibration is `pass_rate = 1.0`, `replay_success_rate = 1.0`, `minimized_success_rate = 1.0`, and `poc_generation_rate = 1.0`.
+
 ### Fuzz Campaign
 
 Start a campaign against a target contract:
