@@ -3,12 +3,12 @@ use crate::common::types::{
     ChainState, EvmInput, ExecutionStatus, SequenceExecutionResult, SingletonTx,
 };
 use crate::config::HardenedDefiConfig;
-use crate::engine::abi_ingest::{AbiIngestReport, ingest_abi_file, merge_abi_registry};
+use crate::engine::abi_ingest::{ingest_abi_file, merge_abi_registry, AbiIngestReport};
 use crate::engine::actors::{ActorModel, ActorModelConfig, ActorSet};
 use crate::engine::bounded_search::{
     BoundedSearchBounds, BoundedSearchEngine, BoundedSearchRequest,
 };
-use crate::engine::bytecode_analysis::{BytecodeAnalysisReport, analyze_bytecode};
+use crate::engine::bytecode_analysis::{analyze_bytecode, BytecodeAnalysisReport};
 use crate::engine::concolic::{ConcolicHint, ConcolicHintStats, ConcolicSolver, ConcolicStrategy};
 use crate::engine::dependency::generate_flow_template_inputs;
 use crate::engine::economic_delta::{EconomicDeltaEngine, EconomicDeltaReport};
@@ -16,8 +16,8 @@ use crate::engine::exploit_path::ExploitPathBuilder;
 use crate::engine::foundry_ingest::FoundryHarnessManifest;
 use crate::engine::invariant_manifest::TargetInvariantManifest;
 use crate::engine::promotion::{
-    PromotionCampaignStats, PromotionConfig, PromotionRequest, promote_finding_artifact,
-    write_campaign_summary,
+    promote_finding_artifact, write_campaign_summary, PromotionCampaignStats, PromotionConfig,
+    PromotionRequest,
 };
 use crate::engine::protocol_model::CounterexampleSearchEngine;
 use crate::engine::scheduler::RustyFuzzScheduler;
@@ -30,7 +30,7 @@ use crate::evm::corpus::{
 use crate::evm::dataflow::DataflowRegistry;
 use crate::evm::executor::EvmExecutor;
 use crate::evm::feedback::{EvmCoverageFeedback, EvmStateNoveltyFeedback, StateNoveltyReport};
-use crate::evm::fork_db::{ForkDb, execution_rpc_budget};
+use crate::evm::fork_db::{execution_rpc_budget, ForkDb};
 use crate::evm::fuzz::{AbiRegistry, EvmMutator};
 use crate::evm::inspector::MAP_SIZE;
 use crate::evm::registry::GlobalAccountRegistry;
@@ -38,7 +38,7 @@ use crate::evm::snapshot::new_evm_snapshot;
 
 use libafl::corpus::{Corpus, Testcase};
 use libafl::events::{
-    EventRestarter, NopEventManager, SendExiting, llmp::LlmpRestartingEventManager,
+    llmp::LlmpRestartingEventManager, EventRestarter, NopEventManager, SendExiting,
 };
 use libafl::state::HasCorpus;
 use parking_lot::{Mutex, RwLock};
@@ -82,6 +82,8 @@ fn mutational_stage_iterations(config: &Config) -> NonZeroUsize {
 struct CampaignTelemetry {
     start: Instant,
     executions: AtomicU64,
+    mutated_inputs: AtomicU64,
+    seed_replays: AtomicU64,
     artifacts: AtomicU64,
     oracle_findings: AtomicU64,
     state_novelty: AtomicU64,
@@ -156,6 +158,8 @@ impl CampaignTelemetry {
         Self {
             start: now,
             executions: AtomicU64::new(0),
+            mutated_inputs: AtomicU64::new(0),
+            seed_replays: AtomicU64::new(0),
             artifacts: AtomicU64::new(0),
             oracle_findings: AtomicU64::new(0),
             state_novelty: AtomicU64::new(0),
@@ -179,6 +183,14 @@ impl CampaignTelemetry {
         mutation_strategies: &[String],
     ) {
         let total = self.executions.fetch_add(1, Ordering::Relaxed) + 1;
+        if mutation_strategies
+            .iter()
+            .any(|strategy| strategy != "seed_or_imported")
+        {
+            self.mutated_inputs.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.seed_replays.fetch_add(1, Ordering::Relaxed);
+        }
         if findings > 0 {
             self.oracle_findings
                 .fetch_add(findings as u64, Ordering::Relaxed);
@@ -218,9 +230,11 @@ impl CampaignTelemetry {
         };
         let concolic = self.concolic_hint_stats.snapshot();
         log::info!(
-            "RustyFuzz telemetry: core={}, executions={}, execs_per_sec_30s={:.3}, execs_per_sec_avg={:.3}, corpus_size={}, coverage_edges_last={}, state_novelty_count={}, oracle_findings={}, persisted_artifacts={}, best_score={}, txs_last={}, score_last={}, mutation_strategy_mix=[{}], concolic_hints={{generated:{},deduplicated:{},applied:{},successful:{}}}",
+            "RustyFuzz telemetry: core={}, executions={}, mutated_inputs={}, seed_replays={}, execs_per_sec_30s={:.3}, execs_per_sec_avg={:.3}, corpus_size={}, coverage_edges_last={}, state_novelty_count={}, oracle_findings={}, persisted_artifacts={}, best_score={}, txs_last={}, score_last={}, mutation_strategy_mix=[{}], concolic_hints={{generated:{},deduplicated:{},applied:{},successful:{}}}",
             core_id,
             total,
+            self.mutated_inputs.load(Ordering::Relaxed),
+            self.seed_replays.load(Ordering::Relaxed),
             interval_execs_per_sec,
             total_execs_per_sec,
             corpus_size,
@@ -254,6 +268,14 @@ impl CampaignTelemetry {
 
     fn coverage_edges(&self) -> u64 {
         self.max_coverage_edges.load(Ordering::Relaxed)
+    }
+
+    fn mutated_inputs(&self) -> u64 {
+        self.mutated_inputs.load(Ordering::Relaxed)
+    }
+
+    fn seed_replays(&self) -> u64 {
+        self.seed_replays.load(Ordering::Relaxed)
     }
 
     fn executions(&self) -> u64 {
@@ -296,10 +318,12 @@ fn log_bounded_campaign_progress(
         return;
     }
     log::info!(
-        "Hard-bounded campaign progress: mode={}, reserved_execs={}, completed_execs={}, max_execs={:?}, artifacts={}, coverage_edges={}",
+        "Hard-bounded campaign progress: mode={}, reserved_execs={}, completed_execs={}, mutated_inputs={}, seed_replays={}, max_execs={:?}, artifacts={}, coverage_edges={}",
         label,
         budget.reserved(),
         telemetry.executions(),
+        telemetry.mutated_inputs(),
+        telemetry.seed_replays(),
         budget.max_execs,
         telemetry.artifacts(),
         telemetry.coverage_edges()
@@ -1848,29 +1872,26 @@ async fn run_single_process_campaign(
     };
 
     if config.max_execs.is_some() || config.duration_secs.is_some() {
-        anyhow::ensure!(
-            !direct_seed_inputs.is_empty(),
-            "bounded single-process campaign has no direct seed inputs"
-        );
         log::info!(
-            "Running direct hard-bounded single-process campaign: max_execs={:?}, duration_secs={:?}, seed_pool={}",
+            "Running mutational hard-bounded single-process campaign: max_execs={:?}, duration_secs={:?}, seed_pool={}, corpus_size={}",
             config.max_execs,
             config.duration_secs,
-            direct_seed_inputs.len()
+            direct_seed_inputs.len(),
+            state.corpus().count()
         );
+        let mut executor = InProcessExecutor::with_timeout::<()>(
+            &mut harness,
+            tuple_list!(observer),
+            &mut fuzzer,
+            &mut state,
+            &mut manager,
+            execution_timeout,
+        )?;
         let mut bounded_progress_report = Instant::now();
-        let mut next_seed = 0usize;
         while !budget.exhausted() {
-            let input = direct_seed_inputs[next_seed % direct_seed_inputs.len()].clone();
-            next_seed = next_seed.wrapping_add(1);
-            let exit = harness(&input);
-            if matches!(exit, ExitKind::Crash) {
-                log::warn!(
-                    "Direct bounded execution returned crash; continuing until budget is exhausted"
-                );
-            }
+            let _ = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
             log_bounded_campaign_progress(
-                "single-direct",
+                "single-mutational",
                 &mut bounded_progress_report,
                 &budget,
                 &telemetry,
@@ -2567,6 +2588,8 @@ fn maybe_promote_artifact(
             let summary = promotion_stats.summary(
                 campaign_id,
                 telemetry.execution_count(),
+                telemetry.mutated_inputs(),
+                telemetry.seed_replays(),
                 telemetry.artifact_count(),
                 telemetry.coverage_edges(),
             );
@@ -2590,6 +2613,8 @@ fn write_final_campaign_summary(
     let summary = promotion_stats.summary(
         campaign_id,
         telemetry.execution_count(),
+        telemetry.mutated_inputs(),
+        telemetry.seed_replays(),
         telemetry.artifact_count(),
         telemetry.coverage_edges(),
     );
@@ -2778,6 +2803,17 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_distinguishes_mutations_from_seed_replays() {
+        let telemetry = CampaignTelemetry::new();
+        telemetry.record_execution(0, 1, 0, 0, 1, 0, 0, &["seed_or_imported".to_string()]);
+        telemetry.record_execution(0, 1, 0, 0, 1, 0, 0, &["abi_word_mutation".to_string()]);
+
+        assert_eq!(telemetry.executions(), 2);
+        assert_eq!(telemetry.seed_replays(), 1);
+        assert_eq!(telemetry.mutated_inputs(), 1);
+    }
+
+    #[test]
     fn campaign_cores_respects_libafl_env_alias() {
         std::env::set_var("LIBAFL_CORES", "0-1");
         std::env::remove_var("RUSTYFUZZ_CORES");
@@ -2876,20 +2912,14 @@ mod tests {
 
         let merged = merge_bytecode_profile(seed_profile, Some(&report), false);
         assert!(!merged.protocol_types.contains(&ProtocolType::Erc20Token));
-        assert!(
-            merged
-                .protocol_types
-                .contains(&ProtocolType::ProxyUpgradeable)
-        );
-        assert!(
-            merged
-                .protocol_types
-                .contains(&ProtocolType::AccessControlHeavy)
-        );
-        assert!(
-            merged
-                .recommended_invariant_families
-                .contains(&"access-control".to_string())
-        );
+        assert!(merged
+            .protocol_types
+            .contains(&ProtocolType::ProxyUpgradeable));
+        assert!(merged
+            .protocol_types
+            .contains(&ProtocolType::AccessControlHeavy));
+        assert!(merged
+            .recommended_invariant_families
+            .contains(&"access-control".to_string()));
     }
 }

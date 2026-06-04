@@ -29,6 +29,7 @@
 /tests/
 /docs/*
 !/docs/SATORI.md
+!/docs/IMPLEMENTATION_STATUS.md
 /crashes/
 /findings/
 /artifacts/

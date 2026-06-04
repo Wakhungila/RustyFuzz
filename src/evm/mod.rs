@@ -14,9 +14,6 @@ pub mod snapshot;
 
 pub mod trace;
 
-#[cfg(feature = "sgx")]
-pub mod sgx_executor;
-
 #[cfg(feature = "evm")]
 pub mod erc20_discovery;
 #[cfg(feature = "evm")]

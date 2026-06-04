@@ -1,7 +1,7 @@
 use crate::common::oracle::{ProtocolFinding, ProtocolOraclePackKind, ProtocolSeverity, VulnType};
 use crate::engine::abi_ingest::{AbiIngestReport, SelectorClassification};
 use crate::engine::bytecode_analysis::BytecodeAnalysisReport;
-use crate::engine::economic_delta::EconomicDeltaReport;
+use crate::engine::economic_delta::{EconomicDeltaReport, EconomicStateKind};
 use crate::engine::fork_setup::ForkSetupReport;
 use crate::engine::formal_spec::FormalSpecification;
 use crate::engine::permission_model::PermissionModelAnalyzer;
@@ -55,6 +55,11 @@ pub enum TargetInvariantKind {
     NoBadDebtIncrease,
     RequireAttackerProfitBelow,
     RequireNoAccountingAnomaly,
+    Erc4626SharePriceBound,
+    AmmConstantProductNonDecreasing,
+    LendingHealthFactorNotDecreasedBelowOne,
+    CreditedAmountEqualsReceivedAmount,
+    InterestIndexMonotonicAndBounded,
 }
 
 impl TargetInvariantManifest {
@@ -83,7 +88,12 @@ impl TargetInvariantManifest {
                 match function.classification {
                     SelectorClassification::Erc4626Like => manifest.push_rule(
                         "erc4626-share-price-bound",
-                        TargetInvariantKind::MaxSharePriceIncreaseBps,
+                        TargetInvariantKind::Erc4626SharePriceBound,
+                        Some(ProtocolSeverity::High),
+                    ),
+                    SelectorClassification::Erc20Like => manifest.push_rule(
+                        "fee-token-credit-conservation",
+                        TargetInvariantKind::CreditedAmountEqualsReceivedAmount,
                         Some(ProtocolSeverity::High),
                     ),
                     SelectorClassification::OraclePrice | SelectorClassification::PoolEconomic => {
@@ -91,7 +101,12 @@ impl TargetInvariantManifest {
                             "market-price-move-bound",
                             TargetInvariantKind::MaxReservePriceMoveBps,
                             Some(ProtocolSeverity::High),
-                        )
+                        );
+                        manifest.push_rule(
+                            "amm-k-product-nondecreasing",
+                            TargetInvariantKind::AmmConstantProductNonDecreasing,
+                            Some(ProtocolSeverity::High),
+                        );
                     }
                     SelectorClassification::WithdrawClaim
                     | SelectorClassification::FactoryOrPoolCreation
@@ -109,6 +124,33 @@ impl TargetInvariantManifest {
                     ),
                     _ => {}
                 }
+            }
+            if report
+                .target_profile
+                .protocol_types
+                .contains(&ProtocolType::LendingBorrowing)
+            {
+                manifest.push_rule(
+                    "lending-health-factor-bound",
+                    TargetInvariantKind::LendingHealthFactorNotDecreasedBelowOne,
+                    Some(ProtocolSeverity::Critical),
+                );
+                manifest.push_rule(
+                    "interest-index-monotonic-bound",
+                    TargetInvariantKind::InterestIndexMonotonicAndBounded,
+                    Some(ProtocolSeverity::High),
+                );
+            }
+            if report
+                .target_profile
+                .protocol_types
+                .contains(&ProtocolType::AccountingHeavy)
+            {
+                manifest.push_rule(
+                    "accounting-credit-conservation",
+                    TargetInvariantKind::CreditedAmountEqualsReceivedAmount,
+                    Some(ProtocolSeverity::High),
+                );
             }
         }
 
@@ -210,7 +252,7 @@ impl TargetInvariantManifest {
             match summary.protocol_type_hint {
                 Some(ProtocolType::Erc4626Vault) => self.push_rule(
                     &format!("bytecode-{selector}-share-price"),
-                    TargetInvariantKind::MaxSharePriceIncreaseBps,
+                    TargetInvariantKind::Erc4626SharePriceBound,
                     Some(ProtocolSeverity::High),
                 ),
                 Some(ProtocolType::AmmDexPool) | Some(ProtocolType::OraclePriceFeed) => self
@@ -219,11 +261,24 @@ impl TargetInvariantManifest {
                         TargetInvariantKind::MaxReservePriceMoveBps,
                         Some(ProtocolSeverity::High),
                     ),
-                Some(ProtocolType::LendingBorrowing) => self.push_rule(
-                    &format!("bytecode-{selector}-solvency"),
-                    TargetInvariantKind::NoBadDebtIncrease,
-                    Some(ProtocolSeverity::Critical),
-                ),
+                Some(ProtocolType::LendingBorrowing) => {
+                    self.push_rule(
+                        &format!("bytecode-{selector}-solvency"),
+                        TargetInvariantKind::LendingHealthFactorNotDecreasedBelowOne,
+                        Some(ProtocolSeverity::Critical),
+                    );
+                    self.push_rule(
+                        &format!("bytecode-{selector}-interest-index"),
+                        TargetInvariantKind::InterestIndexMonotonicAndBounded,
+                        Some(ProtocolSeverity::High),
+                    );
+                }
+                Some(ProtocolType::Erc20Token) | Some(ProtocolType::AccountingHeavy) => self
+                    .push_rule(
+                        &format!("bytecode-{selector}-credit-conservation"),
+                        TargetInvariantKind::CreditedAmountEqualsReceivedAmount,
+                        Some(ProtocolSeverity::High),
+                    ),
                 _ => {}
             }
         }
@@ -341,6 +396,47 @@ impl TargetInvariantManifest {
                 report.estimated_profit > U256::from(rule.min_profit.unwrap_or_default())
             }
             TargetInvariantKind::RequireNoAccountingAnomaly => report.accounting_anomaly,
+            TargetInvariantKind::Erc4626SharePriceBound => {
+                max_positive_bps_for_kind(report, EconomicStateKind::ShareBalance)
+                    .is_some_and(|bps| bps > rule.max_bps.unwrap_or(500))
+                    || (report.share_price_pressure && report.accounting_anomaly)
+            }
+            TargetInvariantKind::AmmConstantProductNonDecreasing => report
+                .reserve_deltas
+                .iter()
+                .any(|delta| delta.product_change_bps < -(rule.max_bps.unwrap_or(30) as i128)),
+            TargetInvariantKind::LendingHealthFactorNotDecreasedBelowOne => {
+                report.debt_or_collateral_pressure
+                    && (report.suspicious_value_extraction || report.accounting_anomaly)
+            }
+            TargetInvariantKind::CreditedAmountEqualsReceivedAmount => {
+                report.semantic_deltas.iter().any(|delta| {
+                    matches!(delta.kind, EconomicStateKind::TokenBalance)
+                        && delta.delta < 0
+                        && report.semantic_deltas.iter().any(|credit| {
+                            credit.tx_index == delta.tx_index
+                                && matches!(
+                                    credit.kind,
+                                    EconomicStateKind::ShareBalance
+                                        | EconomicStateKind::UnknownAccounting
+                                )
+                                && credit.delta > delta.delta.unsigned_abs() as i128
+                        })
+                }) || report.accounting_anomaly
+            }
+            TargetInvariantKind::InterestIndexMonotonicAndBounded => {
+                report.semantic_deltas.iter().any(|delta| {
+                    matches!(
+                        delta.kind,
+                        EconomicStateKind::Debt
+                            | EconomicStateKind::Collateral
+                            | EconomicStateKind::ShareBalance
+                            | EconomicStateKind::UnknownAccounting
+                    ) && (delta.delta < 0
+                        || bps_change(delta.before, delta.after)
+                            .is_some_and(|bps| bps > rule.max_bps.unwrap_or(500)))
+                })
+            }
         };
         violated.then(|| ProtocolFinding {
             pack: pack_for_rule(&rule.kind),
@@ -348,23 +444,21 @@ impl TargetInvariantManifest {
             severity: rule.severity.clone().unwrap_or(ProtocolSeverity::High),
             tx_index: None,
             target: self.target,
-            evidence: format!(
-                "target invariant `{}` violated via {:?}; confidence={}; profit={}; caveats={}",
-                rule.id,
-                rule.kind,
-                report.confidence,
-                report.estimated_profit,
-                report.caveats.join("; ")
-            ),
+            evidence: invariant_evidence(rule, report),
         })
     }
 }
 
 fn pack_for_rule(kind: &TargetInvariantKind) -> ProtocolOraclePackKind {
     match kind {
-        TargetInvariantKind::MaxSharePriceIncreaseBps => ProtocolOraclePackKind::Erc4626,
-        TargetInvariantKind::MaxReservePriceMoveBps => ProtocolOraclePackKind::Amm,
-        TargetInvariantKind::NoBadDebtIncrease => ProtocolOraclePackKind::Lending,
+        TargetInvariantKind::MaxSharePriceIncreaseBps
+        | TargetInvariantKind::Erc4626SharePriceBound => ProtocolOraclePackKind::Erc4626,
+        TargetInvariantKind::MaxReservePriceMoveBps
+        | TargetInvariantKind::AmmConstantProductNonDecreasing => ProtocolOraclePackKind::Amm,
+        TargetInvariantKind::NoBadDebtIncrease
+        | TargetInvariantKind::LendingHealthFactorNotDecreasedBelowOne
+        | TargetInvariantKind::InterestIndexMonotonicAndBounded => ProtocolOraclePackKind::Lending,
+        TargetInvariantKind::CreditedAmountEqualsReceivedAmount => ProtocolOraclePackKind::Erc20,
         TargetInvariantKind::RequireAttackerProfitBelow
         | TargetInvariantKind::RequireNoAccountingAnomaly => ProtocolOraclePackKind::Erc20,
     }
@@ -372,14 +466,64 @@ fn pack_for_rule(kind: &TargetInvariantKind) -> ProtocolOraclePackKind {
 
 fn vuln_for_rule(rule: &TargetInvariantRule) -> VulnType {
     match rule.kind {
-        TargetInvariantKind::MaxSharePriceIncreaseBps => VulnType::VaultInflation,
-        TargetInvariantKind::MaxReservePriceMoveBps => VulnType::PriceManipulation,
-        TargetInvariantKind::NoBadDebtIncrease => {
+        TargetInvariantKind::MaxSharePriceIncreaseBps
+        | TargetInvariantKind::Erc4626SharePriceBound => VulnType::VaultInflation,
+        TargetInvariantKind::MaxReservePriceMoveBps
+        | TargetInvariantKind::AmmConstantProductNonDecreasing => VulnType::PriceManipulation,
+        TargetInvariantKind::NoBadDebtIncrease
+        | TargetInvariantKind::LendingHealthFactorNotDecreasedBelowOne => {
             VulnType::InvariantViolation("target-specific bad debt invariant".to_string())
         }
+        TargetInvariantKind::CreditedAmountEqualsReceivedAmount => VulnType::AccountingDesync,
+        TargetInvariantKind::InterestIndexMonotonicAndBounded => VulnType::PrecisionLossExploit,
         TargetInvariantKind::RequireAttackerProfitBelow => VulnType::FlashLoanProfit,
         TargetInvariantKind::RequireNoAccountingAnomaly => VulnType::AccountingDesync,
     }
+}
+
+fn invariant_evidence(rule: &TargetInvariantRule, report: &EconomicDeltaReport) -> String {
+    let max_share_bps = max_positive_bps_for_kind(report, EconomicStateKind::ShareBalance);
+    let worst_product_drop_bps = report
+        .reserve_deltas
+        .iter()
+        .map(|delta| delta.product_change_bps)
+        .min();
+    let max_price_bps = report
+        .price_impact
+        .as_ref()
+        .map(|impact| impact.max_price_change_bps);
+    format!(
+        "math invariant `{}` violated via {:?}; limit_bps={:?}; share_bps={:?}; k_change_bps={:?}; price_bps={:?}; confidence={}; profit={}; caveats={}",
+        rule.id,
+        rule.kind,
+        rule.max_bps,
+        max_share_bps,
+        worst_product_drop_bps,
+        max_price_bps,
+        report.confidence,
+        report.estimated_profit,
+        report.caveats.join("; ")
+    )
+}
+
+fn max_positive_bps_for_kind(report: &EconomicDeltaReport, kind: EconomicStateKind) -> Option<u64> {
+    report
+        .semantic_deltas
+        .iter()
+        .filter(|delta| delta.kind == kind)
+        .filter_map(|delta| bps_change(delta.before, delta.after))
+        .max()
+}
+
+fn bps_change(before: U256, after: U256) -> Option<u64> {
+    if before.is_zero() {
+        return (!after.is_zero()).then_some(u64::MAX);
+    }
+    if after <= before {
+        return Some(0);
+    }
+    let delta = after - before;
+    Some(((delta.saturating_mul(U256::from(10_000u64))) / before).to::<u64>())
 }
 
 #[cfg(test)]
@@ -458,7 +602,7 @@ mod tests {
         assert!(manifest
             .invariants
             .iter()
-            .any(|rule| rule.kind == TargetInvariantKind::MaxSharePriceIncreaseBps));
+            .any(|rule| rule.kind == TargetInvariantKind::Erc4626SharePriceBound));
         assert!(manifest
             .invariants
             .iter()
@@ -493,6 +637,76 @@ mod tests {
         assert!(manifest
             .invariants
             .iter()
-            .any(|rule| rule.kind == TargetInvariantKind::MaxSharePriceIncreaseBps));
+            .any(|rule| rule.kind == TargetInvariantKind::Erc4626SharePriceBound));
+    }
+
+    #[test]
+    fn explicit_math_rules_use_concrete_delta_evidence() {
+        let target = Address::new([0x42; 20]);
+        let manifest = TargetInvariantManifest {
+            target: Some(target),
+            invariants: vec![
+                TargetInvariantRule {
+                    id: "erc4626-donation-inflation".to_string(),
+                    kind: TargetInvariantKind::Erc4626SharePriceBound,
+                    max_bps: Some(100),
+                    min_profit: None,
+                    severity: Some(ProtocolSeverity::High),
+                },
+                TargetInvariantRule {
+                    id: "amm-k-product".to_string(),
+                    kind: TargetInvariantKind::AmmConstantProductNonDecreasing,
+                    max_bps: Some(30),
+                    min_profit: None,
+                    severity: Some(ProtocolSeverity::High),
+                },
+            ],
+            formal_spec: None,
+            state_transition_checker: None,
+            permission_analyzer: None,
+            temporal_checker: None,
+        };
+        let report = EconomicDeltaReport {
+            semantic_deltas: vec![crate::engine::economic_delta::SemanticValueDelta {
+                tx_index: 0,
+                address: target,
+                slot: revm::primitives::B256::ZERO,
+                before: U256::from(10_000u64),
+                after: U256::from(10_200u64),
+                delta: 200,
+                kind: EconomicStateKind::ShareBalance,
+                confidence: 95,
+                reason: "concrete vault share-price view delta".to_string(),
+            }],
+            reserve_deltas: vec![crate::engine::economic_delta::ReserveDelta {
+                pool: target,
+                tx_index: 0,
+                slot_a: revm::primitives::B256::ZERO,
+                slot_b: revm::primitives::B256::ZERO,
+                reserve_a_before: U256::from(100u64),
+                reserve_a_after: U256::from(80u64),
+                reserve_b_before: U256::from(100u64),
+                reserve_b_after: U256::from(100u64),
+                product_before: U256::from(10_000u64),
+                product_after: U256::from(8_000u64),
+                product_change_bps: -2_000,
+                price_change_bps: Some(2_500),
+                confidence: 95,
+            }],
+            share_price_pressure: true,
+            price_impact_pressure: true,
+            accounting_anomaly: true,
+            confidence: 95,
+            ..EconomicDeltaReport::default()
+        };
+
+        let findings = manifest.evaluate(&report);
+        assert_eq!(findings.len(), 2);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.evidence.contains("share_bps=Some(200)")));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.evidence.contains("k_change_bps=Some(-2000)")));
     }
 }

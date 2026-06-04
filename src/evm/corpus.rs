@@ -1,5 +1,4 @@
-use crate::common::oracle::ProtocolFinding;
-use crate::common::oracle::ProtocolSeverity;
+use crate::common::oracle::{FindingStatus, ProtocolFinding, ProtocolSeverity};
 use crate::common::types::{ChainState, SequenceExecutionResult, Snapshot, Waypoint};
 use crate::engine::confirmation::{FindingConfirmation, FindingConfirmationGate};
 use crate::engine::exploit_path::ExploitPathCandidate;
@@ -94,6 +93,8 @@ pub struct CampaignArtifactOutcome {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CampaignArtifactTriageSummary {
+    #[serde(default)]
+    pub status: FindingStatus,
     pub persisted_reason: String,
     pub confidence: u64,
     #[serde(default)]
@@ -842,6 +843,7 @@ fn triage_summary(input: TriageSummaryInput<'_>) -> CampaignArtifactTriageSummar
     };
 
     CampaignArtifactTriageSummary {
+        status: triage_status(input.findings, input.confirmation.as_ref()),
         persisted_reason: input.reason.to_string(),
         confidence,
         proof_tier: input.proof_tier,
@@ -858,6 +860,19 @@ fn triage_summary(input: TriageSummaryInput<'_>) -> CampaignArtifactTriageSummar
     }
 }
 
+fn triage_status(
+    findings: &[ProtocolFinding],
+    confirmation: Option<&FindingConfirmation>,
+) -> FindingStatus {
+    if confirmation.is_some_and(|confirmation| confirmation.confirmed) {
+        FindingStatus::Confirmed
+    } else if !findings.is_empty() {
+        FindingStatus::Candidate
+    } else {
+        FindingStatus::Signal
+    }
+}
+
 fn severity_confidence(severity: &ProtocolSeverity) -> u64 {
     match severity {
         ProtocolSeverity::Info => 20,
@@ -870,8 +885,9 @@ fn severity_confidence(severity: &ProtocolSeverity) -> u64 {
 
 fn triage_markdown(record: &CampaignArtifactRecord) -> String {
     format!(
-        "# RustyFuzz Campaign Artifact\n\n- input_id: `{}`\n- reason: `{}`\n- confidence: `{}`\n- proof_tier: `{:?}`\n- high_value_artifact: `{}`\n- replayable: `{}`\n- score: `{}`\n- target: `{:?}`\n- dedup_key: `{}`\n- findings: `{}`\n- confirmation_blockers: `{}`\n\n## False-positive risks\n{}\n\n## Next command\n`{}`\n",
+        "# RustyFuzz Campaign Artifact\n\n- input_id: `{}`\n- status: `{:?}`\n- reason: `{}`\n- confidence: `{}`\n- proof_tier: `{:?}`\n- high_value_artifact: `{}`\n- replayable: `{}`\n- score: `{}`\n- target: `{:?}`\n- dedup_key: `{}`\n- findings: `{}`\n- confirmation_blockers: `{}`\n\n## False-positive risks\n{}\n\n## Next command\n`{}`\n",
         record.input_id,
+        record.triage.status,
         record.reason,
         record.triage.confidence,
         record.triage.proof_tier,

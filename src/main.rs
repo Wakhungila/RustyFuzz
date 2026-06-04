@@ -1,9 +1,10 @@
 use alloy::providers::{Provider, ProviderBuilder};
+use alloy::primitives::keccak256;
 use clap::Parser;
 use libafl_bolts::core_affinity::Cores;
+use revm::database_interface::DatabaseRef;
 use revm::database::CacheDB;
-use revm::primitives::Address;
-use rusty_fuzz::chain::mempool::MempoolScanner;
+use revm::primitives::{Address, U256};
 use rusty_fuzz::common::oracle::{ProtocolOraclePack, ReentrancyOracle, VulnType};
 use rusty_fuzz::common::verifier::ReplayVerifier;
 use rusty_fuzz::config::Config;
@@ -14,9 +15,7 @@ use rusty_fuzz::engine::fork_setup::ForkSetupDiscoverer;
 use rusty_fuzz::engine::foundry_ingest::FoundryHarnessManifest;
 use rusty_fuzz::engine::invariant_manifest::TargetInvariantManifest;
 use rusty_fuzz::engine::minimizer::Minimizer;
-use rusty_fuzz::engine::promotion::{
-    promote_finding_artifact, PromotionConfig, PromotionRequest,
-};
+use rusty_fuzz::engine::promotion::{promote_finding_artifact, PromotionConfig, PromotionRequest};
 use rusty_fuzz::engine::seed_intelligence::SeedIntelligence;
 use rusty_fuzz::evm::corpus::{CampaignArtifactRecord, PersistentCorpus};
 use rusty_fuzz::evm::etherscan_abi_fetcher::EtherscanAbiFetcher;
@@ -283,7 +282,6 @@ enum Command {
         #[arg(long, default_value_t = true)]
         broker_free: bool,
     },
-    ScanMempool,
     Satori {
         #[command(subcommand)]
         command: SatoriCommand,
@@ -413,7 +411,8 @@ async fn main() -> anyhow::Result<()> {
                 max_execs,
                 duration_secs,
                 hardened_defi_config.single_process,
-                !no_synthetic_fallback && (config.allow_synthetic_fallback || allow_synthetic_fallback),
+                !no_synthetic_fallback
+                    && (config.allow_synthetic_fallback || allow_synthetic_fallback),
                 promotion_enabled
             );
             std::io::stdout().flush()?;
@@ -600,9 +599,8 @@ async fn main() -> anyhow::Result<()> {
                 seed_config.retry_backoff_ms = seed_rpc_backoff_ms;
                 seed_config.scan_mode = parse_seed_scan_mode(&seed_mode)?;
                 seed_config.abi_functions = abi_functions;
-                seed_config.resume_cursor = seed_resume_cursor.or_else(|| {
-                    resume.then(|| format!("{output}/seed-cursor.json"))
-                });
+                seed_config.resume_cursor = seed_resume_cursor
+                    .or_else(|| resume.then(|| format!("{output}/seed-cursor.json")));
                 let mut bundle = ingester
                     .ingest_bundle_from_target(&seed_config, &fork_db)
                     .await?;
@@ -610,7 +608,9 @@ async fn main() -> anyhow::Result<()> {
                     scan.chain_id = match chain.as_str() {
                         "bsc" => Some(56),
                         "evm" => None,
-                        other => anyhow::bail!("unsupported --chain `{other}`; expected evm or bsc"),
+                        other => {
+                            anyhow::bail!("unsupported --chain `{other}`; expected evm or bsc")
+                        }
                     };
                 }
                 std::fs::create_dir_all(output)?;
@@ -1171,11 +1171,6 @@ async fn main() -> anyhow::Result<()> {
                 calibration_output.display()
             );
         }
-        Command::ScanMempool => {
-            println!("Starting mempool scanner for chain: {}", config.chain);
-            let scanner = MempoolScanner::new(config.rpc_url.clone());
-            scanner.scan_mempool().await?;
-        }
         Command::Satori { .. } => unreachable!("Satori command is dispatched before config load"),
     }
 
@@ -1364,39 +1359,40 @@ async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyhow::R
 
     print_prove_live_banner(&campaign_id, target, fork_block, options.duration_secs);
 
-    let fetched_abi_path = if options.abi.is_none() {
-        if let Some(api_key) = options
-            .abi_key
-            .clone()
-            .or_else(|| std::env::var("ETHERSCAN_API_KEY").ok())
-        {
+    let abi_fetcher = options
+        .abi_key
+        .clone()
+        .or_else(|| std::env::var("ETHERSCAN_API_KEY").ok())
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+        .map(|api_key| {
             let explorer_url = options
                 .explorer_url
                 .clone()
                 .unwrap_or_else(|| default_explorer_api_url(&options.chain).to_string());
-            let fetcher = EtherscanAbiFetcher::new(api_key, explorer_url);
-            let abi = fetcher.fetch_abi(target).await?;
-            let output = std::path::Path::new(&campaign_report_dir).join("fetched_abi.json");
-            std::fs::write(&output, serde_json::to_vec_pretty(&abi)?)?;
-            println!(
-                "\x1b[36m[abi]\x1b[0m fetched target ABI -> {}",
-                output.display()
-            );
-            Some(output.to_string_lossy().to_string())
+            EtherscanAbiFetcher::new(api_key, explorer_url)
+        });
+
+    let fetched_abi_path = if options.abi.is_none() {
+        if let Some(fetcher) = abi_fetcher.as_ref() {
+            fetch_explorer_abi_to_report(fetcher, target, "target", &campaign_report_dir).await?
         } else {
+            println!(
+                "\x1b[33m[abi]\x1b[0m no ABI supplied and ETHERSCAN_API_KEY is empty; continuing with selector heuristics"
+            );
             None
         }
     } else {
         None
     };
 
-    let abi_path = options
+    let mut resolved_abi_path = options
         .abi
-        .as_deref()
-        .or(fetched_abi_path.as_deref())
-        .or(config.target_abi.as_deref());
+        .clone()
+        .or(fetched_abi_path.clone())
+        .or(config.target_abi.clone());
     let mut abi_report = None;
-    if let Some(abi_path) = abi_path {
+    if let Some(abi_path) = resolved_abi_path.as_deref() {
         let (_abi, _registry, report) = ingest_abi_file(abi_path, Some(target))?;
         let output = std::path::Path::new(&campaign_report_dir).join("abi_report.json");
         std::fs::write(&output, serde_json::to_vec_pretty(&report)?)?;
@@ -1407,6 +1403,55 @@ async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyhow::R
             output.display()
         );
         abi_report = Some(report);
+    }
+
+    if abi_report
+        .as_ref()
+        .is_some_and(|report| report.function_count == 0)
+        && options.abi.is_none()
+    {
+        if let Some(fetcher) = abi_fetcher.as_ref() {
+            let fork_db = ForkDb::new(rpc_url.clone(), fork_block);
+            match discover_eip1967_implementation(&fork_db, target) {
+                Ok(Some(implementation)) => {
+                    println!(
+                        "\x1b[36m[abi]\x1b[0m target ABI has no functions; discovered EIP-1967 implementation {}",
+                        implementation
+                    );
+                    if let Some(path) = fetch_explorer_abi_to_report(
+                        fetcher,
+                        implementation,
+                        "implementation",
+                        &campaign_report_dir,
+                    )
+                    .await?
+                    {
+                        let (_abi, _registry, report) = ingest_abi_file(&path, Some(target))?;
+                        let output = std::path::Path::new(&campaign_report_dir)
+                            .join("implementation_abi_report.json");
+                        std::fs::write(&output, serde_json::to_vec_pretty(&report)?)?;
+                        println!(
+                            "\x1b[36m[abi]\x1b[0m loaded implementation ABI {} functions, {} events -> {}",
+                            report.function_count,
+                            report.event_count,
+                            output.display()
+                        );
+                        resolved_abi_path = Some(path);
+                        abi_report = Some(report);
+                    }
+                }
+                Ok(None) => {
+                    println!(
+                        "\x1b[33m[abi]\x1b[0m target ABI has no functions and no EIP-1967 implementation slot was populated"
+                    );
+                }
+                Err(error) => {
+                    println!(
+                        "\x1b[33m[abi]\x1b[0m target ABI has no functions; EIP-1967 implementation lookup failed ({error})"
+                    );
+                }
+            }
+        }
     }
 
     let seed_bundle_id = if options.skip_seed_discovery || options.max_seeds == 0 {
@@ -1530,10 +1575,7 @@ async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyhow::R
         allow_synthetic_fallback: false,
         hardened_defi: hardened,
         target_invariant_manifest,
-        abi_path: options
-            .abi
-            .or(fetched_abi_path)
-            .or(config.target_abi.clone()),
+        abi_path: resolved_abi_path,
         max_execs: options.max_execs,
         duration_secs: Some(options.duration_secs),
         artifact_limit: Some(options.artifact_limit),
@@ -1562,6 +1604,60 @@ async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyhow::R
         campaign_id, campaign_report_dir
     );
     Ok(())
+}
+
+async fn fetch_explorer_abi_to_report(
+    fetcher: &EtherscanAbiFetcher,
+    address: Address,
+    label: &str,
+    campaign_report_dir: &str,
+) -> anyhow::Result<Option<String>> {
+    match fetcher.fetch_abi(address).await {
+        Ok(abi) => {
+            let filename = match label {
+                "implementation" => "fetched_implementation_abi.json",
+                _ => "fetched_abi.json",
+            };
+            let output = std::path::Path::new(campaign_report_dir).join(filename);
+            std::fs::write(&output, serde_json::to_vec_pretty(&abi)?)?;
+            println!(
+                "\x1b[36m[abi]\x1b[0m fetched {} ABI for {} -> {}",
+                label,
+                address,
+                output.display()
+            );
+            Ok(Some(output.to_string_lossy().to_string()))
+        }
+        Err(error) => {
+            println!(
+                "\x1b[33m[abi]\x1b[0m explorer {} ABI lookup failed for {} ({error}); continuing with selector heuristics",
+                label, address
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn discover_eip1967_implementation(
+    fork_db: &ForkDb,
+    proxy: Address,
+) -> anyhow::Result<Option<Address>> {
+    let slot = eip1967_slot("eip1967.proxy.implementation");
+    let value = fork_db.storage_ref(proxy, slot)?;
+    Ok(address_from_storage_word(value))
+}
+
+fn eip1967_slot(label: &str) -> U256 {
+    U256::from_be_bytes(keccak256(label.as_bytes()).0).saturating_sub(U256::from(1))
+}
+
+fn address_from_storage_word(value: U256) -> Option<Address> {
+    if value.is_zero() {
+        return None;
+    }
+    let bytes = value.to_be_bytes::<32>();
+    let address = Address::from_slice(&bytes[12..]);
+    (address != Address::ZERO).then_some(address)
 }
 
 fn print_prove_live_banner(
@@ -1599,8 +1695,8 @@ fn sanitize_rpc_for_display(raw: &str) -> String {
 
 fn default_explorer_api_url(chain: &str) -> &'static str {
     match chain {
-        "bsc" => "https://api.bscscan.com/api",
-        _ => "https://api.etherscan.io/api",
+        "bsc" => "https://api.etherscan.io/v2/api?chainid=56",
+        _ => "https://api.etherscan.io/v2/api?chainid=1",
     }
 }
 
@@ -1628,7 +1724,12 @@ fn execution_coverage_material(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_campaign_bounds;
+    use super::{
+        address_from_storage_word, discover_eip1967_implementation, eip1967_slot,
+        resolve_campaign_bounds,
+    };
+    use revm::primitives::{Address, U256};
+    use rusty_fuzz::evm::fork_db::ForkDb;
 
     #[test]
     fn fuzz_requires_bounds_unless_unbounded() {
@@ -1644,6 +1745,28 @@ mod tests {
         assert_eq!(
             resolve_campaign_bounds(None, None, true).unwrap(),
             (None, None)
+        );
+    }
+
+    #[test]
+    fn eip1967_implementation_slot_decodes_storage_word_address() {
+        let proxy = Address::repeat_byte(0x11);
+        let implementation = Address::repeat_byte(0x42);
+        let mut padded = [0u8; 32];
+        padded[12..].copy_from_slice(implementation.as_slice());
+        let value = U256::from_be_bytes(padded);
+
+        assert_eq!(address_from_storage_word(value), Some(implementation));
+
+        let fork_db = ForkDb::new_offline("0x1");
+        fork_db.cache_storage(
+            proxy,
+            eip1967_slot("eip1967.proxy.implementation"),
+            value,
+        );
+        assert_eq!(
+            discover_eip1967_implementation(&fork_db, proxy).unwrap(),
+            Some(implementation)
         );
     }
 }

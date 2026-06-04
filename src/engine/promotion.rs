@@ -1,4 +1,6 @@
-use crate::common::oracle::{ProtocolFinding, ProtocolOraclePack, ProtocolSeverity, VulnType};
+use crate::common::oracle::{
+    FindingStatus, ProtocolFinding, ProtocolOraclePack, ProtocolSeverity, VulnType,
+};
 use crate::common::types::{
     CallObservation, ChainState, ExecutionStatus, SequenceExecutionResult, Snapshot, StorageDiff,
 };
@@ -15,12 +17,13 @@ use revm::context::BlockEnv;
 use revm::database::CacheDB;
 use revm::primitives::Address;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FindingLifecycleStage {
@@ -62,10 +65,14 @@ pub struct FindingPromotionRecord {
     pub vuln_type: String,
     pub severity: ProtocolSeverity,
     pub confidence: u64,
+    #[serde(default)]
+    pub status: FindingStatus,
     pub lifecycle_stage: FindingLifecycleStage,
     pub replay_status: String,
     pub minimize_status: String,
     pub poc_status: String,
+    #[serde(default)]
+    pub evidence_hash: Option<String>,
     pub synthetic_mode: bool,
     pub caveats: Vec<String>,
     pub artifact_paths: BTreeMap<String, String>,
@@ -112,11 +119,17 @@ pub struct PocValidationReport {
 pub struct PromotionCampaignSummary {
     pub campaign_id: String,
     pub total_executions: u64,
+    #[serde(default)]
+    pub mutated_inputs: u64,
+    #[serde(default)]
+    pub seed_replays: u64,
     pub total_artifacts: u64,
     #[serde(default)]
     pub coverage_edges: u64,
     #[serde(default)]
     pub interesting_candidates: u64,
+    #[serde(default)]
+    pub candidate_findings: u64,
     #[serde(default)]
     pub unproven_candidates: u64,
     #[serde(default)]
@@ -201,23 +214,32 @@ impl PromotionCampaignStats {
         &self,
         campaign_id: impl Into<String>,
         total_executions: u64,
+        mutated_inputs: u64,
+        seed_replays: u64,
         total_artifacts: u64,
         coverage_edges: u64,
     ) -> PromotionCampaignSummary {
         let promoted_findings = self.promoted_findings.load(Ordering::Relaxed);
         let confirmed_findings = self.confirmed_findings.load(Ordering::Relaxed);
+        let rejected_candidates = self.rejected_candidates.load(Ordering::Relaxed);
         let poc_count = self.poc_count.load(Ordering::Relaxed);
+        let candidate_findings =
+            promoted_findings.saturating_sub(confirmed_findings + rejected_candidates);
+        let unproven_candidates = total_artifacts.saturating_sub(confirmed_findings);
         PromotionCampaignSummary {
             campaign_id: campaign_id.into(),
             total_executions,
+            mutated_inputs,
+            seed_replays,
             total_artifacts,
             coverage_edges,
-            interesting_candidates: total_artifacts.saturating_sub(confirmed_findings),
-            unproven_candidates: total_artifacts.saturating_sub(confirmed_findings),
+            interesting_candidates: unproven_candidates,
+            candidate_findings,
+            unproven_candidates,
             missing_poc_for_promoted: promoted_findings.saturating_sub(poc_count),
             promoted_findings,
             confirmed_findings,
-            rejected_candidates: self.rejected_candidates.load(Ordering::Relaxed),
+            rejected_candidates,
             synthetic_non_production_findings: self
                 .synthetic_non_production_findings
                 .load(Ordering::Relaxed),
@@ -277,6 +299,7 @@ pub fn promote_finding_artifact(
     let replay_status: String;
     let mut minimize_status = "not_run".to_string();
     let mut poc_status = "not_run".to_string();
+    let mut evidence_hash = None;
     let mut minimized_input = input.clone();
 
     match replay_result {
@@ -293,6 +316,7 @@ pub fn promote_finding_artifact(
                 .unwrap_or_default();
             let replay_findings = ProtocolOraclePack::default().evaluate(&execution);
             let replay_report = replay_report(&input, &execution, &replay_findings, final_balances);
+            evidence_hash = Some(hash_json(&replay_report)?);
             let replay_path = finding_dir.join("replay.json");
             write_json(&replay_path, &replay_report)?;
             artifact_paths.insert("replay".to_string(), replay_path.display().to_string());
@@ -433,6 +457,12 @@ pub fn promote_finding_artifact(
         minimize_status == "reduced" || minimize_status == "not_reducible",
         poc_status == "validated",
     );
+    let status = status_for_lifecycle(
+        &lifecycle_stage,
+        replay_status == "success",
+        minimize_status == "reduced" || minimize_status == "not_reducible",
+        poc_status == "validated",
+    );
 
     let record = FindingPromotionRecord {
         finding_id: finding_id.clone(),
@@ -450,10 +480,12 @@ pub fn promote_finding_artifact(
             .map(|finding| finding.severity.clone())
             .unwrap_or(ProtocolSeverity::Info),
         confidence,
+        status,
         lifecycle_stage,
         replay_status,
         minimize_status,
         poc_status,
+        evidence_hash,
         synthetic_mode: request.synthetic_mode,
         caveats,
         artifact_paths,
@@ -651,6 +683,25 @@ pub fn confidence_for(
     }
 }
 
+fn status_for_lifecycle(
+    stage: &FindingLifecycleStage,
+    replayed: bool,
+    minimized: bool,
+    poc_validated: bool,
+) -> FindingStatus {
+    match stage {
+        FindingLifecycleStage::Rejected => FindingStatus::Rejected,
+        FindingLifecycleStage::Confirmed if replayed && minimized && poc_validated => {
+            FindingStatus::Confirmed
+        }
+        FindingLifecycleStage::Candidate
+        | FindingLifecycleStage::Replayed
+        | FindingLifecycleStage::Minimized
+        | FindingLifecycleStage::PocGenerated
+        | FindingLifecycleStage::Confirmed => FindingStatus::Candidate,
+    }
+}
+
 fn promotion_predicate(
     execution: &SequenceExecutionResult,
     target_vuln: Option<&VulnType>,
@@ -733,6 +784,13 @@ fn write_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn hash_json(value: &impl Serialize) -> anyhow::Result<String> {
+    let bytes = serde_json::to_vec(value)?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
 fn finding_markdown(
     record: &FindingPromotionRecord,
     finding: Option<&ProtocolFinding>,
@@ -767,17 +825,53 @@ fn finding_markdown(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let affected = affected_functions_markdown(input, finding);
+    let root_cause = finding
+        .map(|finding| root_cause_for(&finding.vuln))
+        .unwrap_or("No protocol oracle finding survived into this promotion record.");
+    let impact = finding
+        .map(|finding| impact_for(&finding.vuln))
+        .unwrap_or("No exploit impact is established.");
+    let recommended_fix = finding
+        .map(|finding| recommended_fix_for(&finding.vuln))
+        .unwrap_or("Add a detector-specific assertion before treating this artifact as a vulnerability.");
+    let false_positive_checks = false_positive_checks_markdown(record);
+    let limitations = limitations_markdown(record);
+    let severity_label = if record.status == FindingStatus::Confirmed {
+        "Severity"
+    } else {
+        "Severity hint"
+    };
     format!(
-        "# RustyFuzz Finding {}\n\n## Summary\n{}\n\n## Severity\n{:?}\n\n## Confidence\n{}\n\n## Lifecycle stage\n{:?}\n\n## Target\n{:?}\n\n## Fork block\n{}\n\n## Transaction sequence\n{}\n\n## Oracle evidence\n{}\n\n## Storage diffs\nSee replay.json and minimized_input.json.\n\n## Call trace highlights\nSee replay.json.\n\n## Replay result\n{}\n\n## Minimization result\n{}\n\n## Foundry PoC path\n{}\n\n## Reproduction commands\n`cargo run -- replay --input {}`\n\n## Caveats\n{}\n",
+        "# RustyFuzz Finding {}\n\n## Summary\n{}\n\n## Status\n{:?}\n\n## {}\n{:?}\n\n## Confidence\n{}\n\n## Lifecycle stage\n{:?}\n\n## Target\n{:?}\n\n## Fork block\n{}\n\n## Affected contracts and functions\n{}\n\n## Root cause hypothesis\n{}\n\n## Impact\n{}\n\n## Transaction sequence\n{}\n\n## Oracle evidence\n{}\n\n## Storage and call evidence\n- replay: `{}`\n- minimized_input: `{}`\n- evidence_hash: `{}`\n\n## Replay result\n{}\n\n## Minimization result\n{}\n\n## Foundry PoC path\n{}\n\n## Reproduction commands\n`cargo run -- replay --input {}`\n\n## False-positive checks performed\n{}\n\n## Limitations\n{}\n\n## Recommended fix\n{}\n\n## Caveats\n{}\n",
         record.finding_id,
         record.vuln_type,
+        record.status,
+        severity_label,
         record.severity,
         record.confidence,
         record.lifecycle_stage,
         record.target,
         record.fork_block,
+        affected,
+        root_cause,
+        impact,
         txs,
         evidence,
+        record
+            .artifact_paths
+            .get("replay")
+            .cloned()
+            .unwrap_or_else(|| "not generated".to_string()),
+        record
+            .artifact_paths
+            .get("minimized_input")
+            .cloned()
+            .unwrap_or_else(|| "not generated".to_string()),
+        record
+            .evidence_hash
+            .clone()
+            .unwrap_or_else(|| "not available".to_string()),
         record.replay_status,
         record.minimize_status,
         record
@@ -786,19 +880,217 @@ fn finding_markdown(
             .cloned()
             .unwrap_or_else(|| "not generated".to_string()),
         record.input_id,
+        false_positive_checks,
+        limitations,
+        recommended_fix,
         caveats
     )
 }
 
+fn affected_functions_markdown(input: &EvmInput, finding: Option<&ProtocolFinding>) -> String {
+    let mut rows = Vec::new();
+    for (idx, tx) in input.txs.iter().enumerate() {
+        if finding
+            .and_then(|finding| finding.tx_index)
+            .is_some_and(|finding_idx| finding_idx != idx)
+        {
+            continue;
+        }
+        let selector = if tx.input.len() >= 4 {
+            format!("0x{}", hex::encode(&tx.input[..4]))
+        } else {
+            "<fallback-or-empty-calldata>".to_string()
+        };
+        rows.push(format!(
+            "- tx{} target={} selector={} caller={}",
+            idx + 1,
+            tx.to,
+            selector,
+            tx.caller
+        ));
+    }
+    if rows.is_empty() {
+        "- no selector-specific transaction evidence".to_string()
+    } else {
+        rows.join("\n")
+    }
+}
+
+fn root_cause_for(vuln: &VulnType) -> &'static str {
+    match vuln {
+        VulnType::Reentrancy | VulnType::ReadOnlyReentrancy | VulnType::TokenCallbackReentrancy => {
+            "External control is yielded before protocol accounting or invariant restoration is complete."
+        }
+        VulnType::VaultDonationAttack | VulnType::VaultInflation => {
+            "Vault share/accounting math appears sensitive to donation or rounding-driven exchange-rate movement."
+        }
+        VulnType::PriceManipulation | VulnType::PriceOracleManipulation => {
+            "A protocol decision appears dependent on a manipulable or insufficiently bounded price source."
+        }
+        VulnType::PrecisionLossExploit | VulnType::RoundingLeakage => {
+            "Rounding, scaling, or interest-index precision appears to move value in the attacker-favorable direction."
+        }
+        VulnType::AccountingDesync | VulnType::CrossContractDesync => {
+            "Internal accounting appears to diverge from observed token/value movement."
+        }
+        VulnType::PrivilegeEscalation
+        | VulnType::ProxyUpgradeabilityViolation
+        | VulnType::MissingSignerCheck => {
+            "A non-privileged caller appears able to reach privileged state-changing behavior."
+        }
+        VulnType::GovernanceTakeover | VulnType::GovernanceParameterManipulation => {
+            "Governance state appears mutable without the expected proposal, quorum, vote, queue, or timelock preconditions."
+        }
+        VulnType::BridgeInvariantViolation => {
+            "Bridge/message state appears replayable, finalized on the wrong domain, or finalized without valid prerequisite evidence."
+        }
+        VulnType::FlashLoanProfit | VulnType::FlashLoanAttack => {
+            "Temporary liquidity appears to create an extractive state transition that survives repayment."
+        }
+        VulnType::InvariantViolation(_) => {
+            "A configured target invariant was violated by the replayed transaction sequence."
+        }
+        VulnType::UnintendedPanic(_) => {
+            "Execution reached a panic/assertion path that may represent a broken protocol invariant."
+        }
+        _ => "The oracle emitted protocol evidence that needs detector-specific review.",
+    }
+}
+
+fn impact_for(vuln: &VulnType) -> &'static str {
+    match vuln {
+        VulnType::PrivilegeEscalation
+        | VulnType::ProxyUpgradeabilityViolation
+        | VulnType::MissingSignerCheck => {
+            "Unauthorized administrative mutation, upgrade, pause, role grant, or parameter control."
+        }
+        VulnType::VaultDonationAttack
+        | VulnType::VaultInflation
+        | VulnType::PrecisionLossExploit
+        | VulnType::RoundingLeakage
+        | VulnType::AccountingDesync => {
+            "Potential value extraction or protocol accounting loss."
+        }
+        VulnType::PriceManipulation | VulnType::PriceOracleManipulation => {
+            "Potential mispricing, bad debt, unfair liquidation, or value extraction through dependent protocol actions."
+        }
+        VulnType::GovernanceTakeover | VulnType::GovernanceParameterManipulation => {
+            "Potential protocol parameter takeover or unauthorized governance execution."
+        }
+        VulnType::BridgeInvariantViolation => {
+            "Potential double mint/release, wrong-domain finalization, or message replay."
+        }
+        VulnType::FlashLoanProfit | VulnType::FlashLoanAttack => {
+            "Potential atomic profit or solvency damage enabled by temporary liquidity."
+        }
+        VulnType::Reentrancy | VulnType::ReadOnlyReentrancy | VulnType::TokenCallbackReentrancy => {
+            "Potential stale-accounting exploitation, repeated withdrawal, or manipulated downstream reads."
+        }
+        _ => "Impact requires manual review of replay evidence and generated PoC assertions.",
+    }
+}
+
+fn recommended_fix_for(vuln: &VulnType) -> &'static str {
+    match vuln {
+        VulnType::Reentrancy | VulnType::ReadOnlyReentrancy | VulnType::TokenCallbackReentrancy => {
+            "Apply checks-effects-interactions, reentrancy guards where appropriate, and restore accounting before external calls."
+        }
+        VulnType::VaultDonationAttack | VulnType::VaultInflation => {
+            "Use ERC-4626 inflation-resistant share math, minimum share checks, virtual offsets, and donation-aware accounting."
+        }
+        VulnType::PriceManipulation | VulnType::PriceOracleManipulation => {
+            "Use manipulation-resistant oracles, TWAP/median bounds, staleness checks, and action-level price movement limits."
+        }
+        VulnType::PrecisionLossExploit | VulnType::RoundingLeakage => {
+            "Audit scale factors and rounding direction; bound index growth and round against attacker-favorable flows."
+        }
+        VulnType::AccountingDesync | VulnType::CrossContractDesync => {
+            "Credit only actual received amounts, reconcile internal accounting with token balances, and handle fee-on-transfer behavior."
+        }
+        VulnType::PrivilegeEscalation
+        | VulnType::ProxyUpgradeabilityViolation
+        | VulnType::MissingSignerCheck => {
+            "Gate privileged selectors with explicit role checks and protect initializer/upgrade paths on proxy and implementation contracts."
+        }
+        VulnType::GovernanceTakeover | VulnType::GovernanceParameterManipulation => {
+            "Enforce proposal lifecycle, quorum, snapshot vote weight, queue delay, timelock, and one-time execution."
+        }
+        VulnType::BridgeInvariantViolation => {
+            "Bind proofs to domain, nonce, message hash, and consumed-state; reject duplicate or wrong-domain finalization."
+        }
+        _ => "Derive the fix from the replayed invariant violation and add regression tests around the minimized sequence.",
+    }
+}
+
+fn false_positive_checks_markdown(record: &FindingPromotionRecord) -> String {
+    let checks = [
+        (
+            "deterministic replay",
+            record.replay_status == "success",
+            &record.replay_status,
+        ),
+        (
+            "minimization preserved evidence",
+            matches!(record.minimize_status.as_str(), "reduced" | "not_reducible"),
+            &record.minimize_status,
+        ),
+        (
+            "Foundry PoC validated",
+            record.poc_status == "validated",
+            &record.poc_status,
+        ),
+    ];
+    checks
+        .iter()
+        .map(|(name, passed, status)| {
+            format!(
+                "- {}: {} ({})",
+                name,
+                if *passed { "passed" } else { "not passed" },
+                status
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn limitations_markdown(record: &FindingPromotionRecord) -> String {
+    let mut limitations = Vec::new();
+    if record.status != FindingStatus::Confirmed {
+        limitations.push("finding is not confirmed; severity is only a hint");
+    }
+    if record.synthetic_mode {
+        limitations.push("synthetic fallback evidence is non-production");
+    }
+    if record.evidence_hash.is_none() {
+        limitations.push("replay evidence hash is unavailable");
+    }
+    if record.poc_status != "validated" {
+        limitations.push("generated PoC did not pass forge validation");
+    }
+    if limitations.is_empty() {
+        "- none for the current proof pipeline".to_string()
+    } else {
+        limitations
+            .into_iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 fn campaign_summary_markdown(summary: &PromotionCampaignSummary) -> String {
     format!(
-        "# RustyFuzz Campaign Summary\n\n- campaign_id: `{}`\n- total_executions: `{}`\n- total_artifacts: `{}`\n- coverage_edges: `{}`\n- confirmed_vulnerabilities: `{}`\n- interesting_candidates: `{}`\n- promoted_findings: `{}`\n- confirmed_findings: `{}`\n- rejected_candidates: `{}`\n- unproven_candidates: `{}`\n- poc_count: `{}`\n- missing_poc_for_promoted: `{}`\n- replay_failure_count: `{}`\n- synthetic_non_production_findings: `{}`\n- highest_confidence: `{}`\n- minimization_attempts: `{}`\n- minimization_reduced: `{}`\n- minimization_not_reducible: `{}`\n\nSuccess definition: no replay-confirmed finding means no confirmed vulnerability; no passing PoC means the issue is not bounty-grade confirmed.\n",
+        "# RustyFuzz Campaign Summary\n\n- campaign_id: `{}`\n- total_executions: `{}`\n- mutated_inputs: `{}`\n- seed_replays: `{}`\n- total_artifacts: `{}`\n- coverage_edges: `{}`\n- confirmed_vulnerabilities: `{}`\n- interesting_candidates: `{}`\n- candidate_findings: `{}`\n- promoted_findings: `{}`\n- confirmed_findings: `{}`\n- rejected_candidates: `{}`\n- unproven_candidates: `{}`\n- poc_count: `{}`\n- missing_poc_for_promoted: `{}`\n- replay_failure_count: `{}`\n- synthetic_non_production_findings: `{}`\n- highest_confidence: `{}`\n- minimization_attempts: `{}`\n- minimization_reduced: `{}`\n- minimization_not_reducible: `{}`\n\nSuccess definition: no replay-confirmed finding means no confirmed vulnerability; no passing PoC means the issue is not bounty-grade confirmed.\n",
         summary.campaign_id,
         summary.total_executions,
+        summary.mutated_inputs,
+        summary.seed_replays,
         summary.total_artifacts,
         summary.coverage_edges,
         summary.confirmed_findings,
         summary.interesting_candidates,
+        summary.candidate_findings,
         summary.promoted_findings,
         summary.confirmed_findings,
         summary.rejected_candidates,
@@ -865,5 +1157,116 @@ mod tests {
     #[test]
     fn synthetic_record_cannot_be_confirmed_by_confidence() {
         assert!(confidence_for(&FindingLifecycleStage::Confirmed, true, true, true, true) <= 40);
+    }
+
+    #[test]
+    fn status_requires_full_validation_for_confirmed() {
+        assert_eq!(
+            status_for_lifecycle(&FindingLifecycleStage::Candidate, false, false, false),
+            FindingStatus::Candidate
+        );
+        assert_eq!(
+            status_for_lifecycle(&FindingLifecycleStage::PocGenerated, true, true, true),
+            FindingStatus::Candidate
+        );
+        assert_eq!(
+            status_for_lifecycle(&FindingLifecycleStage::Confirmed, true, true, true),
+            FindingStatus::Confirmed
+        );
+        assert_eq!(
+            status_for_lifecycle(&FindingLifecycleStage::Confirmed, true, true, false),
+            FindingStatus::Candidate
+        );
+        assert_eq!(
+            status_for_lifecycle(&FindingLifecycleStage::Rejected, false, false, false),
+            FindingStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn campaign_summary_counts_candidates_confirmed_and_rejected_separately() {
+        let stats = PromotionCampaignStats::default();
+        let confirmed = FindingPromotionRecord {
+            finding_id: "confirmed".to_string(),
+            campaign_id: "campaign".to_string(),
+            input_id: "input-1".to_string(),
+            fork_cache_id: "fork-1".to_string(),
+            target: None,
+            fork_block: 1,
+            vuln_type: "reentrancy".to_string(),
+            severity: ProtocolSeverity::High,
+            confidence: 90,
+            status: FindingStatus::Confirmed,
+            lifecycle_stage: FindingLifecycleStage::Confirmed,
+            replay_status: "success".to_string(),
+            minimize_status: "reduced".to_string(),
+            poc_status: "validated".to_string(),
+            evidence_hash: Some("sha256:test".to_string()),
+            synthetic_mode: false,
+            caveats: Vec::new(),
+            artifact_paths: BTreeMap::new(),
+        };
+        let mut rejected = confirmed.clone();
+        rejected.finding_id = "rejected".to_string();
+        rejected.status = FindingStatus::Rejected;
+        rejected.lifecycle_stage = FindingLifecycleStage::Rejected;
+        rejected.replay_status = "failed".to_string();
+        rejected.poc_status = "not_run".to_string();
+        let mut candidate = confirmed.clone();
+        candidate.finding_id = "candidate".to_string();
+        candidate.status = FindingStatus::Candidate;
+        candidate.lifecycle_stage = FindingLifecycleStage::Minimized;
+        candidate.poc_status = "generated_unvalidated".to_string();
+
+        stats.record(&confirmed);
+        stats.record(&rejected);
+        stats.record(&candidate);
+
+        let summary = stats.summary("campaign", 10, 7, 3, 5, 12);
+        assert_eq!(summary.total_executions, 10);
+        assert_eq!(summary.mutated_inputs, 7);
+        assert_eq!(summary.seed_replays, 3);
+        assert_eq!(summary.promoted_findings, 3);
+        assert_eq!(summary.confirmed_findings, 1);
+        assert_eq!(summary.rejected_candidates, 1);
+        assert_eq!(summary.candidate_findings, 1);
+        assert_eq!(summary.unproven_candidates, 4);
+        assert_eq!(summary.poc_count, 1);
+    }
+
+    #[test]
+    fn finding_markdown_labels_unconfirmed_severity_and_evidence_hash() {
+        let record = FindingPromotionRecord {
+            finding_id: "candidate".to_string(),
+            campaign_id: "campaign".to_string(),
+            input_id: "input-1".to_string(),
+            fork_cache_id: "fork-1".to_string(),
+            target: Some(Address::repeat_byte(0x22)),
+            fork_block: 1,
+            vuln_type: "VaultInflation".to_string(),
+            severity: ProtocolSeverity::High,
+            confidence: 80,
+            status: FindingStatus::Candidate,
+            lifecycle_stage: FindingLifecycleStage::Minimized,
+            replay_status: "success".to_string(),
+            minimize_status: "not_reducible".to_string(),
+            poc_status: "generated_unvalidated".to_string(),
+            evidence_hash: Some("sha256:abc".to_string()),
+            synthetic_mode: false,
+            caveats: Vec::new(),
+            artifact_paths: BTreeMap::new(),
+        };
+        let input = EvmInput {
+            txs: Vec::new(),
+            base_snapshot_id: 0,
+            waypoints: Vec::new(),
+            mutation_provenance: Vec::new(),
+        };
+
+        let markdown = finding_markdown(&record, None, &input);
+        assert!(markdown.contains("## Severity hint"));
+        assert!(markdown.contains("sha256:abc"));
+        assert!(markdown.contains("## Root cause hypothesis"));
+        assert!(markdown.contains("## Recommended fix"));
     }
 }

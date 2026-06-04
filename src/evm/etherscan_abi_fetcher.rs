@@ -56,15 +56,24 @@ impl EtherscanAbiFetcher {
             }
         }
 
+        let separator = if self.base_url.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
         let url = format!(
-            "{}?module=contract&action=getabi&address={:?}&apikey={}",
-            self.base_url, address, self.api_key
+            "{}{}module=contract&action=getabi&address={:?}&apikey={}",
+            self.base_url, separator, address, self.api_key
         );
 
         let response: EtherscanResponse = self.client.get(&url).send().await?.json().await?;
 
         if response.status != "1" {
-            return Err(anyhow!("Etherscan API error: {}", response.message));
+            return Err(anyhow!(
+                "Etherscan API error: {}; result={}",
+                response.message,
+                response.result
+            ));
         }
 
         let abi: JsonAbi = serde_json::from_str(&response.result)?;

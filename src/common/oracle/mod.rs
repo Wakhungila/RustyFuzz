@@ -5,6 +5,20 @@ pub trait VulnerabilityOracle {
     fn check(&self, before: &Snapshot, after: &Snapshot) -> Option<VulnType>;
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FindingStatus {
+    Signal,
+    Candidate,
+    Confirmed,
+    Rejected,
+}
+
+impl Default for FindingStatus {
+    fn default() -> Self {
+        Self::Signal
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum VulnType {
     Reentrancy,

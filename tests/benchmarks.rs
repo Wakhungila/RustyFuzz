@@ -5,7 +5,7 @@ use revm::primitives::{Address, U256};
 use revm::state::{AccountInfo, Bytecode};
 use rusty_fuzz::common::oracle::{
     AccessControlOracle, ERC4626InflationOracle, ProtocolOraclePack, ProtocolOraclePackKind,
-    ProtocolSeverity, ReentrancyOracle, VulnType, VulnerabilityOracle,
+    ProtocolFinding, ProtocolSeverity, ReentrancyOracle, VulnType, VulnerabilityOracle,
 };
 use rusty_fuzz::common::types::{
     CallKind, CallObservation, CallPhase, ChainState, EvmInput, SequenceExecutionResult,
@@ -860,6 +860,62 @@ fn foundry_poc_generation_embeds_protocol_oracle_assertions() {
     assert!(poc.contains("assertRustyFuzzMarketEvidence"));
     assert!(poc.contains("rustyFuzzWord"));
     assert!(poc.contains("market/oracle evidence transaction changed status"));
+}
+
+#[test]
+fn foundry_poc_generation_embeds_access_control_specific_assertions() {
+    let root = std::env::temp_dir().join(format!(
+        "rusty_fuzz_access_poc_test_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create poc dir");
+    let caller = addr(0xa1);
+    let proxy = addr(0xa2);
+    let input = EvmInput {
+        txs: vec![SingletonTx {
+            input: vec![0x36, 0x59, 0xcf, 0xe6],
+            caller,
+            to: proxy,
+            value: U256::ZERO,
+            is_victim: false,
+        }],
+        base_snapshot_id: 0,
+        waypoints: Vec::new(),
+        mutation_provenance: Vec::new(),
+    };
+    let execution = SequenceExecutionResult {
+        tx_results: Vec::new(),
+        total_gas_used: 0,
+        final_coverage_hash: 0,
+        storage_reads: Vec::new(),
+        storage_writes: Vec::new(),
+        storage_diffs: Vec::new(),
+        call_trace: vec![call(0, proxy, vec![0x36, 0x59, 0xcf, 0xe6], true)],
+        oracle_observations: Vec::new(),
+    };
+    let finding = ProtocolFinding {
+        pack: ProtocolOraclePackKind::ProxyUpgradeability,
+        vuln: VulnType::ProxyUpgradeabilityViolation,
+        severity: ProtocolSeverity::High,
+        tx_index: Some(0),
+        target: Some(proxy),
+        evidence: "non-admin caller reached upgrade selector".to_string(),
+    };
+
+    let path = synthesize_foundry_poc_with_findings(
+        &input,
+        &VulnType::ProxyUpgradeabilityViolation,
+        Some(&execution),
+        &[finding],
+        &root,
+        "http://localhost:8545",
+        123,
+    )
+    .expect("generate access poc");
+    let poc = std::fs::read_to_string(path).expect("read poc");
+    assert!(poc.contains("assertRustyFuzzAccessControlEvidence"));
+    assert!(poc.contains("access-control/proxy evidence transaction changed status"));
 }
 
 #[test]

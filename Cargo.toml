@@ -10,7 +10,7 @@ path = "src/bin/benchmark.rs"
 # ─────────────────────────────────────────────────────────────────────────────
 # FEATURES
 # Build EVM only (default):   cargo build --release
-# Build SVM only:             cargo build --release --features svm --no-default-features
+# SVM/SGX:                    unsupported; feature flags emit controlled errors
 # Build with Z3 solver:       cargo build --release --features "evm,z3"
 # Build with notifications:   cargo build --release --features "evm,notifier"
 # ─────────────────────────────────────────────────────────────────────────────
@@ -76,10 +76,9 @@ version  = "1.5.7"
 optional = true
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SVM STACK  (feature = "svm")
-# Pins removed — let Cargo resolve a compatible solana-sdk version that
-# satisfies mollusk-svm 0.0.10's ^2.1 requirement.
-# DO NOT enable evm + svm in the same binary.
+# SVM STACK  (unsupported)
+# Dependencies remain optional for future reconstruction, but the crate root
+# currently emits a controlled compile error when `svm` is enabled.
 # ─────────────────────────────────────────────────────────────────────────────
 [dependencies.solana-sdk]
 version  = "^4.0.1"
