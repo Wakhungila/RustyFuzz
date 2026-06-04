@@ -19,6 +19,7 @@ use rusty_fuzz::engine::promotion::{
 };
 use rusty_fuzz::engine::seed_intelligence::SeedIntelligence;
 use rusty_fuzz::evm::corpus::{CampaignArtifactRecord, PersistentCorpus};
+use rusty_fuzz::evm::etherscan_abi_fetcher::EtherscanAbiFetcher;
 use rusty_fuzz::evm::executor::EvmExecutor;
 use rusty_fuzz::evm::fork::create_fork_block_env;
 use rusty_fuzz::evm::fork_db::ForkDb;
@@ -227,6 +228,52 @@ enum Command {
         fork_cache_id: Option<String>,
         #[arg(long)]
         campaign_id: Option<String>,
+    },
+    ProveLive {
+        #[arg(long, alias = "contract")]
+        target: String,
+        #[arg(long, default_value = "evm")]
+        chain: String,
+        #[arg(long)]
+        block: Option<u64>,
+        #[arg(long)]
+        rpc_url: Option<String>,
+        #[arg(long)]
+        abi: Option<String>,
+        #[arg(long, alias = "etherscan-api-key")]
+        abi_key: Option<String>,
+        #[arg(long)]
+        explorer_url: Option<String>,
+        #[arg(long)]
+        campaign_id: Option<String>,
+        #[arg(long, default_value_t = 300)]
+        duration_secs: u64,
+        #[arg(long)]
+        max_execs: Option<u64>,
+        #[arg(long)]
+        wall_timeout_secs: Option<u64>,
+        #[arg(long, default_value_t = 32)]
+        max_seeds: usize,
+        #[arg(long, default_value_t = 10_000)]
+        search_depth: u64,
+        #[arg(long, default_value = "block-scan")]
+        seed_mode: String,
+        #[arg(long, default_value_t = false)]
+        include_address_hints: bool,
+        #[arg(long, default_value_t = 0.0, alias = "rate-limit-rps")]
+        seed_max_blocks_per_second: f64,
+        #[arg(long, default_value_t = false)]
+        skip_seed_discovery: bool,
+        #[arg(long, default_value_t = 8)]
+        artifact_limit: u64,
+        #[arg(long, default_value_t = 4)]
+        promotion_limit: u64,
+        #[arg(long, default_value_t = 0)]
+        min_finding_confidence: u64,
+        #[arg(long, default_value_t = false)]
+        deterministic: bool,
+        #[arg(long)]
+        rng_seed: Option<u64>,
     },
     Validate {
         #[arg(long)]
@@ -1029,6 +1076,59 @@ async fn main() -> anyhow::Result<()> {
                 record.poc_status
             );
         }
+        Command::ProveLive {
+            target,
+            chain,
+            block,
+            rpc_url,
+            abi,
+            abi_key,
+            explorer_url,
+            campaign_id,
+            duration_secs,
+            max_execs,
+            wall_timeout_secs,
+            max_seeds,
+            search_depth,
+            seed_mode,
+            include_address_hints,
+            seed_max_blocks_per_second,
+            skip_seed_discovery,
+            artifact_limit,
+            promotion_limit,
+            min_finding_confidence,
+            deterministic,
+            rng_seed,
+        } => {
+            run_prove_live(
+                &config,
+                ProveLiveOptions {
+                    target,
+                    chain,
+                    block,
+                    rpc_url,
+                    abi,
+                    abi_key,
+                    explorer_url,
+                    campaign_id,
+                    duration_secs,
+                    max_execs,
+                    wall_timeout_secs,
+                    max_seeds,
+                    search_depth,
+                    seed_mode,
+                    include_address_hints,
+                    seed_max_blocks_per_second,
+                    skip_seed_discovery,
+                    artifact_limit,
+                    promotion_limit,
+                    min_finding_confidence,
+                    deterministic,
+                    rng_seed,
+                },
+            )
+            .await?;
+        }
         Command::Validate {
             benchmarks,
             output,
@@ -1204,6 +1304,303 @@ fn parse_seed_scan_mode(value: &str) -> anyhow::Result<SeedScanMode> {
         other => anyhow::bail!(
             "unsupported --seed-mode `{other}`; expected block-scan, logs, or debug-trace"
         ),
+    }
+}
+
+struct ProveLiveOptions {
+    target: String,
+    chain: String,
+    block: Option<u64>,
+    rpc_url: Option<String>,
+    abi: Option<String>,
+    abi_key: Option<String>,
+    explorer_url: Option<String>,
+    campaign_id: Option<String>,
+    duration_secs: u64,
+    max_execs: Option<u64>,
+    wall_timeout_secs: Option<u64>,
+    max_seeds: usize,
+    search_depth: u64,
+    seed_mode: String,
+    include_address_hints: bool,
+    seed_max_blocks_per_second: f64,
+    skip_seed_discovery: bool,
+    artifact_limit: u64,
+    promotion_limit: u64,
+    min_finding_confidence: u64,
+    deterministic: bool,
+    rng_seed: Option<u64>,
+}
+
+async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyhow::Result<()> {
+    ensure_evm_chain(config)?;
+    anyhow::ensure!(
+        matches!(options.chain.as_str(), "evm" | "eth" | "ethereum" | "bsc"),
+        "unsupported --chain `{}`; expected evm, eth, ethereum, or bsc",
+        options.chain
+    );
+
+    let target = Address::from_str(options.target.trim())?;
+    let rpc_url = options.rpc_url.unwrap_or_else(|| config.rpc_url.clone());
+    let url: reqwest::Url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url);
+    let latest_block = provider.get_block_number().await?;
+    let fork_block = options.block.or(config.fork_block).unwrap_or(latest_block);
+    let campaign_id = options.campaign_id.unwrap_or_else(|| {
+        format!(
+            "prove-live-{}-{fork_block}",
+            target
+                .to_string()
+                .trim_start_matches("0x")
+                .chars()
+                .take(8)
+                .collect::<String>()
+        )
+    });
+    let campaign_id = sanitize_campaign_id(&campaign_id);
+    let campaign_corpus_dir = format!("{}/prove-live/{}", config.corpus_dir, campaign_id);
+    let campaign_report_dir = format!("{}/prove-live/{}", config.report_dir, campaign_id);
+    std::fs::create_dir_all(&campaign_report_dir)?;
+
+    print_prove_live_banner(&campaign_id, target, fork_block, options.duration_secs);
+
+    let fetched_abi_path = if options.abi.is_none() {
+        if let Some(api_key) = options
+            .abi_key
+            .clone()
+            .or_else(|| std::env::var("ETHERSCAN_API_KEY").ok())
+        {
+            let explorer_url = options
+                .explorer_url
+                .clone()
+                .unwrap_or_else(|| default_explorer_api_url(&options.chain).to_string());
+            let fetcher = EtherscanAbiFetcher::new(api_key, explorer_url);
+            let abi = fetcher.fetch_abi(target).await?;
+            let output = std::path::Path::new(&campaign_report_dir).join("fetched_abi.json");
+            std::fs::write(&output, serde_json::to_vec_pretty(&abi)?)?;
+            println!(
+                "\x1b[36m[abi]\x1b[0m fetched target ABI -> {}",
+                output.display()
+            );
+            Some(output.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let abi_path = options
+        .abi
+        .as_deref()
+        .or(fetched_abi_path.as_deref())
+        .or(config.target_abi.as_deref());
+    let mut abi_report = None;
+    if let Some(abi_path) = abi_path {
+        let (_abi, _registry, report) = ingest_abi_file(abi_path, Some(target))?;
+        let output = std::path::Path::new(&campaign_report_dir).join("abi_report.json");
+        std::fs::write(&output, serde_json::to_vec_pretty(&report)?)?;
+        println!(
+            "\x1b[36m[abi]\x1b[0m loaded {} functions, {} events -> {}",
+            report.function_count,
+            report.event_count,
+            output.display()
+        );
+        abi_report = Some(report);
+    }
+
+    let seed_bundle_id = if options.skip_seed_discovery || options.max_seeds == 0 {
+        println!("\x1b[33m[seed]\x1b[0m skipped seed discovery");
+        None
+    } else {
+        let bundle_id = format!("{campaign_id}-seeds");
+        let fork_db = ForkDb::new(rpc_url.clone(), fork_block);
+        let ingester = SeedIngester::new(provider);
+        let mut seed_config = MainnetSeedConfig::new(fork_block, target, options.max_seeds);
+        seed_config.search_depth = options.search_depth.max(options.max_seeds as u64);
+        seed_config.include_address_hints = options.include_address_hints;
+        seed_config.max_blocks_per_second = if options.seed_max_blocks_per_second > 0.0 {
+            Some(options.seed_max_blocks_per_second)
+        } else {
+            None
+        };
+        seed_config.scan_mode = parse_seed_scan_mode(&options.seed_mode)?;
+        if let Some(report) = abi_report.as_ref() {
+            seed_config.abi_functions = seed_abi_functions(report.functions.clone());
+        }
+        let bundle = ingester
+            .ingest_bundle_from_target(&seed_config, &fork_db)
+            .await?;
+        let manifest_output = std::path::Path::new(&campaign_report_dir).join("seed_bundle.json");
+        std::fs::write(&manifest_output, serde_json::to_vec_pretty(&bundle)?)?;
+        let corpus = PersistentCorpus::new(&campaign_corpus_dir)?;
+        corpus.persist_mainnet_seed_bundle(&bundle_id, &bundle)?;
+        println!(
+            "\x1b[36m[seed]\x1b[0m persisted `{}`: {} seeds, {} discovered accounts -> {}",
+            bundle_id,
+            bundle.seeds.len(),
+            bundle.discovered_accounts.len(),
+            manifest_output.display()
+        );
+
+        let setup_report = if let Some(report) = abi_report.as_ref() {
+            ForkSetupDiscoverer::discover_with_abi_report(
+                target,
+                &bundle.seeds,
+                &bundle.discovered_accounts,
+                report,
+            )
+        } else {
+            ForkSetupDiscoverer::discover_from_seed_bundle(
+                target,
+                &bundle.seeds,
+                &bundle.discovered_accounts,
+            )
+        };
+        let setup_output = std::path::Path::new(&campaign_report_dir).join("setup_report.json");
+        std::fs::write(&setup_output, serde_json::to_vec_pretty(&setup_report)?)?;
+        println!(
+            "\x1b[36m[setup]\x1b[0m tokens={}, whales={}, pools={}, oracles={} -> {}",
+            setup_report.tokens.len(),
+            setup_report.whales.len(),
+            setup_report.pools.len(),
+            setup_report.oracle_feeds.len(),
+            setup_output.display()
+        );
+
+        let invariant_manifest = TargetInvariantManifest::generate(
+            Some(target),
+            abi_report.as_ref(),
+            Some(&setup_report),
+            None,
+        );
+        let invariant_output = std::path::Path::new(&campaign_report_dir).join("invariants.toml");
+        std::fs::write(
+            &invariant_output,
+            toml::to_string_pretty(&invariant_manifest)?,
+        )?;
+        println!(
+            "\x1b[36m[invariants]\x1b[0m rules={} -> {}",
+            invariant_manifest.invariants.len(),
+            invariant_output.display()
+        );
+        Some(bundle_id)
+    };
+
+    let target_invariant_manifest = {
+        let path = std::path::Path::new(&campaign_report_dir).join("invariants.toml");
+        if path.exists() {
+            Some(path.to_string_lossy().to_string())
+        } else {
+            let invariant_manifest =
+                TargetInvariantManifest::generate(Some(target), abi_report.as_ref(), None, None);
+            std::fs::write(&path, toml::to_string_pretty(&invariant_manifest)?)?;
+            Some(path.to_string_lossy().to_string())
+        }
+    };
+
+    let mut hardened = config.hardened_defi.clone();
+    hardened.enabled = true;
+    hardened.single_process = true;
+    hardened.enable_bounded_search = true;
+    if options.deterministic || options.rng_seed.is_some() {
+        hardened.deterministic = true;
+        hardened.rng_seed = options.rng_seed;
+    }
+
+    println!(
+        "\x1b[35m[fuzz]\x1b[0m fail-closed fork campaign: rpc={}, target={}, duration={}s, max_execs={:?}",
+        sanitize_rpc_for_display(&rpc_url),
+        target,
+        options.duration_secs,
+        options.max_execs
+    );
+    let fuzz_config = rusty_fuzz::engine::fuzz_engine::Config {
+        rpc_url,
+        fork_block,
+        target_contract: Some(target),
+        corpus_dir: campaign_corpus_dir,
+        report_dir: campaign_report_dir.clone(),
+        foundry_harness: None,
+        mainnet_seed_bundle: seed_bundle_id,
+        in_memory_bytecode: None,
+        cores: None,
+        require_seed_bundle: false,
+        require_rpc_fork: true,
+        allow_synthetic_fallback: false,
+        hardened_defi: hardened,
+        target_invariant_manifest,
+        abi_path: options
+            .abi
+            .or(fetched_abi_path)
+            .or(config.target_abi.clone()),
+        max_execs: options.max_execs,
+        duration_secs: Some(options.duration_secs),
+        artifact_limit: Some(options.artifact_limit),
+        campaign_id: Some(campaign_id.clone()),
+        min_finding_confidence: options.min_finding_confidence,
+        promotion: PromotionConfig {
+            enabled: true,
+            require_replay_for_report: true,
+            require_poc_for_confirmed: true,
+            promotion_limit: Some(options.promotion_limit),
+        },
+    };
+    let watchdog_done = install_campaign_watchdog(
+        options.wall_timeout_secs,
+        options.max_execs,
+        Some(options.duration_secs),
+        false,
+    );
+    let result = rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await;
+    if let Some(done) = watchdog_done {
+        done.store(true, Ordering::SeqCst);
+    }
+    result?;
+    println!(
+        "\x1b[32m[done]\x1b[0m proof campaign `{}` finished. Reports: {}",
+        campaign_id, campaign_report_dir
+    );
+    Ok(())
+}
+
+fn print_prove_live_banner(
+    campaign_id: &str,
+    target: Address,
+    fork_block: u64,
+    duration_secs: u64,
+) {
+    println!(
+        "\x1b[38;5;209m{}\x1b[0m",
+        r#"
+  :::====  :::  === :::===  :::==== ::: === :::===== :::  === :::===== :::=====
+:::  === :::  === :::     :::==== ::: === :::      :::  ===      ===      ===
+=======  ===  ===  =====    ===    =====  ======   ===  ===    ===      ===  
+=== ===  ===  ===     ===   ===     ===   ===      ===  ===  ===      ===    
+===  ===  ======  ======    ===     ===   ===       ======  ======== ========/     
+"#
+    );
+    println!(
+        "🦐 RustyFuzz prove-live | campaign={} | target={} | fork_block={} | duration={}s",
+        campaign_id, target, fork_block, duration_secs
+    );
+    println!("mode=fail-closed rpc-fork synthetic-fallback=off replay-and-poc=required");
+}
+
+fn sanitize_rpc_for_display(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(url) => {
+            let host = url.host_str().unwrap_or("rpc");
+            format!("{}://{}", url.scheme(), host)
+        }
+        Err(_) => "<invalid-rpc-url>".to_string(),
+    }
+}
+
+fn default_explorer_api_url(chain: &str) -> &'static str {
+    match chain {
+        "bsc" => "https://api.bscscan.com/api",
+        _ => "https://api.etherscan.io/api",
     }
 }
 
