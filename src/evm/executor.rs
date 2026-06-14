@@ -21,11 +21,35 @@ const TX_GAS_PRICE_WEI: u128 = 1_000_000_000;
 const FUZZ_CALLER_BALANCE_WEI: u128 = 1_000_000_000_000_000_000_000_000_000_000;
 const MAX_FUZZ_CALL_VALUE_WEI: u128 = 100_000_000_000_000_000_000;
 
-pub struct EvmExecutor {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Exploration,
+    Proof,
+}
+
+pub struct EvmExecutor {
+    mode: ExecutionMode,
+}
 
 impl EvmExecutor {
     pub fn new() -> Self {
-        EvmExecutor {}
+        Self::exploration()
+    }
+
+    pub fn exploration() -> Self {
+        EvmExecutor {
+            mode: ExecutionMode::Exploration,
+        }
+    }
+
+    pub fn proof() -> Self {
+        EvmExecutor {
+            mode: ExecutionMode::Proof,
+        }
+    }
+
+    pub fn mode(&self) -> ExecutionMode {
+        self.mode
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -65,9 +89,11 @@ impl EvmExecutor {
     ) -> Result<TxExecutionResult> {
         let ChainState::Evm(db) = chain_state;
 
-        // Fuzz-generated callers are often synthetic EOAs. If they are not funded
-        // before revm validation, the transaction is rejected before target execution.
-        fund_fuzz_caller(db, tx.caller);
+        if self.mode == ExecutionMode::Exploration {
+            // Fuzz-generated callers are often synthetic EOAs. If they are not funded
+            // before revm validation, the transaction is rejected before target execution.
+            fund_fuzz_caller(db, tx.caller);
+        }
 
         let caller_nonce = db
             .cache
@@ -76,9 +102,14 @@ impl EvmExecutor {
             .map(|account| account.info.nonce)
             .unwrap_or_default();
 
-        // Prevent mutated transaction values from producing impossible payments or
-        // overflow-payment validation failures before useful contract execution.
-        let executed_value = bounded_tx_value(tx.value);
+        let executed_value = match self.mode {
+            ExecutionMode::Exploration => {
+                // Prevent mutated transaction values from producing impossible payments or
+                // overflow-payment validation failures before useful contract execution.
+                bounded_tx_value(tx.value)
+            }
+            ExecutionMode::Proof => tx.value,
+        };
 
         let tx_env = TxEnv {
             caller: tx.caller,

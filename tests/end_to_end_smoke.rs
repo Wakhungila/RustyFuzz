@@ -53,6 +53,13 @@ async fn synthetic_abi_smoke_campaign_does_not_promote_findings() {
             enabled: true,
             require_replay_for_report: true,
             require_poc_for_confirmed: true,
+            strict_proof: true,
+            no_synthetic_proof: true,
+            require_foundry_poc: true,
+            require_minimized: true,
+            reject_heuristics: true,
+            max_finding_noise: Some(0),
+            poc_out: None,
             promotion_limit: Some(8),
         },
     };

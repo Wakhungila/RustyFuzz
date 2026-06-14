@@ -2,17 +2,108 @@ name: RustyFuzz CI
 
 on:
   push:
+    branches: [ main, develop ]
   pull_request:
+    branches: [ main, develop ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  rust:
+  # Unit tests - run on all commits
+  unit-tests:
+    name: Unit Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Format
-        run: cargo fmt --check
+        with:
+          components: rustfmt, clippy
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets
       - name: Check
-        run: cargo check --all-targets
-      - name: Test
+        run: cargo check
+      - name: Unit tests
+        run: cargo test --lib
+      - name: Full tests
         run: cargo test
+      - name: Z3 feature check
+        run: cargo check --features z3
+      - name: SGX unsupported shim check
+        run: cargo check --features sgx
+      - name: SVM is explicitly unsupported
+        run: |
+          set +e
+          cargo check --features svm 2>svm.err
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -q "intentionally unsupported" svm.err
+
+  # Integration tests - run on PRs
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Integration tests
+        run: cargo test --test benchmarks
+
+  # Memory leak detection with sanitizers
+  sanitizers:
+    name: Sanitizer Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rust-src
+      - name: Run with address sanitizer
+        run: |
+          RUSTFLAGS=-Zsanitizer=address cargo test --lib
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=1
+
+  # Benchmark regression detection
+  benchmark-regression:
+    name: Benchmark Regression Detection
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run benchmarks
+        run: cargo test --test benchmarks --release
+      - name: Store benchmark result
+        run: |
+          cargo test --test benchmarks --release -- --nocapture > benchmark_output.txt
+          echo "Benchmark completed"
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark_output.txt
+
+  # Build verification
+  build:
+    name: Build Verification
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+      - name: Build
+        run: cargo build --verbose --release
+      - name: Build with supported optional proof feature
+        run: cargo build --verbose --features z3

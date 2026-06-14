@@ -2,6 +2,7 @@ use crate::common::types::{ComparisonOperand, SymbolicExpression, TaintSource, W
 use revm::primitives::U256;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConcolicHint {
@@ -71,8 +72,26 @@ impl ConcolicHintStats {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct ConcolicSolver;
+/// Concolic solver for generating input mutations based on execution constraints.
+///
+/// The `ConcolicSolver` analyzes execution waypoints (comparisons, branches, arithmetic operations)
+/// and generates hints for mutating inputs to explore alternative execution paths.
+#[derive(Debug, Clone)]
+pub struct ConcolicSolver {
+    /// Maximum time allowed for solving operations (default: 1 second)
+    timeout: Duration,
+    /// Start time for the current solving operation
+    start_time: Option<Instant>,
+}
+
+impl Default for ConcolicSolver {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(1),
+            start_time: None,
+        }
+    }
+}
 
 struct ComparisonSolveInput<'a> {
     op: u8,
@@ -87,10 +106,37 @@ struct ComparisonSolveInput<'a> {
 
 impl ConcolicSolver {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Creates a new ConcolicSolver with a custom timeout
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            start_time: None,
+        }
+    }
+
+    /// Checks if the timeout has been exceeded
+    fn check_timeout(&self) -> bool {
+        if let Some(start) = self.start_time {
+            start.elapsed() > self.timeout
+        } else {
+            false
+        }
+    }
+
+    /// Starts a new timeout window for solving operations
+    fn start_timeout(&mut self) {
+        self.start_time = Some(Instant::now());
     }
 
     pub fn solve_hint(&self, tx_index: usize, waypoint: &Waypoint) -> Option<ConcolicHint> {
+        // Check timeout before starting solve operation
+        if self.check_timeout() {
+            return None;
+        }
+
         match waypoint {
             Waypoint::BranchPath {
                 taken, constraint, ..
@@ -111,6 +157,11 @@ impl ConcolicSolver {
                 rhs_expression,
                 ..
             } => {
+                // Check timeout during complex comparison solving
+                if self.check_timeout() {
+                    return None;
+                }
+
                 let target_true = !*condition;
                 let operand = match tainted_operand {
                     ComparisonOperand::Unknown => {
@@ -148,6 +199,11 @@ impl ConcolicSolver {
                 taint_source: Some(source),
                 ..
             } => {
+                // Check timeout during arithmetic solving
+                if self.check_timeout() {
+                    return None;
+                }
+
                 let solved = solve_arithmetic_boundary(*op, *lhs, *rhs, *third)?;
                 Some(hint_from_source(
                     source,
@@ -162,9 +218,12 @@ impl ConcolicSolver {
     }
 
     pub fn solve_hints<'a>(
-        &self,
+        &mut self,
         tx_waypoints: impl Iterator<Item = (usize, &'a Waypoint)>,
     ) -> Vec<ConcolicHint> {
+        // Start timeout window for batch solve operation
+        self.start_timeout();
+
         let mut hints: Vec<_> = tx_waypoints
             .filter_map(|(tx_index, waypoint)| self.solve_hint(tx_index, waypoint))
             .collect();
@@ -427,7 +486,7 @@ mod tests {
             branch_distance: Some(U256::from(35)),
         };
 
-        let hint = ConcolicSolver::new()
+        let hint = ConcolicSolver::default()
             .solve_hint(0, &waypoint)
             .expect("hint");
         assert_eq!(hint.tx_index, 0);
@@ -452,7 +511,7 @@ mod tests {
             branch_distance: Some(U256::from(91)),
         };
 
-        let hint = ConcolicSolver::new()
+        let hint = ConcolicSolver::default()
             .solve_hint(3, &waypoint)
             .expect("hint");
         assert_eq!(hint.tx_index, 1);
@@ -481,7 +540,7 @@ mod tests {
             branch_distance: Some(U256::from(25)),
         };
 
-        let hint = ConcolicSolver::new()
+        let hint = ConcolicSolver::default()
             .solve_hint(0, &waypoint)
             .expect("hint");
         assert_eq!(hint.calldata_offset, 4);
@@ -505,7 +564,7 @@ mod tests {
             branch_distance: Some(U256::from(9)),
         };
 
-        let hint = ConcolicSolver::new()
+        let hint = ConcolicSolver::default()
             .solve_hint(0, &waypoint)
             .expect("hint");
         assert_eq!(hint.repair_target, ConcolicRepairTarget::TxValue);
@@ -530,7 +589,7 @@ mod tests {
             branch_distance: Some(U256::from(1)),
         };
 
-        let hint = ConcolicSolver::new()
+        let hint = ConcolicSolver::default()
             .solve_hint(0, &waypoint)
             .expect("hint");
         assert_eq!(hint.repair_target, ConcolicRepairTarget::Caller);
@@ -557,7 +616,7 @@ mod tests {
             branch_distance: Some(U256::from(95)),
         };
 
-        let hint = ConcolicSolver::new()
+        let hint = ConcolicSolver::default()
             .solve_hint(2, &waypoint)
             .expect("hint");
         assert_eq!(hint.tx_index, 0);

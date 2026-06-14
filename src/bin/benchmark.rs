@@ -1,7 +1,7 @@
 use clap::Parser;
 use revm::primitives::Address;
 use rusty_fuzz::config::HardenedDefiConfig;
-use rusty_fuzz::engine::fuzz_engine::{Config as FuzzConfig, run_fuzz_campaign};
+use rusty_fuzz::engine::fuzz_engine::{run_fuzz_campaign, Config as FuzzConfig};
 use rusty_fuzz::engine::promotion::{PromotionCampaignSummary, PromotionConfig};
 use rusty_fuzz::evm::corpus::CampaignArtifactRecord;
 use serde::Serialize;

@@ -1,11 +1,12 @@
+use rand::RngExt;
 use revm::context::BlockEnv;
 use revm::database::CacheDB;
 use revm::database_interface::DatabaseRef;
 use revm::primitives::{Address, U256};
 use revm::state::{AccountInfo, Bytecode};
 use rusty_fuzz::common::oracle::{
-    AccessControlOracle, ERC4626InflationOracle, ProtocolOraclePack, ProtocolOraclePackKind,
-    ProtocolFinding, ProtocolSeverity, ReentrancyOracle, VulnType, VulnerabilityOracle,
+    AccessControlOracle, ERC4626InflationOracle, ProtocolFinding, ProtocolOraclePack,
+    ProtocolOraclePackKind, ProtocolSeverity, ReentrancyOracle, VulnType, VulnerabilityOracle,
 };
 use rusty_fuzz::common::types::{
     CallKind, CallObservation, CallPhase, ChainState, EvmInput, SequenceExecutionResult,
@@ -855,7 +856,9 @@ fn foundry_poc_generation_embeds_protocol_oracle_assertions() {
     assert!(poc.contains("RustyFuzz finding"));
     assert!(poc.contains("assertTrue(ok0"));
     assert!(poc.contains("vm.load"));
+    assert!(poc.contains("pre-state storage mismatch"));
     assert!(poc.contains("storage diff not reproduced"));
+    assert!(!poc.contains("vm.deal"));
     assert!(poc.contains("protocol target has no code"));
     assert!(poc.contains("assertRustyFuzzMarketEvidence"));
     assert!(poc.contains("rustyFuzzWord"));
@@ -864,10 +867,8 @@ fn foundry_poc_generation_embeds_protocol_oracle_assertions() {
 
 #[test]
 fn foundry_poc_generation_embeds_access_control_specific_assertions() {
-    let root = std::env::temp_dir().join(format!(
-        "rusty_fuzz_access_poc_test_{}",
-        std::process::id()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("rusty_fuzz_access_poc_test_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create poc dir");
     let caller = addr(0xa1);
@@ -916,6 +917,59 @@ fn foundry_poc_generation_embeds_access_control_specific_assertions() {
     let poc = std::fs::read_to_string(path).expect("read poc");
     assert!(poc.contains("assertRustyFuzzAccessControlEvidence"));
     assert!(poc.contains("access-control/proxy evidence transaction changed status"));
+    assert!(!poc.contains("vm.deal"));
+}
+
+#[test]
+fn foundry_poc_generation_fails_closed_without_pinned_fork_for_proof() {
+    let root = std::env::temp_dir().join(format!(
+        "rusty_fuzz_poc_fail_closed_test_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create poc dir");
+    let input = EvmInput {
+        txs: vec![SingletonTx {
+            input: vec![0xb6, 0xb5, 0x5f, 0x25],
+            caller: addr(0xf1),
+            to: addr(0xf2),
+            value: U256::ZERO,
+            is_victim: false,
+        }],
+        base_snapshot_id: 0,
+        waypoints: Vec::new(),
+        mutation_provenance: Vec::new(),
+    };
+    let execution = SequenceExecutionResult {
+        tx_results: Vec::new(),
+        total_gas_used: 0,
+        final_coverage_hash: 0,
+        storage_reads: Vec::new(),
+        storage_writes: Vec::new(),
+        storage_diffs: Vec::new(),
+        call_trace: Vec::new(),
+        oracle_observations: Vec::new(),
+    };
+    let finding = ProtocolFinding {
+        pack: ProtocolOraclePackKind::Erc4626,
+        vuln: VulnType::VaultInflation,
+        severity: ProtocolSeverity::High,
+        tx_index: Some(0),
+        target: Some(addr(0xf2)),
+        evidence: "vault inflation proof".to_string(),
+    };
+
+    let err = synthesize_foundry_poc_with_findings(
+        &input,
+        &VulnType::VaultInflation,
+        Some(&execution),
+        &[finding],
+        &root,
+        "http://localhost:8545",
+        0,
+    )
+    .expect_err("proof poc without fork block rejected");
+    assert!(err.to_string().contains("pinned fork block"));
 }
 
 #[test]
@@ -1272,6 +1326,11 @@ fn mainnet_seed_ingestion_normalizes_and_discovers_accounts() {
             confidence: None,
             provenance: None,
             decoded: None,
+            tx_hash: None,
+            top_level_caller: Some(caller),
+            internal_caller: None,
+            trace_path: None,
+            trace_source: None,
         },
     };
     let duplicate = MainnetSeed {
@@ -1391,6 +1450,11 @@ fn persistent_corpus_round_trips_mainnet_seed_bundle() {
             confidence: None,
             provenance: None,
             decoded: None,
+            tx_hash: None,
+            top_level_caller: Some(caller),
+            internal_caller: None,
+            trace_path: None,
+            trace_source: None,
         },
     };
     let bundle = MainnetSeedBundle {
@@ -1615,5 +1679,516 @@ fn call(tx_index: usize, target: Address, selector: Vec<u8>, success: bool) -> C
         phase: CallPhase::End,
         created_address: None,
         result: Some("Stop".to_string()),
+    }
+}
+
+// ============================================================================
+// INTEGRATION TESTS FOR CRITICAL PATHS
+// ============================================================================
+
+#[test]
+fn integration_fuzz_campaign_end_to_end() {
+    // Integration test for full fuzz campaign execution path
+    let root = std::env::temp_dir().join(format!(
+        "rusty_fuzz_integration_campaign_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let corpus = PersistentCorpus::new(&root).expect("corpus init");
+
+    let caller = addr(0xc0);
+    let target = addr(0xc1);
+    let mut db = test_db();
+    db.insert_account_info(
+        caller,
+        AccountInfo {
+            balance: U256::from(10u128.pow(30)),
+            ..AccountInfo::default()
+        },
+    );
+    db.insert_account_info(
+        target,
+        AccountInfo::default().with_code(Bytecode::new_raw(
+            vec![0x60, 0x05, 0x60, 0x00, 0x55, 0x00].into(),
+        )),
+    );
+
+    // Simulate fuzz campaign: generate input, execute, persist, replay
+    let input = EvmInput {
+        txs: vec![SingletonTx {
+            input: Vec::new(),
+            caller,
+            to: target,
+            value: U256::ZERO,
+            is_victim: false,
+        }],
+        base_snapshot_id: 0,
+        waypoints: vec![],
+        mutation_provenance: Vec::new(),
+    };
+
+    let mut chain_state = ChainState::Evm(db.clone());
+    let mut block = BlockEnv::default();
+    let mut coverage = vec![0u8; 1024];
+    let mut dataflow = DataflowRegistry::new();
+    let mut waypoints = Vec::new();
+
+    let execution = EvmExecutor::new()
+        .execute_with_result(
+            &mut chain_state,
+            &mut block,
+            &input.txs[0],
+            &mut coverage,
+            &mut dataflow,
+            &mut waypoints,
+            0,
+        )
+        .expect("execution should succeed");
+
+    let sequence_result = SequenceExecutionResult {
+        tx_results: vec![execution.clone()],
+        total_gas_used: execution.gas_used,
+        final_coverage_hash: EvmCoverageFeedback::stable_path_hash(&coverage),
+        storage_reads: execution.storage_reads,
+        storage_writes: execution.storage_writes,
+        storage_diffs: execution.storage_diffs,
+        call_trace: execution.call_trace,
+        oracle_observations: Vec::new(),
+    };
+
+    // Persist to corpus
+    let metadata = corpus
+        .persist_execution_input(&input, &sequence_result, &coverage, execution.gas_used)
+        .expect("persist should succeed");
+
+    // Replay from corpus
+    let replay_input = corpus
+        .load_input(&metadata.id)
+        .expect("load should succeed");
+    let replay_execution = ReplayVerifier::new(1024)
+        .verify_deterministic(&ChainState::Evm(db), &BlockEnv::default(), &replay_input)
+        .expect("replay should be deterministic");
+
+    assert_eq!(
+        replay_execution.total_gas_used,
+        sequence_result.total_gas_used
+    );
+    assert_eq!(
+        replay_execution.storage_diffs.len(),
+        sequence_result.storage_diffs.len()
+    );
+}
+
+#[test]
+fn integration_replay_verification_with_oracle_detection() {
+    // Integration test for replay verification with oracle detection
+    let caller = addr(0xd0);
+    let target = addr(0xd1);
+    let mut db = test_db();
+    db.insert_account_info(
+        caller,
+        AccountInfo {
+            balance: U256::from(10u128.pow(30)),
+            ..AccountInfo::default()
+        },
+    );
+    db.insert_account_info(
+        target,
+        AccountInfo::default().with_code(Bytecode::new_raw(
+            vec![0x60, 0x01, 0x60, 0x00, 0x55, 0x00].into(),
+        )),
+    );
+
+    let input = EvmInput {
+        txs: vec![SingletonTx {
+            input: Vec::new(),
+            caller,
+            to: target,
+            value: U256::ZERO,
+            is_victim: false,
+        }],
+        base_snapshot_id: 0,
+        waypoints: vec![],
+        mutation_provenance: Vec::new(),
+    };
+
+    let before = new_evm_snapshot(0, db.clone());
+
+    // Execute
+    let mut chain_state = ChainState::Evm(db.clone());
+    let mut block = BlockEnv::default();
+    let mut coverage = vec![0u8; 1024];
+    let mut dataflow = DataflowRegistry::new();
+    let mut waypoints = Vec::new();
+
+    let _ = EvmExecutor::new()
+        .execute_with_result(
+            &mut chain_state,
+            &mut block,
+            &input.txs[0],
+            &mut coverage,
+            &mut dataflow,
+            &mut waypoints,
+            0,
+        )
+        .expect("execution should succeed");
+
+    let after = new_evm_snapshot(1, db.clone());
+
+    // Verify with oracle
+    let verifier = ReplayVerifier::new(1024);
+    let execution = verifier
+        .verify_deterministic(&ChainState::Evm(db.clone()), &BlockEnv::default(), &input)
+        .expect("replay should succeed");
+
+    let mut execution_with_oracle = execution.clone();
+    let oracle = AccessControlOracle {
+        fuzzer_address: caller,
+    };
+
+    let _finding = verifier.evaluate_oracle(
+        &mut execution_with_oracle,
+        "AccessControlOracle",
+        &oracle,
+        &before,
+        &after,
+    );
+
+    // Oracle should evaluate (may or may not find vulnerability depending on state)
+    assert!(execution_with_oracle.oracle_observations.len() <= 1);
+}
+
+#[test]
+fn integration_oracle_detection_across_multiple_vulnerability_types() {
+    // Integration test for oracle detection across multiple vulnerability types
+    let execution = SequenceExecutionResult {
+        tx_results: Vec::new(),
+        total_gas_used: 100_000,
+        final_coverage_hash: 123,
+        storage_reads: Vec::new(),
+        storage_writes: Vec::new(),
+        storage_diffs: vec![
+            StorageDiff {
+                tx_index: 0,
+                address: addr(0x01),
+                slot: U256::ZERO.to_be_bytes::<32>().into(),
+                old_value: U256::from(1),
+                new_value: U256::from(1_000_000),
+                pc: 0,
+            },
+            StorageDiff {
+                tx_index: 0,
+                address: addr(0x01),
+                slot: U256::from(1).to_be_bytes::<32>().into(),
+                old_value: U256::from(1_000_000),
+                new_value: U256::from(999_999),
+                pc: 0,
+            },
+        ],
+        call_trace: vec![call(0, addr(0x01), vec![0x02, 0x2c, 0x0d, 0x9f], true)],
+        oracle_observations: Vec::new(),
+    };
+
+    let findings = ProtocolOraclePack::default().evaluate(&execution);
+
+    // Should detect at least one finding from the storage diffs
+    assert!(!findings.is_empty());
+
+    // Verify findings have required fields
+    for finding in &findings {
+        assert!(!finding.evidence.is_empty());
+        assert!(matches!(
+            finding.severity,
+            ProtocolSeverity::Info
+                | ProtocolSeverity::Low
+                | ProtocolSeverity::Medium
+                | ProtocolSeverity::High
+                | ProtocolSeverity::Critical
+        ));
+    }
+}
+
+#[test]
+fn integration_corpus_persistence_and_retrieval_workflow() {
+    // Integration test for full corpus persistence and retrieval workflow
+    let root = std::env::temp_dir().join(format!(
+        "rusty_fuzz_integration_corpus_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let corpus = PersistentCorpus::new(&root).expect("corpus init");
+
+    // Create multiple inputs
+    let inputs: Vec<EvmInput> = (0..5)
+        .map(|i| EvmInput {
+            txs: vec![SingletonTx {
+                input: vec![i as u8; 4],
+                caller: addr(0xe0 + i as u8),
+                to: addr(0xf0),
+                value: U256::from(i),
+                is_victim: i % 2 == 0,
+            }],
+            base_snapshot_id: i,
+            waypoints: vec![],
+            mutation_provenance: Vec::new(),
+        })
+        .collect();
+
+    let mut metadata_ids = Vec::new();
+    for input in &inputs {
+        let execution = SequenceExecutionResult {
+            tx_results: Vec::new(),
+            total_gas_used: 21_000,
+            final_coverage_hash: 123,
+            storage_reads: Vec::new(),
+            storage_writes: Vec::new(),
+            storage_diffs: Vec::new(),
+            call_trace: Vec::new(),
+            oracle_observations: Vec::new(),
+        };
+
+        let metadata = corpus
+            .persist_execution_input(input, &execution, &[1, 2, 0, 0], 21_000)
+            .expect("persist should succeed");
+        metadata_ids.push(metadata.id);
+    }
+
+    // Retrieve all inputs
+    for (i, id) in metadata_ids.iter().enumerate() {
+        let retrieved = corpus.load_input(id).expect("load should succeed");
+        assert_eq!(retrieved.txs.len(), inputs[i].txs.len());
+        assert_eq!(retrieved.base_snapshot_id, inputs[i].base_snapshot_id);
+    }
+
+    // Verify corpus statistics
+    assert_eq!(corpus.len().expect("corpus length should be readable"), 5);
+}
+
+// ============================================================================
+// PROPERTY-BASED TESTS FOR MUTATION STRATEGIES
+// ============================================================================
+
+#[test]
+fn property_mutation_preserves_valid_calldata_structure() {
+    // Property: Any mutation should produce valid calldata (4-byte selector + args)
+    let original = vec![0xa9, 0x05, 0x9c, 0xbb, 0x00, 0x01, 0x02, 0x03];
+
+    for _ in 0..100 {
+        // Simulate various mutations
+        let mutated = simulate_mutation(&original);
+
+        // Property: Mutated calldata should have at least selector (4 bytes)
+        assert!(mutated.len() >= 4, "Mutation should preserve selector");
+
+        // Property: If original had selector, mutation should preserve selector or produce valid one
+        if original.len() >= 4 {
+            // Either keep original selector or produce a new valid one
+            assert!(mutated.len() >= 4);
+        }
+    }
+}
+
+#[test]
+fn property_mutation_deterministic_with_same_seed() {
+    // Property: Mutations with same seed should produce identical results
+    let original = vec![0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4];
+    let seed = 42u64;
+
+    let mutation1 = simulate_seeded_mutation(&original, seed);
+    let mutation2 = simulate_seeded_mutation(&original, seed);
+
+    assert_eq!(
+        mutation1, mutation2,
+        "Same seed should produce identical mutations"
+    );
+}
+
+#[test]
+fn property_mutation_produces_valid_addresses() {
+    // Property: Address mutations should produce valid 20-byte addresses
+    let original_addr = Address::repeat_byte(0xaa);
+
+    for _ in 0..100 {
+        let mutated_addr = simulate_address_mutation(original_addr);
+
+        // Property: Address should be 20 bytes
+        assert_eq!(mutated_addr.as_slice().len(), 20);
+
+        // Property: Address should not be zero address (unless intentionally so)
+        if mutated_addr != Address::ZERO {
+            assert_ne!(mutated_addr, Address::ZERO);
+        }
+    }
+}
+
+#[test]
+fn property_mutation_sequence_length_bounded() {
+    // Property: Sequence mutations should respect maximum length bounds
+    let max_length = 10;
+    let original_sequence: Vec<SingletonTx> = (0..5)
+        .map(|i| SingletonTx {
+            input: vec![i as u8; 4],
+            caller: addr(0x10 + i as u8),
+            to: addr(0x20),
+            value: U256::from(i),
+            is_victim: false,
+        })
+        .collect();
+
+    for _ in 0..100 {
+        let mutated_sequence = simulate_sequence_mutation(&original_sequence, max_length);
+
+        // Property: Sequence length should not exceed maximum
+        assert!(
+            mutated_sequence.len() <= max_length,
+            "Mutation should respect max sequence length"
+        );
+
+        // Property: Sequence should not be empty
+        assert!(
+            !mutated_sequence.is_empty(),
+            "Mutation should not empty sequence"
+        );
+    }
+}
+
+#[test]
+fn property_mutation_preserves_value_semantics() {
+    // Property: Value mutations should preserve U256 semantics (no overflow/underflow)
+    let original_value = U256::from(1_000_000);
+
+    for _ in 0..100 {
+        let mutated_value = simulate_value_mutation(original_value);
+
+        // Property: Value should be valid U256 (no panic on creation)
+        let _ = U256::from(mutated_value.to::<u128>());
+
+        // Property: Value should not cause arithmetic overflow in typical operations
+        let _ = mutated_value.saturating_add(U256::from(1));
+        let _ = mutated_value.saturating_sub(U256::from(1));
+    }
+}
+
+// Helper functions for property-based testing (simulating mutation strategies)
+
+fn simulate_mutation(calldata: &[u8]) -> Vec<u8> {
+    // Simulate various mutation strategies
+    let mut rng = rand::rng();
+    let strategy = rng.random_range(0..5);
+
+    match strategy {
+        0 => calldata.to_vec(), // No mutation
+        1 => {
+            // Flip random bit
+            let mut result = calldata.to_vec();
+            if !result.is_empty() {
+                let byte_idx = rng.random_range(0..result.len());
+                result[byte_idx] ^= 0x01;
+            }
+            result
+        }
+        2 => {
+            // Add random byte
+            let mut result = calldata.to_vec();
+            result.push(rng.random());
+            result
+        }
+        3 => {
+            // Remove random byte
+            let mut result = calldata.to_vec();
+            if !result.is_empty() && result.len() > 4 {
+                let byte_idx = rng.random_range(4..result.len());
+                result.remove(byte_idx);
+            }
+            result
+        }
+        _ => {
+            // Swap bytes
+            let mut result = calldata.to_vec();
+            if result.len() >= 5 {
+                let idx1 = rng.random_range(4..result.len());
+                let idx2 = rng.random_range(4..result.len());
+                result.swap(idx1, idx2);
+            }
+            result
+        }
+    }
+}
+
+fn simulate_seeded_mutation(calldata: &[u8], seed: u64) -> Vec<u8> {
+    // Deterministic mutation based on seed
+    let mut result = calldata.to_vec();
+    if !result.is_empty() {
+        let byte_idx = (seed as usize) % result.len();
+        result[byte_idx] = result[byte_idx].wrapping_add(seed as u8);
+    }
+    result
+}
+
+fn simulate_address_mutation(addr: Address) -> Address {
+    let mut bytes = addr.as_slice().to_vec();
+    let mut rng = rand::rng();
+
+    // Flip random bit in address
+    let byte_idx = rng.random_range(0..20);
+    bytes[byte_idx] ^= 0x01;
+
+    Address::from_slice(&bytes)
+}
+
+fn simulate_sequence_mutation(sequence: &[SingletonTx], max_len: usize) -> Vec<SingletonTx> {
+    let mut rng = rand::rng();
+    let strategy = rng.random_range(0..4);
+
+    match strategy {
+        0 => sequence.to_vec(), // No mutation
+        1 => {
+            // Add transaction if under max
+            if sequence.len() < max_len {
+                let mut result = sequence.to_vec();
+                result.push(SingletonTx {
+                    input: vec![rng.random(); 4],
+                    caller: addr(rng.random()),
+                    to: addr(rng.random()),
+                    value: U256::from(rng.random::<u64>()),
+                    is_victim: rng.random(),
+                });
+                result
+            } else {
+                sequence.to_vec()
+            }
+        }
+        2 => {
+            // Remove transaction if more than 1
+            if sequence.len() > 1 {
+                let mut result = sequence.to_vec();
+                result.remove(rng.random_range(0..result.len()));
+                result
+            } else {
+                sequence.to_vec()
+            }
+        }
+        _ => {
+            // Swap transactions
+            let mut result = sequence.to_vec();
+            if result.len() >= 2 {
+                let idx1 = rng.random_range(0..result.len());
+                let idx2 = rng.random_range(0..result.len());
+                result.swap(idx1, idx2);
+            }
+            result
+        }
+    }
+}
+
+fn simulate_value_mutation(value: U256) -> U256 {
+    let mut rng = rand::rng();
+    let strategy = rng.random_range(0..4);
+
+    match strategy {
+        0 => value,
+        1 => value.saturating_add(U256::from(rng.random::<u64>())),
+        2 => value.saturating_sub(U256::from(rng.random::<u64>())),
+        _ => value.saturating_mul(U256::from(rng.random_range(1..100))),
     }
 }

@@ -1,4 +1,4 @@
-use crate::common::oracle::{ProtocolInvariantEvaluator, VulnType};
+use crate::common::oracle::{EvidenceGrade, ProtocolInvariantEvaluator, RejectionReason, VulnType};
 use crate::common::types::{
     CallKind, CallObservation, CallPhase, ExecutionStatus, OracleObservation,
     SequenceExecutionResult, StorageDiff,
@@ -64,6 +64,267 @@ pub enum ProtocolOraclePackKind {
     ProxyUpgradeability,
     Bridge,
     RuntimePanic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OracleBugClass {
+    UnauthorizedAssetDrain,
+    BalanceInvariantViolation,
+    ShareAccountingInflation,
+    DonationManipulation,
+    ReentrancyStateInconsistency,
+    AccessControlBypass,
+    OraclePriceManipulation,
+    LiquidationAccounting,
+    FeeBypassManipulation,
+    ApprovalAllowanceAbuse,
+    UpgradeProxyMisconfiguration,
+    RoundingAmplification,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RequiredProofArtifact {
+    RealismProof,
+    FoundryPoc,
+    StorageDeltaAssertion,
+    BalanceDeltaAssertion,
+    CallTraceAssertion,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OracleSpec {
+    pub name: &'static str,
+    pub bug_class: OracleBugClass,
+    pub pack: ProtocolOraclePackKind,
+    pub required_preconditions: &'static [&'static str],
+    pub required_state_observations: &'static [&'static str],
+    pub positive_trigger_conditions: &'static [&'static str],
+    pub negative_rejection_rules: &'static [&'static str],
+    pub minimum_evidence_grade: EvidenceGrade,
+    pub required_proof_artifact: RequiredProofArtifact,
+}
+
+pub const ORACLE_SPECS: &[OracleSpec] = &[
+    OracleSpec {
+        name: "unauthorized-asset-drain",
+        bug_class: OracleBugClass::UnauthorizedAssetDrain,
+        pack: ProtocolOraclePackKind::Erc20,
+        required_preconditions: &["attacker is not privileged", "real balance exists on fork"],
+        required_state_observations: &["attacker balance delta", "victim/target balance delta"],
+        positive_trigger_conditions: &["attacker gains assets while target/victim loses assets"],
+        negative_rejection_rules: &[
+            "caller is owner/admin/approved operator",
+            "delta is explained by a successful user withdrawal",
+            "profit requires synthetic balance",
+        ],
+        minimum_evidence_grade: EvidenceGrade::RealisticForkProof,
+        required_proof_artifact: RequiredProofArtifact::BalanceDeltaAssertion,
+    },
+    OracleSpec {
+        name: "balance-invariant-violation",
+        bug_class: OracleBugClass::BalanceInvariantViolation,
+        pack: ProtocolOraclePackKind::Erc20,
+        required_preconditions: &["token/accounting slots are observed before and after"],
+        required_state_observations: &["supply or reserve slot", "account balance slots"],
+        positive_trigger_conditions: &["aggregate balance relation changes unexpectedly"],
+        negative_rejection_rules: &[
+            "mint/burn path explains supply movement",
+            "insufficient balance observations",
+        ],
+        minimum_evidence_grade: EvidenceGrade::DeterministicReplay,
+        required_proof_artifact: RequiredProofArtifact::StorageDeltaAssertion,
+    },
+    OracleSpec {
+        name: "share-accounting-inflation",
+        bug_class: OracleBugClass::ShareAccountingInflation,
+        pack: ProtocolOraclePackKind::Erc4626,
+        required_preconditions: &["vault share/accounting reads are available"],
+        required_state_observations: &[
+            "totalAssets/totalSupply style reads",
+            "share or asset deltas",
+        ],
+        positive_trigger_conditions: &[
+            "share price/accounting moves in attacker-favorable direction",
+        ],
+        negative_rejection_rules: &["zero-asset input", "profit disappears after minimization"],
+        minimum_evidence_grade: EvidenceGrade::RealisticForkProof,
+        required_proof_artifact: RequiredProofArtifact::StorageDeltaAssertion,
+    },
+    OracleSpec {
+        name: "donation-manipulation",
+        bug_class: OracleBugClass::DonationManipulation,
+        pack: ProtocolOraclePackKind::Erc4626,
+        required_preconditions: &["donation or unsolicited asset movement is observed"],
+        required_state_observations: &["asset reserve delta", "share mint/redeem delta"],
+        positive_trigger_conditions: &["donation changes share/accounting outcome"],
+        negative_rejection_rules: &["delta is normal deposit/mint accounting"],
+        minimum_evidence_grade: EvidenceGrade::RealisticForkProof,
+        required_proof_artifact: RequiredProofArtifact::BalanceDeltaAssertion,
+    },
+    OracleSpec {
+        name: "reentrancy-state-inconsistency",
+        bug_class: OracleBugClass::ReentrancyStateInconsistency,
+        pack: ProtocolOraclePackKind::RuntimePanic,
+        required_preconditions: &["nested external call or callback is observed"],
+        required_state_observations: &["pre-callback state", "post-callback state"],
+        positive_trigger_conditions: &[
+            "state is externally observable before invariant restoration",
+        ],
+        negative_rejection_rules: &[
+            "no nested call",
+            "only a revert without state inconsistency",
+        ],
+        minimum_evidence_grade: EvidenceGrade::DeterministicReplay,
+        required_proof_artifact: RequiredProofArtifact::CallTraceAssertion,
+    },
+    OracleSpec {
+        name: "access-control-bypass",
+        bug_class: OracleBugClass::AccessControlBypass,
+        pack: ProtocolOraclePackKind::Governance,
+        required_preconditions: &["caller is not authorized in fork state"],
+        required_state_observations: &["privileged selector call", "privileged storage delta"],
+        positive_trigger_conditions: &["unauthorized caller mutates protected state"],
+        negative_rejection_rules: &["caller has owner/admin role", "role is invented by setup"],
+        minimum_evidence_grade: EvidenceGrade::RealisticForkProof,
+        required_proof_artifact: RequiredProofArtifact::StorageDeltaAssertion,
+    },
+    OracleSpec {
+        name: "oracle-price-manipulation",
+        bug_class: OracleBugClass::OraclePriceManipulation,
+        pack: ProtocolOraclePackKind::Amm,
+        required_preconditions: &["price/reserve read is observed before dependent action"],
+        required_state_observations: &["price/reserve output", "dependent borrow/swap/liquidation"],
+        positive_trigger_conditions: &["dependent action uses manipulated price/reserve"],
+        negative_rejection_rules: &["price movement is within configured threshold"],
+        minimum_evidence_grade: EvidenceGrade::DeterministicReplay,
+        required_proof_artifact: RequiredProofArtifact::CallTraceAssertion,
+    },
+    OracleSpec {
+        name: "liquidation-accounting",
+        bug_class: OracleBugClass::LiquidationAccounting,
+        pack: ProtocolOraclePackKind::Lending,
+        required_preconditions: &["debt/collateral accounting slots are observed"],
+        required_state_observations: &["borrower debt delta", "collateral delta"],
+        positive_trigger_conditions: &["liquidation or borrow accounting relation is violated"],
+        negative_rejection_rules: &["normal repay/liquidation explains the delta"],
+        minimum_evidence_grade: EvidenceGrade::RealisticForkProof,
+        required_proof_artifact: RequiredProofArtifact::StorageDeltaAssertion,
+    },
+    OracleSpec {
+        name: "fee-bypass-manipulation",
+        bug_class: OracleBugClass::FeeBypassManipulation,
+        pack: ProtocolOraclePackKind::Amm,
+        required_preconditions: &["fee/reward accounting slots are observed"],
+        required_state_observations: &["fee accumulator delta", "trade or withdrawal delta"],
+        positive_trigger_conditions: &["value movement avoids expected fee accounting"],
+        negative_rejection_rules: &["fee-exempt role is real in fork state"],
+        minimum_evidence_grade: EvidenceGrade::RealisticForkProof,
+        required_proof_artifact: RequiredProofArtifact::StorageDeltaAssertion,
+    },
+    OracleSpec {
+        name: "approval-allowance-abuse",
+        bug_class: OracleBugClass::ApprovalAllowanceAbuse,
+        pack: ProtocolOraclePackKind::Erc20,
+        required_preconditions: &["allowance slot or approval call is observed"],
+        required_state_observations: &["allowance delta", "transferFrom path"],
+        positive_trigger_conditions: &["allowance is consumed or expanded without owner intent"],
+        negative_rejection_rules: &[
+            "owner explicitly approved allowance",
+            "allowance is synthetic",
+        ],
+        minimum_evidence_grade: EvidenceGrade::RealisticForkProof,
+        required_proof_artifact: RequiredProofArtifact::StorageDeltaAssertion,
+    },
+    OracleSpec {
+        name: "upgrade-proxy-misconfiguration",
+        bug_class: OracleBugClass::UpgradeProxyMisconfiguration,
+        pack: ProtocolOraclePackKind::ProxyUpgradeability,
+        required_preconditions: &["EIP-1967/admin/initializer state is observed"],
+        required_state_observations: &["implementation/admin slot", "upgrade or initializer call"],
+        positive_trigger_conditions: &["unprivileged path mutates upgrade-critical state"],
+        negative_rejection_rules: &["caller is real admin", "initializer already consumed"],
+        minimum_evidence_grade: EvidenceGrade::RealisticForkProof,
+        required_proof_artifact: RequiredProofArtifact::StorageDeltaAssertion,
+    },
+    OracleSpec {
+        name: "rounding-amplification",
+        bug_class: OracleBugClass::RoundingAmplification,
+        pack: ProtocolOraclePackKind::Erc4626,
+        required_preconditions: &["nonzero input amount is observed"],
+        required_state_observations: &["conversion output", "asset/share deltas"],
+        positive_trigger_conditions: &["rounding outcome creates exploitable value difference"],
+        negative_rejection_rules: &["input is zero", "loss/profit disappears after minimization"],
+        minimum_evidence_grade: EvidenceGrade::DeterministicReplay,
+        required_proof_artifact: RequiredProofArtifact::StorageDeltaAssertion,
+    },
+];
+
+pub fn oracle_spec_by_name(name: &str) -> Option<&'static OracleSpec> {
+    ORACLE_SPECS.iter().find(|spec| spec.name == name)
+}
+
+pub fn oracle_spec_for_finding(finding: &ProtocolFinding) -> Option<&'static OracleSpec> {
+    ORACLE_SPECS.iter().find(|spec| {
+        spec.pack == finding.pack
+            && match (&spec.bug_class, &finding.vuln) {
+                (OracleBugClass::UnauthorizedAssetDrain, VulnType::FlashLoanProfit)
+                | (OracleBugClass::UnauthorizedAssetDrain, VulnType::FlashLoanAttack)
+                | (OracleBugClass::BalanceInvariantViolation, VulnType::AccountingDesync)
+                | (OracleBugClass::ShareAccountingInflation, VulnType::VaultInflation)
+                | (OracleBugClass::DonationManipulation, VulnType::VaultDonationAttack)
+                | (OracleBugClass::ReentrancyStateInconsistency, VulnType::Reentrancy)
+                | (OracleBugClass::ReentrancyStateInconsistency, VulnType::ReadOnlyReentrancy)
+                | (OracleBugClass::AccessControlBypass, VulnType::PrivilegeEscalation)
+                | (OracleBugClass::AccessControlBypass, VulnType::GovernanceTakeover)
+                | (OracleBugClass::OraclePriceManipulation, VulnType::PriceManipulation)
+                | (OracleBugClass::OraclePriceManipulation, VulnType::PriceOracleManipulation)
+                | (OracleBugClass::LiquidationAccounting, VulnType::AccountingDesync)
+                | (OracleBugClass::FeeBypassManipulation, VulnType::MevSandwichExploit)
+                | (OracleBugClass::ApprovalAllowanceAbuse, VulnType::Other(_))
+                | (
+                    OracleBugClass::UpgradeProxyMisconfiguration,
+                    VulnType::ProxyUpgradeabilityViolation,
+                )
+                | (OracleBugClass::RoundingAmplification, VulnType::RoundingLeakage) => true,
+                (OracleBugClass::LiquidationAccounting, VulnType::InvariantViolation(label)) => {
+                    label.to_ascii_lowercase().contains("lending")
+                }
+                _ => false,
+            }
+    })
+}
+
+pub fn oracle_rejection_reasons_for_finding(finding: &ProtocolFinding) -> Vec<RejectionReason> {
+    let mut reasons = Vec::new();
+    if finding.evidence.trim().is_empty() {
+        reasons.push(RejectionReason::OracleWeakness);
+    }
+    if finding.target.is_none()
+        && !matches!(
+            finding.pack,
+            ProtocolOraclePackKind::Governance | ProtocolOraclePackKind::RuntimePanic
+        )
+    {
+        reasons.push(RejectionReason::OracleWeakness);
+    }
+    if finding.evidence.to_ascii_lowercase().contains("synthetic") {
+        reasons.push(RejectionReason::SyntheticFundingRequired);
+    }
+    if finding
+        .evidence
+        .to_ascii_lowercase()
+        .contains("invented allowance")
+    {
+        reasons.push(RejectionReason::MissingAllowance);
+    }
+    if finding.evidence.to_ascii_lowercase().contains("privileged")
+        && finding.pack != ProtocolOraclePackKind::ProxyUpgradeability
+    {
+        reasons.push(RejectionReason::PrivilegedRoleRequired);
+    }
+    reasons.sort();
+    reasons.dedup();
+    reasons
 }
 
 #[derive(Debug, Clone)]
@@ -751,6 +1012,101 @@ mod tests {
             storage_diffs,
             call_trace,
             oracle_observations: Vec::new(),
+        }
+    }
+
+    fn spec_positive_finding(spec: &OracleSpec) -> ProtocolFinding {
+        let vuln = match spec.bug_class {
+            OracleBugClass::UnauthorizedAssetDrain => VulnType::FlashLoanProfit,
+            OracleBugClass::BalanceInvariantViolation => VulnType::AccountingDesync,
+            OracleBugClass::ShareAccountingInflation => VulnType::VaultInflation,
+            OracleBugClass::DonationManipulation => VulnType::VaultDonationAttack,
+            OracleBugClass::ReentrancyStateInconsistency => VulnType::Reentrancy,
+            OracleBugClass::AccessControlBypass => VulnType::PrivilegeEscalation,
+            OracleBugClass::OraclePriceManipulation => VulnType::PriceManipulation,
+            OracleBugClass::LiquidationAccounting => {
+                VulnType::InvariantViolation("lending health invariant".to_string())
+            }
+            OracleBugClass::FeeBypassManipulation => VulnType::MevSandwichExploit,
+            OracleBugClass::ApprovalAllowanceAbuse => {
+                VulnType::Other("unbounded allowance mutation".to_string())
+            }
+            OracleBugClass::UpgradeProxyMisconfiguration => VulnType::ProxyUpgradeabilityViolation,
+            OracleBugClass::RoundingAmplification => VulnType::RoundingLeakage,
+        };
+        ProtocolFinding {
+            pack: spec.pack.clone(),
+            vuln,
+            severity: ProtocolSeverity::High,
+            tx_index: Some(0),
+            target: Some(addr(0xaa)),
+            evidence: format!("{} concrete fork evidence", spec.name),
+        }
+    }
+
+    #[test]
+    fn oracle_specs_cover_required_bug_classes() {
+        assert_eq!(ORACLE_SPECS.len(), 12);
+        for spec in ORACLE_SPECS {
+            assert!(!spec.required_preconditions.is_empty(), "{}", spec.name);
+            assert!(
+                !spec.required_state_observations.is_empty(),
+                "{}",
+                spec.name
+            );
+            assert!(
+                !spec.positive_trigger_conditions.is_empty(),
+                "{}",
+                spec.name
+            );
+            assert!(!spec.negative_rejection_rules.is_empty(), "{}", spec.name);
+            assert!(oracle_spec_by_name(spec.name).is_some(), "{}", spec.name);
+        }
+    }
+
+    #[test]
+    fn each_oracle_spec_accepts_positive_and_rejects_incomplete_evidence() {
+        for spec in ORACLE_SPECS {
+            let positive = spec_positive_finding(spec);
+            assert_eq!(
+                oracle_spec_for_finding(&positive).map(|found| found.name),
+                Some(spec.name),
+                "{}",
+                spec.name
+            );
+            assert!(
+                oracle_rejection_reasons_for_finding(&positive).is_empty(),
+                "{}",
+                spec.name
+            );
+
+            let mut missing_observation = positive.clone();
+            missing_observation.target = None;
+            if !matches!(
+                missing_observation.pack,
+                ProtocolOraclePackKind::Governance | ProtocolOraclePackKind::RuntimePanic
+            ) {
+                assert!(
+                    oracle_rejection_reasons_for_finding(&missing_observation)
+                        .contains(&RejectionReason::OracleWeakness),
+                    "{}",
+                    spec.name
+                );
+            }
+
+            let mut heuristic = positive;
+            heuristic.evidence = "synthetic invented allowance privileged heuristic".to_string();
+            let rejections = oracle_rejection_reasons_for_finding(&heuristic);
+            assert!(
+                rejections.contains(&RejectionReason::SyntheticFundingRequired),
+                "{}",
+                spec.name
+            );
+            assert!(
+                rejections.contains(&RejectionReason::MissingAllowance),
+                "{}",
+                spec.name
+            );
         }
     }
 

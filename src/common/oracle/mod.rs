@@ -5,18 +5,36 @@ pub trait VulnerabilityOracle {
     fn check(&self, before: &Snapshot, after: &Snapshot) -> Option<VulnType>;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FindingStatus {
-    Signal,
-    Candidate,
-    Confirmed,
+    #[default]
+    Lead,
+    Replayed,
+    Minimized,
+    Proved,
     Rejected,
 }
 
-impl Default for FindingStatus {
-    fn default() -> Self {
-        Self::Signal
-    }
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EvidenceGrade {
+    #[default]
+    Heuristic,
+    DeterministicReplay,
+    RealisticForkProof,
+    RegressionTested,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RejectionReason {
+    SyntheticFundingRequired,
+    MissingAllowance,
+    MissingBalance,
+    PrivilegedRoleRequired,
+    NonDeterministic,
+    OracleWeakness,
+    ReplayFailed,
+    MinimizedAway,
+    OutOfScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

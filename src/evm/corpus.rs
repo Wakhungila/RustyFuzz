@@ -1,5 +1,7 @@
 use crate::common::oracle::{FindingStatus, ProtocolFinding, ProtocolSeverity};
-use crate::common::types::{ChainState, SequenceExecutionResult, Snapshot, Waypoint};
+use crate::common::types::{
+    ChainState, ExecutionStatus, SequenceExecutionResult, Snapshot, Waypoint,
+};
 use crate::engine::confirmation::{FindingConfirmation, FindingConfirmationGate};
 use crate::engine::exploit_path::ExploitPathCandidate;
 use crate::engine::proof::{ProofCarryingFinding, ProofConfidenceTier};
@@ -12,7 +14,7 @@ use crate::evm::seed_ingester::MainnetSeedBundle;
 use anyhow::Context;
 use libafl_bolts::rands::Rand;
 use parking_lot::RwLock;
-use revm::primitives::{Address, B256};
+use revm::primitives::{Address, B256, U256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
@@ -234,6 +236,28 @@ impl PersistentCorpus {
     pub fn load_input(&self, id: &str) -> anyhow::Result<EvmInput> {
         let bytes = fs::read(self.root.join("inputs").join(format!("{id}.json")))?;
         Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    pub fn len(&self) -> anyhow::Result<usize> {
+        let input_dir = self.root.join("inputs");
+        let mut count = 0usize;
+        for entry in fs::read_dir(input_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("json")
+                && !path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".meta.json"))
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    pub fn is_empty(&self) -> anyhow::Result<bool> {
+        Ok(self.len()? == 0)
     }
 
     pub fn persist_fork_cache(
@@ -865,11 +889,14 @@ fn triage_status(
     confirmation: Option<&FindingConfirmation>,
 ) -> FindingStatus {
     if confirmation.is_some_and(|confirmation| confirmation.confirmed) {
-        FindingStatus::Confirmed
-    } else if !findings.is_empty() {
-        FindingStatus::Candidate
+        FindingStatus::Proved
+    } else if confirmation.is_some_and(|confirmation| confirmation.minimized_path) {
+        FindingStatus::Minimized
+    } else if confirmation.is_some_and(|confirmation| confirmation.replay_success) {
+        FindingStatus::Replayed
     } else {
-        FindingStatus::Signal
+        let _ = findings;
+        FindingStatus::Lead
     }
 }
 
@@ -917,8 +944,12 @@ fn triage_markdown(record: &CampaignArtifactRecord) -> String {
 #[cfg(test)]
 mod artifact_tests {
     use super::*;
-    use crate::common::types::{ExecutionStatus, SingletonTx, StorageDiff, TxExecutionResult};
+    use crate::common::types::{
+        CallKind, CallObservation, CallPhase, ComparisonOperand, ExecutionStatus,
+        OracleObservation, SingletonTx, StorageAccess, StorageDiff, TxExecutionResult, Waypoint,
+    };
     use crate::evm::seed_ingester::{MainnetSeed, SeedMetadata};
+    use revm::database::CacheDB;
     use revm::primitives::U256;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -971,8 +1002,317 @@ mod artifact_tests {
                 confidence: Some(95),
                 provenance: Some("test".to_string()),
                 decoded: None,
+                tx_hash: None,
+                top_level_caller: Some(Address::repeat_byte(0x13)),
+                internal_caller: None,
+                trace_path: None,
+                trace_source: None,
             },
         }
+    }
+
+    fn scored_execution(
+        target: Address,
+        selector: [u8; 4],
+        branch_distance: Option<U256>,
+        oracle: bool,
+        depth: usize,
+        slot: B256,
+        delta: U256,
+    ) -> SequenceExecutionResult {
+        let waypoint = branch_distance.map(|distance| Waypoint::Comparison {
+            op: 0x14,
+            lhs: U256::from(1),
+            rhs: U256::from(2),
+            pc: 7,
+            calldata_offset: Some(4),
+            condition: false,
+            hit: false,
+            taint_source: None,
+            tainted_operand: ComparisonOperand::Lhs,
+            lhs_expression: None,
+            rhs_expression: None,
+            branch_distance: Some(distance),
+        });
+        let diff = StorageDiff {
+            tx_index: 0,
+            address: target,
+            slot,
+            old_value: U256::ZERO,
+            new_value: delta,
+            pc: 1,
+        };
+        let call = CallObservation {
+            tx_index: 0,
+            depth,
+            caller: Address::repeat_byte(0x11),
+            target,
+            value: U256::ZERO,
+            input: selector.to_vec(),
+            output: Vec::new(),
+            gas_limit: 100_000,
+            gas_used: 20_000,
+            success: true,
+            kind: CallKind::Call,
+            phase: CallPhase::End,
+            created_address: None,
+            result: None,
+        };
+        let observation = OracleObservation {
+            oracle: "event:Transfer".to_string(),
+            finding: "near invariant".to_string(),
+            tx_index: Some(0),
+            evidence: "oracle proximity".to_string(),
+        };
+        SequenceExecutionResult {
+            tx_results: vec![TxExecutionResult {
+                tx_index: 0,
+                status: ExecutionStatus::Success,
+                gas_used: 21_000,
+                output: Vec::new(),
+                coverage_hash: 1,
+                coverage_edges: if oracle { 8 } else { 1 },
+                storage_reads: Vec::new(),
+                storage_writes: vec![StorageAccess {
+                    tx_index: 0,
+                    address: target,
+                    slot,
+                    value: Some(delta),
+                    pc: 1,
+                }],
+                storage_diffs: vec![diff.clone()],
+                call_trace: vec![call.clone()],
+                waypoints: waypoint.into_iter().collect(),
+            }],
+            total_gas_used: 21_000,
+            final_coverage_hash: 1,
+            storage_reads: Vec::new(),
+            storage_writes: vec![StorageAccess {
+                tx_index: 0,
+                address: target,
+                slot,
+                value: Some(delta),
+                pc: 1,
+            }],
+            storage_diffs: vec![diff],
+            call_trace: vec![call],
+            oracle_observations: oracle.then_some(observation).into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn snapshot_corpus_grows_from_meaningful_post_transaction_state() {
+        let caller = Address::repeat_byte(0x44);
+        let target = Address::repeat_byte(0x45);
+        let input = EvmInput {
+            txs: vec![SingletonTx {
+                input: vec![0xde, 0xad, 0xbe, 0xef],
+                caller,
+                to: target,
+                value: U256::ZERO,
+                is_victim: false,
+            }],
+            base_snapshot_id: 0,
+            waypoints: Vec::new(),
+            mutation_provenance: Vec::new(),
+        };
+        let mut corpus = SnapshotCorpus::new();
+        corpus.add_snapshot(
+            0,
+            0,
+            Snapshot {
+                id: 0,
+                state: Arc::new(RwLock::new(ChainState::Evm(CacheDB::new(ForkDb::empty())))),
+                coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                producing_input: None,
+                waypoints: Vec::new(),
+                depth: 0,
+                gas_used: 0,
+            },
+        );
+        let execution = SequenceExecutionResult {
+            tx_results: vec![TxExecutionResult {
+                tx_index: 0,
+                status: ExecutionStatus::Success,
+                gas_used: 21_000,
+                output: Vec::new(),
+                coverage_hash: 1,
+                coverage_edges: 1,
+                storage_reads: Vec::new(),
+                storage_writes: Vec::new(),
+                storage_diffs: vec![StorageDiff {
+                    tx_index: 0,
+                    address: target,
+                    slot: B256::ZERO,
+                    old_value: U256::ZERO,
+                    new_value: U256::from(1),
+                    pc: 1,
+                }],
+                call_trace: Vec::new(),
+                waypoints: Vec::new(),
+            }],
+            total_gas_used: 21_000,
+            final_coverage_hash: 1,
+            storage_reads: Vec::new(),
+            storage_writes: Vec::new(),
+            storage_diffs: vec![StorageDiff {
+                tx_index: 0,
+                address: target,
+                slot: B256::ZERO,
+                old_value: U256::ZERO,
+                new_value: U256::from(1),
+                pc: 1,
+            }],
+            call_trace: Vec::new(),
+            oracle_observations: Vec::new(),
+        };
+        let mut coverage = vec![0u8; 8];
+        coverage[3] = 1;
+
+        let id = corpus.maybe_add_post_execution_snapshot(
+            0,
+            &input,
+            ChainState::Evm(CacheDB::new(ForkDb::empty())),
+            &coverage,
+            &execution,
+            8,
+        );
+
+        assert_eq!(id, Some(1));
+        assert_eq!(corpus.snapshots.len(), 2);
+        let snapshot = corpus.get_snapshot(1).expect("snapshot inserted");
+        let snapshot = snapshot.read();
+        assert_eq!(snapshot.depth, 1);
+        assert_eq!(snapshot.producing_input.as_ref(), Some(&input));
+        assert!(snapshot.coverage[3]);
+    }
+
+    #[test]
+    fn snapshot_scoring_is_deterministic_and_componentized() {
+        let target = Address::repeat_byte(0x51);
+        let execution = scored_execution(
+            target,
+            [0xde, 0xad, 0xbe, 0xef],
+            Some(U256::from(1)),
+            true,
+            3,
+            B256::from(U256::from(9).to_be_bytes::<32>()),
+            U256::from(10u128.pow(18)),
+        );
+        let known_slots = HashSet::new();
+        let known_selectors = HashSet::new();
+        let left = SnapshotScore::from_execution(&execution, &known_slots, &known_selectors);
+        let right = SnapshotScore::from_execution(&execution, &known_slots, &known_selectors);
+
+        assert_eq!(left, right);
+        assert_eq!(left.branch_distance, 1);
+        assert_eq!(left.comparison_distance, 1);
+        assert_eq!(left.oracle_proximity, 1);
+        assert_eq!(left.event_novelty, 1);
+        assert!(left.total(&SnapshotScoreWeights::default()) > 0);
+    }
+
+    #[test]
+    fn high_value_snapshot_score_outranks_low_value_snapshot() {
+        let target = Address::repeat_byte(0x52);
+        let high = scored_execution(
+            target,
+            [0xaa, 0xbb, 0xcc, 0xdd],
+            Some(U256::from(1)),
+            true,
+            4,
+            B256::from(U256::from(1).to_be_bytes::<32>()),
+            U256::from(10u128.pow(18)),
+        );
+        let low = scored_execution(
+            target,
+            [0xaa, 0xbb, 0xcc, 0xdd],
+            None,
+            false,
+            0,
+            B256::from(U256::from(1).to_be_bytes::<32>()),
+            U256::from(1),
+        );
+        let weights = SnapshotScoreWeights::default();
+        assert!(
+            SnapshotScore::from_execution(&high, &HashSet::new(), &HashSet::new()).total(&weights)
+                > SnapshotScore::from_execution(&low, &HashSet::new(), &HashSet::new())
+                    .total(&weights)
+        );
+    }
+
+    #[test]
+    fn snapshot_pruning_retains_promising_state() {
+        let target = Address::repeat_byte(0x53);
+        let mut corpus = SnapshotCorpus::new();
+        corpus.add_snapshot(
+            0,
+            0,
+            Snapshot {
+                id: 0,
+                state: Arc::new(RwLock::new(ChainState::Evm(CacheDB::new(ForkDb::empty())))),
+                coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                producing_input: None,
+                waypoints: Vec::new(),
+                depth: 0,
+                gas_used: 0,
+            },
+        );
+        let input = EvmInput {
+            txs: vec![SingletonTx {
+                input: vec![0xaa, 0xbb, 0xcc, 0xdd],
+                caller: Address::repeat_byte(0x13),
+                to: target,
+                value: U256::ZERO,
+                is_victim: false,
+            }],
+            base_snapshot_id: 0,
+            waypoints: Vec::new(),
+            mutation_provenance: Vec::new(),
+        };
+        let low = scored_execution(
+            target,
+            [0x10, 0x00, 0x00, 0x00],
+            None,
+            false,
+            0,
+            B256::from(U256::from(1).to_be_bytes::<32>()),
+            U256::from(1),
+        );
+        let high = scored_execution(
+            target,
+            [0x20, 0x00, 0x00, 0x00],
+            Some(U256::from(1)),
+            true,
+            5,
+            B256::from(U256::from(2).to_be_bytes::<32>()),
+            U256::from(10u128.pow(18)),
+        );
+        let coverage = vec![1u8; 8];
+        let low_id = corpus
+            .maybe_add_post_execution_snapshot(
+                0,
+                &input,
+                ChainState::Evm(CacheDB::new(ForkDb::empty())),
+                &coverage,
+                &low,
+                8,
+            )
+            .expect("low snapshot");
+        let high_id = corpus
+            .maybe_add_post_execution_snapshot(
+                0,
+                &input,
+                ChainState::Evm(CacheDB::new(ForkDb::empty())),
+                &coverage,
+                &high,
+                2,
+            )
+            .expect("high snapshot");
+
+        assert!(corpus.snapshots.contains_key(&high_id));
+        assert!(!corpus.snapshots.contains_key(&low_id));
+        assert_eq!(corpus.snapshots.len(), 2);
     }
 
     #[test]
@@ -1213,6 +1553,185 @@ pub struct SnapshotMetadata {
     pub coverage_score: usize,
     pub read_set: HashSet<(Address, B256)>,
     pub write_set: HashSet<(Address, B256)>,
+    pub score: SnapshotScore,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SnapshotScore {
+    pub new_coverage: u64,
+    pub branch_distance: u64,
+    pub comparison_distance: u64,
+    pub oracle_proximity: u64,
+    pub asset_delta_proximity: u64,
+    pub storage_slot_sensitivity: u64,
+    pub call_depth_novelty: u64,
+    pub selector_novelty: u64,
+    pub revert_reason_novelty: u64,
+    pub event_novelty: u64,
+    pub state_transition_rarity: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotScoreWeights {
+    pub new_coverage: u64,
+    pub branch_distance: u64,
+    pub comparison_distance: u64,
+    pub oracle_proximity: u64,
+    pub asset_delta_proximity: u64,
+    pub storage_slot_sensitivity: u64,
+    pub call_depth_novelty: u64,
+    pub selector_novelty: u64,
+    pub revert_reason_novelty: u64,
+    pub event_novelty: u64,
+    pub state_transition_rarity: u64,
+}
+
+impl Default for SnapshotScoreWeights {
+    fn default() -> Self {
+        Self {
+            new_coverage: 10,
+            branch_distance: 8,
+            comparison_distance: 6,
+            oracle_proximity: 14,
+            asset_delta_proximity: 10,
+            storage_slot_sensitivity: 8,
+            call_depth_novelty: 5,
+            selector_novelty: 5,
+            revert_reason_novelty: 4,
+            event_novelty: 3,
+            state_transition_rarity: 9,
+        }
+    }
+}
+
+impl SnapshotScore {
+    pub fn total(&self, weights: &SnapshotScoreWeights) -> u64 {
+        self.new_coverage
+            .saturating_mul(weights.new_coverage)
+            .saturating_add(self.branch_distance.saturating_mul(weights.branch_distance))
+            .saturating_add(
+                self.comparison_distance
+                    .saturating_mul(weights.comparison_distance),
+            )
+            .saturating_add(
+                self.oracle_proximity
+                    .saturating_mul(weights.oracle_proximity),
+            )
+            .saturating_add(
+                self.asset_delta_proximity
+                    .saturating_mul(weights.asset_delta_proximity),
+            )
+            .saturating_add(
+                self.storage_slot_sensitivity
+                    .saturating_mul(weights.storage_slot_sensitivity),
+            )
+            .saturating_add(
+                self.call_depth_novelty
+                    .saturating_mul(weights.call_depth_novelty),
+            )
+            .saturating_add(
+                self.selector_novelty
+                    .saturating_mul(weights.selector_novelty),
+            )
+            .saturating_add(
+                self.revert_reason_novelty
+                    .saturating_mul(weights.revert_reason_novelty),
+            )
+            .saturating_add(self.event_novelty.saturating_mul(weights.event_novelty))
+            .saturating_add(
+                self.state_transition_rarity
+                    .saturating_mul(weights.state_transition_rarity),
+            )
+    }
+
+    pub fn from_execution(
+        execution: &SequenceExecutionResult,
+        known_storage_slots: &HashSet<(Address, B256)>,
+        known_selectors: &HashSet<[u8; 4]>,
+    ) -> Self {
+        let waypoints = execution
+            .tx_results
+            .iter()
+            .flat_map(|result| result.waypoints.iter());
+        let mut near_branch = 0u64;
+        let mut near_comparison = 0u64;
+        for waypoint in waypoints {
+            if let Waypoint::Comparison {
+                branch_distance: Some(distance),
+                ..
+            } = waypoint
+            {
+                if *distance <= U256::from(256) {
+                    near_branch += 1;
+                }
+                if *distance <= U256::from(4096) {
+                    near_comparison += 1;
+                }
+            }
+        }
+        let selectors: HashSet<[u8; 4]> = execution
+            .call_trace
+            .iter()
+            .filter_map(|call| call.input.get(0..4)?.try_into().ok())
+            .collect();
+        let touched_slots: HashSet<(Address, B256)> = execution
+            .storage_diffs
+            .iter()
+            .map(|diff| (diff.address, diff.slot))
+            .collect();
+        let asset_delta_proximity = execution
+            .storage_diffs
+            .iter()
+            .filter(|diff| {
+                let delta = if diff.new_value > diff.old_value {
+                    diff.new_value - diff.old_value
+                } else {
+                    diff.old_value - diff.new_value
+                };
+                delta >= U256::from(10u128.pow(12))
+            })
+            .count() as u64;
+        let revert_reason_novelty = execution
+            .tx_results
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result.status,
+                    ExecutionStatus::Revert | ExecutionStatus::Halt(_)
+                )
+            })
+            .filter(|result| !result.output.is_empty())
+            .count() as u64;
+        Self {
+            new_coverage: execution
+                .tx_results
+                .iter()
+                .map(|result| result.coverage_edges as u64)
+                .sum(),
+            branch_distance: near_branch,
+            comparison_distance: near_comparison,
+            oracle_proximity: execution.oracle_observations.len() as u64,
+            asset_delta_proximity,
+            storage_slot_sensitivity: touched_slots.difference(known_storage_slots).count() as u64,
+            call_depth_novelty: execution
+                .call_trace
+                .iter()
+                .map(|call| call.depth as u64)
+                .max()
+                .unwrap_or_default(),
+            selector_novelty: selectors.difference(known_selectors).count() as u64,
+            revert_reason_novelty,
+            event_novelty: execution
+                .oracle_observations
+                .iter()
+                .filter(|observation| observation.oracle.to_ascii_lowercase().contains("event"))
+                .count() as u64,
+            state_transition_rarity: touched_slots
+                .iter()
+                .filter(|slot| !known_storage_slots.contains(slot))
+                .count() as u64,
+        }
+    }
 }
 
 impl SnapshotCorpus {
@@ -1244,8 +1763,123 @@ impl SnapshotCorpus {
                 coverage_score,
                 read_set: HashSet::new(), // Populated after execution
                 write_set: HashSet::new(),
+                score: SnapshotScore {
+                    new_coverage: coverage_score as u64,
+                    ..SnapshotScore::default()
+                },
             },
         );
+    }
+
+    pub fn maybe_add_post_execution_snapshot(
+        &mut self,
+        parent_id: u64,
+        input: &EvmInput,
+        state: ChainState,
+        coverage: &[u8],
+        execution: &SequenceExecutionResult,
+        max_snapshots: usize,
+    ) -> Option<u64> {
+        if !meaningful_snapshot_execution(execution) {
+            return None;
+        }
+
+        let id = self
+            .snapshots
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or_default()
+            .saturating_add(1);
+        let parent_depth = self
+            .metadata
+            .get(&parent_id)
+            .map(|metadata| metadata.depth)
+            .unwrap_or_default();
+        let mut snapshot = Snapshot {
+            id,
+            state: Arc::new(RwLock::new(state)),
+            coverage: coverage_bitvec(coverage),
+            producing_input: Some(input.clone()),
+            waypoints: execution
+                .tx_results
+                .iter()
+                .flat_map(|result| result.waypoints.clone())
+                .collect(),
+            depth: parent_depth.saturating_add(1),
+            gas_used: execution.total_gas_used,
+        };
+        snapshot.apply_waypoint_backpressure();
+        self.add_snapshot(id, parent_id, snapshot);
+        self.update_snapshot_metadata_from_execution(id, execution);
+        self.prune_to_limit(max_snapshots.max(1));
+        Some(id)
+    }
+
+    fn update_snapshot_metadata_from_execution(
+        &mut self,
+        id: u64,
+        execution: &SequenceExecutionResult,
+    ) {
+        let known_storage_slots = self
+            .metadata
+            .values()
+            .flat_map(|metadata| metadata.write_set.iter().copied())
+            .collect::<HashSet<_>>();
+        let known_selectors = self
+            .snapshots
+            .values()
+            .filter_map(|snapshot| snapshot.read().producing_input.clone())
+            .flat_map(|input| input.txs.into_iter())
+            .filter_map(|tx| tx.input.get(0..4)?.try_into().ok())
+            .collect::<HashSet<_>>();
+        let score =
+            SnapshotScore::from_execution(execution, &known_storage_slots, &known_selectors);
+        if let Some(metadata) = self.metadata.get_mut(&id) {
+            metadata.read_set = execution
+                .storage_reads
+                .iter()
+                .map(|read| (read.address, read.slot))
+                .collect();
+            metadata.write_set = execution
+                .storage_writes
+                .iter()
+                .map(|write| (write.address, write.slot))
+                .collect();
+            metadata.coverage_score = metadata
+                .coverage_score
+                .saturating_add(execution.storage_diffs.len())
+                .saturating_add(execution.call_trace.len())
+                .saturating_add(execution.oracle_observations.len() * 10);
+            metadata.score = score;
+        }
+        for read in &execution.storage_reads {
+            *self
+                .global_read_hotspots
+                .entry((read.address, read.slot))
+                .or_default() += 1;
+        }
+    }
+
+    fn prune_to_limit(&mut self, max_snapshots: usize) {
+        while self.snapshots.len() > max_snapshots {
+            let Some((&id, _)) =
+                self.metadata
+                    .iter()
+                    .filter(|(id, _)| **id != 0)
+                    .min_by_key(|(_, metadata)| {
+                        (
+                            metadata.score.total(&SnapshotScoreWeights::default()),
+                            metadata.coverage_score,
+                            metadata.write_set.len(),
+                            std::cmp::Reverse(metadata.visits),
+                        )
+                    })
+            else {
+                break;
+            };
+            self.prune_recursive(id);
+        }
     }
 
     /// Directed Power Schedule: Prioritizes snapshots that are likely to fill
@@ -1264,7 +1898,10 @@ impl SnapshotCorpus {
             // If this branch is "near" a gap, give it a 10x multiplier.
             let gap_intersection =
                 (snap.coverage.clone() & self.priority_gap_map.clone()).count_ones();
-            let energy = meta.coverage_score + (gap_intersection * 10);
+            let energy = meta
+                .coverage_score
+                .saturating_add(gap_intersection * 10)
+                .saturating_add(meta.score.total(&SnapshotScoreWeights::default()) as usize);
 
             weighted_ids.push((*id, energy));
         }
@@ -1344,6 +1981,34 @@ impl SnapshotCorpus {
     pub fn get_snapshot(&self, id: u64) -> Option<Arc<RwLock<Snapshot>>> {
         self.snapshots.get(&id).cloned()
     }
+}
+
+fn meaningful_snapshot_execution(execution: &SequenceExecutionResult) -> bool {
+    execution
+        .tx_results
+        .iter()
+        .any(|result| matches!(result.status, ExecutionStatus::Success))
+        && (!execution.storage_diffs.is_empty()
+            || !execution.storage_writes.is_empty()
+            || !execution.oracle_observations.is_empty()
+            || execution.call_trace.len() > execution.tx_results.len()
+            || execution.tx_results.iter().any(|result| {
+                result.coverage_edges > 0
+                    || result
+                        .waypoints
+                        .iter()
+                        .any(|waypoint| matches!(waypoint, Waypoint::Comparison { .. }))
+            }))
+}
+
+fn coverage_bitvec(coverage: &[u8]) -> BitVec<u8, Lsb0> {
+    let mut out = bitvec::bitvec![u8, Lsb0; 0; coverage.len()];
+    for (idx, hit) in coverage.iter().enumerate() {
+        if *hit != 0 {
+            out.set(idx, true);
+        }
+    }
+    out
 }
 
 impl Default for SnapshotCorpus {

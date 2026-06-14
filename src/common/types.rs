@@ -9,12 +9,84 @@ use std::sync::Arc;
 
 pub use crate::evm::fuzz::EvmInput;
 
+/// Maximum number of waypoints allowed per transaction to prevent unbounded memory growth
+pub const MAX_WAYPOINTS_PER_TX: usize = 1000;
+
+/// Maximum total waypoints allowed across all transactions in an input
+pub const MAX_TOTAL_WAYPOINTS: usize = 10000;
+
+/// Maximum memory usage in bytes before triggering backpressure (default: 2GB)
+pub const MAX_MEMORY_USAGE_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// Memory usage monitoring utilities
+pub struct MemoryMonitor;
+
+impl MemoryMonitor {
+    /// Gets the current memory usage of the process in bytes
+    pub fn current_memory_usage() -> usize {
+        #[cfg(target_os = "linux")]
+        {
+            // Read from /proc/self/status
+            if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+                for line in status.lines() {
+                    if line.starts_with("VmRSS:") {
+                        // VmRSS is in kB
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            if let Ok(kb) = parts[1].parse::<usize>() {
+                                return kb * 1024;
+                            }
+                        }
+                    }
+                }
+            }
+            // Fallback: estimate based on allocation
+            0
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            // On non-Linux systems, we can't easily get memory usage without external crates
+            // Return 0 to indicate unknown, or use platform-specific code
+            0
+        }
+    }
+
+    /// Checks if memory usage exceeds the limit
+    pub fn exceeds_limit() -> bool {
+        Self::current_memory_usage() > MAX_MEMORY_USAGE_BYTES
+    }
+
+    /// Gets memory usage as a human-readable string
+    pub fn memory_usage_string() -> String {
+        let bytes = Self::current_memory_usage();
+        let mb = bytes / (1024 * 1024);
+        let gb = mb / 1024;
+        if gb > 0 {
+            format!("{} GB", gb)
+        } else if mb > 0 {
+            format!("{} MB", mb)
+        } else {
+            format!("{} KB", bytes / 1024)
+        }
+    }
+}
+
+/// Represents a single EVM transaction in a fuzzing sequence.
+///
+/// A `SingletonTx` contains all the necessary information to execute a transaction
+/// during fuzzing, including calldata, caller, target address, value, and victim status.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SingletonTx {
+    /// The transaction calldata (function selector + arguments)
     pub input: Vec<u8>,
+    /// The address of the transaction sender
     pub caller: Address,
+    /// The target contract address
     pub to: Address,
+    /// The ETH value sent with the transaction
     pub value: U256,
+    /// Whether this transaction is marked as a victim (for MEV/sandwich attacks)
     pub is_victim: bool,
 }
 
@@ -128,6 +200,17 @@ pub struct Snapshot {
     pub waypoints: Vec<Waypoint>,
     pub depth: u32,
     pub gas_used: u64,
+}
+
+impl Snapshot {
+    /// Applies backpressure to waypoint accumulation by truncating if over limit
+    pub fn apply_waypoint_backpressure(&mut self) {
+        if self.waypoints.len() > MAX_WAYPOINTS_PER_TX {
+            // Keep the most recent waypoints (they're more relevant for concolic solving)
+            let excess = self.waypoints.len() - MAX_WAYPOINTS_PER_TX;
+            self.waypoints.drain(0..excess);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]

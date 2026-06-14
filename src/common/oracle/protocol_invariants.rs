@@ -457,9 +457,7 @@ fn protocol_invariant_to_finding(finding: ProtocolInvariantFinding) -> ProtocolF
             VulnType::PriceManipulation
         }
         ProtocolInvariantFamily::GovernanceTimelock => VulnType::GovernanceTakeover,
-        ProtocolInvariantFamily::BridgeReplay => {
-            VulnType::BridgeInvariantViolation
-        }
+        ProtocolInvariantFamily::BridgeReplay => VulnType::BridgeInvariantViolation,
         ProtocolInvariantFamily::LendingHealth => {
             VulnType::InvariantViolation("lending health invariant".to_string())
         }

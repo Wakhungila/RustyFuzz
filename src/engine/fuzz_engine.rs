@@ -55,6 +55,7 @@ use std::{
 };
 
 const DEFAULT_MUTATIONAL_STAGE_MAX_ITERATIONS: usize = 128;
+const MAX_SNAPSHOT_CORPUS_SIZE: usize = 4096;
 
 fn campaign_rng_seed(config: &Config, core_id: usize) -> u64 {
     if config.hardened_defi.deterministic {
@@ -106,9 +107,12 @@ impl CampaignBudget {
             let workers = workers.max(1) as u64;
             execs.div_ceil(workers).max(1)
         });
+        let shutdown_grace = campaign_shutdown_grace();
         Self {
             max_execs,
-            deadline: duration_secs.map(|secs| Instant::now() + Duration::from_secs(secs)),
+            deadline: duration_secs.map(|secs| {
+                Instant::now() + Duration::from_secs(secs.saturating_sub(shutdown_grace))
+            }),
             reserved_execs: AtomicU64::new(0),
         }
     }
@@ -356,9 +360,69 @@ pub struct Config {
     pub promotion: PromotionConfig,
 }
 
+impl Config {
+    /// Ensures proper state isolation by creating campaign-specific directories
+    /// based on the campaign_id. This prevents cross-contamination between campaigns.
+    pub fn ensure_state_isolation(&self) -> anyhow::Result<()> {
+        let campaign_suffix = self
+            .campaign_id
+            .as_ref()
+            .map(|id| {
+                format!(
+                    "_{}",
+                    id.replace(|c: char| !c.is_alphanumeric() && c != '_', "_")
+                )
+            })
+            .unwrap_or_default();
+
+        // Ensure corpus directory is isolated per campaign
+        let isolated_corpus_dir = format!("{}{}", self.corpus_dir, campaign_suffix);
+        fs::create_dir_all(&isolated_corpus_dir)?;
+
+        // Ensure report directory is isolated per campaign
+        let isolated_report_dir = format!("{}{}", self.report_dir, campaign_suffix);
+        fs::create_dir_all(&isolated_report_dir)?;
+
+        Ok(())
+    }
+
+    /// Returns the isolated corpus directory for this campaign
+    pub fn isolated_corpus_dir(&self) -> String {
+        let campaign_suffix = self
+            .campaign_id
+            .as_ref()
+            .map(|id| {
+                format!(
+                    "_{}",
+                    id.replace(|c: char| !c.is_alphanumeric() && c != '_', "_")
+                )
+            })
+            .unwrap_or_default();
+        format!("{}{}", self.corpus_dir, campaign_suffix)
+    }
+
+    /// Returns the isolated report directory for this campaign
+    pub fn isolated_report_dir(&self) -> String {
+        let campaign_suffix = self
+            .campaign_id
+            .as_ref()
+            .map(|id| {
+                format!(
+                    "_{}",
+                    id.replace(|c: char| !c.is_alphanumeric() && c != '_', "_")
+                )
+            })
+            .unwrap_or_default();
+        format!("{}{}", self.report_dir, campaign_suffix)
+    }
+}
+
 pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let start_time = Instant::now();
+
+    // Ensure state isolation before starting the campaign
+    config.ensure_state_isolation()?;
 
     let monitor = SimpleMonitor::new(|s| {
         log::info!("Stats: {} | Duration: {:?}", s, start_time.elapsed());
@@ -910,6 +974,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     };
 
                     let mut current_state = base_snap_arc.read().state.read().clone();
+                    drop(snapshot_corpus_guard);
 
                     let base_fork_state = match &current_state {
                         ChainState::Evm(db) => db.clone(),
@@ -968,6 +1033,25 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     let report = state_novelty_feedback
                         .write()
                         .observe_execution(&execution);
+                    unsafe {
+                        let map_slice = std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE);
+                        if let Some(snapshot_id) = snapshot_corpus.write().maybe_add_post_execution_snapshot(
+                            snap_id,
+                            input,
+                            current_state.clone(),
+                            map_slice,
+                            &execution,
+                            MAX_SNAPSHOT_CORPUS_SIZE,
+                        ) {
+                            log::debug!(
+                                "Inserted post-execution snapshot id={} parent={} txs={} state_novelty={}",
+                                snapshot_id,
+                                snap_id,
+                                input.txs.len(),
+                                report.novelty_score()
+                            );
+                        }
+                    }
 
                     let mut findings = protocol_oracles.evaluate(&execution);
                     let economic_delta = (config.hardened_defi.enabled
@@ -1640,6 +1724,7 @@ async fn run_single_process_campaign(
         };
 
         let mut current_state = base_snap_arc.read().state.read().clone();
+        drop(snapshot_corpus_guard);
         let base_fork_state = match &current_state {
             ChainState::Evm(db) => db.clone(),
         };
@@ -1688,6 +1773,25 @@ async fn run_single_process_campaign(
 
         let execution = sequence_result_from_tx_results(tx_results);
         let report = state_novelty_feedback.write().observe_execution(&execution);
+        unsafe {
+            let map_slice = std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE);
+            if let Some(snapshot_id) = snapshot_corpus.write().maybe_add_post_execution_snapshot(
+                snap_id,
+                input,
+                current_state.clone(),
+                map_slice,
+                &execution,
+                MAX_SNAPSHOT_CORPUS_SIZE,
+            ) {
+                log::debug!(
+                    "Inserted post-execution snapshot id={} parent={} txs={} state_novelty={}",
+                    snapshot_id,
+                    snap_id,
+                    input.txs.len(),
+                    report.novelty_score()
+                );
+            }
+        }
         let mut findings = protocol_oracles.evaluate(&execution);
         let economic_delta = (config.hardened_defi.enabled
             && config.hardened_defi.enable_economic_delta)
@@ -1940,6 +2044,13 @@ fn campaign_execution_timeout() -> Duration {
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_EXECUTION_TIMEOUT)
+}
+
+fn campaign_shutdown_grace() -> u64 {
+    std::env::var("RUSTYFUZZ_CAMPAIGN_SHUTDOWN_GRACE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(15)
 }
 
 fn startup_rpc_timeout() -> Duration {
@@ -2830,6 +2941,14 @@ mod tests {
         std::env::set_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS", "7");
         assert_eq!(campaign_execution_timeout(), Duration::from_secs(7));
         std::env::remove_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn campaign_budget_reserves_shutdown_grace_for_duration_runs() {
+        std::env::set_var("RUSTYFUZZ_CAMPAIGN_SHUTDOWN_GRACE_SECS", "2");
+        let budget = CampaignBudget::new(None, Some(1), 1);
+        assert!(budget.exhausted());
+        std::env::remove_var("RUSTYFUZZ_CAMPAIGN_SHUTDOWN_GRACE_SECS");
     }
 
     #[test]

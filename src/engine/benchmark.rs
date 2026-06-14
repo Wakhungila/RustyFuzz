@@ -11,7 +11,7 @@ use crate::engine::bounded_search::{
     BoundedSearchBounds, BoundedSearchEngine, BoundedSearchRequest,
 };
 use crate::engine::confirmation::{FindingConfirmationConfig, FindingConfirmationGate};
-use crate::engine::exploit_coverage::{ExploitClass, ExploitCoverageReport, build_coverage_report};
+use crate::engine::exploit_coverage::{build_coverage_report, ExploitClass, ExploitCoverageReport};
 use crate::engine::exploit_path::{
     CounterexampleProofStatus, ExploitPathBuilder, ExploitPathCandidate, MinimizedSequenceStatus,
     ReplayabilityStatus,
@@ -30,10 +30,10 @@ use crate::evm::inspector::MAP_SIZE;
 use anyhow::{Context, Result};
 use revm::context::BlockEnv;
 use revm::database::CacheDB;
-use revm::primitives::{Address, B256, U256, keccak256};
+use revm::primitives::{keccak256, Address, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -597,6 +597,16 @@ pub struct BenchmarkManifest {
     pub replay_command: Option<String>,
     #[serde(default)]
     pub poc_generation: PocGenerationExpectation,
+    #[serde(default)]
+    pub expected_oracle: Option<String>,
+    #[serde(default)]
+    pub expected_minimum_evidence_grade: Option<crate::common::oracle::EvidenceGrade>,
+    #[serde(default)]
+    pub expected_proof_artifact: Option<String>,
+    #[serde(default)]
+    pub expected_failure_kind: Option<BenchmarkFailureKind>,
+    #[serde(default)]
+    pub expected_cli_exit: Option<i32>,
     pub max_duration_secs: Option<u64>,
     #[serde(default)]
     pub seed_hints: Vec<String>,
@@ -742,6 +752,25 @@ pub enum ValidationStatus {
     SkippedByConfig,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "PascalCase")]
+pub enum BenchmarkFailureKind {
+    SetupFailure,
+    AbiMissing,
+    BytecodeMissing,
+    SeedDiscoveryFailure,
+    SearchFailure,
+    SnapshotSchedulingFailure,
+    OracleDidNotTrigger,
+    ReplayFailure,
+    MinimizationFailure,
+    RealismProofFailure,
+    PocGenerationFailure,
+    RegressionTestFailure,
+    #[default]
+    Passed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BenchmarkValidationResult {
     pub benchmark_id: String,
@@ -776,6 +805,16 @@ pub struct BenchmarkValidationResult {
     #[serde(default)]
     pub proof: Option<ProofCarryingFinding>,
     pub foundry_poc_generated: bool,
+    #[serde(default)]
+    pub failure_kind: BenchmarkFailureKind,
+    #[serde(default)]
+    pub expected_oracle: Option<String>,
+    #[serde(default)]
+    pub expected_minimum_evidence_grade: Option<crate::common::oracle::EvidenceGrade>,
+    #[serde(default)]
+    pub expected_proof_artifact: Option<String>,
+    #[serde(default)]
+    pub expected_cli_exit: Option<i32>,
     pub executions_to_signal: Option<u64>,
     pub time_to_signal_secs: Option<f64>,
     pub false_positive_notes: Vec<String>,
@@ -1070,6 +1109,15 @@ impl ValidationRunner {
                 "executed benchmark but evidence did not satisfy success criteria; matched={matched:?}, missing={missing:?}"
             )
         };
+        let foundry_poc_generated = observation.foundry_poc_path.is_some();
+        let failure_kind = classify_benchmark_failure(
+            manifest,
+            observation,
+            strongest,
+            candidate,
+            proof_confirmed,
+            foundry_poc_generated,
+        );
 
         BenchmarkValidationResult {
             benchmark_id: manifest.id.clone(),
@@ -1114,7 +1162,12 @@ impl ValidationRunner {
                 .or_else(|| proof.map(|proof| proof.proof_status.clone()))
                 .or_else(|| candidate.map(|candidate| candidate.proof_status.clone())),
             proof: proof.cloned(),
-            foundry_poc_generated: observation.foundry_poc_path.is_some(),
+            foundry_poc_generated,
+            failure_kind,
+            expected_oracle: manifest.expected_oracle.clone(),
+            expected_minimum_evidence_grade: manifest.expected_minimum_evidence_grade.clone(),
+            expected_proof_artifact: manifest.expected_proof_artifact.clone(),
+            expected_cli_exit: manifest.expected_cli_exit,
             executions_to_signal: observation.executions,
             time_to_signal_secs: observation.elapsed_secs,
             false_positive_notes: observation.false_positive_notes.clone(),
@@ -1146,6 +1199,7 @@ impl ValidationRunner {
         status: ValidationStatus,
         reason: String,
     ) -> BenchmarkValidationResult {
+        let failure_kind = skipped_failure_kind(status.clone());
         BenchmarkValidationResult {
             benchmark_id: manifest.id.clone(),
             vulnerability_class: manifest.vulnerability_class.clone(),
@@ -1184,6 +1238,11 @@ impl ValidationRunner {
             proof_status: None,
             proof: None,
             foundry_poc_generated: false,
+            failure_kind,
+            expected_oracle: manifest.expected_oracle.clone(),
+            expected_minimum_evidence_grade: manifest.expected_minimum_evidence_grade.clone(),
+            expected_proof_artifact: manifest.expected_proof_artifact.clone(),
+            expected_cli_exit: manifest.expected_cli_exit,
             executions_to_signal: None,
             time_to_signal_secs: None,
             false_positive_notes: vec![reason],
@@ -1236,6 +1295,11 @@ impl ValidationRunner {
             proof_status: None,
             proof: None,
             foundry_poc_generated: false,
+            failure_kind: BenchmarkFailureKind::SetupFailure,
+            expected_oracle: manifest.expected_oracle.clone(),
+            expected_minimum_evidence_grade: manifest.expected_minimum_evidence_grade.clone(),
+            expected_proof_artifact: manifest.expected_proof_artifact.clone(),
+            expected_cli_exit: manifest.expected_cli_exit,
             executions_to_signal: None,
             time_to_signal_secs: None,
             false_positive_notes: vec![reason],
@@ -2555,6 +2619,61 @@ fn live_minimized_status(
     MinimizedSequenceStatus::Minimized
 }
 
+fn skipped_failure_kind(status: ValidationStatus) -> BenchmarkFailureKind {
+    match status {
+        ValidationStatus::NotRunMissingFixture
+        | ValidationStatus::NotRunMissingTarget
+        | ValidationStatus::NotRunMissingSuccessCriteria
+        | ValidationStatus::NotRunUnsupportedMode
+        | ValidationStatus::FailedExecution
+        | ValidationStatus::SkippedByConfig => BenchmarkFailureKind::SetupFailure,
+        ValidationStatus::Found | ValidationStatus::NotFound => BenchmarkFailureKind::Passed,
+    }
+}
+
+fn classify_benchmark_failure(
+    manifest: &BenchmarkManifest,
+    observation: &ValidationObservation,
+    strongest: Option<&ProtocolFinding>,
+    candidate: Option<&ExploitPathCandidate>,
+    proof_confirmed: bool,
+    foundry_poc_generated: bool,
+) -> BenchmarkFailureKind {
+    if strongest.is_some()
+        && proof_confirmed
+        && (manifest.poc_generation == PocGenerationExpectation::NotRequired
+            || foundry_poc_generated)
+    {
+        return BenchmarkFailureKind::Passed;
+    }
+    if observation.executions.unwrap_or_default() == 0 {
+        return BenchmarkFailureKind::SearchFailure;
+    }
+    if observation.findings.is_empty() || strongest.is_none() {
+        return BenchmarkFailureKind::OracleDidNotTrigger;
+    }
+    if candidate.is_none() {
+        return BenchmarkFailureKind::SearchFailure;
+    }
+    if candidate
+        .is_some_and(|candidate| candidate.replayability_status != ReplayabilityStatus::Replayable)
+    {
+        return BenchmarkFailureKind::ReplayFailure;
+    }
+    if candidate.is_some_and(|candidate| {
+        candidate.minimized_sequence_status != MinimizedSequenceStatus::Minimized
+    }) {
+        return BenchmarkFailureKind::MinimizationFailure;
+    }
+    if !proof_confirmed {
+        return BenchmarkFailureKind::RealismProofFailure;
+    }
+    if manifest.poc_generation != PocGenerationExpectation::NotRequired && !foundry_poc_generated {
+        return BenchmarkFailureKind::PocGenerationFailure;
+    }
+    BenchmarkFailureKind::RegressionTestFailure
+}
+
 fn load_manifest_file(path: &Path) -> Result<BenchmarkManifest> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read benchmark manifest {}", path.display()))?;
@@ -3175,6 +3294,13 @@ mod tests {
             ],
             replay_command: None,
             poc_generation: PocGenerationExpectation::Expected,
+            expected_oracle: Some("erc4626".to_string()),
+            expected_minimum_evidence_grade: Some(
+                crate::common::oracle::EvidenceGrade::RealisticForkProof,
+            ),
+            expected_proof_artifact: Some("foundry-poc".to_string()),
+            expected_failure_kind: Some(BenchmarkFailureKind::Passed),
+            expected_cli_exit: Some(0),
             max_duration_secs: Some(600),
             seed_hints: vec!["0xb6b55f25".to_string()],
             notes: None,
@@ -3305,6 +3431,13 @@ mod tests {
             success_criteria: criteria,
             replay_command: None,
             poc_generation: PocGenerationExpectation::Expected,
+            expected_oracle: Some("protocol-oracle".to_string()),
+            expected_minimum_evidence_grade: Some(
+                crate::common::oracle::EvidenceGrade::RealisticForkProof,
+            ),
+            expected_proof_artifact: Some("foundry-poc".to_string()),
+            expected_failure_kind: Some(BenchmarkFailureKind::Passed),
+            expected_cli_exit: Some(0),
             max_duration_secs: Some(120),
             seed_hints: vec!["deposit".to_string()],
             notes: None,
@@ -3341,6 +3474,13 @@ mod tests {
             ],
             replay_command: Some("cargo run --release -- replay --input-id ...".to_string()),
             poc_generation: PocGenerationExpectation::Required,
+            expected_oracle: Some("live-protocol-oracle".to_string()),
+            expected_minimum_evidence_grade: Some(
+                crate::common::oracle::EvidenceGrade::RealisticForkProof,
+            ),
+            expected_proof_artifact: Some("foundry-poc".to_string()),
+            expected_failure_kind: Some(BenchmarkFailureKind::Passed),
+            expected_cli_exit: Some(10),
             max_duration_secs: Some(120),
             seed_hints: vec!["deposit".to_string()],
             notes: Some("live-fork example manifest".to_string()),
@@ -3589,12 +3729,10 @@ success_criteria = ["expected_finding", "invariant_violation"]
 
         assert!(result.executed, "{:?}", result);
         assert_ne!(result.status, ValidationStatus::FailedExecution);
-        assert!(
-            result
-                .false_positive_notes
-                .iter()
-                .any(|note| note.contains("replay backend: cached-fork-fixture"))
-        );
+        assert!(result
+            .false_positive_notes
+            .iter()
+            .any(|note| note.contains("replay backend: cached-fork-fixture")));
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -3657,6 +3795,13 @@ success_criteria = ["expected_finding", "invariant_violation"]
             ],
             replay_command: None,
             poc_generation: PocGenerationExpectation::Expected,
+            expected_oracle: Some("erc4626".to_string()),
+            expected_minimum_evidence_grade: Some(
+                crate::common::oracle::EvidenceGrade::RealisticForkProof,
+            ),
+            expected_proof_artifact: Some("foundry-poc".to_string()),
+            expected_failure_kind: Some(BenchmarkFailureKind::RealismProofFailure),
+            expected_cli_exit: Some(20),
             max_duration_secs: Some(60),
             seed_hints: vec!["deposit".to_string()],
             notes: Some("blind rediscovery test".to_string()),
@@ -3668,12 +3813,10 @@ success_criteria = ["expected_finding", "invariant_violation"]
         assert!(!result.synthesized_sequence.is_empty());
         assert!(result.search_driver.is_some());
         assert!(result.equivalence_class.is_some());
-        assert!(
-            result
-                .false_positive_notes
-                .iter()
-                .any(|note| note.contains("blind rediscovery"))
-        );
+        assert!(result
+            .false_positive_notes
+            .iter()
+            .any(|note| note.contains("blind rediscovery")));
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -3736,6 +3879,13 @@ success_criteria = ["expected_finding", "invariant_violation"]
             ],
             replay_command: None,
             poc_generation: PocGenerationExpectation::Required,
+            expected_oracle: Some("proxy-upgradeability".to_string()),
+            expected_minimum_evidence_grade: Some(
+                crate::common::oracle::EvidenceGrade::RealisticForkProof,
+            ),
+            expected_proof_artifact: Some("foundry-poc".to_string()),
+            expected_failure_kind: Some(BenchmarkFailureKind::Passed),
+            expected_cli_exit: Some(10),
             max_duration_secs: Some(60),
             seed_hints: vec!["initialize".to_string()],
             notes: Some("confirmed blind rediscovery test".to_string()),
@@ -3772,7 +3922,8 @@ success_criteria = ["expected_finding", "invariant_violation"]
     #[test]
     fn evaluates_success_criteria_from_findings() {
         let runner = ValidationRunner;
-        let manifest = manifest();
+        let mut benchmark_manifest = manifest();
+        benchmark_manifest.poc_generation = PocGenerationExpectation::NotRequired;
         let findings = vec![finding(
             VulnType::VaultInflation,
             "share inflation during deposit/redeem path",
@@ -3792,18 +3943,82 @@ success_criteria = ["expected_finding", "invariant_violation"]
             elapsed_secs: Some(2.5),
             ..ValidationObservation::default()
         };
-        let result = runner.evaluate_observation(&manifest, &observation);
+        let result = runner.evaluate_observation(&benchmark_manifest, &observation);
         assert!(result.found);
         assert_eq!(result.status, ValidationStatus::Found);
-        assert!(
-            result
-                .matched_criteria
-                .contains(&SuccessCriterion::ExpectedFinding)
+        assert!(result
+            .matched_criteria
+            .contains(&SuccessCriterion::ExpectedFinding));
+        assert!(result
+            .matched_criteria
+            .contains(&SuccessCriterion::SharePriceManipulation));
+        assert_eq!(result.failure_kind, BenchmarkFailureKind::Passed);
+        assert_eq!(result.expected_oracle.as_deref(), Some("erc4626"));
+    }
+
+    #[test]
+    fn benchmark_taxonomy_classifies_oracle_proof_and_poc_failures() {
+        let runner = ValidationRunner;
+        let mut manifest = manifest();
+        manifest.poc_generation = PocGenerationExpectation::NotRequired;
+
+        let no_oracle = ValidationObservation {
+            executions: Some(10),
+            ..ValidationObservation::default()
+        };
+        assert_eq!(
+            runner
+                .evaluate_observation(&manifest, &no_oracle)
+                .failure_kind,
+            BenchmarkFailureKind::OracleDidNotTrigger
         );
-        assert!(
-            result
-                .matched_criteria
-                .contains(&SuccessCriterion::SharePriceManipulation)
+
+        let findings = vec![finding(VulnType::VaultInflation, "share inflation")];
+        let proof_failed = ValidationObservation {
+            findings: findings.clone(),
+            exploit_candidate: Some(fixture_exploit_candidate()),
+            proof: Some(
+                ProofCarryingFinding::from_candidate(
+                    &fixture_exploit_candidate(),
+                    &fixture_execution(),
+                    &findings,
+                )
+                .with_replay_result(
+                    crate::engine::proof::ReplayVerificationStatus::Mismatch {
+                        reason: "taxonomy proof failure".to_string(),
+                    },
+                ),
+            ),
+            executions: Some(10),
+            ..ValidationObservation::default()
+        };
+        assert_eq!(
+            runner
+                .evaluate_observation(&manifest, &proof_failed)
+                .failure_kind,
+            BenchmarkFailureKind::RealismProofFailure
+        );
+
+        let mut no_poc_manifest = manifest.clone();
+        no_poc_manifest.poc_generation = PocGenerationExpectation::Required;
+        let proof = ProofCarryingFinding::from_candidate(
+            &fixture_exploit_candidate(),
+            &fixture_execution(),
+            &findings,
+        )
+        .with_replay_result(crate::engine::proof::ReplayVerificationStatus::Verified);
+        let no_poc = ValidationObservation {
+            findings,
+            exploit_candidate: Some(fixture_exploit_candidate()),
+            proof: Some(proof),
+            executions: Some(10),
+            ..ValidationObservation::default()
+        };
+        assert_eq!(
+            runner
+                .evaluate_observation(&no_poc_manifest, &no_poc)
+                .failure_kind,
+            BenchmarkFailureKind::PocGenerationFailure
         );
     }
 
@@ -3886,6 +4101,10 @@ success_criteria = ["expected_finding", "invariant_violation"]
         assert!(!result.found);
         assert_eq!(result.status, ValidationStatus::NotFound);
         assert_eq!(result.observed_finding, None);
+        assert_eq!(
+            result.failure_kind,
+            BenchmarkFailureKind::OracleDidNotTrigger
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -3946,13 +4165,11 @@ success_criteria = ["expected_finding", "invariant_violation"]
         assert!(json.contains("\"status\": \"not_run_missing_fixture\""));
         assert!(json.contains("\"reason\":"));
         assert_eq!(report.coverage.total_classes, 12);
-        assert!(
-            report
-                .coverage
-                .entries
-                .iter()
-                .any(|entry| !entry.benchmark_ids.is_empty())
-        );
+        assert!(report
+            .coverage
+            .entries
+            .iter()
+            .any(|entry| !entry.benchmark_ids.is_empty()));
         assert_eq!(report.calibration.benchmark_count, 1);
     }
 
@@ -3978,11 +4195,9 @@ success_criteria = ["expected_finding", "invariant_violation"]
             ..ValidationObservation::default()
         };
         let result = runner.evaluate_observation(&manifest, &observation);
-        assert!(
-            result
-                .matched_criteria
-                .contains(&SuccessCriterion::InvariantViolation)
-        );
+        assert!(result
+            .matched_criteria
+            .contains(&SuccessCriterion::InvariantViolation));
     }
 
     #[test]
@@ -4006,10 +4221,8 @@ success_criteria = ["expected_finding", "invariant_violation"]
     fn seed_hints_produce_explainable_seed_candidates() {
         let candidates = manifest().seed_candidates();
         assert!(!candidates.is_empty());
-        assert!(
-            candidates
-                .iter()
-                .any(|candidate| candidate.reason.contains("benchmark"))
-        );
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.reason.contains("benchmark")));
     }
 }

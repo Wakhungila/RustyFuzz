@@ -1,10 +1,6 @@
 use bitvec::bitvec;
 use bitvec::prelude::{BitSlice, Lsb0};
-use libafl::{
-    prelude::*,
-    stages::Stage,
-    state::HasCorpus,
-};
+use libafl::{prelude::*, stages::Stage, state::HasCorpus};
 use parking_lot::RwLock;
 use revm::context::BlockEnv;
 use std::collections::HashSet;

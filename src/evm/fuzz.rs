@@ -23,6 +23,9 @@ use std::{collections::HashMap, sync::Arc};
 /// Maximum number of entries allowed in the decode cache before eviction is triggered.
 const MAX_DECODE_CACHE_SIZE: usize = 10000;
 
+/// Maximum number of transactions allowed in a sequence to prevent unbounded growth.
+const MAX_SEQUENCE_LENGTH: usize = 100;
+
 /// Registry of known function selectors and their input types.
 #[derive(Default, Clone, Debug)]
 pub struct AbiRegistry {
@@ -37,13 +40,20 @@ pub struct MutationProvenance {
     pub detail: String,
 }
 
-/// Represents a structured EVM execution step.
-/// This is the "Input" that LibAFL evolves.
+/// Represents a structured EVM execution sequence.
+///
+/// This is the primary input type that LibAFL evolves during fuzzing. An `EvmInput`
+/// contains a sequence of transactions, execution feedback (waypoints), and metadata
+/// about how the input was mutated.
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct EvmInput {
-    pub txs: Vec<SingletonTx>, // Change to a sequence for multi-step exploits
-    pub base_snapshot_id: u64, // The ID of the snapshot this input was derived from
-    pub waypoints: Vec<Vec<Waypoint>>, // execution feedback per transaction
+    /// Sequence of transactions to execute (multi-step exploits)
+    pub txs: Vec<SingletonTx>,
+    /// The ID of the snapshot this input was derived from
+    pub base_snapshot_id: u64,
+    /// Execution feedback (waypoints) per transaction
+    pub waypoints: Vec<Vec<Waypoint>>,
+    /// History of mutations applied to this input
     #[serde(default)]
     pub mutation_provenance: Vec<MutationProvenance>,
 }
@@ -51,6 +61,39 @@ pub struct EvmInput {
 impl Input for EvmInput {
     fn generate_name(&self, _id: Option<CorpusId>) -> String {
         format!("seq_{}_len_{}", self.base_snapshot_id, self.txs.len())
+    }
+}
+
+impl EvmInput {
+    /// Validates that the input respects system limits
+    pub fn validate(&self) -> bool {
+        self.txs.len() <= MAX_SEQUENCE_LENGTH
+    }
+
+    /// Applies backpressure to waypoint accumulation by truncating if over limit
+    pub fn apply_waypoint_backpressure(&mut self) {
+        // Enforce per-transaction waypoint limit
+        for tx_waypoints in &mut self.waypoints {
+            if tx_waypoints.len() > crate::common::types::MAX_WAYPOINTS_PER_TX {
+                let excess = tx_waypoints.len() - crate::common::types::MAX_WAYPOINTS_PER_TX;
+                tx_waypoints.drain(0..excess);
+            }
+        }
+
+        // Enforce total waypoint limit across all transactions
+        let total_waypoints: usize = self.waypoints.iter().map(|w| w.len()).sum();
+        if total_waypoints > crate::common::types::MAX_TOTAL_WAYPOINTS {
+            // Remove waypoints from earlier transactions (keep recent ones)
+            let mut to_remove = total_waypoints - crate::common::types::MAX_TOTAL_WAYPOINTS;
+            for tx_waypoints in &mut self.waypoints {
+                if to_remove == 0 {
+                    break;
+                }
+                let remove_count = to_remove.min(tx_waypoints.len());
+                tx_waypoints.drain(0..remove_count);
+                to_remove -= remove_count;
+            }
+        }
     }
 }
 
@@ -67,13 +110,23 @@ impl Named for EvmMutator {
     }
 }
 
-/// A top-tier mutator doesn't just flip bits; it understands the EVM state.
+/// EVM-aware mutation engine for LibAFL.
+///
+/// The `EvmMutator` implements domain-specific mutation strategies that understand
+/// EVM semantics, including ABI-aware mutations, concolic solving, economic pressure,
+/// and MEV patterns like sandwich attacks.
 pub struct EvmMutator {
+    /// Registry of known function selectors and their input types
     pub abi_registry: Arc<AbiRegistry>,
+    /// Registry of known contracts and their relationships
     pub account_registry: Arc<RwLock<GlobalAccountRegistry>>,
+    /// Queue of concolic hints to apply during mutation
     pub concolic_hints: Arc<Mutex<Vec<ConcolicHint>>>,
+    /// Statistics about concolic hint generation and application
     pub concolic_hint_stats: Arc<ConcolicHintStats>,
+    /// Cache of ABI types for function selectors
     pub type_cache: RwLock<HashMap<[u8; 4], DynSolType>>,
+    /// LRU cache for decoded calldata values
     pub decode_cache: RwLock<LruCache<Vec<u8>, DynSolValue>>,
 }
 
@@ -134,6 +187,11 @@ impl EvmMutator {
         }
     }
 
+    /// Checks if adding `count` transactions would exceed the maximum sequence length
+    fn can_add_transactions(&self, input: &EvmInput, count: usize) -> bool {
+        input.txs.len() + count <= MAX_SEQUENCE_LENGTH
+    }
+
     pub fn with_concolic_hints(
         abi_registry: Arc<AbiRegistry>,
         account_registry: Arc<RwLock<GlobalAccountRegistry>>,
@@ -191,7 +249,7 @@ impl EvmMutator {
             return MutationResult::Skipped;
         }
 
-        let solver = ConcolicSolver::new();
+        let mut solver = ConcolicSolver::new();
         let hints = solver.solve_hints(
             input
                 .waypoints
@@ -248,7 +306,12 @@ impl EvmMutator {
             return MutationResult::Skipped;
         }
 
-        let solver = ConcolicSolver::new();
+        // Enforce maximum sequence length
+        if !self.can_add_transactions(input, 1) {
+            return MutationResult::Skipped;
+        }
+
+        let mut solver = ConcolicSolver::new();
         let hints = solver.solve_hints(
             input
                 .waypoints
@@ -298,6 +361,11 @@ impl EvmMutator {
     }
 
     fn structural_mutation<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+        // Enforce maximum sequence length
+        if !self.can_add_transactions(input, 1) {
+            return MutationResult::Skipped;
+        }
+
         let selector = self.random_selector(rand);
         let types = match self.abi_registry.functions.get(&selector) {
             Some(types) => types,
@@ -342,6 +410,11 @@ impl EvmMutator {
             Some(tx) => (tx.caller, tx.to),
             None => return MutationResult::Skipped,
         };
+
+        // Enforce maximum sequence length
+        if !self.can_add_transactions(input, 1) {
+            return MutationResult::Skipped;
+        }
 
         let registry = self.account_registry.read();
         let downstream = registry.get_downstream_targets(&last_to);
@@ -468,6 +541,12 @@ impl EvmMutator {
             return MutationResult::Skipped;
         }
 
+        // Enforce maximum sequence length (flashloan wrap adds transactions)
+        // Estimate: flashloan typically adds 2-3 transactions (borrow, execute, repay)
+        if !self.can_add_transactions(input, 3) {
+            return MutationResult::Skipped;
+        }
+
         let registry = self.account_registry.read();
         let lender = match registry.random_contract(rand) {
             Some(l) => l,
@@ -481,6 +560,12 @@ impl EvmMutator {
             amount: U256::from(10u128.pow(21)),
         };
         *input = template.wrap_sequence(input.clone());
+
+        // Validate the wrapped sequence doesn't exceed limit
+        if input.txs.len() > MAX_SEQUENCE_LENGTH {
+            return MutationResult::Skipped;
+        }
+
         self.record_mutation(
             input,
             "flashloan_wrap",
@@ -535,6 +620,11 @@ impl EvmMutator {
     }
 
     fn oracle_pressure<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+        // Enforce maximum sequence length
+        if !self.can_add_transactions(input, 1) {
+            return MutationResult::Skipped;
+        }
+
         let registry = self.account_registry.read();
         let dex_pool = match registry.random_contract(rand) {
             Some(p) => p,
@@ -568,6 +658,11 @@ impl EvmMutator {
     }
 
     fn mev_sandwich<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+        // Enforce maximum sequence length (mev_sandwich adds 2 transactions)
+        if !self.can_add_transactions(input, 2) {
+            return MutationResult::Skipped;
+        }
+
         let idx = match self.random_index(rand, input.txs.len()) {
             Some(i) => i,
             None => return MutationResult::Skipped,

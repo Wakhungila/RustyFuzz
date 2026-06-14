@@ -1,9 +1,9 @@
-use alloy::providers::{Provider, ProviderBuilder};
 use alloy::primitives::keccak256;
+use alloy::providers::{Provider, ProviderBuilder};
 use clap::Parser;
 use libafl_bolts::core_affinity::Cores;
-use revm::database_interface::DatabaseRef;
 use revm::database::CacheDB;
+use revm::database_interface::DatabaseRef;
 use revm::primitives::{Address, U256};
 use rusty_fuzz::common::oracle::{ProtocolOraclePack, ReentrancyOracle, VulnType};
 use rusty_fuzz::common::verifier::ReplayVerifier;
@@ -15,7 +15,9 @@ use rusty_fuzz::engine::fork_setup::ForkSetupDiscoverer;
 use rusty_fuzz::engine::foundry_ingest::FoundryHarnessManifest;
 use rusty_fuzz::engine::invariant_manifest::TargetInvariantManifest;
 use rusty_fuzz::engine::minimizer::Minimizer;
-use rusty_fuzz::engine::promotion::{promote_finding_artifact, PromotionConfig, PromotionRequest};
+use rusty_fuzz::engine::promotion::{
+    promote_finding_artifact, PromotionCampaignSummary, PromotionConfig, PromotionRequest,
+};
 use rusty_fuzz::engine::seed_intelligence::SeedIntelligence;
 use rusty_fuzz::evm::corpus::{CampaignArtifactRecord, PersistentCorpus};
 use rusty_fuzz::evm::etherscan_abi_fetcher::EtherscanAbiFetcher;
@@ -97,6 +99,20 @@ enum Command {
         require_replay_for_report: bool,
         #[arg(long, default_value_t = true)]
         require_poc_for_confirmed: bool,
+        #[arg(long, default_value_t = false)]
+        strict_proof: bool,
+        #[arg(long, default_value_t = false)]
+        no_synthetic_proof: bool,
+        #[arg(long, default_value_t = false)]
+        require_foundry_poc: bool,
+        #[arg(long, default_value_t = false)]
+        require_minimized: bool,
+        #[arg(long, default_value_t = false)]
+        reject_heuristics: bool,
+        #[arg(long)]
+        max_finding_noise: Option<u64>,
+        #[arg(long)]
+        poc_out: Option<String>,
         #[arg(long)]
         promotion_limit: Option<u64>,
     },
@@ -227,6 +243,20 @@ enum Command {
         fork_cache_id: Option<String>,
         #[arg(long)]
         campaign_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        strict_proof: bool,
+        #[arg(long, default_value_t = false)]
+        no_synthetic_proof: bool,
+        #[arg(long, default_value_t = false)]
+        require_foundry_poc: bool,
+        #[arg(long, default_value_t = false)]
+        require_minimized: bool,
+        #[arg(long, default_value_t = false)]
+        reject_heuristics: bool,
+        #[arg(long)]
+        max_finding_noise: Option<u64>,
+        #[arg(long)]
+        poc_out: Option<String>,
     },
     ProveLive {
         #[arg(long, alias = "contract")]
@@ -269,6 +299,20 @@ enum Command {
         promotion_limit: u64,
         #[arg(long, default_value_t = 0)]
         min_finding_confidence: u64,
+        #[arg(long, default_value_t = true)]
+        strict_proof: bool,
+        #[arg(long, default_value_t = true)]
+        no_synthetic_proof: bool,
+        #[arg(long, default_value_t = true)]
+        require_foundry_poc: bool,
+        #[arg(long, default_value_t = true)]
+        require_minimized: bool,
+        #[arg(long, default_value_t = true)]
+        reject_heuristics: bool,
+        #[arg(long)]
+        max_finding_noise: Option<u64>,
+        #[arg(long)]
+        poc_out: Option<String>,
         #[arg(long, default_value_t = false)]
         deterministic: bool,
         #[arg(long)]
@@ -340,6 +384,13 @@ async fn main() -> anyhow::Result<()> {
             no_promote_findings,
             require_replay_for_report,
             require_poc_for_confirmed,
+            strict_proof,
+            no_synthetic_proof,
+            require_foundry_poc,
+            require_minimized,
+            reject_heuristics,
+            max_finding_noise,
+            poc_out,
             promotion_limit,
         } => {
             let raw_target = match contract.as_deref() {
@@ -455,6 +506,13 @@ async fn main() -> anyhow::Result<()> {
                     enabled: promotion_enabled,
                     require_replay_for_report,
                     require_poc_for_confirmed,
+                    strict_proof,
+                    no_synthetic_proof,
+                    require_foundry_poc,
+                    require_minimized,
+                    reject_heuristics,
+                    max_finding_noise,
+                    poc_out,
                     promotion_limit,
                 },
             };
@@ -727,6 +785,11 @@ async fn main() -> anyhow::Result<()> {
                             confidence: None,
                             provenance: Some("historical-json-ingest".to_string()),
                             decoded: None,
+                            tx_hash: None,
+                            top_level_caller: Some(caller),
+                            internal_caller: None,
+                            trace_path: None,
+                            trace_source: None,
                         },
                         input,
                     }
@@ -917,6 +980,13 @@ async fn main() -> anyhow::Result<()> {
                         enabled: true,
                         require_replay_for_report: true,
                         require_poc_for_confirmed: true,
+                        strict_proof: true,
+                        no_synthetic_proof: true,
+                        require_foundry_poc: true,
+                        require_minimized: true,
+                        reject_heuristics: true,
+                        max_finding_noise: Some(0),
+                        poc_out: None,
                         promotion_limit: Some(8),
                     },
                 };
@@ -1038,6 +1108,13 @@ async fn main() -> anyhow::Result<()> {
             input_id,
             fork_cache_id,
             campaign_id,
+            strict_proof,
+            no_synthetic_proof,
+            require_foundry_poc,
+            require_minimized,
+            reject_heuristics,
+            max_finding_noise,
+            poc_out,
         } => {
             ensure_evm_chain(&config)?;
             let corpus = PersistentCorpus::new(&config.corpus_dir)?;
@@ -1054,6 +1131,13 @@ async fn main() -> anyhow::Result<()> {
                 enabled: true,
                 require_replay_for_report: true,
                 require_poc_for_confirmed: true,
+                strict_proof,
+                no_synthetic_proof,
+                require_foundry_poc,
+                require_minimized,
+                reject_heuristics,
+                max_finding_noise,
+                poc_out,
                 promotion_limit: None,
             };
             let record = promote_finding_artifact(PromotionRequest {
@@ -1097,6 +1181,13 @@ async fn main() -> anyhow::Result<()> {
             artifact_limit,
             promotion_limit,
             min_finding_confidence,
+            strict_proof,
+            no_synthetic_proof,
+            require_foundry_poc,
+            require_minimized,
+            reject_heuristics,
+            max_finding_noise,
+            poc_out,
             deterministic,
             rng_seed,
         } => {
@@ -1123,6 +1214,13 @@ async fn main() -> anyhow::Result<()> {
                     artifact_limit,
                     promotion_limit,
                     min_finding_confidence,
+                    strict_proof,
+                    no_synthetic_proof,
+                    require_foundry_poc,
+                    require_minimized,
+                    reject_heuristics,
+                    max_finding_noise,
+                    poc_out,
                     deterministic,
                     rng_seed,
                 },
@@ -1323,6 +1421,13 @@ struct ProveLiveOptions {
     artifact_limit: u64,
     promotion_limit: u64,
     min_finding_confidence: u64,
+    strict_proof: bool,
+    no_synthetic_proof: bool,
+    require_foundry_poc: bool,
+    require_minimized: bool,
+    reject_heuristics: bool,
+    max_finding_noise: Option<u64>,
+    poc_out: Option<String>,
     deterministic: bool,
     rng_seed: Option<u64>,
 }
@@ -1560,6 +1665,7 @@ async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyhow::R
         options.duration_secs,
         options.max_execs
     );
+    apply_prove_live_runtime_defaults(options.duration_secs);
     let fuzz_config = rusty_fuzz::engine::fuzz_engine::Config {
         rpc_url,
         fork_block,
@@ -1585,6 +1691,13 @@ async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyhow::R
             enabled: true,
             require_replay_for_report: true,
             require_poc_for_confirmed: true,
+            strict_proof: options.strict_proof,
+            no_synthetic_proof: options.no_synthetic_proof,
+            require_foundry_poc: options.require_foundry_poc,
+            require_minimized: options.require_minimized,
+            reject_heuristics: options.reject_heuristics,
+            max_finding_noise: options.max_finding_noise,
+            poc_out: options.poc_out,
             promotion_limit: Some(options.promotion_limit),
         },
     };
@@ -1603,7 +1716,58 @@ async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyhow::R
         "\x1b[32m[done]\x1b[0m proof campaign `{}` finished. Reports: {}",
         campaign_id, campaign_report_dir
     );
+    if let Some(exit_code) = prove_live_exit_code(&campaign_report_dir)? {
+        std::process::exit(exit_code);
+    }
     Ok(())
+}
+
+fn prove_live_exit_code(report_dir: &str) -> anyhow::Result<Option<i32>> {
+    let summary_path = std::path::Path::new(report_dir).join("campaign_summary.json");
+    if !summary_path.exists() {
+        return Ok(None);
+    }
+    let summary: PromotionCampaignSummary = serde_json::from_slice(&std::fs::read(&summary_path)?)?;
+    if summary.confirmed_findings > 0 {
+        Ok(Some(10))
+    } else if summary.replay_failure_count > 0
+        || summary.missing_poc_for_promoted > 0
+        || summary.rejected_candidates > 0
+    {
+        Ok(Some(20))
+    } else if summary.candidate_findings > 0 || summary.unproven_candidates > 0 {
+        Ok(Some(11))
+    } else {
+        Ok(Some(0))
+    }
+}
+
+fn apply_prove_live_runtime_defaults(duration_secs: u64) {
+    let default_exec_timeout = duration_secs.clamp(5, 15);
+    if std::env::var("RUSTYFUZZ_EXEC_TIMEOUT_SECS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_none()
+    {
+        std::env::set_var(
+            "RUSTYFUZZ_EXEC_TIMEOUT_SECS",
+            default_exec_timeout.to_string(),
+        );
+        println!(
+            "\x1b[36m[runtime]\x1b[0m default per-input timeout={}s (override with RUSTYFUZZ_EXEC_TIMEOUT_SECS)",
+            default_exec_timeout
+        );
+    }
+    if std::env::var("RUSTYFUZZ_EXEC_RPC_BUDGET")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_none()
+    {
+        std::env::set_var("RUSTYFUZZ_EXEC_RPC_BUDGET", "4");
+        println!(
+            "\x1b[36m[runtime]\x1b[0m default per-input RPC budget=4 (override with RUSTYFUZZ_EXEC_RPC_BUDGET)"
+        );
+    }
 }
 
 async fn fetch_explorer_abi_to_report(
@@ -1725,10 +1889,12 @@ fn execution_coverage_material(
 #[cfg(test)]
 mod tests {
     use super::{
-        address_from_storage_word, discover_eip1967_implementation, eip1967_slot,
+        address_from_storage_word, apply_prove_live_runtime_defaults,
+        discover_eip1967_implementation, eip1967_slot, prove_live_exit_code,
         resolve_campaign_bounds,
     };
     use revm::primitives::{Address, U256};
+    use rusty_fuzz::engine::promotion::PromotionCampaignSummary;
     use rusty_fuzz::evm::fork_db::ForkDb;
 
     #[test]
@@ -1759,14 +1925,69 @@ mod tests {
         assert_eq!(address_from_storage_word(value), Some(implementation));
 
         let fork_db = ForkDb::new_offline("0x1");
-        fork_db.cache_storage(
-            proxy,
-            eip1967_slot("eip1967.proxy.implementation"),
-            value,
-        );
+        fork_db.cache_storage(proxy, eip1967_slot("eip1967.proxy.implementation"), value);
         assert_eq!(
             discover_eip1967_implementation(&fork_db, proxy).unwrap(),
             Some(implementation)
         );
+    }
+
+    #[test]
+    fn prove_live_runtime_defaults_are_overrideable() {
+        std::env::remove_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS");
+        std::env::remove_var("RUSTYFUZZ_EXEC_RPC_BUDGET");
+        apply_prove_live_runtime_defaults(300);
+        assert_eq!(std::env::var("RUSTYFUZZ_EXEC_TIMEOUT_SECS").unwrap(), "15");
+        assert_eq!(std::env::var("RUSTYFUZZ_EXEC_RPC_BUDGET").unwrap(), "4");
+
+        std::env::set_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS", "9");
+        std::env::set_var("RUSTYFUZZ_EXEC_RPC_BUDGET", "8");
+        apply_prove_live_runtime_defaults(300);
+        assert_eq!(std::env::var("RUSTYFUZZ_EXEC_TIMEOUT_SECS").unwrap(), "9");
+        assert_eq!(std::env::var("RUSTYFUZZ_EXEC_RPC_BUDGET").unwrap(), "8");
+
+        std::env::remove_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS");
+        std::env::remove_var("RUSTYFUZZ_EXEC_RPC_BUDGET");
+    }
+
+    #[test]
+    fn prove_live_exit_codes_distinguish_findings_leads_and_failures() {
+        fn write_summary(dir: &std::path::Path, summary: PromotionCampaignSummary) {
+            std::fs::create_dir_all(dir).expect("dir");
+            std::fs::write(
+                dir.join("campaign_summary.json"),
+                serde_json::to_vec_pretty(&summary).expect("json"),
+            )
+            .expect("summary");
+        }
+        let base =
+            std::env::temp_dir().join(format!("rustyfuzz-prove-live-exit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let mut summary = PromotionCampaignSummary::default();
+        summary.confirmed_findings = 1;
+        write_summary(&base, summary.clone());
+        assert_eq!(
+            prove_live_exit_code(base.to_str().unwrap()).unwrap(),
+            Some(10)
+        );
+
+        summary.confirmed_findings = 0;
+        summary.candidate_findings = 1;
+        summary.rejected_candidates = 0;
+        write_summary(&base, summary.clone());
+        assert_eq!(
+            prove_live_exit_code(base.to_str().unwrap()).unwrap(),
+            Some(11)
+        );
+
+        summary.candidate_findings = 0;
+        summary.rejected_candidates = 1;
+        write_summary(&base, summary);
+        assert_eq!(
+            prove_live_exit_code(base.to_str().unwrap()).unwrap(),
+            Some(20)
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

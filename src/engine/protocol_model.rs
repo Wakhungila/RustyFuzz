@@ -797,7 +797,7 @@ fn dependency_sequence_score_from_graph(graph: &TransactionDependencyGraph) -> u
 }
 
 fn concolic_hints_from_execution(execution: &SequenceExecutionResult) -> Vec<ConcolicHint> {
-    let solver = ConcolicSolver::new();
+    let mut solver = ConcolicSolver::new();
     solver.solve_hints(execution.tx_results.iter().flat_map(|tx| {
         tx.waypoints
             .iter()

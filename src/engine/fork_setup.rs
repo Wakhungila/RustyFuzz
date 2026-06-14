@@ -879,6 +879,11 @@ mod tests {
                 confidence: None,
                 provenance: None,
                 decoded: None,
+                tx_hash: None,
+                top_level_caller: Some(caller),
+                internal_caller: None,
+                trace_path: None,
+                trace_source: None,
             },
         }
     }

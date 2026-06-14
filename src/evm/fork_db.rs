@@ -1,10 +1,10 @@
 use parking_lot::Mutex;
 use revm::database::CacheDB;
 use revm::database_interface::{DBErrorMarker, DatabaseRef};
-use revm::primitives::{Address, B256, StorageKey, StorageValue, U256};
+use revm::primitives::{Address, StorageKey, StorageValue, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;

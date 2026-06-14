@@ -1,8 +1,6 @@
 # RustyFuzz
 
-A stateful EVM fuzzer for protocol-security research. RustyFuzz combines deterministic transaction-sequence execution, fork-aware state replay, real coverage feedback, protocol oracle evidence, and reproducible crash reporting into a coherent fuzzing foundation.
-
-**Status**: Production-ready EVM core with hardened execution, fork caching, and deterministic replay. Protocol oracle packs, concolic solving, and PoC generation are integrated. SVM support is separate and experimental.
+A stateful EVM fuzzer for smart contract security research. RustyFuzz executes transaction sequences deterministically against forked EVM state, with coverage feedback, protocol oracle detection, and reproducible crash reporting.
 
 ## What Is RustyFuzz?
 
@@ -16,7 +14,7 @@ RustyFuzz is a fuzzing engine designed for finding state-machine bugs in smart c
 - **Supports protocol-specific oracles** for ERC20, ERC4626, AMM, lending, and governance patterns.
 - **Applies concolic hints** to guide the mutator toward satisfying branch constraints without requiring a full symbolic solver.
 
-It is **not** a general-purpose fuzzer. It is built for multi-transaction invariant violations and economic attacks, where state carries meaning across transactions.
+**Scope**: Designed for multi-transaction invariant violations and economic attacks where state carries meaning across transactions. Not a general-purpose fuzzer.
 
 ## Core Architecture
 
@@ -402,13 +400,13 @@ Satori does not broadcast transactions, use private keys, or label model output 
 
 ## Installation
 
-### Prerequisites
+### Requirements
 
-- **Rust 1.70+** ([install](https://rustup.rs/))
-- **Cargo**
-- **libz3-dev** (if using `--features z3` for optional Z3 solver integration)
+- Rust 1.70+
+- Cargo
+- libz3-dev (optional, for Z3 concolic solver integration)
 
-### Building
+### Build
 
 **Default (EVM only)**:
 ```bash
@@ -426,17 +424,17 @@ brew install z3
 cargo build --release --features z3
 ```
 
-**SVM (Solana)** — separate, non-default build:
+**SVM (Solana)** - separate build:
 ```bash
 cargo build --release --features svm --no-default-features
 ```
 
-**Validation**:
+**Verification**:
 ```bash
 cargo fmt
 cargo check
 cargo clippy -- -D warnings
-cargo test
+cargo test --lib
 ```
 
 ## Configuration
@@ -1054,31 +1052,28 @@ cargo clippy -- -D warnings
 2. Add mutation provenance tracking.
 3. Register with LibAFL's `Mutator` trait.
 
-## What's Next
+## Development Roadmap
 
-The highest-impact engineering priorities:
+Priority engineering tasks:
 
-1. **Operator workflow**: Promote CLI commands to polished, CI-friendly operation with structured output and dry-run modes.
-2. **Solver-backed synthesis**: Move beyond cloning patched transactions; synthesize setup/action/assertion sequences from branch frontiers.
-3. **Dynamic type repair**: Fully repair offset tables for dynamic arrays, bytes, strings, nested tuples when applying concolic hints.
-4. **Semantic invariants**: Convert oracle evidence into replay assertions that verify semantic deltas, not only storage reproduction.
-5. **Frontier-driven scheduling**: Use persisted branch-distance and expression metadata for energy assignment and crash shrinking.
-6. **Differential replay hardening**: Rich diff reports for gas, output, storage, call traces, fork-cache misses.
-7. **SVM stabilization**: Complete and harden as a standalone execution target after EVM core is complete.
+1. Operator workflow: CI-friendly operation with structured output and dry-run modes
+2. Solver-backed synthesis: Synthesize setup/action/assertion sequences from branch frontiers
+3. Dynamic type repair: Full offset table repair for dynamic arrays, bytes, strings, nested tuples
+4. Semantic invariants: Convert oracle evidence into replay assertions for semantic deltas
+5. Frontier-driven scheduling: Use branch-distance and expression metadata for energy assignment
+6. Differential replay hardening: Rich diff reports for gas, output, storage, call traces
+7. SVM stabilization: Complete as standalone execution target
 
-## Engineering Position
+## Technical Limitations
 
-RustyFuzz is a coherent EVM fuzzing foundation with deterministic execution, real coverage, state novelty, fork caching, protocol evidence, concolic assists, custom scheduling, replay, minimization, and PoC generation.
-
-It is **not** a magic bullet. Finding high-impact bugs in mature protocols depends on:
-- Target modeling (what invariants matter?)
-- Harness quality (how do we encode those invariants?)
-- Seed quality (are we starting with realistic states?)
-- Fork state (is the RPC endpoint honest?)
-- Oracle precision (are detections accurate or noisy?)
-- Researcher judgment (does the evidence make sense?)
-
-The goal of this codebase is to make these inputs compound instead of fighting a broken runtime.
+- **SVM**: Separated and not part of hardened EVM campaign path
+- **SGX**: Feature-gated and experimental
+- **LLM guidance**: Scaffolding present but inert unless explicitly integrated
+- **Z3 integration**: Optional; core concolic path is deterministic and internal
+- **Symbolic execution**: Bounded, deterministic concolic assistance only
+- **Keccak preimage solving**: Not implemented
+- **Dynamic array constraint solving**: Partial; offset tables repaired for simple cases
+- **Protocol-specific exploit synthesis**: Oracles are evidence-driven, not protocol replacements
 
 ## Contributing
 

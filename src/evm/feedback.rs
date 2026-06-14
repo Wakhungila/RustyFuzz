@@ -355,7 +355,6 @@ impl<S> libafl::feedbacks::StateInitializer<S> for EvmCoverageFeedback {
 impl<EM, S, OT> Feedback<EM, EvmInput, OT, S> for EvmCoverageFeedback
 where
     S: HasCorpus<EvmInput>,
-    // EM: UsesState<State = S>, // TODO: UsesState trait moved in libafl
     OT: ObserversTuple<S, EvmInput> + MatchName,
 {
     fn is_interesting(

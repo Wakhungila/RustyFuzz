@@ -6,8 +6,9 @@ use alloy::providers::Provider;
 use alloy::rpc::types::eth::{BlockTransactions, Filter};
 use anyhow::Context;
 use revm::database_interface::DatabaseRef;
-use revm::primitives::{Address, B256, U256, keccak256};
+use revm::primitives::{keccak256, Address, B256, U256};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -142,6 +143,16 @@ pub struct SeedMetadata {
     pub provenance: Option<String>,
     #[serde(default)]
     pub decoded: Option<DecodedCalldataMetadata>,
+    #[serde(default)]
+    pub tx_hash: Option<B256>,
+    #[serde(default)]
+    pub top_level_caller: Option<Address>,
+    #[serde(default)]
+    pub internal_caller: Option<Address>,
+    #[serde(default)]
+    pub trace_path: Option<String>,
+    #[serde(default)]
+    pub trace_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -290,7 +301,12 @@ impl<P: Provider> SeedIngester<P> {
             }
             let block_num = start_block.saturating_sub(offset);
             if config.scan_mode == SeedScanMode::DebugTrace {
-                self.debug_trace_block(config, block_num).await;
+                let mut trace_seeds = self.debug_trace_block(config, block_num).await;
+                candidates.append(&mut trace_seeds);
+                if candidates.len() >= config.max_seeds {
+                    candidates.truncate(config.max_seeds);
+                    break;
+                }
             }
             rate_limit_block_fetch(config, last_fetch).await;
             let Some(block) = self.fetch_block_with_retries(block_num, config).await? else {
@@ -413,23 +429,31 @@ impl<P: Provider> SeedIngester<P> {
         Ok(())
     }
 
-    async fn debug_trace_block(&self, config: &MainnetSeedConfig, block_num: u64) {
+    async fn debug_trace_block(
+        &self,
+        config: &MainnetSeedConfig,
+        block_num: u64,
+    ) -> Vec<MainnetSeed> {
         let params = (
             format!("0x{block_num:x}"),
             serde_json::json!({ "tracer": "callTracer", "timeout": "10s" }),
         );
-        if let Err(err) = self
+        match self
             .provider
             .client()
             .request::<_, serde_json::Value>("debug_traceBlockByNumber", params)
             .await
         {
-            log::warn!(
-                "debug_traceBlockByNumber unavailable for seed scan block {} target {}: {}",
-                block_num,
-                config.target,
-                err
-            );
+            Ok(trace) => seeds_from_debug_trace_value(config, &trace),
+            Err(err) => {
+                log::warn!(
+                    "debug_traceBlockByNumber unavailable for seed scan block {} target {}: {}",
+                    block_num,
+                    config.target,
+                    err
+                );
+                Vec::new()
+            }
         }
     }
 
@@ -496,6 +520,7 @@ pub fn seed_abi_functions(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn seed_from_parts(
     config: &MainnetSeedConfig,
     source_block: u64,
@@ -545,12 +570,265 @@ fn seed_from_parts(
         confidence: Some(if match_kind == DIRECT_MATCH { 95 } else { 75 }),
         provenance: Some(provenance.to_string()),
         decoded,
+        tx_hash: None,
+        top_level_caller: Some(caller),
+        internal_caller: None,
+        trace_path: None,
+        trace_source: None,
     };
     MainnetSeed {
         id: stable_seed_id(&seed_input, &metadata),
         input: seed_input,
         metadata,
     }
+}
+
+pub fn seeds_from_debug_trace_value(config: &MainnetSeedConfig, trace: &Value) -> Vec<MainnetSeed> {
+    let mut out = Vec::new();
+    let trace_source = detect_trace_source(trace);
+    let entries: Vec<&Value> = match trace {
+        Value::Array(values) => values.iter().collect(),
+        Value::Object(_) => vec![trace],
+        _ => Vec::new(),
+    };
+    for (tx_ordinal, entry) in entries.into_iter().enumerate() {
+        let tx_hash = entry
+            .get("txHash")
+            .or_else(|| entry.get("hash"))
+            .or_else(|| entry.get("transactionHash"))
+            .and_then(parse_b256);
+        let block_number = entry
+            .get("blockNumber")
+            .and_then(parse_u64_quantity)
+            .unwrap_or(config.fork_block);
+        let root = if entry.get("action").is_some() {
+            entry
+        } else {
+            entry.get("result").unwrap_or(entry)
+        };
+        let root_call = trace_call_view(root);
+        let top_level_caller = root_call.get("from").and_then(parse_address);
+        collect_trace_call_seeds(
+            config,
+            root,
+            block_number,
+            tx_ordinal,
+            tx_hash,
+            top_level_caller,
+            &trace_source,
+            "0".to_string(),
+            &mut out,
+        );
+        collect_log_only_trace_seed(
+            config,
+            root,
+            block_number,
+            tx_ordinal,
+            tx_hash,
+            top_level_caller,
+            &trace_source,
+            &mut out,
+        );
+    }
+    normalize_seeds(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_trace_call_seeds(
+    config: &MainnetSeedConfig,
+    call: &Value,
+    block_number: u64,
+    transaction_ordinal: usize,
+    tx_hash: Option<B256>,
+    top_level_caller: Option<Address>,
+    trace_source: &str,
+    trace_path: String,
+    out: &mut Vec<MainnetSeed>,
+) {
+    let call_view = trace_call_view(call);
+    let Some(to) = call_view.get("to").and_then(parse_address) else {
+        return;
+    };
+    let input_bytes = call
+        .get("input")
+        .or_else(|| call.get("calldata"))
+        .or_else(|| call_view.get("input"))
+        .or_else(|| call_view.get("calldata"))
+        .and_then(parse_hex_bytes)
+        .unwrap_or_default();
+    let include_address_hints = config.include_address_hints || !config.abi_functions.is_empty();
+    if let Some(match_kind) =
+        seed_match_kind(to, config.target, &input_bytes, include_address_hints)
+    {
+        let internal_caller = call_view.get("from").and_then(parse_address);
+        let value = call_view
+            .get("value")
+            .and_then(parse_u256_quantity)
+            .unwrap_or_default();
+        let mut seed = seed_from_parts(
+            config,
+            block_number,
+            0,
+            transaction_ordinal,
+            internal_caller.or(top_level_caller).unwrap_or_default(),
+            to,
+            value,
+            input_bytes,
+            if to == config.target {
+                "trace-internal-target"
+            } else {
+                match_kind
+            },
+            "debug-trace-call",
+        );
+        seed.metadata.tx_hash = tx_hash;
+        seed.metadata.top_level_caller = top_level_caller;
+        seed.metadata.internal_caller = internal_caller;
+        seed.metadata.trace_path = Some(trace_path.clone());
+        seed.metadata.trace_source = Some(trace_source.to_string());
+        out.push(seed);
+    }
+
+    if let Some(calls) = call
+        .get("calls")
+        .or_else(|| call.get("children"))
+        .and_then(|calls| calls.as_array())
+    {
+        for (idx, child) in calls.iter().enumerate() {
+            collect_trace_call_seeds(
+                config,
+                child,
+                block_number,
+                transaction_ordinal,
+                tx_hash,
+                top_level_caller,
+                trace_source,
+                format!("{trace_path}.{idx}"),
+                out,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_log_only_trace_seed(
+    config: &MainnetSeedConfig,
+    root: &Value,
+    block_number: u64,
+    transaction_ordinal: usize,
+    tx_hash: Option<B256>,
+    top_level_caller: Option<Address>,
+    trace_source: &str,
+    out: &mut Vec<MainnetSeed>,
+) {
+    let Some(logs) = root.get("logs").and_then(|logs| logs.as_array()) else {
+        return;
+    };
+    if !logs
+        .iter()
+        .any(|log| log.get("address").and_then(parse_address) == Some(config.target))
+    {
+        return;
+    }
+    let call_view = trace_call_view(root);
+    let to = call_view
+        .get("to")
+        .and_then(parse_address)
+        .unwrap_or(config.target);
+    let input_bytes = call_view
+        .get("input")
+        .or_else(|| call_view.get("calldata"))
+        .and_then(parse_hex_bytes)
+        .unwrap_or_default();
+    let caller = call_view
+        .get("from")
+        .and_then(parse_address)
+        .or(top_level_caller)
+        .unwrap_or_default();
+    let mut seed = seed_from_parts(
+        config,
+        block_number,
+        0,
+        transaction_ordinal,
+        caller,
+        to,
+        U256::ZERO,
+        input_bytes,
+        "trace-log-target",
+        "debug-trace-log",
+    );
+    seed.metadata.tx_hash = tx_hash;
+    seed.metadata.top_level_caller = top_level_caller;
+    seed.metadata.internal_caller = Some(caller);
+    seed.metadata.trace_path = Some("logs".to_string());
+    seed.metadata.trace_source = Some(trace_source.to_string());
+    out.push(seed);
+}
+
+fn trace_call_view(value: &Value) -> &Value {
+    value.get("action").unwrap_or(value)
+}
+
+fn detect_trace_source(trace: &Value) -> String {
+    let first = match trace {
+        Value::Array(values) => values.first(),
+        Value::Object(_) => Some(trace),
+        _ => None,
+    };
+    let Some(first) = first else {
+        return "unknown".to_string();
+    };
+    let root = first.get("result").unwrap_or(first);
+    if root.get("calls").is_some() {
+        "geth-callTracer".to_string()
+    } else if root.get("action").is_some() || first.get("action").is_some() {
+        "openethereum-erigon-flat".to_string()
+    } else if root.get("logs").is_some() {
+        "logs-only".to_string()
+    } else {
+        "unknown-debug-trace".to_string()
+    }
+}
+
+fn parse_address(value: &Value) -> Option<Address> {
+    let raw = value.as_str()?.trim();
+    raw.parse().ok()
+}
+
+fn parse_b256(value: &Value) -> Option<B256> {
+    let raw = value.as_str()?.trim();
+    raw.parse().ok()
+}
+
+fn parse_hex_bytes(value: &Value) -> Option<Vec<u8>> {
+    let raw = value
+        .as_str()?
+        .trim()
+        .strip_prefix("0x")
+        .unwrap_or(value.as_str()?.trim());
+    hex::decode(raw).ok()
+}
+
+fn parse_u256_quantity(value: &Value) -> Option<U256> {
+    if let Some(raw) = value.as_str() {
+        let raw = raw.trim();
+        if let Some(hex) = raw.strip_prefix("0x") {
+            return U256::from_str_radix(hex, 16).ok();
+        }
+        return U256::from_str_radix(raw, 10).ok();
+    }
+    value.as_u64().map(U256::from)
+}
+
+fn parse_u64_quantity(value: &Value) -> Option<u64> {
+    if let Some(raw) = value.as_str() {
+        let raw = raw.trim();
+        if let Some(hex) = raw.strip_prefix("0x") {
+            return u64::from_str_radix(hex, 16).ok();
+        }
+        return raw.parse().ok();
+    }
+    value.as_u64()
 }
 
 pub fn discover_accounts_from_seeds(
@@ -766,5 +1044,191 @@ mod tests {
         assert_eq!(retry_backoff_delay_ms(250, 1), 500);
         assert_eq!(retry_backoff_delay_ms(250, 2), 1000);
         assert_eq!(retry_backoff_delay_ms(0, 3), 8);
+    }
+
+    #[test]
+    fn debug_trace_parser_extracts_internal_router_seed_with_provenance() {
+        let target: Address = "0xf4326F612bF8Dbc8d2b685fCb5B78BB978b08D65"
+            .parse()
+            .expect("target");
+        let router = Address::repeat_byte(0xbb);
+        let top = Address::repeat_byte(0xaa);
+        let mut config = MainnetSeedConfig::new(123, target, 8);
+        config.include_address_hints = true;
+        let trace = serde_json::json!([
+            {
+                "txHash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                "result": {
+                    "from": top,
+                    "to": router,
+                    "input": "0x12345678",
+                    "value": "0x0",
+                    "calls": [
+                        {
+                            "from": router,
+                            "to": target,
+                            "input": "0xa9059cbb000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000000000000000000000000000000000000000000000000000001",
+                            "value": "0x0"
+                        }
+                    ]
+                }
+            }
+        ]);
+
+        let seeds = seeds_from_debug_trace_value(&config, &trace);
+
+        assert_eq!(seeds.len(), 1);
+        let seed = &seeds[0];
+        assert_eq!(seed.input.txs[0].to, target);
+        assert_eq!(seed.metadata.top_level_caller, Some(top));
+        assert_eq!(seed.metadata.internal_caller, Some(router));
+        assert_eq!(seed.metadata.trace_path.as_deref(), Some("0.0"));
+        assert_eq!(
+            seed.metadata.trace_source.as_deref(),
+            Some("geth-callTracer")
+        );
+        assert_eq!(
+            seed.metadata.match_kind.as_deref(),
+            Some("trace-internal-target")
+        );
+        assert_eq!(
+            seed.metadata.tx_hash,
+            Some(
+                "0x1111111111111111111111111111111111111111111111111111111111111111"
+                    .parse()
+                    .expect("hash")
+            )
+        );
+    }
+
+    #[test]
+    fn debug_trace_parser_accepts_flat_action_result_trace() {
+        let target = Address::repeat_byte(0x41);
+        let caller = Address::repeat_byte(0x42);
+        let mut config = MainnetSeedConfig::new(123, target, 8);
+        config.include_address_hints = true;
+        let trace = serde_json::json!([
+            {
+                "transactionHash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+                "blockNumber": "0x7b",
+                "traceAddress": [0, 1],
+                "action": {
+                    "from": caller,
+                    "to": target,
+                    "input": "0xabcdef01",
+                    "value": "0x0",
+                    "callType": "call"
+                },
+                "result": {
+                    "output": "0x"
+                }
+            }
+        ]);
+
+        let seeds = seeds_from_debug_trace_value(&config, &trace);
+
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].metadata.source_block, 123);
+        assert_eq!(
+            seeds[0].metadata.trace_source.as_deref(),
+            Some("openethereum-erigon-flat")
+        );
+        assert_eq!(
+            seeds[0].metadata.tx_hash,
+            Some(
+                "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    .parse()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn debug_trace_parser_extracts_nested_delegatecall_proxy_target() {
+        let proxy = Address::repeat_byte(0x51);
+        let implementation = Address::repeat_byte(0x52);
+        let target = implementation;
+        let config = MainnetSeedConfig::new(500, target, 8);
+        let trace = serde_json::json!({
+            "txHash": "0x3333333333333333333333333333333333333333333333333333333333333333",
+            "blockNumber": 500,
+            "result": {
+                "from": Address::repeat_byte(0x53),
+                "to": proxy,
+                "input": "0x11111111",
+                "calls": [{
+                    "type": "DELEGATECALL",
+                    "from": proxy,
+                    "to": implementation,
+                    "input": "0x12345678",
+                    "value": "0x0"
+                }]
+            }
+        });
+
+        let seeds = seeds_from_debug_trace_value(&config, &trace);
+
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].input.txs[0].to, target);
+        assert_eq!(seeds[0].metadata.trace_path.as_deref(), Some("0.0"));
+        assert_eq!(seeds[0].metadata.internal_caller, Some(proxy));
+    }
+
+    #[test]
+    fn debug_trace_parser_emits_logs_only_target_seed() {
+        let target = Address::repeat_byte(0x61);
+        let router = Address::repeat_byte(0x62);
+        let caller = Address::repeat_byte(0x63);
+        let config = MainnetSeedConfig::new(600, target, 8);
+        let trace = serde_json::json!({
+            "txHash": "0x4444444444444444444444444444444444444444444444444444444444444444",
+            "blockNumber": 600,
+            "result": {
+                "from": caller,
+                "to": router,
+                "input": "0x99999999",
+                "logs": [{
+                    "address": target,
+                    "topics": []
+                }]
+            }
+        });
+
+        let seeds = seeds_from_debug_trace_value(&config, &trace);
+
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(
+            seeds[0].metadata.match_kind.as_deref(),
+            Some("trace-log-target")
+        );
+        assert_eq!(seeds[0].metadata.trace_path.as_deref(), Some("logs"));
+        assert_eq!(seeds[0].metadata.trace_source.as_deref(), Some("logs-only"));
+    }
+
+    #[test]
+    fn debug_trace_parser_matches_calldata_embedded_target_hint() {
+        let target = Address::repeat_byte(0x71);
+        let aggregator = Address::repeat_byte(0x72);
+        let mut config = MainnetSeedConfig::new(700, target, 8);
+        config.include_address_hints = true;
+        let calldata = format!("0xaaaaaaaa000000000000000000000000{}", hex::encode(target));
+        let trace = serde_json::json!({
+            "txHash": "0x5555555555555555555555555555555555555555555555555555555555555555",
+            "result": {
+                "from": Address::repeat_byte(0x73),
+                "to": aggregator,
+                "input": calldata
+            }
+        });
+
+        let seeds = seeds_from_debug_trace_value(&config, &trace);
+
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].input.txs[0].to, aggregator);
+        assert_eq!(seeds[0].metadata.matched_target, Some(target));
+        assert_eq!(
+            seeds[0].metadata.match_kind.as_deref(),
+            Some("address-hint")
+        );
     }
 }

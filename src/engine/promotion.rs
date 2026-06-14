@@ -1,10 +1,11 @@
 use crate::common::oracle::{
-    FindingStatus, ProtocolFinding, ProtocolOraclePack, ProtocolSeverity, VulnType,
+    oracle_rejection_reasons_for_finding, EvidenceGrade, FindingStatus, ProtocolFinding,
+    ProtocolOraclePack, ProtocolSeverity, RejectionReason, VulnType,
 };
 use crate::common::types::{
     CallObservation, ChainState, ExecutionStatus, SequenceExecutionResult, Snapshot, StorageDiff,
 };
-use crate::common::verifier::ReplayVerifier;
+use crate::common::verifier::{RealismVerifier, ReplayVerifier};
 use crate::engine::economic_delta::TokenBalanceView;
 use crate::engine::exploit_synthesizer::synthesize_foundry_poc_with_findings;
 use crate::engine::minimizer::Minimizer;
@@ -40,6 +41,20 @@ pub struct PromotionConfig {
     pub enabled: bool,
     pub require_replay_for_report: bool,
     pub require_poc_for_confirmed: bool,
+    #[serde(default)]
+    pub strict_proof: bool,
+    #[serde(default)]
+    pub no_synthetic_proof: bool,
+    #[serde(default)]
+    pub require_foundry_poc: bool,
+    #[serde(default)]
+    pub require_minimized: bool,
+    #[serde(default)]
+    pub reject_heuristics: bool,
+    #[serde(default)]
+    pub max_finding_noise: Option<u64>,
+    #[serde(default)]
+    pub poc_out: Option<String>,
     pub promotion_limit: Option<u64>,
 }
 
@@ -49,6 +64,13 @@ impl Default for PromotionConfig {
             enabled: false,
             require_replay_for_report: true,
             require_poc_for_confirmed: true,
+            strict_proof: false,
+            no_synthetic_proof: false,
+            require_foundry_poc: false,
+            require_minimized: false,
+            reject_heuristics: false,
+            max_finding_noise: None,
+            poc_out: None,
             promotion_limit: None,
         }
     }
@@ -67,6 +89,10 @@ pub struct FindingPromotionRecord {
     pub confidence: u64,
     #[serde(default)]
     pub status: FindingStatus,
+    #[serde(default)]
+    pub evidence_grade: EvidenceGrade,
+    #[serde(default)]
+    pub rejection_reasons: Vec<RejectionReason>,
     pub lifecycle_stage: FindingLifecycleStage,
     pub replay_status: String,
     pub minimize_status: String,
@@ -301,6 +327,8 @@ pub fn promote_finding_artifact(
     let mut poc_status = "not_run".to_string();
     let mut evidence_hash = None;
     let mut minimized_input = input.clone();
+    let mut realism_proof = None;
+    let mut policy_rejections = Vec::new();
 
     match replay_result {
         Ok(execution) => {
@@ -324,8 +352,12 @@ pub fn promote_finding_artifact(
             lifecycle_stage = FindingLifecycleStage::Replayed;
 
             let executor = EvmExecutor::new();
-            let minimizer =
-                Minimizer::new(&executor, &NullOracle, base_db, request.block_env.clone());
+            let minimizer = Minimizer::new(
+                &executor,
+                &NullOracle,
+                base_db.clone(),
+                request.block_env.clone(),
+            );
             let original_len = input.txs.len();
             let target_vuln = finding.as_ref().map(|finding| finding.vuln.clone());
             let minimized = minimizer.minimize_crash(&input, |candidate_execution| {
@@ -374,12 +406,19 @@ pub fn promote_finding_artifact(
 
             if minimize_status == "reduced" || minimize_status == "not_reducible" {
                 if let Some(finding) = finding.as_ref() {
+                    let poc_dir = request
+                        .config
+                        .poc_out
+                        .as_deref()
+                        .map(Path::new)
+                        .unwrap_or(&finding_dir);
+                    fs::create_dir_all(poc_dir)?;
                     match synthesize_foundry_poc_with_findings(
                         &minimized_input,
                         &finding.vuln,
                         Some(&execution),
                         &request.artifact.findings,
-                        &finding_dir,
+                        poc_dir,
                         request.rpc_url,
                         request.fork_block,
                     ) {
@@ -421,6 +460,25 @@ pub fn promote_finding_artifact(
                     );
                 }
             }
+
+            let realism = RealismVerifier::new(MAP_SIZE).prove(
+                &ChainState::Evm(base_db.clone()),
+                request.block_env,
+                &minimized_input,
+            );
+            let realism_path = finding_dir.join("realism_proof.json");
+            write_json(&realism_path, &realism)?;
+            artifact_paths.insert(
+                "realism_proof".to_string(),
+                realism_path.display().to_string(),
+            );
+            if !realism.success {
+                caveats.push(format!(
+                    "realistic proof rejected candidate: {:?}",
+                    realism.rejection_reasons
+                ));
+            }
+            realism_proof = Some(realism);
         }
         Err(err) => {
             replay_status = "failed".to_string();
@@ -442,6 +500,7 @@ pub fn promote_finding_artifact(
         && !request.synthetic_mode
         && (!request.config.require_poc_for_confirmed || poc_status == "validated")
         && replay_status == "success"
+        && realism_proof.as_ref().is_some_and(|proof| proof.success)
     {
         lifecycle_stage = FindingLifecycleStage::Confirmed;
     }
@@ -450,19 +509,84 @@ pub fn promote_finding_artifact(
         lifecycle_stage = FindingLifecycleStage::PocGenerated;
     }
 
+    let strict_proof = request.config.strict_proof;
+    let no_synthetic_proof = request.config.no_synthetic_proof || strict_proof;
+    let require_minimized = request.config.require_minimized || strict_proof;
+    let require_foundry_poc = request.config.require_foundry_poc || strict_proof;
+    let reject_heuristics = request.config.reject_heuristics || strict_proof;
+    let minimized = minimize_status == "reduced" || minimize_status == "not_reducible";
+    let realism_success = realism_proof.as_ref().is_some_and(|proof| proof.success);
+    for finding in &request.artifact.findings {
+        let oracle_rejections = oracle_rejection_reasons_for_finding(finding);
+        if !oracle_rejections.is_empty() && (strict_proof || reject_heuristics) {
+            policy_rejections.extend(oracle_rejections);
+            caveats.push(format!(
+                "oracle evidence failed strict precondition checks for {:?}",
+                finding.vuln
+            ));
+        }
+    }
+
+    if no_synthetic_proof && request.synthetic_mode {
+        policy_rejections.push(RejectionReason::SyntheticFundingRequired);
+        caveats.push("strict proof rejected synthetic fallback evidence".to_string());
+    }
+    if require_minimized && !minimized {
+        policy_rejections.push(RejectionReason::MinimizedAway);
+        caveats.push("strict proof requires a minimized sequence".to_string());
+    }
+    if require_foundry_poc && poc_status != "validated" {
+        policy_rejections.push(RejectionReason::OracleWeakness);
+        caveats.push("strict proof requires a validated Foundry PoC artifact".to_string());
+    }
+    if reject_heuristics && (replay_status != "success" || !realism_success) {
+        policy_rejections.push(if replay_status == "success" {
+            RejectionReason::ReplayFailed
+        } else {
+            RejectionReason::OracleWeakness
+        });
+        caveats.push("strict proof rejects heuristic-only evidence".to_string());
+    }
+    if request.config.max_finding_noise == Some(0)
+        && lifecycle_stage != FindingLifecycleStage::Confirmed
+    {
+        policy_rejections.push(RejectionReason::OracleWeakness);
+        caveats.push("max finding noise is zero; non-proved finding rejected".to_string());
+    }
+    if !policy_rejections.is_empty() {
+        lifecycle_stage = FindingLifecycleStage::Rejected;
+    }
+
     let confidence = confidence_for(
         &lifecycle_stage,
         request.synthetic_mode,
         replay_status == "success",
-        minimize_status == "reduced" || minimize_status == "not_reducible",
+        minimized,
         poc_status == "validated",
     );
     let status = status_for_lifecycle(
         &lifecycle_stage,
         replay_status == "success",
-        minimize_status == "reduced" || minimize_status == "not_reducible",
-        poc_status == "validated",
+        minimized,
+        poc_status == "validated" && realism_success,
     );
+    let evidence_grade = realism_proof
+        .as_ref()
+        .map(|proof| proof.evidence_grade.clone())
+        .unwrap_or_else(|| {
+            if replay_status == "success" {
+                EvidenceGrade::DeterministicReplay
+            } else {
+                EvidenceGrade::Heuristic
+            }
+        });
+    let mut rejection_reasons = realism_proof
+        .as_ref()
+        .map(|proof| proof.rejection_reasons.clone())
+        .unwrap_or_default();
+    rejection_reasons.extend(policy_rejections);
+    rejection_reasons.sort();
+    rejection_reasons.dedup();
 
     let record = FindingPromotionRecord {
         finding_id: finding_id.clone(),
@@ -481,6 +605,8 @@ pub fn promote_finding_artifact(
             .unwrap_or(ProtocolSeverity::Info),
         confidence,
         status,
+        evidence_grade,
+        rejection_reasons,
         lifecycle_stage,
         replay_status,
         minimize_status,
@@ -674,9 +800,7 @@ pub fn confidence_for(
     } else {
         65
     };
-    if synthetic_mode {
-        cap.min(40)
-    } else if *stage == FindingLifecycleStage::Rejected {
+    if synthetic_mode || *stage == FindingLifecycleStage::Rejected {
         cap.min(40)
     } else {
         cap
@@ -692,13 +816,13 @@ fn status_for_lifecycle(
     match stage {
         FindingLifecycleStage::Rejected => FindingStatus::Rejected,
         FindingLifecycleStage::Confirmed if replayed && minimized && poc_validated => {
-            FindingStatus::Confirmed
+            FindingStatus::Proved
         }
-        FindingLifecycleStage::Candidate
-        | FindingLifecycleStage::Replayed
-        | FindingLifecycleStage::Minimized
-        | FindingLifecycleStage::PocGenerated
-        | FindingLifecycleStage::Confirmed => FindingStatus::Candidate,
+        FindingLifecycleStage::PocGenerated | FindingLifecycleStage::Minimized => {
+            FindingStatus::Minimized
+        }
+        FindingLifecycleStage::Replayed => FindingStatus::Replayed,
+        FindingLifecycleStage::Candidate | FindingLifecycleStage::Confirmed => FindingStatus::Lead,
     }
 }
 
@@ -834,10 +958,12 @@ fn finding_markdown(
         .unwrap_or("No exploit impact is established.");
     let recommended_fix = finding
         .map(|finding| recommended_fix_for(&finding.vuln))
-        .unwrap_or("Add a detector-specific assertion before treating this artifact as a vulnerability.");
+        .unwrap_or(
+            "Add a detector-specific assertion before treating this artifact as a vulnerability.",
+        );
     let false_positive_checks = false_positive_checks_markdown(record);
     let limitations = limitations_markdown(record);
-    let severity_label = if record.status == FindingStatus::Confirmed {
+    let severity_label = if record.status == FindingStatus::Proved {
         "Severity"
     } else {
         "Severity hint"
@@ -1056,7 +1182,7 @@ fn false_positive_checks_markdown(record: &FindingPromotionRecord) -> String {
 
 fn limitations_markdown(record: &FindingPromotionRecord) -> String {
     let mut limitations = Vec::new();
-    if record.status != FindingStatus::Confirmed {
+    if record.status != FindingStatus::Proved {
         limitations.push("finding is not confirmed; severity is only a hint");
     }
     if record.synthetic_mode {
@@ -1163,19 +1289,19 @@ mod tests {
     fn status_requires_full_validation_for_confirmed() {
         assert_eq!(
             status_for_lifecycle(&FindingLifecycleStage::Candidate, false, false, false),
-            FindingStatus::Candidate
+            FindingStatus::Lead
         );
         assert_eq!(
             status_for_lifecycle(&FindingLifecycleStage::PocGenerated, true, true, true),
-            FindingStatus::Candidate
+            FindingStatus::Minimized
         );
         assert_eq!(
             status_for_lifecycle(&FindingLifecycleStage::Confirmed, true, true, true),
-            FindingStatus::Confirmed
+            FindingStatus::Proved
         );
         assert_eq!(
             status_for_lifecycle(&FindingLifecycleStage::Confirmed, true, true, false),
-            FindingStatus::Candidate
+            FindingStatus::Lead
         );
         assert_eq!(
             status_for_lifecycle(&FindingLifecycleStage::Rejected, false, false, false),
@@ -1196,7 +1322,9 @@ mod tests {
             vuln_type: "reentrancy".to_string(),
             severity: ProtocolSeverity::High,
             confidence: 90,
-            status: FindingStatus::Confirmed,
+            status: FindingStatus::Proved,
+            evidence_grade: EvidenceGrade::RealisticForkProof,
+            rejection_reasons: Vec::new(),
             lifecycle_stage: FindingLifecycleStage::Confirmed,
             replay_status: "success".to_string(),
             minimize_status: "reduced".to_string(),
@@ -1214,7 +1342,7 @@ mod tests {
         rejected.poc_status = "not_run".to_string();
         let mut candidate = confirmed.clone();
         candidate.finding_id = "candidate".to_string();
-        candidate.status = FindingStatus::Candidate;
+        candidate.status = FindingStatus::Minimized;
         candidate.lifecycle_stage = FindingLifecycleStage::Minimized;
         candidate.poc_status = "generated_unvalidated".to_string();
 
@@ -1246,7 +1374,9 @@ mod tests {
             vuln_type: "VaultInflation".to_string(),
             severity: ProtocolSeverity::High,
             confidence: 80,
-            status: FindingStatus::Candidate,
+            status: FindingStatus::Minimized,
+            evidence_grade: EvidenceGrade::DeterministicReplay,
+            rejection_reasons: Vec::new(),
             lifecycle_stage: FindingLifecycleStage::Minimized,
             replay_status: "success".to_string(),
             minimize_status: "not_reducible".to_string(),

@@ -11,12 +11,18 @@ use crate::evm::trace::ExecutionTrace;
 use revm::primitives::U256;
 use serde::{Deserialize, Serialize};
 
-// TODO: Missing module - stub or implement
-#[allow(dead_code)]
+/// ProfitReport: Tracks profit and loss from execution sequences.
+/// Used to calculate economic impact of vulnerabilities and attack paths.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfitReport {
+    /// Total profit extracted from the protocol (e.g., stolen funds, arbitrage gains)
     pub profit: U256,
+    /// Total loss incurred by the protocol or users (e.g., drained funds, bad debt)
     pub loss: U256,
+    /// Net profit/loss (profit - loss)
+    pub net: U256,
+    /// Breakdown by actor address
+    pub by_actor: std::collections::HashMap<revm::primitives::Address, (U256, U256)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -672,13 +678,92 @@ impl Default for ProfitReport {
         Self {
             profit: U256::ZERO,
             loss: U256::ZERO,
+            net: U256::ZERO,
+            by_actor: std::collections::HashMap::new(),
         }
     }
 }
 
 impl ProfitReport {
-    pub fn is_significant(&self, _threshold: u64) -> bool {
-        self.profit > U256::ZERO
+    /// Creates a new ProfitReport from execution results by analyzing storage diffs
+    /// and balance changes to calculate actual profit/loss.
+    pub fn from_execution(
+        _execution: &SequenceExecutionResult,
+        initial_balances: &std::collections::HashMap<revm::primitives::Address, U256>,
+        final_balances: &std::collections::HashMap<revm::primitives::Address, U256>,
+    ) -> Self {
+        let mut report = Self::default();
+
+        // Calculate balance changes for each actor
+        for (address, initial) in initial_balances {
+            let final_balance = final_balances.get(address).unwrap_or(initial);
+            let change = if *final_balance > *initial {
+                *final_balance - *initial
+            } else {
+                *initial - *final_balance
+            };
+
+            // Determine if this is profit or loss based on context
+            // For now, treat positive balance changes as profit
+            if *final_balance > *initial {
+                report.profit = report.profit.saturating_add(change);
+                report.by_actor.insert(*address, (change, U256::ZERO));
+            } else {
+                report.loss = report.loss.saturating_add(change);
+                report.by_actor.insert(*address, (U256::ZERO, change));
+            }
+        }
+
+        // Calculate net profit/loss
+        report.net = if report.profit > report.loss {
+            report.profit - report.loss
+        } else {
+            report.loss - report.profit
+        };
+
+        report
+    }
+
+    /// Creates a simplified ProfitReport from storage deltas
+    pub fn from_storage_deltas(execution: &SequenceExecutionResult) -> Self {
+        let mut report = Self::default();
+
+        // Sum up significant storage deltas as potential profit/loss
+        for diff in &execution.storage_diffs {
+            let delta = if diff.new_value > diff.old_value {
+                diff.new_value - diff.old_value
+            } else {
+                diff.old_value - diff.new_value
+            };
+
+            // Only count significant deltas (> 1e18 wei)
+            if delta > U256::from(10u128.pow(18)) {
+                report.profit = report.profit.saturating_add(delta);
+            }
+        }
+
+        report.net = report.profit;
+        report
+    }
+
+    /// Returns true if the profit/loss is significant (above threshold)
+    pub fn is_significant(&self, threshold: U256) -> bool {
+        self.profit > threshold || self.loss > threshold
+    }
+
+    /// Returns the profit/loss ratio (0.0 to 1.0)
+    pub fn profit_loss_ratio(&self) -> f64 {
+        if self.loss == U256::ZERO {
+            if self.profit == U256::ZERO {
+                0.0
+            } else {
+                1.0
+            }
+        } else {
+            let profit_f64 = self.profit.to::<u128>() as f64;
+            let loss_f64 = self.loss.to::<u128>() as f64;
+            profit_f64 / (profit_f64 + loss_f64)
+        }
     }
 }
 
