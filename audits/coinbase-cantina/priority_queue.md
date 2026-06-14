@@ -1,0 +1,225 @@
+# Coinbase Cantina Priority Queue
+
+Ranking is based on custody, authorization complexity, upgradeability, cross-chain semantics, external calls, accounting complexity, historical-seed usefulness, and realistic fork-testability.
+
+## Critical priority
+
+- `Base–Solana Bridge` / `CrossChainERC20Factory` / `Base` / `0xDD56781d0509650f8C2981231B6C917f2d5d7dF2` — score `79`; cross-chain message or wrapped asset surface; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `SmartWalletFactory` / `Base` / `0x0BA5ED0c6AA8c49038F819E587E2633c4A9F428a` — score `77`; authorization/signature/account-abstraction surface; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `TokenFactory` / `Base` / `0x0000C479718a45e3D80b9A71C17b2E954CfA1515` — score `77`; authorization/signature/account-abstraction surface; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Base–Solana Bridge` / `BridgeValidator` / `Base` / `0xAF24c1c24Ff3BF1e6D882518120fC25442d6794B` — score `73`; authorization/signature/account-abstraction surface; cross-chain message or wrapped asset surface; EVM mainnet fork tooling available
+- `Commerce Payments` / `SpendPermissionPaymentCollector` / `Base` / `0x8d9F34934dc9619e5DC3Df27D0A40b4A744E7eAa` — score `67`; authorization/signature/account-abstraction surface; payment custody/accounting surface; EVM mainnet fork tooling available
+- `Echo` / `DistributorFactory` / `Base` / `0x3002aadad07ab12e5bb8098de3542bee2ad44fed` — score `67`; minting/factory/token custody surface; distribution/vesting/accounting surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Echo` / `DistributorFactory` / `Ethereum` / `0xd6d4b339b972c7dfa427b6818396aeabb5bc03b9` — score `67`; minting/factory/token custody surface; distribution/vesting/accounting surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Echo` / `DistributorFactory` / `Optimism` / `0x2fbdd01e44513302bb2789302e98749fb01c0e8d` — score `67`; minting/factory/token custody surface; distribution/vesting/accounting surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Liqufi` / `WeightedTokenVestingLockupFactory` / `Arbitrum` / `0xD42eA6a51ec16c0Cb581695343F9F3d652d98945` — score `67`; minting/factory/token custody surface; distribution/vesting/accounting surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Liqufi` / `WeightedTokenVestingLockupFactory` / `Base` / `0x08c1820bA6A0B88eB1f3E3eC7C9B8cf85E63C6FC` — score `67`; minting/factory/token custody surface; distribution/vesting/accounting surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Liqufi` / `WeightedTokenVestingLockupFactory` / `Ethereum` / `0x341251e680fB0FD4f47aD4dC1AD61C3bE5142d0e` — score `67`; minting/factory/token custody surface; distribution/vesting/accounting surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Liqufi` / `WeightedTokenVestingLockupFactory` / `Optimism` / `0x85F2A6BB58E52c9189fD8748790C5059508FBDc1` — score `67`; minting/factory/token custody surface; distribution/vesting/accounting surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Liqufi` / `WeightedTokenVestingLockupFactory` / `Polygon` / `0xc7284314593e952717b6a0b78766887b37fb1720` — score `67`; minting/factory/token custody surface; distribution/vesting/accounting surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Echo` / `DistributorFactory` / `BNB Smart Chain` / `0x985a20e7bec906778f811799aebf50f90d10f71b` — score `62`; minting/factory/token custody surface; distribution/vesting/accounting surface; upgrade/factory/registry complexity
+- `Echo` / `DistributorFactory` / `ZKSync Era` / `0xa9311c40e4038f6c9597aa07fddd643ae6147d08` — score `62`; minting/factory/token custody surface; distribution/vesting/accounting surface; upgrade/factory/registry complexity
+- `Liqufi` / `WeightedTokenVestingFactory V1` / `BNB Smart Chain` / `0x834297cAF503d9455395A62336e653FCf2234962` — score `62`; minting/factory/token custody surface; distribution/vesting/accounting surface; upgrade/factory/registry complexity
+- `Liqufi` / `WeightedTokenVestingLockupFactory` / `Avalanche` / `0x5bFd3bDFf68346909d352757055e98f2654a3c10` — score `62`; minting/factory/token custody surface; distribution/vesting/accounting surface; upgrade/factory/registry complexity
+
+## High priority
+
+- `Base–Solana Bridge` / `Twin Beacon` / `Base` / `0xb326c02150bb0De265Bb0eCeDA53531ab0163bf6` — score `57`; cross-chain message or wrapped asset surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Base–Solana Bridge` / `Twin Implementation` / `Base` / `0xb0887e4793d944Cf7bA674B3b3FA5C15900ddaA7` — score `57`; cross-chain message or wrapped asset surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Liqufi` / `BatchPayments` / `Arbitrum` / `0x39C4B71D53Db0B6B647fe5013608eeA292db4A73` — score `57`; payment custody/accounting surface; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `BatchPayments` / `Base` / `0x834297cAF503d9455395A62336e653FCf2234962` — score `57`; payment custody/accounting surface; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `BatchPayments` / `Ethereum` / `0x39C4B71D53Db0B6B647fe5013608eeA292db4A73` — score `57`; payment custody/accounting surface; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `BatchPayments` / `Optimism` / `0x39C4B71D53Db0B6B647fe5013608eeA292db4A73` — score `57`; payment custody/accounting surface; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `BatchPayments` / `Polygon` / `0x39C4B71D53Db0B6B647fe5013608eeA292db4A73` — score `57`; payment custody/accounting surface; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `EIP-7702` / `EIP7702Proxy` / `Arbitrum` / `0x7702cb554e6bFb442cb743A7dF23154544a7176C` — score `55`; authorization/signature/account-abstraction surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `EIP-7702` / `EIP7702Proxy` / `Ethereum` / `0x7702cb554e6bFb442cb743A7dF23154544a7176C` — score `55`; authorization/signature/account-abstraction surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Liqufi` / `BatchPayments` / `Avalanche` / `0x39C4B71D53Db0B6B647fe5013608eeA292db4A73` — score `52`; payment custody/accounting surface; distribution/vesting/accounting surface
+- `Liqufi` / `BatchPayments` / `BNB Smart Chain` / `0x39C4B71D53Db0B6B647fe5013608eeA292db4A73` — score `52`; payment custody/accounting surface; distribution/vesting/accounting surface
+- `Echo` / `DealFactory` / `Base` / `0x475ddcfd166b80d41d2778ec3a8fa8bbcc887095` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Recovery Signer` / `RecoverySignerFactory` / `Base` / `0xf3Ef80A7664c286997B35b0D1a6d56A9008F9336` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `MintFactory` / `Base` / `0x20e26eD291B85A44A6Eb9b0D336512b53fd93092` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `MintFactory` / `Base` / `0x560aa3207ae4b516A5489E04f2Fa2e2808CEa896` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `MintFactoryCreator` / `Base` / `0xAeb73b6C8ed3776EA6b9284082588c55E35e1b27` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `MintFactoryCreator` / `Base` / `0x52d443855E4d15dc47d323fA94e7d92342d3Eb57` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `MintFactoryFree` / `Base` / `0x5da05215acA9eDBE27CBDCE86888986E4b4c996F` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `MintForwarderFactory` / `Base` / `0x000054fCEAB4632B9c8B7fd20cE9790352426716` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `MintForwarderFactory` / `Base` / `0x0000FF0b7Fdf0449c0761356680c0516fD76c0f5` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `MintForwarderFactory` / `Base` / `0x0000F4E1b81A88A7b1732a4A5FdfaA4999F45075` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `MintForwarderFactory` / `Base` / `0x00001962896d81F18Bca192a2Bc90f85b5478698` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `MintForwarderFactory` / `Base` / `0x0000Bfaa45AA7352D7A5b151D34f4EFc096E9Cf6` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `MintForwarderFactory` / `Base` / `0x0000Efa3D0485d3E0B6A48adE0d61a59451f648f` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `MintForwarderFactory` / `Base` / `0x00002027199E51Ce5648E56F0F003759e3D7b16e` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `MintForwarderFactory` / `Base` / `0x0000c1c5F00bD1843b6c1703eA1F457a2Bb5c457` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `MintForwarderFactory` / `Base` / `0x0000000000E552550beC95A36217A91CeBA099b0` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `MintForwarderFactory` / `Ethereum` / `0x0000000000E552550beC95A36217A91CeBA099b0` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `TokenFactory` / `Base` / `0x0000D340e876e1De249CcA0FD91d91aE612741E8` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `TokenFactory` / `Base` / `0x00003f0f758054D91430AFC79b8666fbA06ccB2c` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `TokenFactory` / `Base` / `0x0000955334545d3c2bdECE50C7F3877054F4dCF7` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `TokenFactory` / `Base` / `0x000036624A21E2047D28449989A943c64b5210d0` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `TokenFactory` / `Base` / `0x00005721895c940fe1066B147358cE6d31A31378` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `TokenFactory` / `Base` / `0x0000B216f5011f882604D2cFa295A83d77025727` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `TokenFactory` / `Base` / `0x0000DfcD0263aC062b3fC7A17aBd1f0407f389A6` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `TokenFactory` / `Base` / `0x00000000001c3dC9A681A014e2732bF1419aFAec` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `TokenFactory` / `Ethereum` / `0x00000000001c3dC9A681A014e2732bF1419aFAec` — score `49`; minting/factory/token custody surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Base–Solana Bridge` / `Bridge` / `Base` / `0x3eff766C76a1be2Ce1aCF2B69c78bCae257D5188` — score `45`; cross-chain message or wrapped asset surface; EVM mainnet fork tooling available
+- `Echo` / `Distributor Implementation` / `Base` / `0x1798D23f29968b4fff7A60A90645B0939d04f47E` — score `45`; distribution/vesting/accounting surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Echo` / `Distributor Implementation` / `Base` / `0x1B4fA4F9BDd13Bfdec49DA85750Ab38387EE4DCF` — score `45`; distribution/vesting/accounting surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Echo` / `Distributor Implementation` / `Ethereum` / `0x900857be98cd16C97f270Ce450169761858eb559` — score `45`; distribution/vesting/accounting surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Echo` / `Distributor Implementation` / `Optimism` / `0xF9456B2d7EA7CDD9accAa89771DD9E9709C5bB6a` — score `45`; distribution/vesting/accounting surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Echo` / `Distributor Implementation` / `Optimism` / `0xB3678A158E83946D02eaBa654a1a6e8eA4d6889C` — score `45`; distribution/vesting/accounting surface; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+
+## Medium priority
+
+- `Account Policies` / `MorphoLendPolicy` / `Base` / `0x015Cf8dbB7F1045280B96d0afd308dFa7AcB84F0` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Account Policies` / `MorphoLoanProtectionPolicy` / `Base` / `0x001B6f938eA6D0A57D02B3e9503b958149A2a7e3` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Account Policies` / `MorphoWETHLoanProtectionPolicy` / `Base` / `0xe14A101ADF9AE492Dd8e9D2ED7763460A6AE8Cd7` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Account Policies` / `PolicyManager` / `Base` / `0x75b3015780776952102a8bFA6202d2e3c1F4EFc5` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Account Policies` / `PublicERC6492Validator` / `Base` / `0xBde308aEFDdF0fc0bd2156348F380719620d65Cc` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Basenames` / `BNSDiscountValidator` / `Base` / `0x20b433c640DFb8c2e3C6aBB0533314b2d7B9f2FF` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Basenames` / `BaseETHDiscountValidator` / `Base` / `0x55564490a44FDC2aEEa54B60eB1c79F124FD88b9` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Basenames` / `CB1DiscountValidator` / `Base` / `0x9de4Ab12320684cec803Edb72aA3a920250d392C` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Basenames` / `CBIdDiscountValidator` / `Base` / `0x0A484e560946818787135EAD632771589523dE82` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Basenames` / `DevfolioDiscountValidator` / `Base` / `0xB635802085b405A9C8BA7225ae866f60b63d8503` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Basenames` / `EaMerkleDiscountValidator` / `Base` / `0x6E89d99643DB1223697C77A9F8B2Cb07E898e743` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Basenames` / `OCSNFTDiscountValidator` / `Base` / `0x55246A2AE466257B2fB54d4BB881Fb3f17D8e03e` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Basenames` / `VADiscountValidator` / `Base` / `0x012076854d030128dc72B34621287Bb585210315` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `CoinbaseSmartWalletValidator` / `Arbitrum` / `0x79A33f950b90C7d07E66950daedf868BD0cDcF96` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `CoinbaseSmartWalletValidator` / `Base` / `0x79A33f950b90C7d07E66950daedf868BD0cDcF96` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `CoinbaseSmartWalletValidator` / `Ethereum` / `0x79A33f950b90C7d07E66950daedf868BD0cDcF96` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `CoinbaseSmartWalletValidator` / `Optimism` / `0x79A33f950b90C7d07E66950daedf868BD0cDcF96` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `DefaultReceiver` / `Arbitrum` / `0x2a8010A9D71D2a5AEA19D040F8b4797789A194a9` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `DefaultReceiver` / `Base` / `0x2a8010A9D71D2a5AEA19D040F8b4797789A194a9` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `DefaultReceiver` / `Ethereum` / `0x2a8010A9D71D2a5AEA19D040F8b4797789A194a9` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `DefaultReceiver` / `Optimism` / `0x2a8010A9D71D2a5AEA19D040F8b4797789A194a9` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `MagicSpend` / `Base` / `0x736b661a643B57F11d131CB3Ae6129C22ea02843` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `MagicSpend` / `Base` / `0xe1D39a19Af4319eBA972fd70A5280CA0aE7cA0AC` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `MagicSpend` / `Base` / `0xF7F64baDcbf64A1DbcAE29C223BE1387F8a301A0` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `MagicSpend` / `Base` / `0x485B2544745786FA2dD95B8C239f6CB3a63D198d` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `MagicSpend` / `Base` / `0xa5b50A9ed69811aFA07151b3B98b8F6B58C5c28A` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `MagicSpend` / `Base` / `0x325A4Af669032B6b1296C3084f8070D04F9AD581` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `MagicSpend` / `Base` / `0xd27D5277215754dc84C8e0736D8fef2Ed39d92F3` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `MagicSpend` / `Base` / `0x53899E2B6C6202C5Eb4F229DA1294F17A0C3876e` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `MagicSpend` / `Base` / `0x7d334106dAa009Ef62CBd34C1624Bee2277bA735` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `MagicSpend` / `Base` / `0xfb1A43620c648A43eEE7bc112db5F2498e619DC5` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `MagicSpend` / `Base` / `0x1d3F02EF7D6881C5018863d740c026639aC7fa41` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `MagicSpend` / `Base` / `0xbd25CE451C24554f53D984b8C64B7A0aBC5FDbB5` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `MagicSpend` / `Base` / `0x5c77CF220dFA3dBBB052D9b4934E61d69cb393a5` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `VerifyingPaymaster V6` / `Base` / `0xa270ef92c1E11f1C1f95753C2E56801e8125fA83` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Smart Wallet Infrastructure` / `VerifyingPaymaster V7` / `Base` / `0x2FAEB0760D4230Ef2aC21496Bb4F0b47D634FD4c` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Coinbase Validator Staking Infrastructure` / `BatchDeposit` / `Ethereum` / `0x8eBda19DdEE719DAB78DEf3e22c3d37970e35217` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `EIP-7702` / `NonceTracker` / `Arbitrum` / `0xD0Ff13c28679FDd75Bc09c0a430a0089bf8b95a8` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `EIP-7702` / `NonceTracker` / `Base` / `0xD0Ff13c28679FDd75Bc09c0a430a0089bf8b95a8` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `EIP-7702` / `NonceTracker` / `Ethereum` / `0xD0Ff13c28679FDd75Bc09c0a430a0089bf8b95a8` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `EIP-7702` / `NonceTracker` / `Optimism` / `0xD0Ff13c28679FDd75Bc09c0a430a0089bf8b95a8` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Spend Permissions` / `PublicERC6492Validator` / `Arbitrum` / `0xcfCE48B757601F3f351CB6f434CB0517aEEE293D` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Spend Permissions` / `PublicERC6492Validator` / `Base` / `0xcfCE48B757601F3f351CB6f434CB0517aEEE293D` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Spend Permissions` / `PublicERC6492Validator` / `Ethereum` / `0xcfCE48B757601F3f351CB6f434CB0517aEEE293D` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Spend Permissions` / `PublicERC6492Validator` / `Optimism` / `0xcfCE48B757601F3f351CB6f434CB0517aEEE293D` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Spend Permissions` / `PublicERC6492Validator` / `Polygon` / `0xcfCE48B757601F3f351CB6f434CB0517aEEE293D` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Spend Permissions` / `SpendPermissionManager` / `Arbitrum` / `0xf85210B21cC50302F477BA56686d2019dC9b67Ad` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Spend Permissions` / `SpendPermissionManager` / `Base` / `0xf85210B21cC50302F477BA56686d2019dC9b67Ad` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Spend Permissions` / `SpendPermissionManager` / `Ethereum` / `0xf85210B21cC50302F477BA56686d2019dC9b67Ad` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Spend Permissions` / `SpendPermissionManager` / `Optimism` / `0xf85210B21cC50302F477BA56686d2019dC9b67Ad` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Spend Permissions` / `SpendPermissionManager` / `Polygon` / `0xf85210B21cC50302F477BA56686d2019dC9b67Ad` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Spend Permissions` / `SpendRouter` / `Base` / `0x1a672dE48c82278b2F1BB68d7b9141634dD6BE29` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Verified Pools` / `BasicPolicy` / `Base` / `0xcC7fE2Cf5B79F3EFaBF42caC8E223813242E1454` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Verified Pools` / `RemoveLiquidityPolicy` / `Base` / `0x071fF6D93895c8E6537C572a6D40CF47c36aBed7` — score `43`; authorization/signature/account-abstraction surface; EVM mainnet fork tooling available
+- `Base–Solana Bridge` / `Relayer` / `Solana` / `g1et5VenhfJHJwsdJsDbxWZuotD5H4iELNG61kS4fb9` — score `40`; cross-chain message or wrapped asset surface
+- `Base–Solana Bridge` / `Solana Bridge Program` / `Solana` / `HNCne2FkVaNghhjKXapxJzPaBvAKDG1Ge3gqhZyfVWLM` — score `40`; cross-chain message or wrapped asset surface
+- `Echo` / `Distributor Implementation` / `BNB Smart Chain` / `0x5cDf694C5bE8B9E83663e16eFA8a09FE284b3238` — score `40`; distribution/vesting/accounting surface; upgrade/factory/registry complexity
+- `Echo` / `Distributor Implementation` / `BNB Smart Chain` / `0x103937F52B9E8Fdd370845E049F3601c2979890a` — score `40`; distribution/vesting/accounting surface; upgrade/factory/registry complexity
+- `Echo` / `Distributor Implementation` / `ZKSync Era` / `0xAbf8fcD8954Af787A8f7c080D10E7AcD7BD1F5B5` — score `40`; distribution/vesting/accounting surface; upgrade/factory/registry complexity
+- `Commerce Payments` / `AuthCaptureEscrow` / `Base` / `0xBdEA0D1bcC5966192B070Fdf62aB4EF5b4420cff` — score `39`; payment custody/accounting surface; EVM mainnet fork tooling available
+- `Commerce Payments` / `ERC3009PaymentCollector` / `Base` / `0x0E3dF9510de65469C4518D7843919c0b8C7A7757` — score `39`; payment custody/accounting surface; EVM mainnet fork tooling available
+- `Commerce Payments` / `OperatorRefundCollector` / `Base` / `0x934907bffd0901b6A21e398B9C53A4A38F02fa5d` — score `39`; payment custody/accounting surface; EVM mainnet fork tooling available
+- `Commerce Payments` / `Permit2PaymentCollector` / `Base` / `0x992476B9Ee81d52a5BdA0622C333938D0Af0aB26` — score `39`; payment custody/accounting surface; EVM mainnet fork tooling available
+- `Commerce Payments` / `PreApprovalPaymentCollector` / `Base` / `0x1b77ABd71FCD21fbe2398AE821Aa27D1E6B94bC6` — score `39`; payment custody/accounting surface; EVM mainnet fork tooling available
+- `Basenames` / `OpenEdition721Mint` / `Base` / `0x75D2eA122cC20B6e661775Ac18ffF0B4547B9fe6` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Token — ADA` / `Coinbase Wrapped ADA` / `Base` / `0xcbADA732173e39521CDBE8bf59a6Dc85A9fc7b8c` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Token — ADA` / `Coinbase Wrapped ADA Mint Forwarder` / `Base` / `0x8c44C6a9ee7e64a65F288714d1Bb8043Cf0f3C5C` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Token — DOGE` / `Coinbase Wrapped DOGE` / `Base` / `0xcbD06E5A2B0C65597161de254AA074E489dEb510` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Token — DOGE` / `Coinbase Wrapped DOGE Mint Forwarder` / `Base` / `0x0549899a89e661044f9E7a1B76A157d407D85163` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Token — LTC` / `Coinbase Wrapped LTC` / `Base` / `0xcb17C9Db87B595717C857a08468793f5bAb6445F` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Token — LTC` / `Coinbase Wrapped LTC Mint Forwarder` / `Base` / `0x423077A24c3019E3A291bE2D29a34A4D97AA2DeD` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Token — XRP` / `Coinbase Wrapped XRP` / `Base` / `0xcb585250f852C6c6bf90434AB21A00f02833a4af` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Token — XRP` / `Coinbase Wrapped XRP Mint Forwarder` / `Base` / `0x2ebDCFaCCB0c3B6039Dd8C7c30bF633ACE8c268C` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `BatchBlacklister` / `Base` / `0x20F25adf31BD5Ed53367293C6926bF1AdfC7Ea54` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `BatchBlacklister` / `Base` / `0x76D62719c6A7766c8478B46f995E99AD4675d86a` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `BatchBlacklister` / `Base` / `0x17165086067fc58a04CB8E9dA5B6917B6f23f109` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `BatchBlacklister` / `Base` / `0xA9A4408db72F168c5b0bf413b369824450517126` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `BatchBlacklister` / `Base` / `0x4d5b3aca5968f7075F023d2A7AA830358C3c2b48` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `BatchBlacklister` / `Base` / `0xE3111D45733Efee14bFB1EbE2364D929eDBd9059` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `BatchBlacklister` / `Base` / `0xadab385DFD0bB2c21E292c5F586471a2878A101e` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `BatchBlacklister` / `Base` / `0x0C8B7E98b39aA7983D2444661805a628E8A041DB` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `BatchBlacklister` / `Base` / `0xF903f3A8B30a7b645e76DB8511b4121cc96160EB` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `BatchBlacklister` / `Ethereum` / `0xF903f3A8B30a7b645e76DB8511b4121cc96160EB` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `BatchBlacklisterV2` / `Arbitrum` / `0x63d7212C0503b04BdC2BCCe90fe26800859F2f81` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `BatchBlacklisterV2` / `Base` / `0xa0BF66C54002cEb15aB6E8423EebB994E8b2f7FE` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Wrapped Tokens Infrastructure` / `BatchBlacklisterV2` / `Ethereum` / `0xE34Fd8e02815125aB0947434e42978a8A4e70906` — score `37`; minting/factory/token custody surface; EVM mainnet fork tooling available
+- `Echo` / `Settlement` / `Base` / `0x7263056963E131153927234e0Ce1457a32D888a4` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Flywheel Protocol` / `AdConversion` / `Base` / `0x5a178f113d9851c72c63e7f58255d4520c1a1d9d` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Flywheel Protocol` / `BuilderCodes` / `Base` / `0x000000bc7e6457e610fe52dcc0ca5b3ce59c8e80` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Flywheel Protocol` / `Flywheel` / `Base` / `0x00000f14ad09382841db481403d1775adee1179f` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Flywheel Protocol` / `SimpleRewards` / `Base` / `0x58c5fa1e6e651320499ccfb2198ede481b35c87b` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `VestingModuleRegistry` / `Arbitrum` / `0x6A46c2411e6FD9205D44b82C5B32B2Db7C150263` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `VestingModuleRegistry` / `Base` / `0x674A3Ab5d2be0dA09bF1662E1f9827bdDA3d103F` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `VestingModuleRegistry` / `Ethereum` / `0x782F402C93E9b0d931197cD727e006356B55699d` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `VestingModuleRegistry` / `Optimism` / `0xC34c1643c4C2488315Dc709FCB5ABc6b4E3dE6C7` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `VestingModuleRegistry` / `Polygon` / `0x00F849ca595cFa7CeCd052E77e9d152618333E8E` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `WeightedTokenVestingLockup` / `Arbitrum` / `0xaa861940DD2ED2fE4a3108E51f7f117bb6798E65` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `WeightedTokenVestingLockup` / `Base` / `0x2A06274c976C4db9CbaF702B559E0B5765D07b0d` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `WeightedTokenVestingLockup` / `Ethereum` / `0xb7486B5bd2d14714950B082EafebE9822a1d96eE` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `WeightedTokenVestingLockup` / `Optimism` / `0x16879Ca809e8CA2783d89C2Ee830671A8C348230` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `WeightedTokenVestingLockup` / `Polygon` / `0x9efea6f63d583624E5a459D680D3A27Adf6C570d` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `WeightedVestingModule` / `Arbitrum` / `0xF3D74Bc4E97aD56DDcB0576629c360fB40A871e2` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `WeightedVestingModule` / `Base` / `0xcc93eb838F061A375A37d0d65E8D68f15e9D07E5` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `WeightedVestingModule` / `Ethereum` / `0xc76B81D835A6Ef88fb9b841C22Ed492473577aC3` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `WeightedVestingModule` / `Optimism` / `0x848E9743b6D0aC5614f6427d94fEd295Fe393b6d` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+- `Liqufi` / `WeightedVestingModule` / `Polygon` / `0x595db8eCa8d64f28A57D5F240204FDc8AdbCb8c7` — score `33`; distribution/vesting/accounting surface; EVM mainnet fork tooling available
+
+## Low priority
+
+- `Liqufi` / `VestingModuleRegistry` / `Avalanche` / `0xE57499B85448582a0bFd486283a0a023581D2778` — score `28`; distribution/vesting/accounting surface
+- `Liqufi` / `VestingModuleRegistry` / `BNB Smart Chain` / `0x208F9c3Ca561977ee49AB84E2243c1531a265bd1` — score `28`; distribution/vesting/accounting surface
+- `Liqufi` / `WeightedTokenVesting V1` / `BNB Smart Chain` / `0x674A3Ab5d2be0dA09bF1662E1f9827bdDA3d103F` — score `28`; distribution/vesting/accounting surface
+- `Liqufi` / `WeightedTokenVestingLockup` / `Avalanche` / `0xB487A8739AA114178C5aA5608eF1D2fc26D17A9e` — score `28`; distribution/vesting/accounting surface
+- `Liqufi` / `WeightedVestingModule` / `Avalanche` / `0xD85d9Cd1E453AeE54e448Cef4941F0718922a672` — score `28`; distribution/vesting/accounting surface
+- `Liqufi` / `WeightedVestingModule` / `BNB Smart Chain` / `0x3065aa025a27B42B98E43a5fF7B3965c0174D1bD` — score `28`; distribution/vesting/accounting surface
+- `Basenames` / `BaseRegistrar` / `Base` / `0x03c4738Ee98aE44591e1A4A4F3CaB6641d95DD9a` — score `27`; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Basenames` / `EARegistrarController` / `Base` / `0xd3e6775Ed9B7dC12B205C8E608Dc3767B9e5eFdA` — score `27`; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Basenames` / `RegistrarController` / `Base` / `0x4cCb0BB02FCABA27e82a56646E81d8c5bC4119a5` — score `27`; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Basenames` / `ReverseRegistrar` / `Base` / `0x79EA96012eEa67A83431F1701B3dFf7e37F9E282` — score `27`; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `DEX Aggregator` / `ZeroExProxy` / `Base` / `0x29ef818a2A9d182Fa9A9D27d61881a239fa03E4B` — score `27`; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `DEX Aggregator` / `ZeroExProxy` / `Ethereum` / `0x564d6e3A879c007183fAd17beD9A70630F090651` — score `27`; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Echo` / `Deal Implementation` / `Base` / `0x65cDabC9EbF1DfB72600754aa98F90A2EA285Eba` — score `27`; upgrade/factory/registry complexity; EVM mainnet fork tooling available
+- `Base AppChains` / `DeployChain` / `Base` / `0xe8c6D9460Ce61D260260d27f30bde8b8d1a8341e` — score `15`; EVM mainnet fork tooling available
+- `Base AppChains` / `SuperchainConfig` / `Base` / `0xc5b0B126fFD9D36084af85359a07Fb798A405aDc` — score `15`; EVM mainnet fork tooling available
+- `Basenames` / `EAExponentialPremiumPriceOracle` / `Base` / `0x46114792Cc08Baf79006f25Ec9eE23AC64e119ca` — score `15`; EVM mainnet fork tooling available
+- `Basenames` / `ExponentialPremiumPriceOracle` / `Base` / `0x508CFE43aa84b8048cB6d39037cE0dc96d8aDc75` — score `15`; EVM mainnet fork tooling available
+- `Basenames` / `L1Resolver` / `Ethereum` / `0xde9049636F4a1dfE0a64d1bFe3155C0A14C54F31` — score `15`; EVM mainnet fork tooling available
+- `Basenames` / `L1Resolver` / `Ethereum` / `0x480F8F2FfE823Dc70F499Cc2542C42a3a6aD3f20` — score `15`; EVM mainnet fork tooling available
+- `Basenames` / `L2Resolver` / `Base` / `0xC6d566A56A1aFf6508b41f6c90ff131615583BCD` — score `15`; EVM mainnet fork tooling available
+- `Basenames` / `LaunchAuctionPriceOracle` / `Base` / `0xd53B558e1F07289acedf028d226974AbBa258312` — score `15`; EVM mainnet fork tooling available
+- `Basenames` / `Registry` / `Base` / `0xB94704422c2a1E396835A571837Aa5AE53285a95` — score `15`; EVM mainnet fork tooling available
+- `Coinbase Attestations` / `CoinbaseAttester` / `Base` / `0x357458739F90461b99789350868CD7CF330Dd7EE` — score `15`; EVM mainnet fork tooling available
+- `Coinbase Attestations` / `CoinbaseIndexer` / `Base` / `0x2c7eE1E5f416dfF40054c27A62f7B357C4E8619C` — score `15`; EVM mainnet fork tooling available
+- `Coinbase Attestations` / `CoinbaseResolver` / `Base` / `0xD867CbEd445c37b0F95Cc956fe6B539BdEf7F32f` — score `15`; EVM mainnet fork tooling available
+- `Coinbase Attestations` / `EAS` / `Base` / `0x4200000000000000000000000000000000000021` — score `15`; EVM mainnet fork tooling available
+- `Coinbase Attestations` / `SchemaRegistry` / `Base` / `0x4200000000000000000000000000000000000020` — score `15`; EVM mainnet fork tooling available
+- `Echo` / `ERC20PermitFundingConduit` / `Base` / `0x29BEa561cb302FD2B85F5c0c6086BE8b1560F2df` — score `15`; EVM mainnet fork tooling available
+- `Echo` / `FunderIntegration` / `Base` / `0x5D09B26B148f9b9e341E9DB8116e3DFa7755CFd6` — score `15`; EVM mainnet fork tooling available
+- `Echo` / `GenericRegistry` / `Base` / `0x73612914c81a9c072333ea9ea71a9b26a5b9a707` — score `15`; EVM mainnet fork tooling available
+- `Echo` / `GenericRegistry` / `Ethereum` / `0xd643980ee0ef698d37217d8f0123b0f766adec71` — score `15`; EVM mainnet fork tooling available
+- `Echo` / `GenericRegistry` / `Optimism` / `0x84730533ed3d4dcbac265976a5d7ef47ad2e1e9f` — score `15`; EVM mainnet fork tooling available
+- `Echo` / `Linear Unlocker` / `Base` / `0x166415114ef0f243e1bba193df3862b78c13521f` — score `15`; EVM mainnet fork tooling available
+- `Echo` / `Linear Unlocker` / `Base` / `0xbceb8401e7a6b3b35ab15d94c369aa7863b550a9` — score `15`; EVM mainnet fork tooling available
+- `Echo` / `MultiChainWithdrawer` / `Base` / `0x5fd109945d80fd2e54ffa331ebfe18ca301f2a67` — score `15`; EVM mainnet fork tooling available
+- `Verified Pools` / `SignatureChecker` / `Base` / `0x2D04d1743BaB35B13841A466788479c591E01381` — score `15`; EVM mainnet fork tooling available
+- `Verified Pools` / `VerifiedPoolsBasicHook` / `Base` / `0x5cd525c621AFCa515Bf58631D4733fbA7B72Aae4` — score `15`; EVM mainnet fork tooling available
+- `Verified Pools` / `VerifiedPoolsPositionDescriptor` / `Base` / `0x0705717527934a1E10e5328A0B92462c8eB1A28F` — score `15`; EVM mainnet fork tooling available
+- `Verified Pools` / `VerifiedPoolsPositionManager` / `Base` / `0x043ac8DBd2F0e932800210260f207806650C6145` — score `15`; EVM mainnet fork tooling available
+- `Echo` / `GenericRegistry` / `BNB Smart Chain` / `0x198cbbf1232bb033268a7276ca91d1f3cd4cb896` — score `10`; listed in Tier 1 mainnet scope
+
+## Selected First Product-Family Audit
+
+Start with `Spend Permissions`: `SpendPermissionManager`, `SpendRouter`, and `PublicERC6492Validator` across Base/Ethereum/Optimism/Arbitrum/Polygon, with the first concrete harness focused on Base. This cluster combines authorization, signature replay, nonce/period accounting, ERC-1271/ERC-6492 validation, and direct spend routing impact while remaining manageable.

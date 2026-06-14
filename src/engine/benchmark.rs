@@ -23,6 +23,7 @@ use crate::engine::protocol_model::CounterexampleSearchEngine;
 use crate::engine::scoring::CampaignScore;
 use crate::engine::seed_intelligence::{SeedCandidate, SeedIntelligence, SeedSourceType, SeedTag};
 use crate::engine::target_profile::TargetProfiler;
+use crate::evm::corpus::SnapshotScoreWeights;
 use crate::evm::feedback::StateNoveltyReport;
 use crate::evm::fork_db::{ForkDb, ForkDbCacheSnapshot};
 use crate::evm::fuzz::{AbiRegistry, EvmInput};
@@ -2674,6 +2675,19 @@ fn classify_benchmark_failure(
     BenchmarkFailureKind::RegressionTestFailure
 }
 
+pub fn snapshot_weights_for_manifest(manifest: &BenchmarkManifest) -> SnapshotScoreWeights {
+    let mut hints = vec![format!("{:?}", manifest.vulnerability_class)];
+    if let Some(known_class) = &manifest.known_exploit_class {
+        hints.push(known_class.clone());
+    }
+    if let Some(oracle) = &manifest.expected_oracle {
+        hints.push(oracle.clone());
+    }
+    hints.extend(manifest.expected_exploit_shape.iter().cloned());
+    hints.extend(manifest.seed_hints.iter().cloned());
+    SnapshotScoreWeights::for_known_bug_class(&hints.join(" "))
+}
+
 fn load_manifest_file(path: &Path) -> Result<BenchmarkManifest> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read benchmark manifest {}", path.display()))?;
@@ -4020,6 +4034,27 @@ success_criteria = ["expected_finding", "invariant_violation"]
                 .failure_kind,
             BenchmarkFailureKind::PocGenerationFailure
         );
+    }
+
+    #[test]
+    fn benchmark_manifest_derives_known_bug_snapshot_weights() {
+        let mut share_manifest = manifest();
+        share_manifest.known_exploit_class = Some("erc4626 donation share inflation".to_string());
+        let share_weights = snapshot_weights_for_manifest(&share_manifest);
+        let default_weights = SnapshotScoreWeights::default();
+        assert!(share_weights.asset_delta_proximity > default_weights.asset_delta_proximity);
+        assert!(share_weights.state_transition_rarity > default_weights.state_transition_rarity);
+
+        let mut permission_manifest = manifest();
+        permission_manifest.vulnerability_class = VulnerabilityClass::ApprovalAllowanceAbuse;
+        permission_manifest.expected_oracle = Some("spend-permission allowance abuse".to_string());
+        permission_manifest.expected_exploit_shape =
+            vec!["permission replay through router".to_string()];
+        let permission_weights = snapshot_weights_for_manifest(&permission_manifest);
+        assert!(
+            permission_weights.storage_slot_sensitivity > default_weights.storage_slot_sensitivity
+        );
+        assert!(permission_weights.selector_novelty > default_weights.selector_novelty);
     }
 
     #[test]

@@ -1242,6 +1242,101 @@ mod artifact_tests {
     }
 
     #[test]
+    fn known_bug_class_weights_emphasize_relevant_snapshot_signals() {
+        let default = SnapshotScoreWeights::default();
+        let share = SnapshotScoreWeights::for_known_bug_class("erc4626 share inflation");
+        let access = SnapshotScoreWeights::for_known_bug_class("proxy access-control bypass");
+        let bridge = SnapshotScoreWeights::for_known_bug_class("bridge replay finalization bug");
+
+        assert!(share.asset_delta_proximity > default.asset_delta_proximity);
+        assert!(share.state_transition_rarity > default.state_transition_rarity);
+        assert!(access.branch_distance > default.branch_distance);
+        assert!(access.selector_novelty > default.selector_novelty);
+        assert!(bridge.call_depth_novelty > default.call_depth_novelty);
+        assert!(bridge.selector_novelty > default.selector_novelty);
+    }
+
+    #[test]
+    fn class_weighted_snapshot_energy_prioritizes_known_bug_shape() {
+        let target = Address::repeat_byte(0x54);
+        let mut corpus = SnapshotCorpus::new();
+        corpus.add_snapshot(
+            0,
+            0,
+            Snapshot {
+                id: 0,
+                state: Arc::new(RwLock::new(ChainState::Evm(CacheDB::new(ForkDb::empty())))),
+                coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                producing_input: None,
+                waypoints: Vec::new(),
+                depth: 0,
+                gas_used: 0,
+            },
+        );
+        let input = EvmInput {
+            txs: vec![SingletonTx {
+                input: vec![0xb6, 0xb5, 0x5f, 0x25],
+                caller: Address::repeat_byte(0x13),
+                to: target,
+                value: U256::ZERO,
+                is_victim: false,
+            }],
+            base_snapshot_id: 0,
+            waypoints: Vec::new(),
+            mutation_provenance: Vec::new(),
+        };
+        let accounting_like = scored_execution(
+            target,
+            [0xb6, 0xb5, 0x5f, 0x25],
+            None,
+            true,
+            1,
+            B256::from(U256::from(3).to_be_bytes::<32>()),
+            U256::from(10u128.pow(18)),
+        );
+        let shallow_coverage = scored_execution(
+            target,
+            [0x01, 0x02, 0x03, 0x04],
+            Some(U256::from(4)),
+            false,
+            0,
+            B256::from(U256::from(3).to_be_bytes::<32>()),
+            U256::from(1),
+        );
+        let coverage = vec![1u8; 8];
+        let accounting_id = corpus
+            .maybe_add_post_execution_snapshot(
+                0,
+                &input,
+                ChainState::Evm(CacheDB::new(ForkDb::empty())),
+                &coverage,
+                &accounting_like,
+                8,
+            )
+            .expect("accounting-like snapshot");
+        let shallow_id = corpus
+            .maybe_add_post_execution_snapshot(
+                0,
+                &input,
+                ChainState::Evm(CacheDB::new(ForkDb::empty())),
+                &coverage,
+                &shallow_coverage,
+                8,
+            )
+            .expect("shallow snapshot");
+
+        let weights = SnapshotScoreWeights::for_known_bug_class("erc4626 share inflation");
+        let accounting_energy = corpus
+            .snapshot_energy_with_weights(accounting_id, &weights)
+            .expect("accounting energy");
+        let shallow_energy = corpus
+            .snapshot_energy_with_weights(shallow_id, &weights)
+            .expect("shallow energy");
+
+        assert!(accounting_energy > shallow_energy);
+    }
+
+    #[test]
     fn snapshot_pruning_retains_promising_state() {
         let target = Address::repeat_byte(0x53);
         let mut corpus = SnapshotCorpus::new();
@@ -1604,6 +1699,79 @@ impl Default for SnapshotScoreWeights {
     }
 }
 
+impl SnapshotScoreWeights {
+    pub fn for_known_bug_class(class_hint: &str) -> Self {
+        let mut weights = Self::default();
+        let normalized = class_hint.to_ascii_lowercase();
+
+        if normalized.contains("access")
+            || normalized.contains("privilege")
+            || normalized.contains("proxy")
+            || normalized.contains("upgrade")
+        {
+            weights.branch_distance = 14;
+            weights.comparison_distance = 10;
+            weights.selector_novelty = 12;
+            weights.storage_slot_sensitivity = 12;
+            weights.call_depth_novelty = 8;
+        }
+
+        if normalized.contains("erc4626")
+            || normalized.contains("share")
+            || normalized.contains("donation")
+            || normalized.contains("inflation")
+            || normalized.contains("accounting")
+        {
+            weights.asset_delta_proximity = 18;
+            weights.oracle_proximity = 16;
+            weights.storage_slot_sensitivity = 14;
+            weights.state_transition_rarity = 14;
+        }
+
+        if normalized.contains("oracle") || normalized.contains("price") {
+            weights.oracle_proximity = 24;
+            weights.event_novelty = 8;
+            weights.call_depth_novelty = 10;
+            weights.comparison_distance = 10;
+        }
+
+        if normalized.contains("bridge")
+            || normalized.contains("replay")
+            || normalized.contains("cross-chain")
+            || normalized.contains("finalization")
+        {
+            weights.selector_novelty = 14;
+            weights.call_depth_novelty = 12;
+            weights.state_transition_rarity = 16;
+            weights.event_novelty = 8;
+        }
+
+        if normalized.contains("reentrancy") {
+            weights.call_depth_novelty = 18;
+            weights.storage_slot_sensitivity = 14;
+            weights.state_transition_rarity = 14;
+        }
+
+        if normalized.contains("rounding") || normalized.contains("precision") {
+            weights.branch_distance = 12;
+            weights.comparison_distance = 14;
+            weights.asset_delta_proximity = 12;
+        }
+
+        if normalized.contains("allowance")
+            || normalized.contains("approval")
+            || normalized.contains("permission")
+        {
+            weights.selector_novelty = 12;
+            weights.storage_slot_sensitivity = 16;
+            weights.branch_distance = 12;
+            weights.oracle_proximity = 12;
+        }
+
+        weights
+    }
+}
+
 impl SnapshotScore {
     pub fn total(&self, weights: &SnapshotScoreWeights) -> u64 {
         self.new_coverage
@@ -1885,25 +2053,23 @@ impl SnapshotCorpus {
     /// Directed Power Schedule: Prioritizes snapshots that are likely to fill
     /// gaps identified in existing Forge coverage runs.
     pub fn select_snapshot<R: Rand>(&mut self, rand: &mut R) -> Option<u64> {
+        self.select_snapshot_with_weights(rand, &SnapshotScoreWeights::default())
+    }
+
+    pub fn select_snapshot_with_weights<R: Rand>(
+        &mut self,
+        rand: &mut R,
+        weights: &SnapshotScoreWeights,
+    ) -> Option<u64> {
         if self.snapshots.is_empty() {
             return None;
         }
 
-        // Calculate energy per snapshot: base coverage + "Gap Potential"
         let mut weighted_ids = Vec::new();
-        for (id, meta) in &self.metadata {
-            let snap = self.snapshots.get(id).unwrap().read();
-
-            // Heuristic: Intersect current snapshot coverage with the gap map.
-            // If this branch is "near" a gap, give it a 10x multiplier.
-            let gap_intersection =
-                (snap.coverage.clone() & self.priority_gap_map.clone()).count_ones();
-            let energy = meta
-                .coverage_score
-                .saturating_add(gap_intersection * 10)
-                .saturating_add(meta.score.total(&SnapshotScoreWeights::default()) as usize);
-
-            weighted_ids.push((*id, energy));
+        for id in self.metadata.keys() {
+            if let Some(energy) = self.snapshot_energy_with_weights(*id, weights) {
+                weighted_ids.push((*id, energy));
+            }
         }
 
         let total_energy: usize = weighted_ids.iter().map(|(_, e)| *e).sum();
@@ -1922,6 +2088,21 @@ impl SnapshotCorpus {
         }
 
         self.snapshots.keys().next().cloned()
+    }
+
+    pub fn snapshot_energy_with_weights(
+        &self,
+        id: u64,
+        weights: &SnapshotScoreWeights,
+    ) -> Option<usize> {
+        let meta = self.metadata.get(&id)?;
+        let snap = self.snapshots.get(&id)?.read();
+        let gap_intersection = (snap.coverage.clone() & self.priority_gap_map.clone()).count_ones();
+        Some(
+            meta.coverage_score
+                .saturating_add(gap_intersection * 10)
+                .saturating_add(meta.score.total(weights) as usize),
+        )
     }
 
     pub fn update_metadata(&mut self, id: u64, new_coverage: usize) {

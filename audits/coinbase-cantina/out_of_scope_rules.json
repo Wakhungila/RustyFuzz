@@ -1,0 +1,74 @@
+{
+  "explicitly_out_of_scope_targets": [
+    "Contracts deployed on testnets or devnets.",
+    "Contracts deployed on mainnet only for testing.",
+    "Contracts deployed on mainnet for Coinbase internal use.",
+    "Third-party dependencies of Coinbase contracts.",
+    "Third-party contracts used by Coinbase to provide services unless directly controlled by Coinbase and expressly included."
+  ],
+  "default_out_of_scope_findings": [
+    "Issues already identified in previous security reviews.",
+    "Third-party contracts not under Coinbase direct project control.",
+    "Issues involving non-standard ERC-20 tokens unless the affected product explicitly supports that behavior.",
+    "Rounding errors without significant security or financial impact.",
+    "User errors requiring obviously incorrect parameters.",
+    "Vulnerabilities manifesting only during extreme market conditions.",
+    "Incorrect data supplied by third-party oracles.",
+    "Theoretical exploits without a practical proof of concept.",
+    "Issues requiring leaked, stolen, or compromised keys or credentials.",
+    "Sybil attacks.",
+    "Centralization risks.",
+    "Basic economic or governance attacks, including 51% attacks.",
+    "Protocol design choices without a concrete security failure.",
+    "Gas optimization issues or high gas costs.",
+    "Best-practice-only recommendations.",
+    "Submissions generated using ChatGPT or other LLM tools."
+  ],
+  "explicit_exception": "Oracle manipulation and flash-loan attacks remain in scope even though incorrect third-party oracle data is excluded, but only with practical local proof of direct impact.",
+  "local_research_boundary": {
+    "no_public_broadcast": true,
+    "allowed": [
+      "read verified source code",
+      "public bytecode/storage/transaction history",
+      "read-only RPC calls",
+      "public traces",
+      "local Anvil forks",
+      "local-only impersonation",
+      "RustyFuzz campaigns",
+      "Forge tests",
+      "manual review"
+    ],
+    "prohibited": [
+      "eth_sendTransaction",
+      "eth_sendRawTransaction",
+      "real asset transfers",
+      "interference with users or infrastructure",
+      "testing outside exact scope"
+    ]
+  },
+  "reportability_requirements": [
+    "The affected deployment is Coinbase-controlled, deployed on mainnet, and within Tier 1.",
+    "The vulnerable behavior is realistically reachable under valid permissions, state, liquidity, timing, and transaction-ordering assumptions.",
+    "The issue violates an intended security invariant rather than merely representing a design choice or best-practice recommendation.",
+    "The impact is concrete and material, such as:",
+    "Loss or theft of assets",
+    "Unauthorized spending or minting",
+    "Permanent or significant freezing of assets",
+    "Signature or authorization bypass",
+    "Replay attacks",
+    "Cross-chain message forgery",
+    "Accounting corruption",
+    "Insolvency",
+    "Equivalent material security impact",
+    "A deterministic executable proof of concept reproduces the issue using a local deployment, mock environment, or mainnet fork.",
+    "The proof of concept does not rely on:",
+    "Leaked or compromised credentials",
+    "Third-party compromise",
+    "Unsupported token behavior",
+    "Extreme market assumptions",
+    "Obviously invalid user inputs",
+    "Known issues, previous security reviews, duplicate root causes, and defects isolated to third-party code have been ruled out.",
+    "The final report must be independently verified and authored by the researcher.",
+    "Raw LLM-generated findings or reports must not be submitted."
+  ]
+}

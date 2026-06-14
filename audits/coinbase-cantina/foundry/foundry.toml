@@ -1,0 +1,26 @@
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+allow_paths = ["../targets/base/spend-permissions/contracts"]
+solc_version = "0.8.28"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 999999
+ffi = false
+remappings = [
+  "forge-std/=lib/forge-std/src/",
+  "spend-permissions/=../targets/base/spend-permissions/contracts/SpendRouter/",
+  "spm-only/=../targets/base/spend-permissions/contracts/SpendPermissionManager/",
+  "validator-only/=../targets/base/spend-permissions/contracts/PublicERC6492Validator/",
+  "magicspend/=../targets/base/spend-permissions/contracts/SpendRouter/lib/magicspend/src/",
+  "magic-spend/=../targets/base/spend-permissions/contracts/SpendPermissionManager/lib/magic-spend/src/",
+  "openzeppelin-contracts/=../targets/base/spend-permissions/contracts/SpendPermissionManager/lib/openzeppelin-contracts/",
+  "smart-wallet/=../targets/base/spend-permissions/contracts/SpendPermissionManager/lib/smart-wallet/src/",
+  "solady/=../targets/base/spend-permissions/contracts/SpendRouter/lib/solady/src/",
+  "webauthn-sol/=../targets/base/spend-permissions/contracts/SpendPermissionManager/lib/webauthn-sol/src/",
+  "FreshCryptoLib/=../targets/base/spend-permissions/contracts/SpendPermissionManager/lib/webauthn-sol/lib/FreshCryptoLib/solidity/src/",
+  "account-abstraction/=../targets/base/spend-permissions/contracts/SpendPermissionManager/lib/account-abstraction/contracts/"
+]

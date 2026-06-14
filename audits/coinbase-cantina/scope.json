@@ -1,0 +1,462 @@
+[
+  {
+    "productFamily": "Account Policies",
+    "contractName": "PolicyManager",
+    "chain": "Base",
+    "deployedAddress": "0x75b3015780776952102a8bFA6202d2e3c1F4EFc5",
+    "description": "Account policy management.",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Account Policies",
+    "contractName": "MorphoLendPolicy",
+    "chain": "Base",
+    "deployedAddress": "0x015Cf8dbB7F1045280B96d0afd308dFa7AcB84F0",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Account Policies",
+    "contractName": "MorphoLoanProtectionPolicy",
+    "chain": "Base",
+    "deployedAddress": "0x001B6f938eA6D0A57D02B3e9503b958149A2a7e3",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Account Policies",
+    "contractName": "MorphoWETHLoanProtectionPolicy",
+    "chain": "Base",
+    "deployedAddress": "0xe14A101ADF9AE492Dd8e9D2ED7763460A6AE8Cd7",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Account Policies",
+    "contractName": "PublicERC6492Validator",
+    "chain": "Base",
+    "deployedAddress": "0xBde308aEFDdF0fc0bd2156348F380719620d65Cc",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Base AppChains",
+    "contractName": "DeployChain",
+    "chain": "Base",
+    "deployedAddress": "0xe8c6D9460Ce61D260260d27f30bde8b8d1a8341e",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Base AppChains",
+    "contractName": "SuperchainConfig",
+    "chain": "Base",
+    "deployedAddress": "0xc5b0B126fFD9D36084af85359a07Fb798A405aDc",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "OpenEdition721Mint",
+    "chain": "Base",
+    "deployedAddress": "0x75D2eA122cC20B6e661775Ac18ffF0B4547B9fe6",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "EARegistrarController",
+    "chain": "Base",
+    "deployedAddress": "0xd3e6775Ed9B7dC12B205C8E608Dc3767B9e5eFdA",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "L2Resolver",
+    "chain": "Base",
+    "deployedAddress": "0xC6d566A56A1aFf6508b41f6c90ff131615583BCD",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "RegistrarController",
+    "chain": "Base",
+    "deployedAddress": "0x4cCb0BB02FCABA27e82a56646E81d8c5bC4119a5",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "CB1DiscountValidator",
+    "chain": "Base",
+    "deployedAddress": "0x9de4Ab12320684cec803Edb72aA3a920250d392C",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "BaseETHDiscountValidator",
+    "chain": "Base",
+    "deployedAddress": "0x55564490a44FDC2aEEa54B60eB1c79F124FD88b9",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "CBIdDiscountValidator",
+    "chain": "Base",
+    "deployedAddress": "0x0A484e560946818787135EAD632771589523dE82",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "VADiscountValidator",
+    "chain": "Base",
+    "deployedAddress": "0x012076854d030128dc72B34621287Bb585210315",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "BNSDiscountValidator",
+    "chain": "Base",
+    "deployedAddress": "0x20b433c640DFb8c2e3C6bB0533314b2d7B9f2FF",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "OCSNFTDiscountValidator",
+    "chain": "Base",
+    "deployedAddress": "0x55246A2AE466257B2fB54d4BB881Fb3f17D8e03e",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "EAExponentialPremiumPriceOracle",
+    "chain": "Base",
+    "deployedAddress": "0x46114792Cc08Baf79006f25Ec9eE23AC64e119ca",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "ExponentialPremiumPriceOracle",
+    "chain": "Base",
+    "deployedAddress": "0x508CFE43aa84b8048cB6d39037cE0dc96d8aDc75",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "BaseRegistrar",
+    "chain": "Base",
+    "deployedAddress": "0x03c4738Ee98aE44591e1A4A4F3CaB6641d95DD9a",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "EaMerkleDiscountValidator",
+    "chain": "Base",
+    "deployedAddress": "0x6E89d99643DB1223697C77A9bF8B2Cb07E898e743",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "ReverseRegistrar",
+    "chain": "Base",
+    "deployedAddress": "0x79EA96012eEa67A83431F1701B3dFf7e37F9E282",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "DevfolioDiscountValidator",
+    "chain": "Base",
+    "deployedAddress": "0xB635802085b405A9C8BA7225ae866f60b63d8503",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "LaunchAuctionPriceOracle",
+    "chain": "Base",
+    "deployedAddress": "0xd53B558e1F07289acedf028d226974AbBa258312",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "Registry",
+    "chain": "Base",
+    "deployedAddress": "0xB94704422c2a1E396835A571837Aa5AE53285a95",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "L1Resolver",
+    "chain": "Ethereum",
+    "deployedAddress": "0xde9049636F4a1dfE0a64d1bFe3155C0A14C54F31",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Basenames",
+    "contractName": "L1Resolver",
+    "chain": "Ethereum",
+    "deployedAddress": "0x480F8F2FfE823Dc70F499Cc2542C42a3a6aD3f20",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Attestations",
+    "contractName": "EAS",
+    "chain": "Base",
+    "deployedAddress": "0x4200000000000000000000000000000000000021",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Attestations",
+    "contractName": "SchemaRegistry",
+    "chain": "Base",
+    "deployedAddress": "0x4200000000000000000000000000000000000020",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Attestations",
+    "contractName": "CoinbaseIndexer",
+    "chain": "Base",
+    "deployedAddress": "0x2c7eE1E5f416dfF40054c27A62f7B357C4E8619C",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Attestations",
+    "contractName": "CoinbaseAttester",
+    "chain": "Base",
+    "deployedAddress": "0x357458739F90461b99789350868CD7CF330Dd7EE",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Attestations",
+    "contractName": "CoinbaseResolver",
+    "chain": "Base",
+    "deployedAddress": "0xD867CbEd445c37b0F95Cc956fe6B539BdEf7F32f",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "CoinbaseSmartWalletValidator",
+    "chain": "Ethereum",
+    "deployedAddress": "0x79A33f950b90C7d07E66950daedf868BD0cDcF96",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "CoinbaseSmartWalletValidator",
+    "chain": "Optimism",
+    "deployedAddress": "0x79A33f950b90C7d07E66950daedf868BD0cDcF96",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "CoinbaseSmartWalletValidator",
+    "chain": "Arbitrum",
+    "deployedAddress": "0x79A33f950b90C7d07E66950daedf868BD0cDcF96",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "CoinbaseSmartWalletValidator",
+    "chain": "Base",
+    "deployedAddress": "0x79A33f950b90C7d07E66950daedf868BD0cDcF96",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "DefaultReceiver",
+    "chain": "Ethereum",
+    "deployedAddress": "0x2a8010A9D71D2a5AEA19D040F8b4797789A194a9",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "DefaultReceiver",
+    "chain": "Base",
+    "deployedAddress": "0x2a8010A9D71D2a5AEA19D040F8b4797789A194a9",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "DefaultReceiver",
+    "chain": "Arbitrum",
+    "deployedAddress": "0x2a8010A9D71D2a5AEA19D040F8b4797789A194a9",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "DefaultReceiver",
+    "chain": "Optimism",
+    "deployedAddress": "0x2a8010A9D71D2a5AEA19D040F8b4797789A194a9",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "MagicSpend",
+    "chain": "Base",
+    "deployedAddress": "0x736b661a643B57F11d131CB3Ae6129C22ea02843",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "MagicSpend",
+    "chain": "Base",
+    "deployedAddress": "0xe1D39a19Af4319eBA972fd70A5280CA0aE7cA0AC",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "MagicSpend",
+    "chain": "Base",
+    "deployedAddress": "0xF7F64bADcbf64A1DbcAE29C223BE1387F8a301A0",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "MagicSpend",
+    "chain": "Base",
+    "deployedAddress": "0x485B2544745786FA2dD95B8C239f6CB3a63D198d",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "MagicSpend",
+    "chain": "Base",
+    "deployedAddress": "0xa5b50A9ed69811aFA07151b3B98b8F6B58C5c28A",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "MagicSpend",
+    "chain": "Base",
+    "deployedAddress": "0x325A4Af669032B6b1296C3084f8070D04F9AD581",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "MagicSpend",
+    "chain": "Base",
+    "deployedAddress": "0xd27D5277215754dc84C8e0736D8fef2Ed39d92F3",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "MagicSpend",
+    "chain": "Base",
+    "deployedAddress": "0x53899E2B6C6202C5Eb4F229DA1294F17A0C3876e",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "MagicSpend",
+    "chain": "Base",
+    "deployedAddress": "0x7d334106dAa009Ef62CBd34C1624Bee2277bA735",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "MagicSpend",
+    "chain": "Base",
+    "deployedAddress": "0xfb1A43620c648A43eEE7bc112db5F2498e619DC5",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "MagicSpend",
+    "chain": "Base",
+    "deployedAddress": "0x1d3F02EF7D6881C5018863d740c026639aC7fa41",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "MagicSpend",
+    "chain": "Base",
+    "deployedAddress": "0xbd25CE451C24554f53D984b8C64B7A0aBC5FDbB5",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "MagicSpend",
+    "chain": "Base",
+    "deployedAddress": "0x5c77CF220dFA3dBBB052D9b4934E61d69cb393a5",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "TokenFactory",
+    "chain": "Base",
+    "deployedAddress": "0x0000C479718a45e3D80b9A71C17b2E954CfA1515",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "SmartWalletFactory",
+    "chain": "Base",
+    "deployedAddress": "0x0BA5ED0c6AA8c49038F819E587E2633c4A9F428a",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "VerifyingPaymaster V7",
+    "chain": "Base",
+    "deployedAddress": "0x2FAEB0760D4230Ef2aC21496Bb4F0b47D634FD4c",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Smart Wallet Infrastructure",
+    "contractName": "VerifyingPaymaster V6",
+    "chain": "Base",
+    "deployedAddress": "0xa270ef92c1E11f1C1df95753C2E56801e8125fA83",
+    "description": "",
+    "sourceAvailability": "unknown"
+  },
+  {
+    "productFamily": "Coinbase Validator Staking Infrastructure",
+    "contractName": "BatchDeposit",
+    "chain": "Ethereum",
+    "deployedAddress": "0x8 licensors as for the platform, contract, and product, the specific licenses can vary, but common ones include the MIT License, Apache License 2.0, BSD licenses, and proprietary licenses.

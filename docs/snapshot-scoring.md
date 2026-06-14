@@ -20,3 +20,24 @@ Components:
 `SnapshotScoreWeights::default()` defines deterministic weights. Scheduling adds
 the weighted score to coverage and gap-map energy. Pruning removes the lowest
 weighted score first, while preserving the root snapshot.
+
+Known-bug and benchmark-driven campaigns can derive class-aware weights with
+`SnapshotScoreWeights::for_known_bug_class(...)` or
+`benchmark::snapshot_weights_for_manifest(...)`. These profiles preserve the
+same components but shift energy toward the state features that matter for a
+bug family:
+
+- access-control/proxy/upgrade: branch distance, comparisons, selectors, and
+  sensitive storage slots.
+- share/accounting/donation: asset deltas, oracle proximity, sensitive storage,
+  and rare transitions.
+- oracle/price: oracle proximity, event novelty, call depth, and comparisons.
+- bridge/replay/finalization: selectors, call depth, rare transitions, and
+  events.
+- permission/approval/allowance: selectors, sensitive storage, branch frontier,
+  and oracle proximity.
+
+`SnapshotCorpus::select_snapshot_with_weights` applies these profiles without
+changing the default scheduler path. This lets known-bug benchmarks tune state
+selection while keeping strict replay and proof requirements outside the
+exploration scheduler.

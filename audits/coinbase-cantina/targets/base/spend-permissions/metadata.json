@@ -1,0 +1,216 @@
+{
+  "product_family": "Spend Permissions",
+  "selected_first": true,
+  "targets": [
+    {
+      "product_family": "Spend Permissions",
+      "contract_name": "SpendPermissionManager",
+      "chain": "Ethereum",
+      "deployed_address": "0xf85210B21cC50302F477BA56686d2019dC9b67Ad",
+      "scope_tier": "Tier 1",
+      "description": "SpendPermissionManager listed under Spend Permissions in Coinbase Cantina Tier 1 scope.",
+      "likely_proxy_type": "unknown_pending_bytecode_review",
+      "source_availability": "pending_explorer_or_official_repo_check",
+      "implementation_address": null,
+      "current_implementation_bytecode_hash": null,
+      "priority_score": 43,
+      "priority_bucket": "Medium priority",
+      "priority_reasons": [
+        "authorization/signature/account-abstraction surface",
+        "EVM mainnet fork tooling available"
+      ],
+      "audit_status": "inventory_parsed_not_reviewed"
+    },
+    {
+      "product_family": "Spend Permissions",
+      "contract_name": "PublicERC6492Validator",
+      "chain": "Ethereum",
+      "deployed_address": "0xcfCE48B757601F3f351CB6f434CB0517aEEE293D",
+      "scope_tier": "Tier 1",
+      "description": "PublicERC6492Validator listed under Spend Permissions in Coinbase Cantina Tier 1 scope.",
+      "likely_proxy_type": "unknown_pending_bytecode_review",
+      "source_availability": "pending_explorer_or_official_repo_check",
+      "implementation_address": null,
+      "current_implementation_bytecode_hash": null,
+      "priority_score": 43,
+      "priority_bucket": "Medium priority",
+      "priority_reasons": [
+        "authorization/signature/account-abstraction surface",
+        "EVM mainnet fork tooling available"
+      ],
+      "audit_status": "inventory_parsed_not_reviewed"
+    },
+    {
+      "product_family": "Spend Permissions",
+      "contract_name": "SpendPermissionManager",
+      "chain": "Base",
+      "deployed_address": "0xf85210B21cC50302F477BA56686d2019dC9b67Ad",
+      "scope_tier": "Tier 1",
+      "description": "SpendPermissionManager listed under Spend Permissions in Coinbase Cantina Tier 1 scope.",
+      "likely_proxy_type": "unknown_pending_bytecode_review",
+      "source_availability": "pending_explorer_or_official_repo_check",
+      "implementation_address": null,
+      "current_implementation_bytecode_hash": null,
+      "priority_score": 43,
+      "priority_bucket": "Medium priority",
+      "priority_reasons": [
+        "authorization/signature/account-abstraction surface",
+        "EVM mainnet fork tooling available"
+      ],
+      "audit_status": "inventory_parsed_not_reviewed"
+    },
+    {
+      "product_family": "Spend Permissions",
+      "contract_name": "SpendRouter",
+      "chain": "Base",
+      "deployed_address": "0x1a672dE48c82278b2F1BB68d7b9141634dD6BE29",
+      "scope_tier": "Tier 1",
+      "description": "SpendRouter listed under Spend Permissions in Coinbase Cantina Tier 1 scope.",
+      "likely_proxy_type": "unknown_pending_bytecode_review",
+      "source_availability": "pending_explorer_or_official_repo_check",
+      "implementation_address": null,
+      "current_implementation_bytecode_hash": null,
+      "priority_score": 43,
+      "priority_bucket": "Medium priority",
+      "priority_reasons": [
+        "authorization/signature/account-abstraction surface",
+        "EVM mainnet fork tooling available"
+      ],
+      "audit_status": "inventory_parsed_not_reviewed"
+    },
+    {
+      "product_family": "Spend Permissions",
+      "contract_name": "PublicERC6492Validator",
+      "chain": "Base",
+      "deployed_address": "0xcfCE48B757601F3f351CB6f434CB0517aEEE293D",
+      "scope_tier": "Tier 1",
+      "description": "PublicERC6492Validator listed under Spend Permissions in Coinbase Cantina Tier 1 scope.",
+      "likely_proxy_type": "unknown_pending_bytecode_review",
+      "source_availability": "pending_explorer_or_official_repo_check",
+      "implementation_address": null,
+      "current_implementation_bytecode_hash": null,
+      "priority_score": 43,
+      "priority_bucket": "Medium priority",
+      "priority_reasons": [
+        "authorization/signature/account-abstraction surface",
+        "EVM mainnet fork tooling available"
+      ],
+      "audit_status": "inventory_parsed_not_reviewed"
+    },
+    {
+      "product_family": "Spend Permissions",
+      "contract_name": "SpendPermissionManager",
+      "chain": "Optimism",
+      "deployed_address": "0xf85210B21cC50302F477BA56686d2019dC9b67Ad",
+      "scope_tier": "Tier 1",
+      "description": "SpendPermissionManager listed under Spend Permissions in Coinbase Cantina Tier 1 scope.",
+      "likely_proxy_type": "unknown_pending_bytecode_review",
+      "source_availability": "pending_explorer_or_official_repo_check",
+      "implementation_address": null,
+      "current_implementation_bytecode_hash": null,
+      "priority_score": 43,
+      "priority_bucket": "Medium priority",
+      "priority_reasons": [
+        "authorization/signature/account-abstraction surface",
+        "EVM mainnet fork tooling available"
+      ],
+      "audit_status": "inventory_parsed_not_reviewed"
+    },
+    {
+      "product_family": "Spend Permissions",
+      "contract_name": "PublicERC6492Validator",
+      "chain": "Optimism",
+      "deployed_address": "0xcfCE48B757601F3f351CB6f434CB0517aEEE293D",
+      "scope_tier": "Tier 1",
+      "description": "PublicERC6492Validator listed under Spend Permissions in Coinbase Cantina Tier 1 scope.",
+      "likely_proxy_type": "unknown_pending_bytecode_review",
+      "source_availability": "pending_explorer_or_official_repo_check",
+      "implementation_address": null,
+      "current_implementation_bytecode_hash": null,
+      "priority_score": 43,
+      "priority_bucket": "Medium priority",
+      "priority_reasons": [
+        "authorization/signature/account-abstraction surface",
+        "EVM mainnet fork tooling available"
+      ],
+      "audit_status": "inventory_parsed_not_reviewed"
+    },
+    {
+      "product_family": "Spend Permissions",
+      "contract_name": "SpendPermissionManager",
+      "chain": "Arbitrum",
+      "deployed_address": "0xf85210B21cC50302F477BA56686d2019dC9b67Ad",
+      "scope_tier": "Tier 1",
+      "description": "SpendPermissionManager listed under Spend Permissions in Coinbase Cantina Tier 1 scope.",
+      "likely_proxy_type": "unknown_pending_bytecode_review",
+      "source_availability": "pending_explorer_or_official_repo_check",
+      "implementation_address": null,
+      "current_implementation_bytecode_hash": null,
+      "priority_score": 43,
+      "priority_bucket": "Medium priority",
+      "priority_reasons": [
+        "authorization/signature/account-abstraction surface",
+        "EVM mainnet fork tooling available"
+      ],
+      "audit_status": "inventory_parsed_not_reviewed"
+    },
+    {
+      "product_family": "Spend Permissions",
+      "contract_name": "PublicERC6492Validator",
+      "chain": "Arbitrum",
+      "deployed_address": "0xcfCE48B757601F3f351CB6f434CB0517aEEE293D",
+      "scope_tier": "Tier 1",
+      "description": "PublicERC6492Validator listed under Spend Permissions in Coinbase Cantina Tier 1 scope.",
+      "likely_proxy_type": "unknown_pending_bytecode_review",
+      "source_availability": "pending_explorer_or_official_repo_check",
+      "implementation_address": null,
+      "current_implementation_bytecode_hash": null,
+      "priority_score": 43,
+      "priority_bucket": "Medium priority",
+      "priority_reasons": [
+        "authorization/signature/account-abstraction surface",
+        "EVM mainnet fork tooling available"
+      ],
+      "audit_status": "inventory_parsed_not_reviewed"
+    },
+    {
+      "product_family": "Spend Permissions",
+      "contract_name": "SpendPermissionManager",
+      "chain": "Polygon",
+      "deployed_address": "0xf85210B21cC50302F477BA56686d2019dC9b67Ad",
+      "scope_tier": "Tier 1",
+      "description": "SpendPermissionManager listed under Spend Permissions in Coinbase Cantina Tier 1 scope.",
+      "likely_proxy_type": "unknown_pending_bytecode_review",
+      "source_availability": "pending_explorer_or_official_repo_check",
+      "implementation_address": null,
+      "current_implementation_bytecode_hash": null,
+      "priority_score": 43,
+      "priority_bucket": "Medium priority",
+      "priority_reasons": [
+        "authorization/signature/account-abstraction surface",
+        "EVM mainnet fork tooling available"
+      ],
+      "audit_status": "inventory_parsed_not_reviewed"
+    },
+    {
+      "product_family": "Spend Permissions",
+      "contract_name": "PublicERC6492Validator",
+      "chain": "Polygon",
+      "deployed_address": "0xcfCE48B757601F3f351CB6f434CB0517aEEE293D",
+      "scope_tier": "Tier 1",
+      "description": "PublicERC6492Validator listed under Spend Permissions in Coinbase Cantina Tier 1 scope.",
+      "likely_proxy_type": "unknown_pending_bytecode_review",
+      "source_availability": "pending_explorer_or_official_repo_check",
+      "implementation_address": null,
+      "current_implementation_bytecode_hash": null,
+      "priority_score": 43,
+      "priority_bucket": "Medium priority",
+      "priority_reasons": [
+        "authorization/signature/account-abstraction surface",
+        "EVM mainnet fork tooling available"
+      ],
+      "audit_status": "inventory_parsed_not_reviewed"
+    }
+  ],
+  "status": "selected_for_phase_4_source_and_bytecode_verification"
+}

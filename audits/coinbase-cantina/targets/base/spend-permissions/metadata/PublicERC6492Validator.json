@@ -1,0 +1,20 @@
+{
+  "label": "PublicERC6492Validator",
+  "contract_name": "PublicERC6492Validator",
+  "address": "0xcfCE48B757601F3f351CB6f434CB0517aEEE293D",
+  "chain": "Base",
+  "chain_id": 8453,
+  "source": "BaseScan verified source page saved under logs/",
+  "compiler": null,
+  "optimization": null,
+  "evm_version": null,
+  "source_files": [
+    "src/PublicERC6492Validator.sol",
+    "lib/solady/src/utils/SignatureCheckerLib.sol"
+  ],
+  "abi_path": "audits/coinbase-cantina/targets/base/spend-permissions/abi/PublicERC6492Validator.json",
+  "runtime_bytecode_path": "audits/coinbase-cantina/targets/base/spend-permissions/bytecode/PublicERC6492Validator.runtime.hex",
+  "runtime_bytecode_len_bytes": 597,
+  "runtime_bytecode_hash": "0x94a000eab18fdda0465241bd0e82487463fb2e539854a3645542e57ed8dde484",
+  "verified_exact_match": true
+}
