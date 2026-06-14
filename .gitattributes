@@ -1,0 +1,6 @@
+
+# Generated audit artifacts
+audits/**/logs/*.html linguist-generated=true
+
+# Retrieved third-party dependency source
+audits/**/contracts/**/lib/** linguist-vendored=true
