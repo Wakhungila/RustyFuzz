@@ -4,3 +4,12 @@ audits/**/logs/*.html linguist-generated=true
 
 # Retrieved third-party dependency source
 audits/**/contracts/**/lib/** linguist-vendored=true
+
+# Third-party Solidity dependencies
+audits/**/contracts/**/lib/** linguist-vendored=true
+audits/**/foundry/lib/** linguist-vendored=true
+
+# Generated audit artifacts
+audits/**/logs/** linguist-generated=true
+audits/**/bytecode/** linguist-generated=true
+audits/**/seeds/** linguist-generated=true
