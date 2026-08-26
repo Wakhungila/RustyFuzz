@@ -858,8 +858,6 @@ mod tests {
                 is_victim: false,
             }],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         MainnetSeed {
             id: id.to_string(),

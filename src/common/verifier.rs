@@ -571,8 +571,6 @@ mod tests {
                 is_victim: false,
             }],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let base = ChainState::Evm(CacheDB::new(ForkDb::empty()));
         let report = RealismVerifier::new(1024).prove(&base, &BlockEnv::default(), &input);
@@ -607,8 +605,6 @@ mod tests {
                 is_victim: false,
             }],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let base = ChainState::Evm(db);
         let report = RealismVerifier::new(1024).prove(&base, &BlockEnv::default(), &input);
@@ -618,5 +614,48 @@ mod tests {
         assert_eq!(report.evidence_grade, EvidenceGrade::RealisticForkProof);
         assert!(report.rejection_reasons.is_empty());
         assert!(report.execution.is_some());
+    }
+
+    #[test]
+    fn is_victim_role_marker_does_not_change_evm_execution() {
+        // `is_victim` is a fuzzer role marker; EvmExecutor constructs TxEnv from
+        // caller/value/data/to only, so both executions must produce identical
+        // state effects (gas, storage, call trace, coverage).
+        let caller = addr(0x53);
+        let target = addr(0x54);
+        let make_input = |is_victim: bool| EvmInput {
+            txs: vec![SingletonTx {
+                caller,
+                to: target,
+                value: U256::from(1),
+                input: Vec::new(),
+                is_victim,
+            }],
+            base_snapshot_id: 0,
+        };
+        let base_db = || {
+            let mut db = CacheDB::new(ForkDb::empty());
+            db.insert_account_info(
+                caller,
+                AccountInfo {
+                    balance: U256::from(10u128.pow(30)),
+                    ..AccountInfo::default()
+                },
+            );
+            ChainState::Evm(db)
+        };
+
+        let verifier = ReplayVerifier::new(1024);
+        let plain = verifier
+            .replay(&base_db(), &BlockEnv::default(), &make_input(false))
+            .expect("plain replay");
+        let victim = verifier
+            .replay(&base_db(), &BlockEnv::default(), &make_input(true))
+            .expect("victim-marked replay");
+
+        assert_eq!(plain.total_gas_used, victim.total_gas_used);
+        assert_eq!(plain.final_coverage_hash, victim.final_coverage_hash);
+        assert_eq!(plain.storage_diffs, victim.storage_diffs);
+        assert_eq!(plain.call_trace, victim.call_trace);
     }
 }

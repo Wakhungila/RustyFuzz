@@ -2,7 +2,7 @@ use crate::common::types::SingletonTx;
 use crate::engine::bytecode_analysis::FunctionSliceSummary;
 use crate::engine::foundry_ingest::FoundryHarnessManifest;
 use crate::engine::target_profile::ProtocolType;
-use crate::evm::fuzz::{AbiRegistry, EvmInput, MutationProvenance};
+use crate::evm::fuzz::{AbiRegistry, EvmInput, EvmTestcaseMetadata, MutationProvenance};
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use revm::primitives::{keccak256, Address, B256, U256};
 use serde::{Deserialize, Serialize};
@@ -51,20 +51,13 @@ pub struct SeedCandidate {
 }
 
 impl SeedCandidate {
-    pub fn into_evm_input(self, base_snapshot_id: u64) -> EvmInput {
+    /// Converts the candidate into semantic input plus testcase metadata.
+    pub fn into_parts(self, base_snapshot_id: u64) -> (EvmInput, EvmTestcaseMetadata) {
         let detail = format!(
             "seed source={:?}, confidence={}, reason={}",
             self.source_type, self.confidence_score, self.reason
         );
-        EvmInput {
-            txs: vec![SingletonTx {
-                input: self.calldata,
-                caller: self.caller,
-                to: self.target,
-                value: self.value,
-                is_victim: false,
-            }],
-            base_snapshot_id,
+        let metadata = EvmTestcaseMetadata {
             waypoints: Vec::new(),
             mutation_provenance: vec![MutationProvenance {
                 strategy: "seed_intelligence".to_string(),
@@ -72,7 +65,26 @@ impl SeedCandidate {
                 selector: self.selector,
                 detail,
             }],
+        };
+        (
+            EvmInput::new(vec![self.into_singleton_tx()], base_snapshot_id),
+            metadata,
+        )
+    }
+
+    fn into_singleton_tx(self) -> SingletonTx {
+        SingletonTx {
+            input: self.calldata,
+            caller: self.caller,
+            to: self.target,
+            value: self.value,
+            is_victim: false,
         }
+    }
+
+    /// Semantic-only conversion; seed provenance is available via `into_parts`.
+    pub fn into_evm_input(self, base_snapshot_id: u64) -> EvmInput {
+        self.into_parts(base_snapshot_id).0
     }
 }
 
@@ -906,11 +918,11 @@ impl SeedIntelligence {
         candidates: Vec<SeedCandidate>,
         base_snapshot_id: u64,
         max_sequence_len: usize,
-    ) -> Vec<EvmInput> {
+    ) -> Vec<(EvmInput, EvmTestcaseMetadata)> {
         let mut inputs = candidates
             .iter()
             .cloned()
-            .map(|candidate| candidate.into_evm_input(base_snapshot_id))
+            .map(|candidate| candidate.into_parts(base_snapshot_id))
             .collect::<Vec<_>>();
         let max_window = max_sequence_len.clamp(2, 4).min(candidates.len());
         for window_len in 2..=max_window {
@@ -932,12 +944,13 @@ impl SeedIntelligence {
                         detail: candidate.reason.clone(),
                     });
                 }
-                inputs.push(EvmInput {
-                    txs,
-                    base_snapshot_id,
-                    waypoints: Vec::new(),
-                    mutation_provenance: provenance,
-                });
+                inputs.push((
+                    EvmInput::new(txs, base_snapshot_id),
+                    EvmTestcaseMetadata {
+                        waypoints: Vec::new(),
+                        mutation_provenance: provenance,
+                    },
+                ));
             }
         }
         inputs
@@ -1068,7 +1081,7 @@ mod tests {
         assert!(seeds[0].tags.contains(&SeedTag::Erc20));
         let inputs = intelligence.historical_candidates_to_inputs(seeds, 0, 2);
         assert!(!inputs.is_empty());
-        assert_eq!(inputs[0].txs[0].caller, Address::repeat_byte(0x13));
+        assert_eq!(inputs[0].0.txs[0].caller, Address::repeat_byte(0x13));
     }
 
     #[test]
@@ -1103,7 +1116,7 @@ mod tests {
             .parse_historical_seed_json(json)
             .expect("historical seeds");
         let inputs = intelligence.historical_candidates_to_inputs(seeds, 0, 4);
-        assert!(inputs.iter().any(|input| input.txs.len() == 2));
+        assert!(inputs.iter().any(|(input, _)| input.txs.len() == 2));
     }
 
     #[test]

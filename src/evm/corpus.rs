@@ -8,7 +8,7 @@ use crate::engine::proof::{ProofCarryingFinding, ProofConfidenceTier};
 use crate::engine::scoring::CampaignScore;
 use crate::evm::feedback::EvmCoverageFeedback;
 use crate::evm::fork_db::{EvmCacheDb, ForkDb, ForkDbCacheSnapshot};
-use crate::evm::fuzz::EvmInput;
+use crate::evm::fuzz::{EvmInput, EvmTestcaseMetadata};
 use crate::evm::inspector::MAP_SIZE;
 use crate::evm::seed_ingester::MainnetSeedBundle;
 use anyhow::Context;
@@ -182,11 +182,12 @@ impl PersistentCorpus {
         coverage: &[u8],
         gas_used: u64,
     ) -> anyhow::Result<CorpusEntryMetadata> {
-        let encoded = serde_json::to_vec(input)?;
-        let input_hash = format!("0x{}", hex::encode(revm::primitives::keccak256(&encoded)));
-        let id = input_hash.trim_start_matches("0x")[..16].to_string();
+        // Stage 2B: identity is derived from canonical semantic content only
+        // (schema version || base snapshot || transactions), never from serialized
+        // feedback fields.
+        let input_hash = input.semantic_input_hash();
         let metadata = CorpusEntryMetadata {
-            id: id.clone(),
+            id: String::new(),
             input_hash,
             path_hash: EvmCoverageFeedback::stable_path_hash(coverage),
             state_hash: 0,
@@ -197,11 +198,7 @@ impl PersistentCorpus {
             frontier: CorpusFrontierMetadata::default(),
         };
 
-        let input_path = self.root.join("inputs").join(format!("{id}.json"));
-        let meta_path = self.root.join("inputs").join(format!("{id}.meta.json"));
-        fs::write(input_path, serde_json::to_vec_pretty(input)?)?;
-        fs::write(meta_path, serde_json::to_vec_pretty(&metadata)?)?;
-        Ok(metadata)
+        self.write_entry_file(input, metadata)
     }
 
     pub fn persist_execution_input(
@@ -211,11 +208,10 @@ impl PersistentCorpus {
         coverage: &[u8],
         state_novelty_score: u64,
     ) -> anyhow::Result<CorpusEntryMetadata> {
-        let encoded = serde_json::to_vec(input)?;
-        let input_hash = format!("0x{}", hex::encode(revm::primitives::keccak256(&encoded)));
-        let id = input_hash.trim_start_matches("0x")[..16].to_string();
+        // Stage 2B: canonical semantic identity; execution feedback stays out.
+        let input_hash = input.semantic_input_hash();
         let metadata = CorpusEntryMetadata {
-            id: id.clone(),
+            id: String::new(),
             input_hash,
             path_hash: EvmCoverageFeedback::stable_path_hash(coverage),
             state_hash: crate::evm::feedback::stable_execution_state_hash(execution),
@@ -226,6 +222,48 @@ impl PersistentCorpus {
             frontier: frontier_metadata(execution),
         };
 
+        self.write_entry_file(input, metadata)
+    }
+
+    /// Writes one input entry using the legacy 16-hex-char filename derived
+    /// from the full semantic hash.
+    ///
+    /// Stage 2B.1 collision guard: the truncated prefix is only an index hint.
+    /// When the target files already exist we compare the recorded full input
+    /// hash against the entry being written:
+    /// - equal -> same semantic input; rewriting is idempotent;
+    /// - different -> a real 64-bit-prefix collision (or legacy foreign file);
+    ///   the new entry keeps both inputs distinct under a deterministic
+    ///   extended name `<prefix>-<fullhash>.json`.
+    ///
+    /// Historical corpora never rewritten; loading resolves full hashes via
+    /// `load_input_with_metadata` against `input_hash` when needed.
+    fn write_entry_file(
+        &self,
+        input: &EvmInput,
+        mut metadata: CorpusEntryMetadata,
+    ) -> anyhow::Result<CorpusEntryMetadata> {
+        let full_hash = metadata.input_hash.trim_start_matches("0x").to_string();
+        let prefix = &full_hash[..16];
+        let input_path = self.root.join("inputs").join(format!("{prefix}.json"));
+        let meta_path = self.root.join("inputs").join(format!("{prefix}.meta.json"));
+
+        let id = if input_path.exists() {
+            let existing_full = fs::read_to_string(&meta_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_str::<CorpusEntryMetadata>(&bytes).ok())
+                .map(|existing| existing.input_hash)
+                .unwrap_or_default();
+            if existing_full.trim_start_matches("0x") == full_hash {
+                prefix.to_string()
+            } else {
+                format!("{prefix}-{full_hash}")
+            }
+        } else {
+            prefix.to_string()
+        };
+
+        metadata.id = id.clone();
         let input_path = self.root.join("inputs").join(format!("{id}.json"));
         let meta_path = self.root.join("inputs").join(format!("{id}.meta.json"));
         fs::write(input_path, serde_json::to_vec_pretty(input)?)?;
@@ -233,9 +271,27 @@ impl PersistentCorpus {
         Ok(metadata)
     }
 
-    pub fn load_input(&self, id: &str) -> anyhow::Result<EvmInput> {
+    /// Loads a persisted input together with any legacy feedback/provenance.
+    ///
+    /// Pre-Stage-2B corpus files embed `waypoints` and `mutation_provenance`
+    /// directly in the input JSON. This loader splits them explicitly so no
+    /// historical data is silently discarded. Semantic inputs written after
+    /// Stage 2B deserialize with empty metadata.
+    pub fn load_input_with_metadata(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<(EvmInput, EvmTestcaseMetadata)> {
         let bytes = fs::read(self.root.join("inputs").join(format!("{id}.json")))?;
-        Ok(serde_json::from_slice(&bytes)?)
+        EvmInput::split_legacy_json(&bytes)
+            .map_err(|err| anyhow::Error::new(err).context("deserialize persisted EvmInput"))
+    }
+
+    /// Legacy-compatible loader returning only the semantic executable input.
+    ///
+    /// TODO(stage-4): retire once all loaders consume `load_input_with_metadata`
+    /// or metadata moves fully into LibAFL testcase state.
+    pub fn load_input(&self, id: &str) -> anyhow::Result<EvmInput> {
+        Ok(self.load_input_with_metadata(id)?.0)
     }
 
     pub fn len(&self) -> anyhow::Result<usize> {
@@ -619,8 +675,10 @@ impl PersistentCorpus {
         execution: &SequenceExecutionResult,
         crash: Option<&CrashRecord>,
     ) -> anyhow::Result<PathBuf> {
-        let encoded = serde_json::to_vec(input)?;
-        let input_hash = hex::encode(revm::primitives::keccak256(&encoded));
+        let input_hash = input
+            .semantic_input_hash()
+            .trim_start_matches("0x")
+            .to_string();
         let report_id = &input_hash[..16];
         let path = self.root.join(format!("repro_{report_id}.md"));
 
@@ -777,8 +835,7 @@ fn artifact_equivalence_components(
     target: Option<Address>,
     reason: &str,
 ) -> anyhow::Result<ArtifactEquivalenceComponents> {
-    let encoded = serde_json::to_vec(input)?;
-    let sequence_hash = format!("0x{}", hex::encode(revm::primitives::keccak256(encoded)));
+    let sequence_hash = input.semantic_input_hash();
     let mut finding_types: Vec<_> = findings
         .iter()
         .map(|finding| format!("{:?}:{:?}", finding.pack, finding.vuln))
@@ -984,8 +1041,6 @@ mod artifact_tests {
                     is_victim: false,
                 }],
                 base_snapshot_id: 0,
-                waypoints: Vec::new(),
-                mutation_provenance: Vec::new(),
             },
             metadata: SeedMetadata {
                 source_block: 100,
@@ -1113,8 +1168,6 @@ mod artifact_tests {
                 is_victim: false,
             }],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let mut corpus = SnapshotCorpus::new();
         corpus.add_snapshot(
@@ -1282,8 +1335,6 @@ mod artifact_tests {
                 is_victim: false,
             }],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let accounting_like = scored_execution(
             target,
@@ -1362,8 +1413,6 @@ mod artifact_tests {
                 is_victim: false,
             }],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let low = scored_execution(
             target,
@@ -1421,8 +1470,6 @@ mod artifact_tests {
                 is_victim: false,
             }],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let execution = SequenceExecutionResult {
             tx_results: vec![TxExecutionResult {
@@ -1491,8 +1538,6 @@ mod artifact_tests {
                 is_victim: false,
             }],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let execution = SequenceExecutionResult {
             tx_results: vec![TxExecutionResult {
@@ -1565,6 +1610,194 @@ mod artifact_tests {
         assert_eq!(first.record.input_id, second.record.input_id);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stage_2b_legacy_input_json_preserves_feedback_and_keeps_semantic_identity() {
+        let root = temp_corpus_root("stage2b-legacy-load");
+        let corpus = PersistentCorpus::new(&root).expect("corpus");
+        let target = Address::repeat_byte(0xab);
+        let clean = EvmInput {
+            txs: vec![SingletonTx {
+                input: vec![0xde, 0xad, 0xbe, 0xef],
+                caller: Address::repeat_byte(0x13),
+                to: target,
+                value: U256::from(1_000u64),
+                is_victim: false,
+            }],
+            base_snapshot_id: 42,
+        };
+
+        // Write a pre-Stage-2B style input file with embedded feedback.
+        let mut legacy_json = serde_json::to_value(&clean).unwrap();
+        legacy_json["waypoints"] = serde_json::json!([[]]);
+        legacy_json["mutation_provenance"] = serde_json::json!([{
+            "strategy": "goal_max_attacker_profit",
+            "tx_index": null,
+            "selector": null,
+            "detail": "bounded search"
+        }]);
+        let id = corpus_root_input_id(&clean);
+        let path = root.join("inputs").join(format!("{id}.json"));
+        std::fs::write(path, serde_json::to_vec_pretty(&legacy_json).unwrap()).unwrap();
+
+        let (input, metadata) = corpus.load_input_with_metadata(&id).expect("legacy load");
+        assert_eq!(input, clean);
+        assert_eq!(metadata.waypoints.len(), 1);
+        assert_eq!(metadata.mutation_provenance.len(), 1);
+        assert_eq!(
+            metadata.mutation_provenance[0].strategy,
+            "goal_max_attacker_profit"
+        );
+
+        // The semantic identity of the legacy record matches a clean rewrite:
+        // provenance differences cannot split one executable testcase into two.
+        assert_eq!(
+            input.semantic_input_hash(),
+            EvmInput::split_legacy_json(serde_json::to_vec_pretty(&input).unwrap().as_slice())
+                .unwrap()
+                .0
+                .semantic_input_hash()
+        );
+        assert_eq!(input.semantic_input_id(), clean.semantic_input_id());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stage_2b_semantic_dedupe_ignores_feedback_variants() {
+        let target = Address::repeat_byte(0xcd);
+        let txs = vec![SingletonTx {
+            input: vec![0xde, 0xad, 0xbe, 0xef],
+            caller: Address::repeat_byte(0x13),
+            to: target,
+            value: U256::ZERO,
+            is_victim: false,
+        }];
+
+        let plain = EvmInput::new(txs.clone(), 3);
+        let feedback_variant_json = serde_json::json!({
+            "txs": serde_json::to_value(&txs).unwrap(),
+            "base_snapshot_id": 3,
+            "waypoints": [[], [], []],
+            "mutation_provenance": [
+                {"strategy": "caller", "tx_index": 0, "selector": null, "detail": "changed caller role"},
+                {"strategy": "value_boundary", "tx_index": 0, "selector": null, "detail": "changed tx value"}
+            ]
+        });
+        let (feedback_variant, metadata) =
+            EvmInput::split_legacy_json(feedback_variant_json.to_string().as_bytes()).unwrap();
+
+        assert_ne!(metadata.waypoints, EvmTestcaseMetadata::default().waypoints);
+        // Identical execution-defining content, different feedback: same identity.
+        assert_eq!(
+            plain.semantic_input_id(),
+            feedback_variant.semantic_input_id()
+        );
+
+        // Different execution-defining content must not deduplicate.
+        let mut different_value = plain.clone();
+        different_value.txs[0].value = U256::from(7u64);
+        assert_ne!(
+            plain.semantic_input_id(),
+            different_value.semantic_input_id()
+        );
+    }
+
+    #[test]
+    fn stage_2b1_prefix_collision_preserves_both_entries() {
+        let root = temp_corpus_root("stage2b1-prefix-collision");
+        let corpus = PersistentCorpus::new(&root).expect("corpus");
+        let target = Address::repeat_byte(0xef);
+        let victim_input = EvmInput {
+            txs: vec![SingletonTx {
+                input: vec![0xde, 0xad, 0xbe, 0xef],
+                caller: Address::repeat_byte(0x13),
+                to: target,
+                value: U256::from(5_000u64),
+                is_victim: true,
+            }],
+            base_snapshot_id: 7,
+        };
+        let attacker_input = EvmInput {
+            txs: vec![SingletonTx {
+                input: vec![0xde, 0xad, 0xbe, 0xef],
+                caller: Address::repeat_byte(0x13),
+                to: target,
+                value: U256::from(5_000u64),
+                is_victim: false,
+            }],
+            base_snapshot_id: 7,
+        };
+        // The two inputs differ only in the analysis-only role marker, so they
+        // share one semantic InputId. To exercise the prefix-collision path we
+        // plant a foreign legacy entry under the same truncated prefix whose
+        // recorded full hash points elsewhere.
+        let metadata = corpus
+            .persist_input(&victim_input, &[1, 2, 3], 21_000)
+            .expect("persist first");
+        let full_hash = metadata.input_hash.trim_start_matches("0x").to_string();
+        assert_eq!(metadata.id, full_hash[..16]);
+
+        // Inject a foreign record occupying the same 16-hex prefix with a
+        // different full semantic hash.
+        let foreign = CorpusEntryMetadata {
+            id: metadata.id.clone(),
+            input_hash: format!("0x{}{}", "9".repeat(16), "a".repeat(48)),
+            ..serde_json::from_str::<CorpusEntryMetadata>(
+                &std::fs::read_to_string(
+                    root.join("inputs")
+                        .join(format!("{}.meta.json", metadata.id)),
+                )
+                .unwrap_or_else(|_| serde_json::to_string(&metadata).unwrap()),
+            )
+            .unwrap_or(metadata.clone())
+        };
+        std::fs::write(
+            root.join("inputs")
+                .join(format!("{}.meta.json", metadata.id)),
+            serde_json::to_vec_pretty(&foreign).unwrap(),
+        )
+        .unwrap();
+
+        let second = corpus
+            .persist_execution_input(
+                &attacker_input,
+                &scored_minimal_execution(target),
+                &[4, 5, 6],
+                3,
+            )
+            .expect("persist colliding");
+        assert_ne!(second.id, metadata.id);
+        assert!(second.id.starts_with(&format!("{}-", &full_hash[..16])));
+        assert_eq!(second.input_hash, attacker_input.semantic_input_hash());
+        // Both entries remain loadable and distinct.
+        let loaded_first = corpus
+            .load_input_with_metadata(&metadata.id)
+            .expect("first");
+        let loaded_second = corpus.load_input_with_metadata(&second.id).expect("second");
+        assert_eq!(loaded_first.0.semantic_input_hash(), metadata.input_hash);
+        assert_eq!(
+            loaded_second.0.semantic_input_hash(),
+            attacker_input.semantic_input_hash()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn scored_minimal_execution(_target: Address) -> SequenceExecutionResult {
+        SequenceExecutionResult {
+            tx_results: Vec::new(),
+            total_gas_used: 21_000,
+            final_coverage_hash: 1,
+            storage_reads: Vec::new(),
+            storage_writes: Vec::new(),
+            storage_diffs: Vec::new(),
+            call_trace: Vec::new(),
+            oracle_observations: Vec::new(),
+        }
+    }
+    fn corpus_root_input_id(input: &EvmInput) -> String {
+        input.semantic_input_hash().trim_start_matches("0x")[..16].to_string()
     }
 
     #[test]

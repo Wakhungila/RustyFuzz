@@ -1,11 +1,12 @@
 use crate::common::types::SingletonTx;
 use crate::engine::actors::{ActorModel, ActorModelConfig, ActorSet, ActorType};
+use crate::engine::dependency::{generate_flow_template_inputs, FlowTemplate};
 use crate::engine::exploit_path::{
     CounterexampleProofStatus, ExploitExtensionHint, MinimizedSequenceStatus, ReplayabilityStatus,
 };
 use crate::engine::seed_intelligence::SeedCandidate;
 use crate::engine::target_profile::{ProtocolType, TargetProfile};
-use crate::evm::fuzz::{AbiRegistry, EvmInput, MutationProvenance};
+use crate::evm::fuzz::{AbiRegistry, EvmInput, EvmTestcaseMetadata, MutationProvenance};
 use revm::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +42,9 @@ pub struct BoundedSearchRequest<'a> {
 pub struct BoundedSearchOutcome {
     pub template_name: String,
     pub candidate: crate::engine::protocol_model::CounterexampleCandidate,
+    /// Stage 2B: mutation/objective provenance for this semantic input.
+    #[serde(default)]
+    pub metadata: EvmTestcaseMetadata,
     #[serde(default)]
     pub objectives: Vec<SearchObjectiveHit>,
     #[serde(default)]
@@ -91,7 +95,7 @@ impl BoundedSearchEngine {
             .iter()
             .take(request.bounds.max_actor_roles.max(1))
             .collect::<Vec<_>>();
-        let mut template_inputs = crate::engine::dependency::generate_flow_template_inputs(
+        let mut template_inputs = generate_flow_template_inputs(
             request.target,
             actor_set.address_for(ActorType::Attacker),
             request.abi_registry,
@@ -103,17 +107,18 @@ impl BoundedSearchEngine {
                     .seed_candidates
                     .iter()
                     .cloned()
-                    .map(|seed| seed.into_evm_input(0))
-                    .collect::<Vec<_>>(),
+                    .map(|seed| (seed.into_evm_input(0), EvmTestcaseMetadata::default()))
+                    .collect::<Vec<FlowTemplate>>(),
             );
         }
         if template_inputs.is_empty() {
-            template_inputs.push(
+            template_inputs.push((
                 request
                     .base_input
                     .cloned()
                     .unwrap_or_else(|| fallback_input(request.target)),
-            );
+                EvmTestcaseMetadata::default(),
+            ));
         }
 
         let mut candidates = Vec::new();
@@ -121,7 +126,7 @@ impl BoundedSearchEngine {
         let modeled_space_size = template_count.saturating_mul(actor_space.len().max(1));
         let exhaustive = template_count <= request.bounds.max_template_sequences;
 
-        for mut input in template_inputs
+        for (mut input, mut metadata) in template_inputs
             .into_iter()
             .take(request.bounds.max_template_sequences)
         {
@@ -129,7 +134,7 @@ impl BoundedSearchEngine {
             let selected_profile = classify_candidate_profile(request.target_profile, &input);
             let objective_hits = evaluate_search_objectives(request.target_profile, &input);
             let objective_score = objective_hits.iter().map(|hit| hit.score).sum::<u64>();
-            annotate_objectives(&mut input, &objective_hits);
+            annotate_objectives(&mut metadata, &objective_hits);
             let proof_status = if selected_profile.exhaustive {
                 CounterexampleProofStatus::AbstractlyProven
             } else {
@@ -171,6 +176,7 @@ impl BoundedSearchEngine {
             candidates.push(BoundedSearchOutcome {
                 template_name: selected_profile.template_name,
                 candidate,
+                metadata,
                 objectives: objective_hits,
                 objective_score,
                 exhaustive: selected_profile.exhaustive,
@@ -199,11 +205,12 @@ impl BoundedSearchEngine {
                 .base_input
                 .cloned()
                 .unwrap_or_else(|| fallback_input(request.target));
+            let mut metadata = EvmTestcaseMetadata::default();
             let actor_roles = actor_set.apply_roles_to_sequence(&mut input.txs);
             let selected_profile = classify_candidate_profile(request.target_profile, &input);
             let objective_hits = evaluate_search_objectives(request.target_profile, &input);
             let objective_score = objective_hits.iter().map(|hit| hit.score).sum::<u64>();
-            annotate_objectives(&mut input, &objective_hits);
+            annotate_objectives(&mut metadata, &objective_hits);
             let candidate = crate::engine::protocol_model::CounterexampleCandidate {
                 input,
                 target: Some(request.target),
@@ -233,6 +240,7 @@ impl BoundedSearchEngine {
             candidates.push(BoundedSearchOutcome {
                 template_name: "fallback-generic".to_string(),
                 candidate,
+                metadata,
                 objectives: objective_hits,
                 objective_score,
                 exhaustive: false,
@@ -441,8 +449,8 @@ pub fn evaluate_search_objectives(
     hits
 }
 
-fn annotate_objectives(input: &mut EvmInput, objectives: &[SearchObjectiveHit]) {
-    input
+fn annotate_objectives(metadata: &mut EvmTestcaseMetadata, objectives: &[SearchObjectiveHit]) {
+    metadata
         .mutation_provenance
         .extend(objectives.iter().map(|hit| {
             MutationProvenance {
@@ -617,8 +625,6 @@ fn fallback_input(target: Address) -> EvmInput {
             is_victim: false,
         }],
         base_snapshot_id: 0,
-        waypoints: Vec::new(),
-        mutation_provenance: Vec::new(),
     }
 }
 
@@ -734,8 +740,7 @@ mod tests {
             .any(|hit| { matches!(hit.objective, SearchObjective::IncreaseSharesPerAsset) }));
         assert!(top.objective_score > 0);
         assert!(top
-            .candidate
-            .input
+            .metadata
             .mutation_provenance
             .iter()
             .any(|entry| entry.strategy.starts_with("goal_")));
@@ -817,8 +822,6 @@ mod tests {
                 is_victim: false,
             }],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let hits = evaluate_search_objectives(&profile, &input);
         assert!(hits

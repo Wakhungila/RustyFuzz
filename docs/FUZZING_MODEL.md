@@ -11,7 +11,10 @@ LibAFL-backed scheduler.
 Current important implementation details:
 
 - `EvmInput` is sequence-oriented and already carries a base snapshot id.
-- `EvmInput` still also carries feedback/provenance fields such as waypoints and mutation provenance.
+- Stage 2B (CURRENT): `EvmInput` carries only execution-defining data; waypoints
+  and mutation provenance were moved to `EvmTestcaseMetadata`. During campaigns,
+  guidance flows through `EvmTestcaseMetadataStore` keyed by semantic `InputId`
+  (`rustyfuzz-input-id-v1`); persisted inputs no longer contain feedback fields.
 - `SnapshotCorpus` exists in the current EVM corpus implementation.
 - Sequence mutation and snapshot scoring are implemented inside the monolith.
 - Exploration may use explicit synthetic fallback paths for smoke/benchmark modes.
@@ -55,5 +58,6 @@ SnapshotCorpus
   -> new Snapshot
 ```
 
-Stage 1 does not implement this target. Stage 2 starts with `rustyfuzz-core`
-and the semantic-input boundary.
+Stage 2A implemented `rustyfuzz-core`; Stage 2B implemented the semantic-input
+boundary for `EvmInput` plus canonical `InputId`. Full `ObservationBundle`
+metadata and snapshot redesign remain future stages.

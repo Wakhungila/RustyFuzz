@@ -7,6 +7,7 @@ use crate::engine::exploit_path::exploit_path_score;
 use crate::engine::protocol_model::FormalProtocolModel;
 use crate::evm::feedback::StateNoveltyReport;
 use crate::evm::fuzz::EvmInput;
+use crate::evm::fuzz::MutationProvenance;
 use crate::evm::trace::ExecutionTrace;
 use revm::primitives::U256;
 use serde::{Deserialize, Serialize};
@@ -96,10 +97,12 @@ impl CampaignScorer {
         execution: &SequenceExecutionResult,
         state_novelty: &StateNoveltyReport,
         findings: &[ProtocolFinding],
+        provenance: &[MutationProvenance],
     ) -> CampaignScore {
         let mut explanation = Vec::new();
         let economic_pressure = self.economic_pressure(execution, findings, &mut explanation);
-        let invariant_pressure = self.invariant_pressure(findings, input, &mut explanation);
+        let invariant_pressure =
+            self.invariant_pressure(findings, input, provenance, &mut explanation);
         let protocol_model = FormalProtocolModel::synthesize(input, execution, findings, None);
         let counterexample_pressure = protocol_model.counterexample_pressure();
         if counterexample_pressure > 0 {
@@ -120,14 +123,14 @@ impl CampaignScorer {
             self.exploration_pressure(input, execution, &mut explanation);
         let dataflow_pressure = self.dataflow_pressure(input, execution, &mut explanation);
         exploration_pressure = exploration_pressure.saturating_add(dataflow_pressure);
-        let dependency_pressure = dependency_sequence_score(input);
+        let dependency_pressure = dependency_sequence_score(input, provenance);
         if dependency_pressure > 0 {
             explanation.push(format!(
                 "dependency-aware sequence pressure {dependency_pressure}"
             ));
             exploration_pressure = exploration_pressure.saturating_add(dependency_pressure);
         }
-        let exploit_pressure = exploit_path_score(input);
+        let exploit_pressure = exploit_path_score(provenance);
         if exploit_pressure > 0 {
             explanation.push(format!(
                 "exploit-directed sequence pressure {exploit_pressure}"
@@ -207,7 +210,8 @@ impl CampaignScorer {
     fn invariant_pressure(
         &self,
         findings: &[ProtocolFinding],
-        input: &EvmInput,
+        _input: &EvmInput,
+        provenance: &[MutationProvenance],
         explanation: &mut Vec<String>,
     ) -> u64 {
         let invariant_findings = findings
@@ -226,8 +230,7 @@ impl CampaignScorer {
                 ) || finding.severity == ProtocolSeverity::Critical
             })
             .count() as u64;
-        let oracle_guided_mutations = input
-            .mutation_provenance
+        let oracle_guided_mutations = provenance
             .iter()
             .filter(|mutation| {
                 matches!(
@@ -941,8 +944,6 @@ mod tests {
         let input = EvmInput {
             txs: vec![tx(function_selector("deposit(uint256,address)"))],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let execution = execution_with_txs(
             vec![result(
@@ -974,8 +975,6 @@ mod tests {
                 tx(function_selector("transferFrom(address,address,uint256)")),
             ],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let execution = execution_with_txs(
             vec![result(0, Vec::new()), result(1, Vec::new())],
@@ -994,8 +993,6 @@ mod tests {
                 "liquidationCall(address,address,address,uint256,bool)",
             ))],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let execution = execution_with_txs(
             vec![result(0, Vec::new())],
@@ -1027,8 +1024,6 @@ mod tests {
         let input = EvmInput {
             txs: vec![tx(function_selector("upgradeTo(address)"))],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let execution = execution_with_txs(
             vec![result(

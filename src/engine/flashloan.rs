@@ -1,5 +1,5 @@
 use crate::engine::economic_delta::EconomicDeltaReport;
-use crate::evm::fuzz::{EvmInput, MutationProvenance};
+use crate::evm::fuzz::EvmInput;
 use revm::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 
@@ -43,13 +43,6 @@ impl FlashLoanTemplate {
             value: U256::ZERO,
             is_victim: false,
         }];
-        input.mutation_provenance.push(MutationProvenance {
-            strategy: "flashloan_template".to_string(),
-            tx_index: Some(0),
-            selector: Some(EIP3156_FLASHLOAN_SELECTOR),
-            detail: "borrow->manipulate->exploit->repay wrapper with net-profit validation target"
-                .to_string(),
-        });
         input
     }
 }

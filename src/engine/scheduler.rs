@@ -226,8 +226,6 @@ mod tests {
         EvmInput {
             txs: Vec::new(),
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         }
     }
 

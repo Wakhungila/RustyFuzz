@@ -98,6 +98,29 @@ Required tests:
 - executing a testcase does not silently change its identity;
 - existing serialized inputs have an explicit migration/compatibility path.
 
+### Stage 2B Implementation Status (CURRENT)
+
+Stage 2B is implemented; see
+`docs/reengineering/STAGE_2B_INPUT_METADATA_SEPARATION.md`. Summary of deltas
+from the plan above:
+
+- Semantic input field names were kept as-is (`txs`, `base_snapshot_id`) for
+  persisted-schema stability.
+- Only EVM-relevant metadata was moved: `EvmTestcaseMetadata { waypoints,
+  mutation_provenance }`. Coverage, comparison feedback, state novelty, and
+  scheduler data keep their existing owners; no single giant metadata object
+  was created.
+- Concrete identity contract: `rustyfuzz-input-id-v1`, Keccak-256 over
+  length-prefixed schema version, base snapshot id, and transaction sequence
+  (documented in ADR 0003). Golden regression test pins an exact digest.
+- Legacy compatibility: `LegacyEvmInputV1` + `EvmInput::split_legacy_json`;
+  `PersistentCorpus::load_input_with_metadata` reads pre-separation files
+  without discarding feedback. Historical corpus entries are not rewritten.
+- Metadata ownership during campaigns is a temporary sidecar
+  (`EvmTestcaseMetadataStore`) shared by harnesses and `EvmMutator`,
+  marked `TODO(stage-4)`; scoring/mutator signatures take provenance
+  explicitly to avoid feedback re-entering semantic identity through wrappers.
+
 ## Stage 2C - Snapshot Semantic Model
 
 Goal: define snapshot identity, ancestry, and restoration contracts before

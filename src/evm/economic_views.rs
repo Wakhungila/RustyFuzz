@@ -255,18 +255,16 @@ mod tests {
     fn probe_plan_infers_actors_and_contracts_from_sequence() {
         let caller = Address::new([0x11; 20]);
         let target = Address::new([0x22; 20]);
-        let input = crate::evm::fuzz::EvmInput {
-            txs: vec![SingletonTx {
+        let input = crate::evm::fuzz::EvmInput::new(
+            vec![SingletonTx {
                 input: vec![1, 2, 3, 4],
                 caller,
                 to: target,
                 value: U256::ZERO,
                 is_victim: false,
             }],
-            base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
-        };
+            0,
+        );
         let plan = EconomicViewProbePlan::from_sequence(&input, Some(target));
         assert_eq!(plan.actors, vec![caller]);
         assert!(plan.tokens.contains(&target));

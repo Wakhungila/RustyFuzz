@@ -57,12 +57,7 @@ impl ProofCarryingFinding {
         findings: &[ProtocolFinding],
     ) -> Self {
         let economic_delta = EconomicDeltaEngine::from_execution(
-            &crate::evm::fuzz::EvmInput {
-                txs: candidate.sequence.clone(),
-                base_snapshot_id: 0,
-                waypoints: Vec::new(),
-                mutation_provenance: Vec::new(),
-            },
+            &crate::evm::fuzz::EvmInput::new(candidate.sequence.clone(), 0),
             execution,
         );
         let violated_condition = candidate

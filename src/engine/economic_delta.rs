@@ -1110,8 +1110,6 @@ mod tests {
                 },
             ],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let execution = SequenceExecutionResult {
             tx_results: vec![TxExecutionResult {
@@ -1169,8 +1167,6 @@ mod tests {
                 is_victim: false,
             }],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let execution = SequenceExecutionResult {
             tx_results: vec![TxExecutionResult {
@@ -1219,8 +1215,6 @@ mod tests {
                 is_victim: false,
             }],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let execution = SequenceExecutionResult {
             tx_results: vec![TxExecutionResult {
@@ -1305,8 +1299,6 @@ mod tests {
                 is_victim: false,
             }],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let execution = SequenceExecutionResult {
             tx_results: vec![TxExecutionResult {
@@ -1365,8 +1357,6 @@ mod tests {
                 is_victim: false,
             }],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let diff = StorageDiff {
             tx_index: 0,

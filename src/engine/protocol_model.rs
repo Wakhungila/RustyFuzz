@@ -503,12 +503,12 @@ fn build_candidate_template(
 
     let mut template_inputs = generate_flow_template_inputs(target, attacker, &abi_registry);
     if template_inputs.is_empty() {
-        template_inputs.push(input.clone());
+        template_inputs.push((input.clone(), Default::default()));
     }
 
-    let mut selected = template_inputs
+    let (mut selected, selected_metadata) = template_inputs
         .into_iter()
-        .max_by_key(|candidate| candidate.txs.len())?;
+        .max_by_key(|(candidate, _)| candidate.txs.len())?;
     let actor_roles = if let Some(set) = actor_set {
         set.apply_roles_to_sequence(&mut selected.txs)
     } else {
@@ -552,7 +552,10 @@ fn build_candidate_template(
         .unwrap_or_default();
     let mut evidence = vec![
         format!("formal-model confidence={}", model.confidence),
-        format!("dependency-score={}", dependency_sequence_score(&selected)),
+        format!(
+            "dependency-score={}",
+            dependency_sequence_score(&selected, &selected_metadata.mutation_provenance)
+        ),
     ];
     if let Some(hypothesis) = best_invariant {
         evidence.push(format!(
@@ -916,8 +919,6 @@ mod tests {
                 },
             ],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let execution = SequenceExecutionResult {
             tx_results: vec![TxExecutionResult {
@@ -1006,8 +1007,6 @@ mod tests {
                 is_victim: false,
             }],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let execution = execution_with_selectors(&["deposit(uint256,address)", "latestAnswer()"]);
         let findings = vec![ProtocolFinding {

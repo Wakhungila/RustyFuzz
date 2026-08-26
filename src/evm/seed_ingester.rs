@@ -543,18 +543,16 @@ fn seed_from_parts(
             inputs: function.inputs.clone(),
             classification: function.classification.clone(),
         });
-    let seed_input = EvmInput {
-        txs: vec![SingletonTx {
+    let seed_input = EvmInput::new(
+        vec![SingletonTx {
             input: input_bytes.clone(),
             caller,
             to,
             value,
             is_victim: false,
         }],
-        base_snapshot_id: 0,
-        waypoints: Vec::new(),
-        mutation_provenance: Vec::new(),
-    };
+        0,
+    );
     let metadata = SeedMetadata {
         source_block,
         block_offset,

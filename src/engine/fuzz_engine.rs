@@ -31,7 +31,7 @@ use crate::evm::dataflow::DataflowRegistry;
 use crate::evm::executor::EvmExecutor;
 use crate::evm::feedback::{EvmCoverageFeedback, EvmStateNoveltyFeedback, StateNoveltyReport};
 use crate::evm::fork_db::{execution_rpc_budget, ForkDb};
-use crate::evm::fuzz::{AbiRegistry, EvmMutator};
+use crate::evm::fuzz::{AbiRegistry, EvmMutator, EvmTestcaseMetadataStore, MutationProvenance};
 use crate::evm::inspector::MAP_SIZE;
 use crate::evm::registry::GlobalAccountRegistry;
 use crate::evm::snapshot::new_evm_snapshot;
@@ -674,6 +674,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 let telemetry = Arc::new(CampaignTelemetry::new());
                 let promotion_stats = Arc::new(PromotionCampaignStats::default());
                 let pending_campaign_score = Arc::new(RwLock::new(None));
+                let testcase_metadata_store = EvmTestcaseMetadataStore::default();
                 let campaign_scorer = Arc::new(CampaignScorer::default());
                 let protocol_oracles = Arc::new(ProtocolOraclePack::default());
                 let evm_executor = Arc::new(EvmExecutor::new());
@@ -855,7 +856,9 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
                     if !hardened_seed_candidates.is_empty() {
                         for seed in hardened_seed_candidates.clone() {
-                            state.corpus_mut().add(Testcase::new(seed.into_evm_input(0)))?;
+                            let (input, metadata) = seed.into_parts(0);
+                            testcase_metadata_store.insert(&input, metadata);
+                            state.corpus_mut().add(Testcase::new(input))?;
                             inserted_seed_count += 1;
                         }
                         log::info!(
@@ -876,10 +879,11 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                                     abi_registry.as_ref(),
                                 );
                                 template_inputs.truncate(config.hardened_defi.max_template_sequences);
-                                for mut template in template_inputs {
+                                for (mut template, template_metadata) in template_inputs {
                                     if let Some(actor_set) = hardened_actor_set.as_ref() {
                                         actor_set.apply_roles_to_sequence(&mut template.txs);
                                     }
+                                    testcase_metadata_store.insert(&template, template_metadata);
                                     state.corpus_mut().add(Testcase::new(template))?;
                                     inserted_seed_count += 1;
                                 }
@@ -901,9 +905,11 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                             config.foundry_harness.as_ref(),
                         );
                         for seed in intelligent_seeds {
+                            let (input, metadata) = seed.into_parts(0);
+                            testcase_metadata_store.insert(&input, metadata);
                             state
                                 .corpus_mut()
-                                .add(Testcase::new(seed.into_evm_input(0)))?;
+                                .add(Testcase::new(input))?;
                             inserted_seed_count += 1;
                         }
                         if inserted_seed_count > 0 {
@@ -947,6 +953,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     account_registry.clone(),
                     concolic_hints.clone(),
                     telemetry.concolic_hint_stats.clone(),
+                    testcase_metadata_store.clone(),
                 );
                 let mut stages = tuple_list!(StdMutationalStage::with_max_iterations(
                     mutator,
@@ -1075,8 +1082,16 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     ));
                     apply_min_finding_confidence(&mut findings, config.min_finding_confidence);
 
-                    let mut campaign_score =
-                        campaign_scorer.score(input, &execution, &report, &findings);
+                    let testcase_provenance = testcase_metadata_store
+                        .get_or_default(input)
+                        .mutation_provenance;
+                    let mut campaign_score = campaign_scorer.score(
+                        input,
+                        &execution,
+                        &report,
+                        &findings,
+                        &testcase_provenance,
+                    );
                     if let Some(economic_delta) = economic_delta {
                         let delta_score = EconomicDeltaEngine::score(&economic_delta);
                         if delta_score > 0 {
@@ -1151,7 +1166,7 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     });
 
                     account_registry.write().observe_execution(&execution);
-                    let mutation_strategies = mutation_strategies(input);
+                    let mutation_strategies = mutation_strategies(&testcase_provenance);
                     record_successful_concolic_mutation(
                         telemetry.concolic_hint_stats.as_ref(),
                         &mutation_strategies,
@@ -1410,6 +1425,7 @@ async fn run_single_process_campaign(
     let telemetry = Arc::new(CampaignTelemetry::new());
     let promotion_stats = Arc::new(PromotionCampaignStats::default());
     let pending_campaign_score = Arc::new(RwLock::new(None));
+    let testcase_metadata_store = EvmTestcaseMetadataStore::default();
     let campaign_scorer = Arc::new(CampaignScorer::default());
     let protocol_oracles = Arc::new(ProtocolOraclePack::default());
     let evm_executor = Arc::new(EvmExecutor::new());
@@ -1577,7 +1593,8 @@ async fn run_single_process_campaign(
 
         if !hardened_seed_candidates.is_empty() {
             for seed in hardened_seed_candidates.clone() {
-                let input = seed.into_evm_input(0);
+                let (input, metadata) = seed.into_parts(0);
+                testcase_metadata_store.insert(&input, metadata);
                 direct_seed_inputs.push(input.clone());
                 state.corpus_mut().add(Testcase::new(input))?;
                 inserted_seed_count += 1;
@@ -1610,6 +1627,8 @@ async fn run_single_process_campaign(
                     bounded_result.modeled_space_size
                 );
                 for outcome in bounded_result.candidates.into_iter() {
+                    testcase_metadata_store
+                        .insert(&outcome.candidate.input, outcome.metadata.clone());
                     direct_seed_inputs.push(outcome.candidate.input.clone());
                     state
                         .corpus_mut()
@@ -1630,10 +1649,11 @@ async fn run_single_process_campaign(
                         abi_registry.as_ref(),
                     );
                     template_inputs.truncate(config.hardened_defi.max_template_sequences);
-                    for mut template in template_inputs {
+                    for (mut template, template_metadata) in template_inputs {
                         if let Some(actor_set) = hardened_actor_set.as_ref() {
                             actor_set.apply_roles_to_sequence(&mut template.txs);
                         }
+                        testcase_metadata_store.insert(&template, template_metadata);
                         direct_seed_inputs.push(template.clone());
                         state.corpus_mut().add(Testcase::new(template))?;
                         inserted_seed_count += 1;
@@ -1655,7 +1675,8 @@ async fn run_single_process_campaign(
                 config.foundry_harness.as_ref(),
             );
             for seed in intelligent_seeds {
-                let input = seed.into_evm_input(0);
+                let (input, metadata) = seed.into_parts(0);
+                testcase_metadata_store.insert(&input, metadata);
                 direct_seed_inputs.push(input.clone());
                 state.corpus_mut().add(Testcase::new(input))?;
                 inserted_seed_count += 1;
@@ -1700,6 +1721,7 @@ async fn run_single_process_campaign(
         account_registry.clone(),
         concolic_hints.clone(),
         telemetry.concolic_hint_stats.clone(),
+        testcase_metadata_store.clone(),
     );
     let mut stages = tuple_list!(StdMutationalStage::with_max_iterations(
         mutator,
@@ -1814,7 +1836,11 @@ async fn run_single_process_campaign(
         ));
         apply_min_finding_confidence(&mut findings, config.min_finding_confidence);
 
-        let mut campaign_score = campaign_scorer.score(input, &execution, &report, &findings);
+        let testcase_provenance = testcase_metadata_store
+            .get_or_default(input)
+            .mutation_provenance;
+        let mut campaign_score =
+            campaign_scorer.score(input, &execution, &report, &findings, &testcase_provenance);
         if let Some(economic_delta) = economic_delta {
             let delta_score = EconomicDeltaEngine::score(&economic_delta);
             if delta_score > 0 {
@@ -1883,7 +1909,7 @@ async fn run_single_process_campaign(
         });
 
         account_registry.write().observe_execution(&execution);
-        let mutation_strategies = mutation_strategies(input);
+        let mutation_strategies = mutation_strategies(&testcase_provenance);
         record_successful_concolic_mutation(
             telemetry.concolic_hint_stats.as_ref(),
             &mutation_strategies,
@@ -2293,12 +2319,11 @@ fn campaign_artifact_reason(
     None
 }
 
-fn mutation_strategies(input: &EvmInput) -> Vec<String> {
-    if input.mutation_provenance.is_empty() {
+fn mutation_strategies(provenance: &[MutationProvenance]) -> Vec<String> {
+    if provenance.is_empty() {
         return vec!["seed_or_imported".to_string()];
     }
-    input
-        .mutation_provenance
+    provenance
         .iter()
         .map(|mutation| mutation.strategy.clone())
         .collect()
@@ -2856,18 +2881,16 @@ fn populate_abi_from_foundry_harness(
 }
 
 fn seed_input(target_contract: Address, fuzzer_address: Address) -> EvmInput {
-    EvmInput {
-        txs: vec![SingletonTx {
+    EvmInput::new(
+        vec![SingletonTx {
             input: Vec::new(),
             caller: fuzzer_address,
             to: target_contract,
             value: U256::ZERO,
             is_victim: false,
         }],
-        base_snapshot_id: 0,
-        waypoints: Vec::new(),
-        mutation_provenance: Vec::new(),
-    }
+        0,
+    )
 }
 
 #[cfg(test)]

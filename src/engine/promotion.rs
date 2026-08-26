@@ -1389,8 +1389,6 @@ mod tests {
         let input = EvmInput {
             txs: Vec::new(),
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
 
         let markdown = finding_markdown(&record, None, &input);

@@ -1,5 +1,5 @@
 use crate::common::types::{ExecutionStatus, SequenceExecutionResult, SingletonTx, StorageAccess};
-use crate::evm::fuzz::{AbiRegistry, EvmInput, MutationProvenance};
+use crate::evm::fuzz::{AbiRegistry, EvmInput, EvmTestcaseMetadata, MutationProvenance};
 use alloy_dyn_abi::DynSolValue;
 use revm::primitives::{keccak256, Address, U256};
 use serde::{Deserialize, Serialize};
@@ -87,11 +87,13 @@ impl TransactionDependencyGraph {
     }
 }
 
+pub type FlowTemplate = (EvmInput, EvmTestcaseMetadata);
+
 pub fn generate_flow_template_inputs(
     target: Address,
     caller: Address,
     abi_registry: &AbiRegistry,
-) -> Vec<EvmInput> {
+) -> Vec<FlowTemplate> {
     let mut flows = Vec::new();
     let templates = [
         flow_erc20_approve_transfer_from(target, caller),
@@ -103,8 +105,9 @@ pub fn generate_flow_template_inputs(
         flow_staking_stake_claim_unstake(target, caller),
     ];
 
-    for template in templates {
-        let known_selector_count = template
+    for flow in templates {
+        let known_selector_count = flow
+            .0
             .txs
             .iter()
             .filter_map(|tx| selector_for_calldata(&tx.input))
@@ -116,15 +119,14 @@ pub fn generate_flow_template_inputs(
         if known_selector_count == 0 {
             continue;
         }
-        flows.push(template);
+        flows.push(flow);
     }
 
     flows
 }
 
-pub fn dependency_sequence_score(input: &EvmInput) -> u64 {
-    let provenance_boost = input
-        .mutation_provenance
+pub fn dependency_sequence_score(input: &EvmInput, provenance: &[MutationProvenance]) -> u64 {
+    let provenance_boost = provenance
         .iter()
         .filter(|entry| entry.strategy.starts_with("dependency_"))
         .count() as u64
@@ -298,7 +300,7 @@ fn dedup_edges(edges: &mut Vec<TransactionDependencyEdge>) {
     edges.dedup_by(|a, b| a.from_tx == b.from_tx && a.to_tx == b.to_tx && a.kind == b.kind);
 }
 
-fn flow_erc20_approve_transfer_from(target: Address, caller: Address) -> EvmInput {
+fn flow_erc20_approve_transfer_from(target: Address, caller: Address) -> FlowTemplate {
     flow_input(
         "dependency_flow_erc20_approve_transfer_from",
         target,
@@ -324,7 +326,7 @@ fn flow_erc20_approve_transfer_from(target: Address, caller: Address) -> EvmInpu
     )
 }
 
-fn flow_erc4626_deposit_withdraw(target: Address, caller: Address) -> EvmInput {
+fn flow_erc4626_deposit_withdraw(target: Address, caller: Address) -> FlowTemplate {
     flow_input(
         "dependency_flow_erc4626_deposit_withdraw",
         target,
@@ -350,7 +352,7 @@ fn flow_erc4626_deposit_withdraw(target: Address, caller: Address) -> EvmInput {
     )
 }
 
-fn flow_amm_approve_swap_reverse(target: Address, caller: Address) -> EvmInput {
+fn flow_amm_approve_swap_reverse(target: Address, caller: Address) -> FlowTemplate {
     flow_input(
         "dependency_flow_amm_swap_roundtrip",
         target,
@@ -396,7 +398,7 @@ fn flow_amm_approve_swap_reverse(target: Address, caller: Address) -> EvmInput {
     )
 }
 
-fn flow_lending_deposit_borrow_liquidate(target: Address, caller: Address) -> EvmInput {
+fn flow_lending_deposit_borrow_liquidate(target: Address, caller: Address) -> FlowTemplate {
     flow_input(
         "dependency_flow_lending_collateral_borrow_liquidate",
         target,
@@ -447,7 +449,7 @@ fn flow_lending_deposit_borrow_liquidate(target: Address, caller: Address) -> Ev
     )
 }
 
-fn flow_governance_propose_vote_queue_execute(target: Address, caller: Address) -> EvmInput {
+fn flow_governance_propose_vote_queue_execute(target: Address, caller: Address) -> FlowTemplate {
     flow_input(
         "dependency_flow_governance_lifecycle",
         target,
@@ -477,7 +479,7 @@ fn flow_governance_propose_vote_queue_execute(target: Address, caller: Address) 
     )
 }
 
-fn flow_bridge_send_prove_finalize(target: Address, caller: Address) -> EvmInput {
+fn flow_bridge_send_prove_finalize(target: Address, caller: Address) -> FlowTemplate {
     flow_input(
         "dependency_flow_bridge_send_prove_finalize",
         target,
@@ -503,7 +505,7 @@ fn flow_bridge_send_prove_finalize(target: Address, caller: Address) -> EvmInput
     )
 }
 
-fn flow_staking_stake_claim_unstake(target: Address, caller: Address) -> EvmInput {
+fn flow_staking_stake_claim_unstake(target: Address, caller: Address) -> FlowTemplate {
     flow_input(
         "dependency_flow_staking_stake_claim_unstake",
         target,
@@ -529,10 +531,9 @@ fn flow_input(
     _target: Address,
     _caller: Address,
     txs: Vec<SingletonTx>,
-) -> EvmInput {
-    EvmInput {
-        txs,
-        base_snapshot_id: 0,
+) -> FlowTemplate {
+    let input = EvmInput::new(txs, 0);
+    let metadata = EvmTestcaseMetadata {
         waypoints: Vec::new(),
         mutation_provenance: vec![MutationProvenance {
             strategy: strategy.to_string(),
@@ -540,7 +541,8 @@ fn flow_input(
             selector: None,
             detail: "ordered dependency-aware flow template".to_string(),
         }],
-    }
+    };
+    (input, metadata)
 }
 
 fn tx(target: Address, caller: Address, input: Vec<u8>) -> SingletonTx {
@@ -611,8 +613,6 @@ mod tests {
                 ),
             ],
             base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
         };
         let execution = SequenceExecutionResult {
             tx_results: vec![empty_result(0), empty_result(1)],
@@ -654,11 +654,12 @@ mod tests {
 
         let flows = generate_flow_template_inputs(target, caller, &abi);
 
-        assert!(flows.iter().any(|flow| flow.txs.len() >= 2));
-        let erc20 = flows
+        assert!(flows.iter().any(|(input, _)| input.txs.len() >= 2));
+        let (erc20, erc20_metadata) = flows
             .iter()
-            .find(|flow| {
-                flow.mutation_provenance
+            .find(|(_, metadata)| {
+                metadata
+                    .mutation_provenance
                     .iter()
                     .any(|entry| entry.strategy.contains("erc20"))
             })
@@ -671,7 +672,7 @@ mod tests {
             selector_for_calldata(&erc20.txs[1].input),
             Some(function_selector("transferFrom(address,address,uint256)"))
         );
-        assert!(dependency_sequence_score(erc20) > 0);
+        assert!(dependency_sequence_score(erc20, &erc20_metadata.mutation_provenance) > 0);
     }
 
     fn empty_result(tx_index: usize) -> TxExecutionResult {

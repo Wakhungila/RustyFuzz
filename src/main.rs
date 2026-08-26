@@ -752,7 +752,7 @@ async fn main() -> anyhow::Result<()> {
             let seeds = inputs
                 .into_iter()
                 .enumerate()
-                .map(|(idx, input)| {
+                .map(|(idx, (input, _metadata))| {
                     let first_tx = input.txs.first().cloned();
                     let caller = first_tx
                         .as_ref()

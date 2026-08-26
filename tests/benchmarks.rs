@@ -26,6 +26,7 @@ use rusty_fuzz::evm::feedback::{
     stable_execution_state_hash, EvmCoverageFeedback, EvmStateNoveltyFeedback,
 };
 use rusty_fuzz::evm::fork_db::ForkDb;
+use rusty_fuzz::evm::fuzz::MutationProvenance;
 use rusty_fuzz::evm::registry::GlobalAccountRegistry;
 use rusty_fuzz::evm::seed_ingester::{
     discover_accounts_from_seeds, extract_address_hints, normalize_seeds, seed_match_kind,
@@ -423,8 +424,8 @@ fn state_novelty_feedback_tracks_storage_and_call_graph_novelty() {
 fn campaign_scorer_rewards_economic_and_invariant_pressure() {
     let target = addr(0x35);
     let caller = addr(0x36);
-    let input = EvmInput {
-        txs: vec![
+    let input = EvmInput::new(
+        vec![
             SingletonTx {
                 input: vec![0x02, 0x2c, 0x0d, 0x9f],
                 caller,
@@ -440,15 +441,14 @@ fn campaign_scorer_rewards_economic_and_invariant_pressure() {
                 is_victim: false,
             },
         ],
-        base_snapshot_id: 0,
-        waypoints: Vec::new(),
-        mutation_provenance: vec![rusty_fuzz::evm::fuzz::MutationProvenance {
-            strategy: "oracle_pressure".to_string(),
-            tx_index: Some(0),
-            selector: Some([0x02, 0x2c, 0x0d, 0x9f]),
-            detail: "test".to_string(),
-        }],
-    };
+        0,
+    );
+    let provenance = vec![MutationProvenance {
+        strategy: "oracle_pressure".to_string(),
+        tx_index: Some(0),
+        selector: Some([0x02, 0x2c, 0x0d, 0x9f]),
+        detail: "test".to_string(),
+    }];
     let execution = SequenceExecutionResult {
         tx_results: Vec::new(),
         total_gas_used: 100_000,
@@ -482,7 +482,8 @@ fn campaign_scorer_rewards_economic_and_invariant_pressure() {
     let findings = ProtocolOraclePack::default().evaluate(&execution);
     let mut state_feedback = EvmStateNoveltyFeedback::new();
     let novelty = state_feedback.observe_execution(&execution);
-    let score = CampaignScorer::default().score(&input, &execution, &novelty, &findings);
+    let score =
+        CampaignScorer::default().score(&input, &execution, &novelty, &findings, &provenance);
 
     assert!(score.total > score.state_pressure);
     assert!(score.economic_pressure > 0);
@@ -498,7 +499,7 @@ fn campaign_scorer_rewards_economic_and_invariant_pressure() {
         economic_finding_weight: 1_200,
         ..CampaignScoringConfig::default()
     })
-    .score(&input, &execution, &novelty, &findings);
+    .score(&input, &execution, &novelty, &findings, &provenance);
     assert!(tuned_score.economic_pressure > score.economic_pressure);
 }
 
@@ -521,8 +522,6 @@ fn corpus_metadata_records_state_novelty_hashes() {
             is_victim: false,
         }],
         base_snapshot_id: 0,
-        waypoints: Vec::new(),
-        mutation_provenance: Vec::new(),
     };
     let execution = SequenceExecutionResult {
         tx_results: Vec::new(),
@@ -569,8 +568,6 @@ fn persistent_corpus_writes_campaign_artifact_with_fork_cache() {
             is_victim: true,
         }],
         base_snapshot_id: 0,
-        waypoints: Vec::new(),
-        mutation_provenance: Vec::new(),
     };
     let execution = SequenceExecutionResult {
         tx_results: Vec::new(),
@@ -666,8 +663,6 @@ fn persistent_corpus_round_trips_replay_inputs_and_crashes() {
             is_victim: false,
         }],
         base_snapshot_id: 42,
-        waypoints: vec![],
-        mutation_provenance: Vec::new(),
     };
 
     let metadata = corpus
@@ -712,8 +707,6 @@ fn replay_verifier_is_deterministic_and_reports_reproduction() {
             is_victim: false,
         }],
         base_snapshot_id: 0,
-        waypoints: vec![],
-        mutation_provenance: Vec::new(),
     };
 
     let verifier = ReplayVerifier::new(1024);
@@ -770,8 +763,6 @@ fn foundry_poc_generation_replays_without_fake_assertion() {
             is_victim: false,
         }],
         base_snapshot_id: 0,
-        waypoints: vec![],
-        mutation_provenance: Vec::new(),
     };
 
     let poc_path = synthesize_foundry_poc(
@@ -808,8 +799,6 @@ fn foundry_poc_generation_embeds_protocol_oracle_assertions() {
             is_victim: true,
         }],
         base_snapshot_id: 0,
-        waypoints: Vec::new(),
-        mutation_provenance: Vec::new(),
     };
     let execution = SequenceExecutionResult {
         tx_results: Vec::new(),
@@ -882,8 +871,6 @@ fn foundry_poc_generation_embeds_access_control_specific_assertions() {
             is_victim: false,
         }],
         base_snapshot_id: 0,
-        waypoints: Vec::new(),
-        mutation_provenance: Vec::new(),
     };
     let execution = SequenceExecutionResult {
         tx_results: Vec::new(),
@@ -937,8 +924,6 @@ fn foundry_poc_generation_fails_closed_without_pinned_fork_for_proof() {
             is_victim: false,
         }],
         base_snapshot_id: 0,
-        waypoints: Vec::new(),
-        mutation_provenance: Vec::new(),
     };
     let execution = SequenceExecutionResult {
         tx_results: Vec::new(),
@@ -1020,8 +1005,6 @@ fn crash_minimizer_emits_minimized_foundry_poc() {
             },
         ],
         base_snapshot_id: 0,
-        waypoints: Vec::new(),
-        mutation_provenance: Vec::new(),
     };
     let executor = EvmExecutor::new();
     let minimizer = Minimizer::new(&executor, &ReentrancyOracle, db, BlockEnv::default());
@@ -1158,8 +1141,6 @@ fn benchmark_privilege_escalation() {
             is_victim: false,
         }],
         base_snapshot_id: 0,
-        waypoints: vec![],
-        mutation_provenance: Vec::new(),
     });
 
     // Add waypoint showing the SSTORE was influenced by input
@@ -1306,8 +1287,6 @@ fn mainnet_seed_ingestion_normalizes_and_discovers_accounts() {
             is_victim: false,
         }],
         base_snapshot_id: 0,
-        waypoints: Vec::new(),
-        mutation_provenance: Vec::new(),
     };
 
     let seed = MainnetSeed {
@@ -1431,8 +1410,6 @@ fn persistent_corpus_round_trips_mainnet_seed_bundle() {
             is_victim: false,
         }],
         base_snapshot_id: 0,
-        waypoints: Vec::new(),
-        mutation_provenance: Vec::new(),
     };
     let seed = MainnetSeed {
         id: "seed-roundtrip".to_string(),
@@ -1521,8 +1498,6 @@ fn replay_verifier_loads_persisted_input_and_fork_cache() {
             is_victim: false,
         }],
         base_snapshot_id: 0,
-        waypoints: vec![],
-        mutation_provenance: Vec::new(),
     };
     let metadata = corpus
         .persist_input(&input, &[1, 0, 0, 0], 0)
@@ -1725,8 +1700,6 @@ fn integration_fuzz_campaign_end_to_end() {
             is_victim: false,
         }],
         base_snapshot_id: 0,
-        waypoints: vec![],
-        mutation_provenance: Vec::new(),
     };
 
     let mut chain_state = ChainState::Evm(db.clone());
@@ -1810,8 +1783,6 @@ fn integration_replay_verification_with_oracle_detection() {
             is_victim: false,
         }],
         base_snapshot_id: 0,
-        waypoints: vec![],
-        mutation_provenance: Vec::new(),
     };
 
     let before = new_evm_snapshot(0, db.clone());
@@ -1931,8 +1902,6 @@ fn integration_corpus_persistence_and_retrieval_workflow() {
                 is_victim: i % 2 == 0,
             }],
             base_snapshot_id: i,
-            waypoints: vec![],
-            mutation_provenance: Vec::new(),
         })
         .collect();
 

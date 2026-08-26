@@ -57,7 +57,10 @@ flowchart TD
 
 Known current architecture problems:
 
-- `EvmInput` contains execution feedback/provenance fields, so semantic input identity is not clean.
+- Stage 2B (CURRENT): `EvmInput` is semantic-only (`txs`, `base_snapshot_id`);
+  waypoints/provenance live in `EvmTestcaseMetadata` and a temporary
+  `EvmTestcaseMetadataStore` sidecar. Remaining debt: the store should become
+  native LibAFL testcase/state metadata (TODO(stage-4)).
 - `common` is not core-clean because it imports REVM and `evm::fork_db`; only
   selected neutral types have been bridged to `rustyfuzz-core`.
 - There are duplicate finding lifecycle models in source and older docs.

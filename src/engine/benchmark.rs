@@ -147,8 +147,6 @@ fn synthetic_input(manifest: &BenchmarkManifest, fixture: &SyntheticBenchmarkFix
             is_victim: matches!(fixture.outcome, SyntheticBenchmarkOutcome::NotFound),
         }],
         base_snapshot_id: 0,
-        waypoints: Vec::new(),
-        mutation_provenance: Vec::new(),
     }
 }
 
@@ -1330,6 +1328,7 @@ impl ValidationRunner {
             &execution,
             &state_novelty,
             &findings,
+            &[],
         );
         let mut exploit_candidate = ExploitPathBuilder::from_execution(
             &input, &execution, &findings, &score,
@@ -1517,7 +1516,7 @@ impl ValidationRunner {
             !inputs.is_empty(),
             "live benchmark fixture `{fixture_path}` did not produce any executable inputs"
         );
-        let input = select_best_live_input(inputs);
+        let input = select_best_live_input(inputs.into_iter().map(|(input, _)| input).collect());
 
         let started = std::time::Instant::now();
         let replay_verifier = ReplayVerifier::new(MAP_SIZE);
@@ -1586,6 +1585,7 @@ impl ValidationRunner {
             &execution,
             &state_novelty,
             &findings,
+            &[],
         );
         if let Some(delta) = replay_economic_delta.as_ref() {
             let delta_score = crate::engine::economic_delta::EconomicDeltaEngine::score(delta);
@@ -1786,12 +1786,16 @@ fn execute_blind_rediscovery_benchmark(
 
     let base_inputs =
         intelligence.historical_candidates_to_inputs(historical_candidates.clone(), 0, 4);
-    let base_input = base_inputs.first().cloned().or_else(|| {
-        historical_candidates
-            .first()
-            .cloned()
-            .map(|candidate| candidate.into_evm_input(0))
-    });
+    let base_input = base_inputs
+        .first()
+        .cloned()
+        .map(|(input, _)| input)
+        .or_else(|| {
+            historical_candidates
+                .first()
+                .cloned()
+                .map(|candidate| candidate.into_evm_input(0))
+        });
 
     let bounded_result = BoundedSearchEngine.search(BoundedSearchRequest {
         target,
@@ -1811,12 +1815,7 @@ fn execute_blind_rediscovery_benchmark(
     let mut candidate = selected.candidate.into_exploit_path_candidate();
     candidate.persistence_reason = Some("blind-rediscovery".to_string());
     candidate.proof_status = selected_proof_status.clone();
-    let candidate_input = EvmInput {
-        txs: candidate.sequence.clone(),
-        base_snapshot_id: 0,
-        waypoints: Vec::new(),
-        mutation_provenance: Vec::new(),
-    };
+    let candidate_input = EvmInput::new(candidate.sequence.clone(), 0);
 
     let started = std::time::Instant::now();
     let explicit_fork_cache = live_fixture.fork_cache.or_else(|| {
@@ -1872,6 +1871,7 @@ fn execute_blind_rediscovery_benchmark(
         &execution,
         &state_novelty,
         &findings,
+        &[],
     );
     if let Some(delta) = replay_economic_delta.as_ref() {
         let delta_score = crate::engine::economic_delta::EconomicDeltaEngine::score(delta);

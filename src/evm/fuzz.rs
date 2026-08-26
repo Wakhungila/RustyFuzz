@@ -15,7 +15,8 @@ use libafl::{
 };
 use libafl_bolts::{rands::Rand, HasLen, Named};
 use parking_lot::{Mutex, RwLock};
-use revm::primitives::{Address, U256};
+use revm::primitives::{keccak256, Address, U256};
+use rustyfuzz_core::InputId;
 use serde::{Deserialize, Serialize};
 use std::num::NonZero;
 use std::{collections::HashMap, sync::Arc};
@@ -43,19 +44,48 @@ pub struct MutationProvenance {
 /// Represents a structured EVM execution sequence.
 ///
 /// This is the primary input type that LibAFL evolves during fuzzing. An `EvmInput`
-/// contains a sequence of transactions, execution feedback (waypoints), and metadata
-/// about how the input was mutated.
+/// contains only execution-defining semantic data. Execution feedback and mutation
+/// provenance live in `EvmTestcaseMetadata`.
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct EvmInput {
     /// Sequence of transactions to execute (multi-step exploits)
     pub txs: Vec<SingletonTx>,
     /// The ID of the snapshot this input was derived from
     pub base_snapshot_id: u64,
+}
+
+/// EVM-specific testcase feedback and mutation metadata.
+///
+/// This is intentionally outside `EvmInput` so feedback changes cannot alter the
+/// semantic identity of an executable testcase.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct EvmTestcaseMetadata {
     /// Execution feedback (waypoints) per transaction
+    #[serde(default)]
     pub waypoints: Vec<Vec<Waypoint>>,
     /// History of mutations applied to this input
     #[serde(default)]
     pub mutation_provenance: Vec<MutationProvenance>,
+}
+
+/// Stage 2B compatibility reader for pre-separation input JSON.
+#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct LegacyEvmInputV1 {
+    pub txs: Vec<SingletonTx>,
+    pub base_snapshot_id: u64,
+    #[serde(default)]
+    pub waypoints: Vec<Vec<Waypoint>>,
+    #[serde(default)]
+    pub mutation_provenance: Vec<MutationProvenance>,
+}
+
+/// Temporary metadata bridge for the current monolithic LibAFL mutator/harness.
+///
+/// TODO(stage-4): move this state into LibAFL testcase/state metadata or an
+/// explicit mutation context when campaign worker boundaries are split.
+#[derive(Clone, Default)]
+pub struct EvmTestcaseMetadataStore {
+    inner: Arc<Mutex<HashMap<InputId, EvmTestcaseMetadata>>>,
 }
 
 impl Input for EvmInput {
@@ -65,9 +95,102 @@ impl Input for EvmInput {
 }
 
 impl EvmInput {
+    pub const INPUT_ID_SCHEMA_VERSION: &'static str = "rustyfuzz-input-id-v1";
+
+    /// Creates a semantic input from a transaction sequence and snapshot handle.
+    pub fn new(txs: Vec<SingletonTx>, base_snapshot_id: u64) -> Self {
+        Self {
+            txs,
+            base_snapshot_id,
+        }
+    }
+
     /// Validates that the input respects system limits
     pub fn validate(&self) -> bool {
         self.txs.len() <= MAX_SEQUENCE_LENGTH
+    }
+
+    /// Derives the canonical semantic input ID.
+    ///
+    /// The identity bytes include only the version string, base snapshot id,
+    /// and executable transaction sequence (calldata, caller, target, value).
+    /// Feedback, provenance, role markers (`is_victim`), coverage, scheduler
+    /// scores, oracle output, and execution statistics are excluded: REVM's
+    /// `TxEnv` is built from `caller`, `value`, `data`, and `to` only.
+    pub fn semantic_input_id(&self) -> InputId {
+        let hash = keccak256(self.canonical_identity_bytes());
+        InputId::new(format!("0x{}", hex::encode(hash))).expect("keccak input id is non-empty")
+    }
+
+    pub fn semantic_input_hash(&self) -> String {
+        self.semantic_input_id().into_inner()
+    }
+
+    fn canonical_identity_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        append_len_prefixed(&mut out, Self::INPUT_ID_SCHEMA_VERSION.as_bytes());
+        out.extend_from_slice(&self.base_snapshot_id.to_be_bytes());
+        out.extend_from_slice(&(self.txs.len() as u64).to_be_bytes());
+        for tx in &self.txs {
+            append_len_prefixed(&mut out, &tx.input);
+            out.extend_from_slice(tx.caller.as_slice());
+            out.extend_from_slice(tx.to.as_slice());
+            out.extend_from_slice(&tx.value.to_be_bytes::<32>());
+        }
+        out
+    }
+
+    /// Converts legacy v0.1/Stage 2A input JSON into semantic input plus metadata.
+    pub fn split_legacy_json(bytes: &[u8]) -> serde_json::Result<(Self, EvmTestcaseMetadata)> {
+        let legacy: LegacyEvmInputV1 = serde_json::from_slice(bytes)?;
+        Ok(legacy.into_parts())
+    }
+}
+
+impl LegacyEvmInputV1 {
+    pub fn into_parts(self) -> (EvmInput, EvmTestcaseMetadata) {
+        (
+            EvmInput {
+                txs: self.txs,
+                base_snapshot_id: self.base_snapshot_id,
+            },
+            EvmTestcaseMetadata {
+                waypoints: self.waypoints,
+                mutation_provenance: self.mutation_provenance,
+            },
+        )
+    }
+}
+
+impl EvmTestcaseMetadata {
+    /// Merges `incoming` into `self` without duplicating identical records.
+    ///
+    /// Deterministic ordering: existing waypoints/provenance keep their
+    /// positions; new unique items are appended in incoming order. Bounds are
+    /// re-enforced by the caller via `apply_waypoint_backpressure` and by the
+    /// same 64-entry provenance cap used for single writes.
+    pub fn merge_from(&mut self, incoming: EvmTestcaseMetadata) {
+        for (tx_idx, tx_waypoints) in incoming.waypoints.into_iter().enumerate() {
+            if self.waypoints.len() <= tx_idx {
+                self.waypoints.resize_with(tx_idx + 1, Vec::new);
+            }
+            let target = &mut self.waypoints[tx_idx];
+            for waypoint in tx_waypoints {
+                if !target.contains(&waypoint) {
+                    target.push(waypoint);
+                }
+            }
+        }
+
+        for record in incoming.mutation_provenance {
+            if !self.mutation_provenance.contains(&record) {
+                self.mutation_provenance.push(record);
+            }
+        }
+        if self.mutation_provenance.len() > 64 {
+            let excess = self.mutation_provenance.len() - 64;
+            self.mutation_provenance.drain(0..excess);
+        }
     }
 
     /// Applies backpressure to waypoint accumulation by truncating if over limit
@@ -95,6 +218,81 @@ impl EvmInput {
             }
         }
     }
+
+    pub fn record_mutation(
+        &mut self,
+        strategy: &str,
+        tx_index: Option<usize>,
+        selector: Option<[u8; 4]>,
+        detail: &str,
+    ) {
+        self.mutation_provenance.push(MutationProvenance {
+            strategy: strategy.to_string(),
+            tx_index,
+            selector,
+            detail: detail.to_string(),
+        });
+        if self.mutation_provenance.len() > 64 {
+            let excess = self.mutation_provenance.len() - 64;
+            self.mutation_provenance.drain(0..excess);
+        }
+    }
+}
+
+/// Maximum entries retained by `EvmTestcaseMetadataStore` before eviction.
+///
+/// The store is a Stage 2B sidecar (see TODO(stage-4) on the struct); without a
+/// bound it could grow with every mutated semantic input over a long campaign.
+const MAX_METADATA_STORE_ENTRIES: usize = 65_536;
+
+impl EvmTestcaseMetadataStore {
+    /// Merges metadata into the store for the input's semantic identity.
+    ///
+    /// Deterministic same-id semantics:
+    /// - identical `MutationProvenance` records are not duplicated;
+    /// - new provenance records are appended after existing ones;
+    /// - identical waypoints are not duplicated; new waypoints are appended
+    ///   per transaction index, then waypoint backpressure is re-applied;
+    /// - provenance is capped at 64 entries, dropping the oldest first
+    ///   (same retention policy as provenance recorded inside one metadata);
+    /// - when unrelated inputs evict this entry it is simply replaced.
+    pub fn insert(&self, input: &EvmInput, mut metadata: EvmTestcaseMetadata) {
+        let id = input.semantic_input_id();
+        let mut map = self.inner.lock();
+        if let Some(existing) = map.get_mut(&id) {
+            existing.merge_from(metadata);
+            existing.apply_waypoint_backpressure();
+        } else {
+            if map.len() >= MAX_METADATA_STORE_ENTRIES {
+                // Drop an arbitrary stale entry (HashMap iteration order is fine
+                // for eviction: every entry stays independently valid).
+                if let Some(stale) = map.keys().next().cloned() {
+                    map.remove(&stale);
+                }
+            }
+            metadata.apply_waypoint_backpressure();
+            map.insert(id, metadata);
+        }
+    }
+
+    pub fn get(&self, input: &EvmInput) -> Option<EvmTestcaseMetadata> {
+        self.inner.lock().get(&input.semantic_input_id()).cloned()
+    }
+
+    pub fn get_or_default(&self, input: &EvmInput) -> EvmTestcaseMetadata {
+        self.get(input).unwrap_or_default()
+    }
+
+    /// Number of retained semantic entries; used by bounds tests.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
+}
+
+fn append_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    out.extend_from_slice(bytes);
 }
 
 impl HasLen for EvmInput {
@@ -128,6 +326,8 @@ pub struct EvmMutator {
     pub type_cache: RwLock<HashMap<[u8; 4], DynSolType>>,
     /// LRU cache for decoded calldata values
     pub decode_cache: RwLock<LruCache<Vec<u8>, DynSolValue>>,
+    /// Temporary sidecar store for EVM testcase metadata.
+    pub testcase_metadata: EvmTestcaseMetadataStore,
 }
 
 impl<S> Mutator<EvmInput, S> for EvmMutator
@@ -136,34 +336,39 @@ where
 {
     fn mutate(&mut self, state: &mut S, input: &mut EvmInput) -> Result<MutationResult, Error> {
         let rand = state.rand_mut();
+        let mut metadata = self.testcase_metadata.get_or_default(input);
         let has_concolic_hints = { !self.concolic_hints.lock().is_empty() };
         if has_concolic_hints
             && rand.below(NonZero::new(100).unwrap()) < 15
             && matches!(
-                self.apply_queued_concolic_hint(input),
+                self.apply_queued_concolic_hint(input, &mut metadata),
                 MutationResult::Mutated
             )
         {
+            self.testcase_metadata.insert(input, metadata);
             return Ok(MutationResult::Mutated);
         }
 
         let bucket = rand.below(NonZero::new(100).unwrap());
 
         let result = match bucket {
-            0..=6 => self.concolic_mutation(rand, input),
-            7..=14 => self.concolic_sequence_synthesis(rand, input),
-            15..=24 => self.structural_mutation(rand, input),
-            25..=39 => self.semantic_chaining(rand, input),
-            40..=49 => self.caller_mutation(rand, input),
-            50..=59 => self.discovery_mutation(rand, input),
-            60..=79 => self.abi_mutation(rand, input),
-            80..=88 => self.economic_objective_mutation(rand, input),
-            89..=94 => self.wrap_flashloan(rand, input),
-            95..=97 => self.oracle_pressure(rand, input),
-            98 => self.mev_sandwich(rand, input),
-            _ => self.value_boundary(rand, input),
+            0..=6 => self.concolic_mutation(rand, input, &mut metadata),
+            7..=14 => self.concolic_sequence_synthesis(rand, input, &mut metadata),
+            15..=24 => self.structural_mutation(rand, input, &mut metadata),
+            25..=39 => self.semantic_chaining(rand, input, &mut metadata),
+            40..=49 => self.caller_mutation(rand, input, &mut metadata),
+            50..=59 => self.discovery_mutation(rand, input, &mut metadata),
+            60..=79 => self.abi_mutation(rand, input, &mut metadata),
+            80..=88 => self.economic_objective_mutation(rand, input, &mut metadata),
+            89..=94 => self.wrap_flashloan(rand, input, &mut metadata),
+            95..=97 => self.oracle_pressure(rand, input, &mut metadata),
+            98 => self.mev_sandwich(rand, input, &mut metadata),
+            _ => self.value_boundary(rand, input, &mut metadata),
         };
 
+        if matches!(result, MutationResult::Mutated) {
+            self.testcase_metadata.insert(input, metadata);
+        }
         Ok(result)
     }
 
@@ -184,6 +389,7 @@ impl EvmMutator {
             concolic_hint_stats: Arc::new(ConcolicHintStats::default()),
             type_cache: RwLock::new(HashMap::new()),
             decode_cache: RwLock::new(LruCache::new(MAX_DECODE_CACHE_SIZE)),
+            testcase_metadata: EvmTestcaseMetadataStore::default(),
         }
     }
 
@@ -202,6 +408,7 @@ impl EvmMutator {
             account_registry,
             concolic_hints,
             Arc::new(ConcolicHintStats::default()),
+            EvmTestcaseMetadataStore::default(),
         )
     }
 
@@ -210,6 +417,7 @@ impl EvmMutator {
         account_registry: Arc<RwLock<GlobalAccountRegistry>>,
         concolic_hints: Arc<Mutex<Vec<ConcolicHint>>>,
         concolic_hint_stats: Arc<ConcolicHintStats>,
+        testcase_metadata: EvmTestcaseMetadataStore,
     ) -> Self {
         Self {
             abi_registry,
@@ -218,10 +426,19 @@ impl EvmMutator {
             concolic_hint_stats,
             type_cache: RwLock::new(HashMap::new()),
             decode_cache: RwLock::new(LruCache::new(MAX_DECODE_CACHE_SIZE)),
+            testcase_metadata,
         }
     }
 
-    fn apply_queued_concolic_hint(&self, input: &mut EvmInput) -> MutationResult {
+    pub fn metadata_store(&self) -> EvmTestcaseMetadataStore {
+        self.testcase_metadata.clone()
+    }
+
+    fn apply_queued_concolic_hint(
+        &self,
+        input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
+    ) -> MutationResult {
         let Some(hint) = self.concolic_hints.lock().pop() else {
             return MutationResult::Skipped;
         };
@@ -234,7 +451,7 @@ impl EvmMutator {
         let placement = apply_concolic_hint(tx, &hint, parameter_types.as_deref());
         let selector = selector_for_calldata(&tx.input);
         self.record_mutation(
-            input,
+            metadata,
             "concolic_hint",
             Some(hint.tx_index),
             selector,
@@ -244,14 +461,19 @@ impl EvmMutator {
         MutationResult::Mutated
     }
 
-    fn concolic_mutation<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
-        if input.waypoints.is_empty() {
+    fn concolic_mutation<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
+    ) -> MutationResult {
+        if metadata.waypoints.is_empty() {
             return MutationResult::Skipped;
         }
 
         let mut solver = ConcolicSolver::new();
         let hints = solver.solve_hints(
-            input
+            metadata
                 .waypoints
                 .iter()
                 .enumerate()
@@ -285,7 +507,7 @@ impl EvmMutator {
                 hint.strategy, hint.pc, placement
             );
             self.record_mutation(
-                input,
+                metadata,
                 "concolic_comparison",
                 Some(hint.tx_index),
                 selector,
@@ -301,8 +523,9 @@ impl EvmMutator {
         &self,
         rand: &mut R,
         input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
     ) -> MutationResult {
-        if input.waypoints.is_empty() || input.txs.is_empty() {
+        if metadata.waypoints.is_empty() || input.txs.is_empty() {
             return MutationResult::Skipped;
         }
 
@@ -313,7 +536,7 @@ impl EvmMutator {
 
         let mut solver = ConcolicSolver::new();
         let hints = solver.solve_hints(
-            input
+            metadata
                 .waypoints
                 .iter()
                 .enumerate()
@@ -348,7 +571,7 @@ impl EvmMutator {
         let insert_at = (hint.tx_index + 1).min(input.txs.len());
         input.txs.insert(insert_at, synthesized);
         self.record_mutation(
-            input,
+            metadata,
             "concolic_sequence_synthesis",
             Some(insert_at),
             selector,
@@ -360,7 +583,12 @@ impl EvmMutator {
         MutationResult::Mutated
     }
 
-    fn structural_mutation<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+    fn structural_mutation<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
+    ) -> MutationResult {
         // Enforce maximum sequence length
         if !self.can_add_transactions(input, 1) {
             return MutationResult::Skipped;
@@ -396,7 +624,7 @@ impl EvmMutator {
         };
         input.txs.insert(insert_at, new_tx);
         self.record_mutation(
-            input,
+            metadata,
             "abi_sequence_insert",
             Some(insert_at),
             Some(selector),
@@ -405,7 +633,12 @@ impl EvmMutator {
         MutationResult::Mutated
     }
 
-    fn semantic_chaining<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+    fn semantic_chaining<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
+    ) -> MutationResult {
         let (caller, last_to) = match input.txs.last() {
             Some(tx) => (tx.caller, tx.to),
             None => return MutationResult::Skipped,
@@ -439,7 +672,7 @@ impl EvmMutator {
         };
         input.txs.push(new_tx);
         self.record_mutation(
-            input,
+            metadata,
             "abi_semantic_chain",
             input.txs.len().checked_sub(1),
             Some(selector),
@@ -448,23 +681,39 @@ impl EvmMutator {
         MutationResult::Mutated
     }
 
-    fn caller_mutation<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+    fn caller_mutation<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
+    ) -> MutationResult {
         if let Some(idx) = self.random_index(rand, input.txs.len()) {
             input.txs[idx].caller = Address::new([0x15; 20]);
-            self.record_mutation(input, "caller", Some(idx), None, "changed caller role");
+            self.record_mutation(metadata, "caller", Some(idx), None, "changed caller role");
             MutationResult::Mutated
         } else {
             MutationResult::Skipped
         }
     }
 
-    fn discovery_mutation<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+    fn discovery_mutation<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
+    ) -> MutationResult {
         if let Some(idx) = self.random_index(rand, input.txs.len()) {
             let registry = self.account_registry.read();
             if let Some(target) = registry.random_contract(rand) {
                 input.txs[idx].to = target;
                 drop(registry);
-                self.record_mutation(input, "target_discovery", Some(idx), None, "changed target");
+                self.record_mutation(
+                    metadata,
+                    "target_discovery",
+                    Some(idx),
+                    None,
+                    "changed target",
+                );
                 MutationResult::Mutated
             } else {
                 MutationResult::Skipped
@@ -474,14 +723,19 @@ impl EvmMutator {
         }
     }
 
-    fn abi_mutation<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+    fn abi_mutation<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
+    ) -> MutationResult {
         let idx = match self.random_index(rand, input.txs.len()) {
             Some(i) => i,
             None => return MutationResult::Skipped,
         };
 
         if input.txs[idx].input.len() < 4 {
-            return self.retarget_tx_to_known_abi(rand, input, idx);
+            return self.retarget_tx_to_known_abi(rand, input, metadata, idx);
         }
 
         let mut selector = [0u8; 4];
@@ -490,7 +744,7 @@ impl EvmMutator {
         if !self.abi_registry.functions.contains_key(&selector)
             && rand.below(NonZero::new(100).unwrap()) < 70
         {
-            return self.retarget_tx_to_known_abi(rand, input, idx);
+            return self.retarget_tx_to_known_abi(rand, input, metadata, idx);
         }
 
         let tuple_type = self.type_cache.read().get(&selector).cloned().or_else(|| {
@@ -524,7 +778,7 @@ impl EvmMutator {
             new_input.extend_from_slice(&encoded);
             input.txs[idx].input = new_input;
             self.record_mutation(
-                input,
+                metadata,
                 "abi_argument",
                 Some(idx),
                 Some(selector),
@@ -532,11 +786,16 @@ impl EvmMutator {
             );
             MutationResult::Mutated
         } else {
-            self.retarget_tx_to_known_abi(rand, input, idx)
+            self.retarget_tx_to_known_abi(rand, input, metadata, idx)
         }
     }
 
-    fn wrap_flashloan<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+    fn wrap_flashloan<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
+    ) -> MutationResult {
         if input.txs.is_empty() {
             return MutationResult::Skipped;
         }
@@ -560,6 +819,13 @@ impl EvmMutator {
             amount: U256::from(10u128.pow(21)),
         };
         *input = template.wrap_sequence(input.clone());
+        self.record_mutation(
+            metadata,
+            "flashloan_template",
+            Some(0),
+            Some(EIP3156_FLASHLOAN_SELECTOR),
+            "borrow->manipulate->exploit->repay wrapper with net-profit validation target",
+        );
 
         // Validate the wrapped sequence doesn't exceed limit
         if input.txs.len() > MAX_SEQUENCE_LENGTH {
@@ -567,7 +833,7 @@ impl EvmMutator {
         }
 
         self.record_mutation(
-            input,
+            metadata,
             "flashloan_wrap",
             Some(0),
             Some(EIP3156_FLASHLOAN_SELECTOR),
@@ -580,6 +846,7 @@ impl EvmMutator {
         &self,
         rand: &mut R,
         input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
     ) -> MutationResult {
         if input.txs.is_empty() {
             return MutationResult::Skipped;
@@ -588,7 +855,7 @@ impl EvmMutator {
         let Some(tx) = input.txs.get_mut(idx) else {
             return MutationResult::Skipped;
         };
-        let objective = input
+        let objective = metadata
             .mutation_provenance
             .iter()
             .rev()
@@ -610,7 +877,7 @@ impl EvmMutator {
         }
         tx.input[4..36].copy_from_slice(&amount.to_be_bytes::<32>());
         self.record_mutation(
-            input,
+            metadata,
             "economic_objective",
             Some(idx),
             selector_for_calldata(&input.txs[idx].input),
@@ -619,7 +886,12 @@ impl EvmMutator {
         MutationResult::Mutated
     }
 
-    fn oracle_pressure<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+    fn oracle_pressure<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
+    ) -> MutationResult {
         // Enforce maximum sequence length
         if !self.can_add_transactions(input, 1) {
             return MutationResult::Skipped;
@@ -648,7 +920,7 @@ impl EvmMutator {
         };
         input.txs.insert(0, pressure_tx);
         self.record_mutation(
-            input,
+            metadata,
             "oracle_pressure",
             Some(0),
             Some([0x02, 0x2c, 0x0d, 0x9f]),
@@ -657,7 +929,12 @@ impl EvmMutator {
         MutationResult::Mutated
     }
 
-    fn mev_sandwich<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+    fn mev_sandwich<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
+    ) -> MutationResult {
         // Enforce maximum sequence length (mev_sandwich adds 2 transactions)
         if !self.can_add_transactions(input, 2) {
             return MutationResult::Skipped;
@@ -691,7 +968,7 @@ impl EvmMutator {
         input.txs.insert(idx, frontrun);
         input.txs.insert(idx + 2, backrun);
         self.record_mutation(
-            input,
+            metadata,
             "mev_sandwich",
             Some(idx),
             Some([0x02, 0x2c, 0x0d, 0x9f]),
@@ -700,7 +977,12 @@ impl EvmMutator {
         MutationResult::Mutated
     }
 
-    fn value_boundary<R: Rand>(&self, rand: &mut R, input: &mut EvmInput) -> MutationResult {
+    fn value_boundary<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
+    ) -> MutationResult {
         let idx = match self.random_index(rand, input.txs.len()) {
             Some(i) => i,
             None => return MutationResult::Skipped,
@@ -709,7 +991,13 @@ impl EvmMutator {
         let choices = [U256::ZERO, U256::MAX, U256::from(10u128.pow(18))];
         let choice = rand.below(NonZero::new(choices.len()).unwrap());
         input.txs[idx].value = choices[choice];
-        self.record_mutation(input, "value_boundary", Some(idx), None, "changed tx value");
+        self.record_mutation(
+            metadata,
+            "value_boundary",
+            Some(idx),
+            None,
+            "changed tx value",
+        );
         MutationResult::Mutated
     }
 
@@ -744,6 +1032,7 @@ impl EvmMutator {
         &self,
         rand: &mut R,
         input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
         idx: usize,
     ) -> MutationResult {
         let selector = self.random_selector(rand);
@@ -754,7 +1043,7 @@ impl EvmMutator {
         input.txs[idx].input = self.encode_default_call(selector, types);
         input.txs[idx].value = self.default_call_value(types, rand);
         self.record_mutation(
-            input,
+            metadata,
             "abi_retarget",
             Some(idx),
             Some(selector),
@@ -785,22 +1074,13 @@ impl EvmMutator {
 
     fn record_mutation(
         &self,
-        input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
         strategy: &str,
         tx_index: Option<usize>,
         selector: Option<[u8; 4]>,
         detail: &str,
     ) {
-        input.mutation_provenance.push(MutationProvenance {
-            strategy: strategy.to_string(),
-            tx_index,
-            selector,
-            detail: detail.to_string(),
-        });
-        if input.mutation_provenance.len() > 64 {
-            let excess = input.mutation_provenance.len() - 64;
-            input.mutation_provenance.drain(0..excess);
-        }
+        metadata.record_mutation(strategy, tx_index, selector, detail);
     }
 
     fn mutate_sol_value<R: Rand>(&self, value: &mut DynSolValue, rand: &mut R) {
@@ -1056,7 +1336,9 @@ fn align_abi_word(value: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::types::{ComparisonOperand, SymbolicExpression, TaintSource};
+    use crate::common::types::{
+        CallKind, CallPhase, ComparisonOperand, SymbolicExpression, TaintSource,
+    };
     use crate::engine::concolic::{ConcolicHint, ConcolicStrategy};
     use libafl::mutators::MutationResult;
     use libafl_bolts::rands::RomuDuoJrRand;
@@ -1073,24 +1355,23 @@ mod tests {
         account_registry.contracts.insert(target);
 
         let mutator = EvmMutator::new(Arc::new(registry), Arc::new(RwLock::new(account_registry)));
-        let mut input = EvmInput {
-            txs: Vec::new(),
-            base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
-        };
+        let mut input = EvmInput::new(Vec::new(), 0);
+        let mut metadata = EvmTestcaseMetadata::default();
         let mut rand = RomuDuoJrRand::with_seed(7);
 
         assert_eq!(
-            mutator.structural_mutation(&mut rand, &mut input),
+            mutator.structural_mutation(&mut rand, &mut input, &mut metadata),
             MutationResult::Mutated
         );
         assert_eq!(input.txs.len(), 1);
         assert_eq!(&input.txs[0].input[..4], selector.as_slice());
         assert_eq!(input.txs[0].input.len(), 68);
         assert_eq!(input.txs[0].to, target);
-        assert_eq!(input.mutation_provenance.len(), 1);
-        assert_eq!(input.mutation_provenance[0].strategy, "abi_sequence_insert");
+        assert_eq!(metadata.mutation_provenance.len(), 1);
+        assert_eq!(
+            metadata.mutation_provenance[0].strategy,
+            "abi_sequence_insert"
+        );
     }
 
     #[test]
@@ -1104,27 +1385,26 @@ mod tests {
             Arc::new(registry),
             Arc::new(RwLock::new(GlobalAccountRegistry::default())),
         );
-        let mut input = EvmInput {
-            txs: vec![SingletonTx {
+        let mut input = EvmInput::new(
+            vec![SingletonTx {
                 input: vec![0xde, 0xad, 0xbe, 0xef],
                 caller: Address::repeat_byte(0x11),
                 to: Address::repeat_byte(0x22),
                 value: U256::ZERO,
                 is_victim: false,
             }],
-            base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
-        };
+            0,
+        );
+        let mut metadata = EvmTestcaseMetadata::default();
         let mut rand = RomuDuoJrRand::with_seed(11);
 
         assert_eq!(
-            mutator.abi_mutation(&mut rand, &mut input),
+            mutator.abi_mutation(&mut rand, &mut input, &mut metadata),
             MutationResult::Mutated
         );
         assert_eq!(&input.txs[0].input[..4], selector.as_slice());
         assert_eq!(input.txs[0].input.len(), 36);
-        assert_eq!(input.mutation_provenance[0].strategy, "abi_retarget");
+        assert_eq!(metadata.mutation_provenance[0].strategy, "abi_retarget");
     }
 
     #[test]
@@ -1133,8 +1413,8 @@ mod tests {
             Arc::new(AbiRegistry::default()),
             Arc::new(RwLock::new(GlobalAccountRegistry::default())),
         );
-        let mut input = EvmInput {
-            txs: vec![
+        let mut input = EvmInput::new(
+            vec![
                 SingletonTx {
                     input: vec![0u8; 68],
                     caller: Address::repeat_byte(0x11),
@@ -1150,7 +1430,9 @@ mod tests {
                     is_victim: false,
                 },
             ],
-            base_snapshot_id: 0,
+            0,
+        );
+        let mut metadata = EvmTestcaseMetadata {
             waypoints: vec![
                 Vec::new(),
                 vec![Waypoint::Comparison {
@@ -1173,7 +1455,7 @@ mod tests {
         let mut rand = RomuDuoJrRand::with_seed(19);
 
         assert_eq!(
-            mutator.concolic_mutation(&mut rand, &mut input),
+            mutator.concolic_mutation(&mut rand, &mut input, &mut metadata),
             MutationResult::Mutated
         );
         assert_eq!(
@@ -1181,7 +1463,10 @@ mod tests {
             U256::from(0xfeed_u64)
         );
         assert!(input.txs[1].input[36..68].iter().all(|byte| *byte == 0));
-        assert_eq!(input.mutation_provenance[0].strategy, "concolic_comparison");
+        assert_eq!(
+            metadata.mutation_provenance[0].strategy,
+            "concolic_comparison"
+        );
     }
 
     #[test]
@@ -1199,6 +1484,8 @@ mod tests {
                 is_victim: false,
             }],
             base_snapshot_id: 0,
+        };
+        let mut metadata = EvmTestcaseMetadata {
             waypoints: vec![vec![Waypoint::Comparison {
                 op: 0x14,
                 lhs: U256::ZERO,
@@ -1218,7 +1505,7 @@ mod tests {
         let mut rand = RomuDuoJrRand::with_seed(23);
 
         assert_eq!(
-            mutator.concolic_mutation(&mut rand, &mut input),
+            mutator.concolic_mutation(&mut rand, &mut input, &mut metadata),
             MutationResult::Mutated
         );
         assert_eq!(input.txs[0].input.len(), 68);
@@ -1318,5 +1605,343 @@ mod tests {
         let placement = apply_concolic_hint(&mut tx, &hint, None);
         assert!(placement.contains("msg.sender="));
         assert_eq!(tx.caller, Address::repeat_byte(0x99));
+    }
+
+    fn golden_input() -> EvmInput {
+        EvmInput::new(
+            vec![SingletonTx {
+                input: vec![0xde, 0xad, 0xbe, 0xef],
+                caller: Address::repeat_byte(0x11),
+                to: Address::repeat_byte(0x22),
+                value: U256::from(1_000u64),
+                is_victim: false,
+            }],
+            42,
+        )
+    }
+
+    #[test]
+    fn waypoints_do_not_change_semantic_input_id() {
+        let plain = golden_input();
+        let with_waypoints = golden_input();
+        let metadata = EvmTestcaseMetadata {
+            waypoints: vec![vec![Waypoint::Comparison {
+                op: 0x14,
+                lhs: U256::ZERO,
+                rhs: U256::ONE,
+                pc: 10,
+                calldata_offset: None,
+                condition: false,
+                hit: true,
+                taint_source: None,
+                tainted_operand: ComparisonOperand::Lhs,
+                lhs_expression: None,
+                rhs_expression: None,
+                branch_distance: Some(U256::ONE),
+            }]],
+            mutation_provenance: Vec::new(),
+        };
+        assert_ne!(metadata.waypoints, EvmTestcaseMetadata::default().waypoints);
+        // Semantic identity is a function of the input alone; feedback lives outside.
+        assert_eq!(
+            with_waypoints.semantic_input_id(),
+            plain.semantic_input_id()
+        );
+    }
+
+    #[test]
+    fn provenance_entries_do_not_change_semantic_input_id() {
+        // Same EvmInput, different EvmTestcaseMetadata only: the metadata store
+        // may hold arbitrary provenance variants without affecting identity.
+        let plain = golden_input();
+        let annotated = golden_input();
+        let metadata = EvmTestcaseMetadata {
+            waypoints: Vec::new(),
+            mutation_provenance: vec![
+                MutationProvenance {
+                    strategy: "caller".to_string(),
+                    tx_index: Some(0),
+                    selector: None,
+                    detail: "changed caller role (provenance record only)".to_string(),
+                },
+                MutationProvenance {
+                    strategy: "goal_max_attacker_profit".to_string(),
+                    tx_index: None,
+                    selector: None,
+                    detail: "objective-driven bounded search".to_string(),
+                },
+            ],
+        };
+        assert!(metadata.mutation_provenance != EvmTestcaseMetadata::default().mutation_provenance);
+        assert_eq!(plain, annotated);
+        assert_eq!(plain.semantic_input_id(), annotated.semantic_input_id());
+    }
+
+    #[test]
+    fn execution_defining_differences_change_semantic_input_id() {
+        let base = golden_input();
+
+        let mut calldata_changed = golden_input();
+        calldata_changed.txs[0].input.push(0xff);
+        assert_ne!(
+            calldata_changed.semantic_input_id(),
+            base.semantic_input_id()
+        );
+
+        let mut caller_changed = golden_input();
+        caller_changed.txs[0].caller = Address::repeat_byte(0x33);
+        assert_ne!(caller_changed.semantic_input_id(), base.semantic_input_id());
+
+        let mut value_changed = golden_input();
+        value_changed.txs[0].value = U256::ZERO;
+        assert_ne!(value_changed.semantic_input_id(), base.semantic_input_id());
+
+        let snapshot_changed = EvmInput::new(base.txs.clone(), 43);
+        assert_ne!(
+            snapshot_changed.semantic_input_id(),
+            base.semantic_input_id()
+        );
+    }
+
+    #[test]
+    fn semantic_input_hash_is_deterministic_and_survives_legacy_round_trip() {
+        let first = golden_input().semantic_input_hash();
+        let second = golden_input().semantic_input_hash();
+        assert_eq!(first, second);
+
+        let serialized = serde_json::to_vec(&golden_input()).unwrap();
+        let reparsed: LegacyEvmInputV1 = serde_json::from_slice(&serialized).unwrap();
+        let (input, metadata) = reparsed.into_parts();
+        assert_eq!(input, golden_input());
+        assert_eq!(input.semantic_input_hash(), first);
+        assert!(metadata.waypoints.is_empty());
+        assert!(metadata.mutation_provenance.is_empty());
+    }
+
+    #[test]
+    fn legacy_json_split_preserves_waypoints_and_provenance() {
+        let clean = golden_input();
+        let mut legacy_json = serde_json::to_value(&clean).unwrap();
+        legacy_json["waypoints"] = serde_json::json!([[], []]);
+        legacy_json["mutation_provenance"] = serde_json::json!([{
+            "strategy": "goal_max_attacker_profit",
+            "tx_index": null,
+            "selector": null,
+            "detail": "bounded search"
+        }]);
+        let bytes = serde_json::to_vec(&legacy_json).unwrap();
+
+        let (input, metadata) = EvmInput::split_legacy_json(&bytes).unwrap();
+        assert_eq!(input, clean);
+        assert_eq!(metadata.waypoints.len(), 2);
+        assert_eq!(metadata.mutation_provenance.len(), 1);
+        assert_eq!(
+            metadata.mutation_provenance[0].strategy,
+            "goal_max_attacker_profit"
+        );
+
+        // The legacy file carries no semantic delta; it deduplicates against a
+        // clean rewrite of the same execution-defining content.
+        let round_trip =
+            EvmInput::split_legacy_json(serde_json::to_vec(&input).unwrap().as_slice()).unwrap();
+        assert_eq!(round_trip.0.semantic_input_id(), input.semantic_input_id());
+    }
+
+    #[test]
+    fn semantic_input_hash_matches_pinned_golden_value() {
+        assert_eq!(
+            golden_input().semantic_input_hash(),
+            "0xedbbb6647289e0df39694c6c9a8b810163991ca5cd0ed4c0b387a6c999af74ba"
+        );
+    }
+
+    #[test]
+    fn is_victim_role_marker_does_not_change_semantic_input_id() {
+        let plain = golden_input();
+        let mut victim_marked = golden_input();
+        victim_marked.txs[0].is_victim = true;
+
+        // `is_victim` is an analysis/role marker consumed by MEV/economic-delta
+        // oracles and actor assignment. EvmExecutor builds REVM TxEnv from
+        // caller/value/data/to only, so the victim flag cannot affect execution.
+        assert_ne!(plain.txs, victim_marked.txs);
+        assert_eq!(plain.semantic_input_id(), victim_marked.semantic_input_id());
+    }
+
+    #[test]
+    fn metadata_store_merges_distinct_variants_for_one_semantic_input() {
+        let mutator = EvmMutator::new(
+            Arc::new(AbiRegistry::default()),
+            Arc::new(RwLock::new(GlobalAccountRegistry::default())),
+        );
+        let input = golden_input();
+
+        let record = |strategy: &str, detail: &str| MutationProvenance {
+            strategy: strategy.to_string(),
+            tx_index: None,
+            selector: None,
+            detail: detail.to_string(),
+        };
+
+        mutator.testcase_metadata.insert(
+            &input,
+            EvmTestcaseMetadata {
+                waypoints: vec![vec![Waypoint::BranchPath {
+                    pc: 7,
+                    taken: true,
+                    constraint: Box::new(Waypoint::CallTrace {
+                        tx_idx: 0,
+                        depth: 0,
+                        caller: Address::ZERO,
+                        target: Address::ZERO,
+                        value: U256::ZERO,
+                        input: Vec::new(),
+                        output: Vec::new(),
+                        gas_limit: 0,
+                        gas_used: 0,
+                        success: true,
+                        kind: CallKind::Call,
+                        phase: CallPhase::End,
+                        result: Some("Success".to_string()),
+                    }),
+                }]],
+                mutation_provenance: vec![record("caller", "first write")],
+            },
+        );
+
+        // Same semantic InputId, different metadata variant (the exact review
+        // scenario: InputId X -> A then InputId X -> B).
+        mutator.testcase_metadata.insert(
+            &input,
+            EvmTestcaseMetadata {
+                waypoints: vec![vec![Waypoint::BranchPath {
+                    pc: 11,
+                    taken: false,
+                    constraint: Box::new(Waypoint::CallTrace {
+                        tx_idx: 0,
+                        depth: 0,
+                        caller: Address::ZERO,
+                        target: Address::ZERO,
+                        value: U256::ZERO,
+                        input: Vec::new(),
+                        output: Vec::new(),
+                        gas_limit: 0,
+                        gas_used: 0,
+                        success: true,
+                        kind: CallKind::Call,
+                        phase: CallPhase::End,
+                        result: Some("Success".to_string()),
+                    }),
+                }]],
+                mutation_provenance: vec![
+                    record("caller", "first write"),
+                    record("value_boundary", "second write"),
+                ],
+            },
+        );
+
+        let merged = mutator.testcase_metadata.get_or_default(&input);
+        assert!(merged
+            .waypoints
+            .iter()
+            .flatten()
+            .any(|waypoint| matches!(waypoint, Waypoint::BranchPath { pc: 7, .. })));
+        assert!(merged
+            .waypoints
+            .iter()
+            .flatten()
+            .any(|waypoint| matches!(waypoint, Waypoint::BranchPath { pc: 11, .. })));
+        assert_eq!(
+            merged.mutation_provenance,
+            vec![
+                record("caller", "first write"),
+                record("value_boundary", "second write")
+            ]
+        );
+    }
+
+    #[test]
+    fn metadata_store_respects_entry_bound_and_replace_eviction() {
+        let store = EvmTestcaseMetadataStore::default();
+        let inputs: Vec<EvmInput> = (0..MAX_METADATA_STORE_ENTRIES + 8)
+            .map(|idx| EvmInput::new(golden_input().txs.clone(), idx as u64))
+            .collect();
+        for input in &inputs {
+            store.insert(input, EvmTestcaseMetadata::default());
+        }
+        assert!(store.len() <= MAX_METADATA_STORE_ENTRIES);
+        // Evicted entries return defaults; retained entries keep their metadata.
+        assert_eq!(
+            store.get_or_default(&inputs[0]),
+            EvmTestcaseMetadata::default()
+        );
+        assert_eq!(
+            store.get_or_default(inputs.last().unwrap()),
+            EvmTestcaseMetadata::default()
+        );
+    }
+
+    #[test]
+    fn economic_objective_mutation_preserves_goal_guidance_from_metadata_store() {
+        let mutator = EvmMutator::new(
+            Arc::new(AbiRegistry::default()),
+            Arc::new(RwLock::new(GlobalAccountRegistry::default())),
+        );
+        // Simulate a bounded-search seed whose goal tags live in the metadata store.
+        let seeded = golden_input();
+        mutator.testcase_metadata.insert(
+            &seeded,
+            EvmTestcaseMetadata {
+                waypoints: Vec::new(),
+                mutation_provenance: vec![MutationProvenance {
+                    strategy: "goal_IncreaseSharesPerAsset".to_string(),
+                    tx_index: None,
+                    selector: None,
+                    detail: "objective-driven bounded search".to_string(),
+                }],
+            },
+        );
+
+        // The mutator restores guidance through the store for this semantic input
+        // and the objective mutation still reads it.
+        let mut metadata = mutator.testcase_metadata.get_or_default(&seeded);
+        assert_eq!(
+            metadata.mutation_provenance[0].strategy,
+            "goal_IncreaseSharesPerAsset"
+        );
+
+        let mut input = seeded;
+        let mut rand = RomuDuoJrRand::with_seed(3);
+        assert_eq!(
+            mutator.economic_objective_mutation(&mut rand, &mut input, &mut metadata),
+            MutationResult::Mutated
+        );
+        assert_eq!(
+            U256::from_be_slice(&input.txs[0].input[4..36]),
+            U256::from(10u128.pow(18))
+        );
+        assert_eq!(
+            metadata.mutation_provenance.last().unwrap().strategy,
+            "economic_objective"
+        );
+    }
+
+    #[test]
+    fn economic_objective_mutation_without_guidance_uses_default_objective() {
+        let mutator = EvmMutator::new(
+            Arc::new(AbiRegistry::default()),
+            Arc::new(RwLock::new(GlobalAccountRegistry::default())),
+        );
+        let mut input = golden_input();
+        let mut metadata = EvmTestcaseMetadata::default();
+        let mut rand = RomuDuoJrRand::with_seed(9);
+        assert_eq!(
+            mutator.economic_objective_mutation(&mut rand, &mut input, &mut metadata),
+            MutationResult::Mutated
+        );
+        assert_eq!(
+            U256::from_be_slice(&input.txs[0].input[4..36]),
+            U256::from(10u128.pow(21))
+        );
     }
 }
