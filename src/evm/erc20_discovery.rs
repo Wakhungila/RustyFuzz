@@ -1,8 +1,8 @@
 use crate::common::types::{ChainState, SingletonTx};
-use crate::evm::executor::EvmExecutor;
-use crate::evm::fork_db::EvmCacheDb;
 use crate::evm::fuzz::AbiRegistry;
 use revm::primitives::{keccak256, Address, U256};
+use rustyfuzz_evm::executor::EvmExecutor;
+use rustyfuzz_evm::fork_db::EvmCacheDb;
 use std::sync::Arc;
 
 /// ERC20Discovery: Utility to dynamically find storage slots for ERC20 balances and total supply.
@@ -37,8 +37,8 @@ impl Erc20Discovery {
 
         let mut temp_state = ChainState::Evm(initial_db.clone());
         let mut dummy_coverage =
-            bitvec::bitvec![u8, bitvec::prelude::Lsb0; 0; crate::evm::inspector::MAP_SIZE];
-        let mut dummy_dataflow = crate::evm::dataflow::DataflowRegistry::new();
+            bitvec::bitvec![u8, bitvec::prelude::Lsb0; 0; rustyfuzz_evm::inspector::MAP_SIZE];
+        let mut dummy_dataflow = rustyfuzz_evm::dataflow::DataflowRegistry::new();
         let mut dummy_waypoints = Vec::new();
         let mut dummy_block_env = revm::context::BlockEnv::default();
 

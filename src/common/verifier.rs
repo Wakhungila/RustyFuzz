@@ -3,12 +3,8 @@ use crate::common::oracle::{
 };
 use crate::common::types::{ChainState, OracleObservation, SequenceExecutionResult, Snapshot};
 use crate::evm::corpus::PersistentCorpus;
-use crate::evm::dataflow::DataflowRegistry;
 use crate::evm::economic_views::{snapshot_economic_views, EconomicViewProbePlan};
-use crate::evm::executor::EvmExecutor;
 use crate::evm::feedback::EvmCoverageFeedback;
-use crate::evm::fork_db::EvmCacheDb;
-use crate::evm::fork_db::ForkDb;
 use crate::evm::fuzz::EvmInput;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -17,6 +13,10 @@ use revm::context::BlockEnv;
 use revm::database::CacheDB;
 use revm::database_interface::DatabaseRef;
 use revm::primitives::{Address, U256};
+use rustyfuzz_evm::dataflow::DataflowRegistry;
+use rustyfuzz_evm::executor::EvmExecutor;
+use rustyfuzz_evm::fork_db::EvmCacheDb;
+use rustyfuzz_evm::fork_db::ForkDb;
 use serde::{Deserialize, Serialize};
 
 pub struct ReplayVerifier {

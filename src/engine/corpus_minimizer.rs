@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use crate::common::types::ChainState;
 use crate::evm::corpus::SnapshotCorpus;
-use crate::evm::dataflow::DataflowRegistry;
-use crate::evm::executor::EvmExecutor;
-use crate::evm::fork_db::EvmCacheDb;
 use crate::evm::fuzz::EvmInput;
-use crate::evm::inspector::MAP_SIZE;
+use rustyfuzz_evm::dataflow::DataflowRegistry;
+use rustyfuzz_evm::executor::EvmExecutor;
+use rustyfuzz_evm::fork_db::EvmCacheDb;
+use rustyfuzz_evm::inspector::MAP_SIZE;
 
 pub struct CorpusMinimizationStage<S> {
     pub corpus: Arc<RwLock<SnapshotCorpus>>,

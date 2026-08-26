@@ -25,7 +25,7 @@ impl SvmBridge {
     /// Translates an EVM ChainState into a mapping of pseudo-Solana accounts.
     /// This is used for multi-chain snapshotting where an EVM state change
     /// triggers or influences a simulated SVM environment.
-    pub fn translate_evm_to_svm(evm_state: &ChainState, evm_dataflow: &crate::evm::dataflow::DataflowRegistry) -> crate::common::types::SvmState {
+    pub fn translate_evm_to_svm(evm_state: &ChainState, evm_dataflow: &rustyfuzz_evm::dataflow::DataflowRegistry) -> crate::common::types::SvmState {
         let mut svm_state = crate::common::types::SvmState::default();
 
         if let ChainState::Evm(db) = evm_state {
@@ -73,14 +73,14 @@ impl SvmBridge {
     }
 
     /// Extends the bridge to handle Cross-Program Invocation (CPI) mapping.
-    /// Translates a sequence of EVM transactions into a single Solana transaction 
-    /// containing multiple instructions, allowing the fuzzer to explore 
+    /// Translates a sequence of EVM transactions into a single Solana transaction
+    /// containing multiple instructions, allowing the fuzzer to explore
     /// multi-step logic in the SVM.
     pub fn translate_evm_sequence_to_svm_tx(txs: &[SingletonTx]) -> Transaction {
         let instructions: Vec<Instruction> = txs.iter().map(|tx| {
             let program_id = Pubkey::new_from_array(Self::address_to_pubkey(&tx.to));
             let caller_pubkey = Pubkey::new_from_array(Self::address_to_pubkey(&tx.caller));
-            
+
             // Heuristic: Map EVM caller to the first account and marked as signer.
             // In production, dataflow would identify additional required accounts.
             Instruction {

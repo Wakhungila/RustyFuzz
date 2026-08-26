@@ -1,12 +1,12 @@
 use crate::common::types::{EvmInput, SingletonTx};
 use crate::engine::abi_ingest::{AbiFunctionSummary, SelectorClassification};
-use crate::evm::fork_db::{ForkDb, ForkDbCacheSnapshot};
 use alloy::consensus::Transaction;
 use alloy::providers::Provider;
 use alloy::rpc::types::eth::{BlockTransactions, Filter};
 use anyhow::Context;
 use revm::database_interface::DatabaseRef;
 use revm::primitives::{keccak256, Address, B256, U256};
+use rustyfuzz_evm::fork_db::{ForkDb, ForkDbCacheSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};

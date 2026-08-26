@@ -27,14 +27,14 @@ use crate::engine::target_profile::{ProtocolType, TargetProfile, TargetProfiler}
 use crate::evm::corpus::{
     CampaignArtifactRequest, PersistentCorpus, SeedBundleStatus, SnapshotCorpus,
 };
-use crate::evm::dataflow::DataflowRegistry;
-use crate::evm::executor::EvmExecutor;
 use crate::evm::feedback::{EvmCoverageFeedback, EvmStateNoveltyFeedback, StateNoveltyReport};
-use crate::evm::fork_db::{execution_rpc_budget, ForkDb};
 use crate::evm::fuzz::{AbiRegistry, EvmMutator, EvmTestcaseMetadataStore, MutationProvenance};
-use crate::evm::inspector::MAP_SIZE;
 use crate::evm::registry::GlobalAccountRegistry;
 use crate::evm::snapshot::new_evm_snapshot;
+use rustyfuzz_evm::dataflow::DataflowRegistry;
+use rustyfuzz_evm::executor::EvmExecutor;
+use rustyfuzz_evm::fork_db::{execution_rpc_budget, ForkDb};
+use rustyfuzz_evm::inspector::MAP_SIZE;
 
 use libafl::corpus::{Corpus, Testcase};
 use libafl::events::{

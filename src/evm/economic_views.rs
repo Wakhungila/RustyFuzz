@@ -3,10 +3,10 @@ use crate::engine::economic_delta::{
     AmmReserveView, EconomicViewSnapshot, LendingHealthView, OracleAnswerView, ScalarView,
     TokenBalanceView,
 };
-use crate::evm::dataflow::DataflowRegistry;
-use crate::evm::executor::EvmExecutor;
 use revm::context::BlockEnv;
 use revm::primitives::{keccak256, Address, U256};
+use rustyfuzz_evm::dataflow::DataflowRegistry;
+use rustyfuzz_evm::executor::EvmExecutor;
 use std::collections::BTreeSet;
 
 const VIEW_GAS_MAP_SIZE: usize = 4096;

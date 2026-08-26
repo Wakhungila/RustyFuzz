@@ -1,5 +1,5 @@
 use crate::common::types::{SvmState, VulnType, Snapshot};
-use crate::evm::inspector::MAP_SIZE;
+use rustyfuzz_evm::inspector::MAP_SIZE;
 use crate::svm::executor::SvmExecutor;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::transaction::Transaction;
@@ -28,11 +28,11 @@ impl SvmDifferentialFuzzer {
         // 1. Execute locally via Mollusk
         let mut local_coverage = bitvec![u8, Lsb0; 0; MAP_SIZE];
         let mut local_waypoints = Vec::new();
-        
+
         SvmExecutor::execute_transaction(
-            local_state, 
-            transaction, 
-            local_coverage.as_mut_bitslice(), 
+            local_state,
+            transaction,
+            local_coverage.as_mut_bitslice(),
             &mut local_waypoints
         )?;
 
@@ -60,10 +60,10 @@ impl SvmDifferentialFuzzer {
                                 pubkey, local_acc.lamports, rpc_acc.lamports
                             ))));
                         }
-                        
+
                         if local_acc.data != rpc_acc.data {
                             return Ok(Some(VulnType::DifferentialDivergence(format!(
-                                "Data mismatch for account {}: LocalDataLen={} vs RPCDataLen={}", 
+                                "Data mismatch for account {}: LocalDataLen={} vs RPCDataLen={}",
                                 pubkey, local_acc.data.len(), rpc_acc.data.len()
                             ))));
                         }

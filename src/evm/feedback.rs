@@ -5,11 +5,11 @@
 
 use crate::common::types::{CallPhase, SequenceExecutionResult, StorageDiff};
 use crate::evm::fuzz::EvmInput;
-use crate::evm::inspector::MAP_SIZE;
 use libafl::observers::StdMapObserver;
 use libafl::prelude::*;
 use libafl_bolts::{tuples::MatchName, AsSlice};
 use revm::primitives::{Address, B256, U256};
+use rustyfuzz_evm::inspector::MAP_SIZE;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
 

@@ -20,12 +20,9 @@ use rusty_fuzz::engine::exploit_synthesizer::{
 use rusty_fuzz::engine::minimizer::Minimizer;
 use rusty_fuzz::engine::scoring::{CampaignScore, CampaignScorer, CampaignScoringConfig};
 use rusty_fuzz::evm::corpus::{CampaignArtifactRequest, PersistentCorpus};
-use rusty_fuzz::evm::dataflow::DataflowRegistry;
-use rusty_fuzz::evm::executor::EvmExecutor;
 use rusty_fuzz::evm::feedback::{
     stable_execution_state_hash, EvmCoverageFeedback, EvmStateNoveltyFeedback,
 };
-use rusty_fuzz::evm::fork_db::ForkDb;
 use rusty_fuzz::evm::fuzz::MutationProvenance;
 use rusty_fuzz::evm::registry::GlobalAccountRegistry;
 use rusty_fuzz::evm::seed_ingester::{
@@ -33,6 +30,9 @@ use rusty_fuzz::evm::seed_ingester::{
     MainnetSeed, MainnetSeedBundle, SeedMetadata,
 };
 use rusty_fuzz::evm::snapshot::new_evm_snapshot;
+use rustyfuzz_evm::dataflow::DataflowRegistry;
+use rustyfuzz_evm::executor::EvmExecutor;
+use rustyfuzz_evm::fork_db::ForkDb;
 
 fn addr(byte: u8) -> Address {
     Address::repeat_byte(byte)

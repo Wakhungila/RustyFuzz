@@ -25,14 +25,14 @@ use crate::engine::seed_intelligence::{SeedCandidate, SeedIntelligence, SeedSour
 use crate::engine::target_profile::TargetProfiler;
 use crate::evm::corpus::SnapshotScoreWeights;
 use crate::evm::feedback::StateNoveltyReport;
-use crate::evm::fork_db::{ForkDb, ForkDbCacheSnapshot};
 use crate::evm::fuzz::{AbiRegistry, EvmInput};
-use crate::evm::inspector::MAP_SIZE;
 use anyhow::{Context, Result};
 use revm::context::BlockEnv;
 use revm::database::CacheDB;
 use revm::primitives::{keccak256, Address, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
+use rustyfuzz_evm::fork_db::{ForkDb, ForkDbCacheSnapshot};
+use rustyfuzz_evm::inspector::MAP_SIZE;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;

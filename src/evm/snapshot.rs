@@ -1,6 +1,6 @@
 use crate::common::types::{ChainState, Snapshot};
-use crate::evm::fork_db::EvmCacheDb;
 use bitvec::prelude::Lsb0;
+use rustyfuzz_evm::fork_db::EvmCacheDb;
 
 pub fn new_evm_snapshot(id: u64, initial_state: EvmCacheDb) -> Snapshot {
     Snapshot {

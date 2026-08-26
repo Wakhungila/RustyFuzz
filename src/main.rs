@@ -21,15 +21,15 @@ use rusty_fuzz::engine::promotion::{
 use rusty_fuzz::engine::seed_intelligence::SeedIntelligence;
 use rusty_fuzz::evm::corpus::{CampaignArtifactRecord, PersistentCorpus};
 use rusty_fuzz::evm::etherscan_abi_fetcher::EtherscanAbiFetcher;
-use rusty_fuzz::evm::executor::EvmExecutor;
 use rusty_fuzz::evm::fork::create_fork_block_env;
-use rusty_fuzz::evm::fork_db::ForkDb;
-use rusty_fuzz::evm::inspector::MAP_SIZE;
 use rusty_fuzz::evm::seed_ingester::{
     seed_abi_functions, MainnetSeed, MainnetSeedBundle, MainnetSeedConfig, SeedIngester,
     SeedMetadata, SeedScanMode,
 };
 use rusty_fuzz::satori::cli::SatoriCommand;
+use rustyfuzz_evm::executor::EvmExecutor;
+use rustyfuzz_evm::fork_db::ForkDb;
+use rustyfuzz_evm::inspector::MAP_SIZE;
 use std::io::Write;
 use std::str::FromStr;
 use std::sync::{
@@ -1894,7 +1894,7 @@ mod tests {
     };
     use revm::primitives::{Address, U256};
     use rusty_fuzz::engine::promotion::PromotionCampaignSummary;
-    use rusty_fuzz::evm::fork_db::ForkDb;
+    use rustyfuzz_evm::fork_db::ForkDb;
 
     #[test]
     fn fuzz_requires_bounds_unless_unbounded() {

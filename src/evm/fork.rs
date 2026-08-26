@@ -11,7 +11,7 @@ use revm::database::CacheDB;
 use revm::primitives::{Address, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
 
-use crate::evm::fork_db::{EvmCacheDb, ForkDb};
+use rustyfuzz_evm::fork_db::{EvmCacheDb, ForkDb};
 
 #[cfg(feature = "evm")]
 pub async fn create_fork_db(

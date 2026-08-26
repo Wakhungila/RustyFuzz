@@ -1,8 +1,8 @@
 use crate::common::types::SingletonTx;
-use crate::evm::fork_db::ForkDb;
 use revm::database::CacheDB;
 use revm::primitives::{Address, U256};
 use revm::state::AccountInfo;
+use rustyfuzz_evm::fork_db::ForkDb;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 

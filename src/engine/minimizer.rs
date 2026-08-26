@@ -5,16 +5,16 @@ use crate::common::oracle::{
 use crate::common::types::{ChainState, SequenceExecutionResult, SingletonTx, Snapshot};
 use crate::engine::exploit_synthesizer::synthesize_foundry_poc_with_findings;
 use crate::evm::corpus::{CorpusEntryMetadata, CrashRecord, PersistentCorpus};
-use crate::evm::dataflow::DataflowRegistry;
-use crate::evm::executor::EvmExecutor;
 use crate::evm::feedback::EvmStateNoveltyFeedback;
-use crate::evm::fork_db::EvmCacheDb;
 use crate::evm::fuzz::EvmInput;
-use crate::evm::inspector::MAP_SIZE;
 use crate::evm::snapshot::new_evm_snapshot;
 use bitvec::prelude::*;
 use parking_lot::RwLock;
 use revm::context::BlockEnv;
+use rustyfuzz_evm::dataflow::DataflowRegistry;
+use rustyfuzz_evm::executor::EvmExecutor;
+use rustyfuzz_evm::fork_db::EvmCacheDb;
+use rustyfuzz_evm::inspector::MAP_SIZE;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
