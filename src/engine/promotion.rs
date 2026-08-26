@@ -36,6 +36,27 @@ pub enum FindingLifecycleStage {
     Rejected,
 }
 
+impl FindingLifecycleStage {
+    /// Maps the promotion-pipeline stage onto the canonical Stage 2D lifecycle.
+    ///
+    /// Note: `PocGenerated` maps to `Minimized` — PoC generation is evidence
+    /// gathering and must not advance proof by itself (ADR: AI/forge output
+    /// never proves; invariant #4/#5).
+    ///
+    /// TODO(stage-4): retire this compatibility mapping once the pipeline
+    /// consumes `rustyfuzz_core::FindingLifecycle` directly.
+    pub fn canonical(&self) -> rustyfuzz_core::FindingLifecycle {
+        match self {
+            FindingLifecycleStage::Candidate => rustyfuzz_core::FindingLifecycle::Candidate,
+            FindingLifecycleStage::Replayed => rustyfuzz_core::FindingLifecycle::Replayed,
+            FindingLifecycleStage::Minimized => rustyfuzz_core::FindingLifecycle::Minimized,
+            FindingLifecycleStage::PocGenerated => rustyfuzz_core::FindingLifecycle::Minimized,
+            FindingLifecycleStage::Confirmed => rustyfuzz_core::FindingLifecycle::Proved,
+            FindingLifecycleStage::Rejected => rustyfuzz_core::FindingLifecycle::Rejected,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromotionConfig {
     pub enabled: bool,
@@ -1396,5 +1417,49 @@ mod tests {
         assert!(markdown.contains("sha256:abc"));
         assert!(markdown.contains("## Root cause hypothesis"));
         assert!(markdown.contains("## Recommended fix"));
+    }
+
+    #[test]
+    fn stage_2d_promotion_pipeline_transitions_are_canonical_legal() {
+        use rustyfuzz_core::FindingLifecycle;
+
+        // The exact transition sequence used by the promotion pipeline maps
+        // onto legal canonical transitions. PoC generation does not advance
+        // proof; Confirmed is policy-gated Proved.
+        let steps = [
+            FindingLifecycleStage::Candidate,
+            FindingLifecycleStage::Replayed,
+            FindingLifecycleStage::Minimized,
+            FindingLifecycleStage::PocGenerated,
+            FindingLifecycleStage::Confirmed,
+        ];
+        for pair in steps.windows(2) {
+            let from = pair[0].canonical();
+            let to = pair[1].canonical();
+            assert!(
+                from.can_transition(to),
+                "illegal promotion transition {:?} -> {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // Rejection path stays available from any intermediate stage.
+        for stage in &steps[..steps.len() - 1] {
+            assert!(stage.canonical().can_transition(FindingLifecycle::Rejected));
+        }
+    }
+
+    #[test]
+    fn stage_2d_oracle_signal_maps_to_signal_not_proved() {
+        use rustyfuzz_core::FindingLifecycle;
+
+        // Freshly detected findings hold status Lead, canonically Signal; the
+        // trust model forbids jumping to Proved without deterministic stages.
+        let lead = FindingStatus::default();
+        assert_eq!(lead.canonical(), FindingLifecycle::Signal);
+        assert!(lead
+            .canonical()
+            .transition(FindingLifecycle::Proved)
+            .is_err());
     }
 }

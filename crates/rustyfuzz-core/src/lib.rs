@@ -21,7 +21,9 @@ pub mod snapshot;
 
 pub use error::{CoreError, CoreResult};
 pub use execution::ExecutionStatus;
-pub use finding::{EvidenceKind, EvidenceRef};
+pub use finding::{
+    EvidenceKind, EvidenceRef, FindingIdentity, FindingLifecycle, IllegalTransition,
+};
 pub use ids::{CampaignId, EvidenceId, FindingId, InputId, OracleId, SnapshotId};
 pub use metadata::TestcaseMetadata;
 pub use snapshot::{SnapshotMetadata, StateFingerprint};

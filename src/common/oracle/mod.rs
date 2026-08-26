@@ -15,6 +15,22 @@ pub enum FindingStatus {
     Rejected,
 }
 
+impl FindingStatus {
+    /// Maps the legacy status onto the canonical Stage 2D lifecycle.
+    ///
+    /// TODO(stage-4): retire this compatibility mapping once callers consume
+    /// `rustyfuzz_core::FindingLifecycle` directly.
+    pub fn canonical(&self) -> rustyfuzz_core::FindingLifecycle {
+        match self {
+            FindingStatus::Lead => rustyfuzz_core::FindingLifecycle::Signal,
+            FindingStatus::Replayed => rustyfuzz_core::FindingLifecycle::Replayed,
+            FindingStatus::Minimized => rustyfuzz_core::FindingLifecycle::Minimized,
+            FindingStatus::Proved => rustyfuzz_core::FindingLifecycle::Proved,
+            FindingStatus::Rejected => rustyfuzz_core::FindingLifecycle::Rejected,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EvidenceGrade {
     #[default]
