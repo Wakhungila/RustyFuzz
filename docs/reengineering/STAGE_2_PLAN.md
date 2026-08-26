@@ -1,6 +1,6 @@
 # Stage 2 Migration Plan
 
-Status: TARGET plan. Not implemented in Stage 1.
+Status: TARGET plan with Stage 2A progress recorded.
 
 Stage 2 is the first production architecture migration. It must proceed in
 small, compilable steps and preserve the Stage 0.5 regression gate.
@@ -15,10 +15,24 @@ integration in the same patch as type extraction.
 
 Goal: create a stable, REVM-free domain crate.
 
+Implementation progress:
+
+- Stage 2A introduced `crates/rustyfuzz-core` as the only new production crate.
+- The root `rusty-fuzz` package remains in place and now participates in the
+  workspace.
+- Strong IDs, typed core errors, neutral snapshot/testcase metadata skeletons,
+  evidence references, and `ExecutionStatus` are present in `rustyfuzz-core`.
+- `ExecutionStatus` is temporarily re-exported through `src/common/types.rs` so
+  existing callers keep their public path.
+- Semantic transaction/input reshaping was deliberately deferred to Stage 2B.
+- Snapshot corpus, EVM executor, scheduler, mutators, oracles, Satori, and
+  artifact layout were not changed.
+
 Initial type families:
 
 - strong IDs: `InputId`, `SnapshotId`, `CampaignId`, `OracleId`;
-- semantic transaction/input shapes;
+- semantic transaction/input shapes; deferred to Stage 2B except for ID
+  destination types;
 - execution status/result summaries that do not require REVM internals;
 - snapshot metadata;
 - finding/evidence skeletons;

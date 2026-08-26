@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/rustyfuzz-core"]
+resolver = "2"
+
 [package]
 name = "rusty-fuzz"
 version = "0.1.0"
@@ -35,6 +39,7 @@ sgx      = []
 # FUZZING CORE
 # ─────────────────────────────────────────────────────────────────────────────
 [dependencies]
+rustyfuzz-core = { path = "crates/rustyfuzz-core" }
 libafl       = { version = "0.15.4", features = ["prelude"] }
 libafl_bolts = { version = "0.15.4", features = ["prelude"] }
 log          = "0.4.29"

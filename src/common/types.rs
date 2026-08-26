@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 pub use crate::evm::fuzz::EvmInput;
+// TODO(stage-2b): replace legacy numeric/string identifiers in corpus and
+// artifacts with these strong core IDs as semantic input metadata is split out.
+pub use rustyfuzz_core::{CampaignId, InputId, OracleId, SnapshotId};
+// TODO(stage-2e): keep this compatibility path until EVM execution result
+// types move behind the rustyfuzz-evm boundary.
+pub use rustyfuzz_core::ExecutionStatus;
 
 /// Maximum number of waypoints allowed per transaction to prevent unbounded memory growth
 pub const MAX_WAYPOINTS_PER_TX: usize = 1000;
@@ -93,13 +99,6 @@ pub struct SingletonTx {
 #[derive(Clone)]
 pub enum ChainState {
     Evm(EvmCacheDb),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum ExecutionStatus {
-    Success,
-    Revert,
-    Halt(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

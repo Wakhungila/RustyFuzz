@@ -4,19 +4,29 @@ Status: CURRENT and TARGET reference.
 
 This document separates the current v0.1 monolith from the approved v0.2 target.
 Target sections describe migration intent only; they are not claims about code
-that exists today.
+that exists today. Stage 2A has introduced the first workspace member,
+`rustyfuzz-core`, but the runtime is still the existing monolith.
 
 ## Current Architecture - v0.1
 
-RustyFuzz is currently one Cargo package named `rusty-fuzz`. The default and
-supported production path is EVM. The current package contains REVM execution,
-LibAFL campaign orchestration, protocol oracles, artifact persistence, benchmark
-orchestration, CLI command handling, and Satori research tooling in one crate.
+RustyFuzz is currently a Cargo workspace with two members:
+
+- the existing package named `rusty-fuzz`;
+- `crates/rustyfuzz-core`, a dependency-light domain crate introduced in Stage
+  2A.
+
+The default and supported production path is still EVM. The current
+`rusty-fuzz` package contains REVM execution, LibAFL campaign orchestration,
+protocol oracles, artifact persistence, benchmark orchestration, CLI command
+handling, and Satori research tooling in one crate.
 
 Main current boundaries:
 
 - `src/main.rs`: CLI parsing and command execution; currently larger than a thin dispatcher.
 - `src/bin/benchmark.rs`: benchmark child-process runner.
+- `crates/rustyfuzz-core/**`: PARTIALLY IMPLEMENTED stable IDs, neutral
+  metadata skeletons, typed core errors, and the dependency-neutral
+  `ExecutionStatus`.
 - `src/common/**`: shared execution/finding/report/verifier types, but still depends on REVM and EVM modules.
 - `src/evm/**`: REVM executor, fork DB, snapshots, corpus, ABI-aware mutation, traces, and feedback.
 - `src/engine/**`: LibAFL campaign runtime, scheduler, scoring, benchmark validation, seed intelligence, concolic hints, minimization, promotion, and proof support.
@@ -30,6 +40,7 @@ Current high-level dependencies:
 
 ```mermaid
 flowchart TD
+    Core["crates/rustyfuzz-core/**\nPARTIAL stable domain types"]
     CLI["src/main.rs\nsrc/bin/benchmark.rs"] --> Engine["src/engine/**\nLibAFL campaign, scoring, proof, benchmarks"]
     CLI --> Satori["src/satori/**\nEXPERIMENTAL AI/static analysis"]
     Engine --> EVM["src/evm/**\nREVM executor, fork DB, corpus, mutators"]
@@ -38,6 +49,7 @@ flowchart TD
     Engine --> Oracles["src/oracles/**\neconomic signal module"]
     EVM --> Common
     Common --> EVM
+    Common --> Core
     Hybrid["src/hybrid/**\nEXPERIMENTAL"] --> EVM
     SVM["src/svm/**\nUNSUPPORTED"] -. compile guard .-> CLI
     SGX["src/sgx/**\nUNSUPPORTED shim"] -. status only .-> CLI
@@ -46,7 +58,8 @@ flowchart TD
 Known current architecture problems:
 
 - `EvmInput` contains execution feedback/provenance fields, so semantic input identity is not clean.
-- `common` is not core-clean because it imports REVM and `evm::fork_db`.
+- `common` is not core-clean because it imports REVM and `evm::fork_db`; only
+  selected neutral types have been bridged to `rustyfuzz-core`.
 - There are duplicate finding lifecycle models in source and older docs.
 - Runtime paths are reconstructed in multiple modules; there is no `RunLayout`.
 - Satori is useful but coupled to one provider path and runtime layout.
@@ -55,18 +68,23 @@ Known current architecture problems:
 ## Target Architecture - v0.2
 
 The v0.2 target is an EVM-only supported production kernel with a staged
-workspace extraction. This is not implemented in Stage 1.
+workspace extraction. Stage 2A has implemented only the first core crate
+boundary.
 
 Target crates:
 
-- `rustyfuzz-core`: stable domain IDs, inputs, execution observations, snapshots, findings, metadata, and typed errors. No REVM, LibAFL internals, RPC clients, AI SDKs, or CLI framework dependencies.
-- `rustyfuzz-evm`: REVM backend, fork DB, ABI handling, bytecode analysis, inspectors, traces, lazy RPC state, and EVM state representation.
-- `rustyfuzz-engine`: LibAFL campaign builder/runtime/worker, feedback, mutators, scheduler, snapshots, seeds, concolic, minimization, and proof orchestration.
-- `rustyfuzz-oracles`: oracle traits, evidence, and production oracle packs.
-- `rustyfuzz-artifacts`: versioned runtime layout, manifests, persistence queue, reports, and schema round trips.
-- `rustyfuzz-ai`: optional provider-neutral AI proposal subsystem.
-- `rustyfuzz-cli`: thin command parser and dispatcher.
-- `rustyfuzz-testkit`: deterministic fixtures and shared test helpers.
+- `rustyfuzz-core`: PARTIALLY IMPLEMENTED. Currently owns strong IDs, typed
+  core errors, neutral snapshot/testcase metadata skeletons, evidence
+  references, and `ExecutionStatus`. Target scope also includes stable inputs,
+  execution observations, snapshots, findings, and metadata. No REVM, LibAFL
+  internals, RPC clients, AI SDKs, or CLI framework dependencies.
+- `rustyfuzz-evm`: TARGET. REVM backend, fork DB, ABI handling, bytecode analysis, inspectors, traces, lazy RPC state, and EVM state representation.
+- `rustyfuzz-engine`: TARGET. LibAFL campaign builder/runtime/worker, feedback, mutators, scheduler, snapshots, seeds, concolic, minimization, and proof orchestration.
+- `rustyfuzz-oracles`: TARGET. Oracle traits, evidence, and production oracle packs.
+- `rustyfuzz-artifacts`: TARGET. Versioned runtime layout, manifests, persistence queue, reports, and schema round trips.
+- `rustyfuzz-ai`: TARGET. Optional provider-neutral AI proposal subsystem.
+- `rustyfuzz-cli`: TARGET. Thin command parser and dispatcher.
+- `rustyfuzz-testkit`: TARGET. Deterministic fixtures and shared test helpers.
 
 Target dependency direction:
 
