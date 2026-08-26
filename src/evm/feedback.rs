@@ -313,18 +313,8 @@ impl EvmCoverageFeedback {
     }
 
     pub fn stable_path_hash(coverage: &[u8]) -> u64 {
-        let mut hash = 0xcbf29ce484222325u64;
-        for (idx, hit) in coverage.iter().copied().enumerate() {
-            let bucket = bucket_hitcount(hit);
-            if bucket == 0 {
-                continue;
-            }
-            hash ^= idx as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-            hash ^= bucket as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash
+        // Stage 2E: hashing lives in `rustyfuzz-evm`; behavior unchanged.
+        rustyfuzz_evm::coverage::stable_path_hash(coverage)
     }
 }
 
