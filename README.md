@@ -2,6 +2,19 @@
 
 A stateful EVM fuzzer for smart contract security research. RustyFuzz executes transaction sequences deterministically against forked EVM state, with coverage feedback, protocol oracle detection, and reproducible crash reporting.
 
+## Project Status
+
+RustyFuzz v0.1 is currently a single-crate EVM-first fuzzer. The codebase has working REVM execution, LibAFL integration, fork caching, ABI-aware mutation, coverage/state feedback, replay-oriented artifacts, benchmark fixtures, and Satori research tooling.
+
+Status boundaries:
+
+- **Working today**: default EVM build, tests, benchmark smoke tests, Z3/LLM/notifier feature checks, SGX status shim, and pinned sanitizer library tests.
+- **Experimental**: Satori/AI research workflow, hybrid taint/concolic components, benchmark orchestration, and promotion/reporting paths that still need architectural separation.
+- **Unsupported**: SVM production fuzzing, SGX production execution, and `--no-default-features` builds in the current monolith.
+- **Planned for v0.2**: a staged workspace extraction with `rustyfuzz-core`, `rustyfuzz-evm`, `rustyfuzz-engine`, `rustyfuzz-oracles`, `rustyfuzz-artifacts`, `rustyfuzz-ai`, `rustyfuzz-cli`, and `rustyfuzz-testkit`.
+
+Canonical project docs start at [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), and [docs/reengineering/BASELINE.md](docs/reengineering/BASELINE.md).
+
 ## What Is RustyFuzz?
 
 RustyFuzz is a fuzzing engine designed for finding state-machine bugs in smart contracts. Unlike property-based testing frameworks, RustyFuzz:
@@ -402,7 +415,7 @@ Satori does not broadcast transactions, use private keys, or label model output 
 
 ### Requirements
 
-- Rust 1.70+
+- Rust 1.97.1, pinned by `rust-toolchain.toml`
 - Cargo
 - libz3-dev (optional, for Z3 concolic solver integration)
 
@@ -424,17 +437,21 @@ brew install z3
 cargo build --release --features z3
 ```
 
-**SVM (Solana)** - separate build:
+**Unsupported configurations**:
+
 ```bash
-cargo build --release --features svm --no-default-features
+cargo check --features svm          # intentionally fails
+cargo check --no-default-features   # unsupported in the current monolith
 ```
+
+SVM is not a production backend in v0.1/v0.2. SGX is an unsupported status shim.
 
 **Verification**:
 ```bash
-cargo fmt
-cargo check
-cargo clippy -- -D warnings
-cargo test --lib
+cargo fmt --all -- --check
+cargo check --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## Configuration
@@ -949,9 +966,9 @@ src/
 │   ├── trace.rs                 Call/create trace collection
 │   ├── snapshot.rs              State snapshots
 │   ├── erc20_discovery.rs       ERC20 token detection
-│   ├── sgx_executor.rs          SGX-based execution (experimental)
 │   └── mod.rs
-├── svm/                         Separated Solana VM surface (experimental)
+├── svm/                         Unsupported Solana VM prototype
+├── sgx/                         Unsupported SGX status shim
 └── lib.rs                       Public API
 
 benchmarks/
@@ -978,8 +995,8 @@ docs/
 
 ## Experimental and Limited Areas
 
-- **SVM**: Separated and intentionally not part of hardened EVM campaign path.
-- **SGX**: Feature-gated and experimental.
+- **SVM**: Intentionally unsupported and excluded from the production EVM path.
+- **SGX**: Unsupported status shim only.
 - **LLM guidance**: Scaffolding present but inert unless explicitly integrated.
 - **Z3 integration**: Optional; core concolic path is deterministic and internal.
 - **Symbolic execution**: Not full symbolic execution; bounded, deterministic concolic assistance.
@@ -1062,12 +1079,12 @@ Priority engineering tasks:
 4. Semantic invariants: Convert oracle evidence into replay assertions for semantic deltas
 5. Frontier-driven scheduling: Use branch-distance and expression metadata for energy assignment
 6. Differential replay hardening: Rich diff reports for gas, output, storage, call traces
-7. SVM stabilization: Complete as standalone execution target
+7. Repository/workspace migration: follow `docs/reengineering/STAGE_2_PLAN.md`
 
 ## Technical Limitations
 
-- **SVM**: Separated and not part of hardened EVM campaign path
-- **SGX**: Feature-gated and experimental
+- **SVM**: Intentionally unsupported; future work is quarantine, not Stage 1 repair
+- **SGX**: Unsupported status shim only
 - **LLM guidance**: Scaffolding present but inert unless explicitly integrated
 - **Z3 integration**: Optional; core concolic path is deterministic and internal
 - **Symbolic execution**: Bounded, deterministic concolic assistance only

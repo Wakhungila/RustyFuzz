@@ -1,5 +1,8 @@
 # Benchmarking
 
+> **SUPERSEDED:** This lowercase document is retained for historical context.
+> The canonical benchmarking document is `docs/BENCHMARKING.md`.
+
 Benchmark manifests live under `benchmarks/`.
 
 A benchmark should define:

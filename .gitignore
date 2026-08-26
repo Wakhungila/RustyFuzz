@@ -13,38 +13,12 @@
 # ─────────────────────────────────────────────────────────────
 # RustyFuzz runtime artifacts
 # ─────────────────────────────────────────────────────────────
+/.rustyfuzz/
 /corpus/
-/satori/
 /saved-runs/
 /reports/*
 !/reports/satori_baseline.md
-/benchmarks/*
-!/benchmarks/historical/
-!/benchmarks/historical/**
-!/benchmarks/blind/
-!/benchmarks/blind/**
-!/benchmarks/live/
-!/benchmarks/live/**
 /seeds/
-/tests/
-!/tests/benchmarks.rs
-/docs/*
-!/docs/SATORI.md
-!/docs/IMPLEMENTATION_STATUS.md
-!/docs/adr/
-!/docs/adr/**
-!/docs/ALGORITHMS.md
-!/docs/CONFIGURATION.md
-!/docs/COMPARISON.md
-!/docs/architecture.md
-!/docs/benchmarking.md
-!/docs/engineering-status.md
-!/docs/finding-lifecycle.md
-!/docs/oracle-design.md
-!/docs/proof-model.md
-!/docs/snapshot-scoring.md
-!/docs/reengineering/
-!/docs/reengineering/**
 /crashes/
 /findings/
 /artifacts/
@@ -58,6 +32,35 @@
 /.runs/
 formal_spec.toml
 PoolFactory.json
+
+# Satori / AI runtime output. Keep docs, config examples, prompts, and
+# placeholder files trackable.
+/satori/cache/*
+!/satori/cache/.gitkeep
+/satori/jobs/*
+!/satori/jobs/.gitkeep
+/satori/memory/*
+!/satori/memory/.gitkeep
+/satori/packets/*
+!/satori/packets/.gitkeep
+/satori/reports/*
+!/satori/reports/.gitkeep
+/satori/runs/*
+!/satori/runs/.gitkeep
+
+# Local benchmark and fuzz output. Deterministic benchmark manifests and
+# fixtures under benchmarks/** remain trackable.
+/benchmarks/results/
+/benchmarks/tmp/
+/benchmarks/generated/
+
+# Temporary Foundry or PoC-generation projects.
+/out/
+/broadcast/
+/foundry-cache/
+/foundry-tmp/
+/tmp-foundry/
+/foundry-projects/
 
 # Runtime campaign databases / generated state
 *.cache

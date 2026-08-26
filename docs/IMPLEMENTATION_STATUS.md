@@ -261,3 +261,12 @@ Phase 7: report quality.
   false-positive checks, limitations, and recommended fix sections.
 - Open: enrich these sections with detector-owned structured fields instead of
   class-level templates.
+# SUPERSEDED
+
+This status document is retained for historical context. For the reviewed
+re-engineering baseline and current-vs-target status, use:
+
+- `docs/reengineering/BASELINE.md`
+- `docs/reengineering/CODEBASE_INVENTORY.md`
+- `docs/ARCHITECTURE.md`
+- `docs/FINDING_LIFECYCLE.md`

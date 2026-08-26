@@ -1,5 +1,8 @@
 # Architecture
 
+> **SUPERSEDED:** This lowercase document is retained for historical context.
+> The canonical architecture document is `docs/ARCHITECTURE.md`.
+
 RustyFuzz is currently an EVM-first research engine.
 
 - CLI entrypoints live in `src/main.rs`.

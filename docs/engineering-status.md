@@ -118,3 +118,8 @@ This command intentionally fails by policy:
   oracle-proximity metrics still need deeper executor/oracle integration.
 - Seed ingestion handles callTracer-style debug traces; more provider-specific trace
   fixtures are needed before claiming broad live-RPC compatibility.
+# SUPERSEDED
+
+This engineering status snapshot is retained for historical context. The
+canonical current baseline is `docs/reengineering/BASELINE.md`, and the Stage 1
+repository-hygiene policy is `docs/reengineering/RUNTIME_DATA_POLICY.md`.

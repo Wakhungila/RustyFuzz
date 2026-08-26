@@ -1,5 +1,10 @@
 # Configuration Guide
 
+Status: CURRENT v0.1 configuration notes. Examples still use legacy runtime
+paths such as `corpus/` and `reports/`. The future canonical runtime root is
+`.rustyfuzz/`, documented in `docs/ARTIFACT_FORMAT.md`; production code has not
+been migrated to that layout yet.
+
 This guide provides recommended configuration values for different use cases of RustyFuzz.
 
 ## Use Cases

@@ -1,5 +1,8 @@
 # Finding Lifecycle
 
+> **SUPERSEDED:** This lowercase document is retained for historical context.
+> The canonical lifecycle document is `docs/FINDING_LIFECYCLE.md`.
+
 RustyFuzz findings use this status model:
 
 - `Lead`: heuristic signal or oracle evidence that is not proven.
