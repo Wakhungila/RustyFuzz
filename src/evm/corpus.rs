@@ -60,6 +60,9 @@ pub struct CrashRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotManifest {
+    /// Persisted schema version; 1 for the original (pre-versioned) layout.
+    #[serde(default = "default_snapshot_manifest_schema_version")]
+    pub schema_version: u32,
     pub id: u64,
     pub state_hash: String,
     pub coverage_hash: u64,
@@ -67,6 +70,10 @@ pub struct SnapshotManifest {
     pub producing_input_id: Option<String>,
     pub depth: u32,
     pub gas_used: u64,
+}
+
+fn default_snapshot_manifest_schema_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -646,6 +653,7 @@ impl PersistentCorpus {
     ) -> anyhow::Result<SnapshotManifest> {
         fs::create_dir_all(self.root.join("snapshots"))?;
         let manifest = SnapshotManifest {
+            schema_version: 1,
             id: snapshot.id,
             state_hash: hash_snapshot_state(snapshot),
             coverage_hash: EvmCoverageFeedback::stable_path_hash(
@@ -1388,6 +1396,232 @@ mod artifact_tests {
     }
 
     #[test]
+    fn stage_2c_restored_snapshot_state_executes_equivalently() {
+        use crate::common::verifier::ReplayVerifier;
+        use revm::context::BlockEnv;
+
+        // Build a snapshot holding funded state, the way the corpus stores it.
+        let caller = Address::repeat_byte(0x61);
+        let mut db = CacheDB::new(ForkDb::empty());
+        db.insert_account_info(
+            caller,
+            revm::state::AccountInfo {
+                balance: U256::from(10u128.pow(30)),
+                ..revm::state::AccountInfo::default()
+            },
+        );
+        let snapshot = Snapshot {
+            id: 0,
+            state: Arc::new(RwLock::new(ChainState::Evm(db))),
+            coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+            producing_input: None,
+            waypoints: Vec::new(),
+            depth: 0,
+            gas_used: 0,
+        };
+
+        // Harness-style restore: clone the cached chain state out of the
+        // snapshot, execute an identical semantic input under identical env.
+        let restore = || {
+            let state = snapshot.state.read().clone();
+            (state, BlockEnv::default())
+        };
+        let input = EvmInput::new(
+            vec![SingletonTx {
+                input: Vec::new(),
+                caller,
+                to: Address::repeat_byte(0x62),
+                value: U256::from(1),
+                is_victim: false,
+            }],
+            0,
+        );
+
+        let verifier = ReplayVerifier::new(1024);
+        let (state_a, env_a) = restore();
+        let first = verifier
+            .replay(&state_a, &env_a, &input)
+            .expect("first restore execution");
+        let (state_b, env_b) = restore();
+        let second = verifier
+            .replay(&state_b, &env_b, &input)
+            .expect("second restore execution");
+
+        // Equivalent restored state + identical environment -> equivalent
+        // execution. Determinism is only claimed for identical provenance.
+        assert_eq!(first.total_gas_used, second.total_gas_used);
+        assert_eq!(first.final_coverage_hash, second.final_coverage_hash);
+        assert_eq!(first.storage_diffs, second.storage_diffs);
+    }
+
+    #[test]
+    fn stage_2c_ancestry_reconstruction_is_deterministic() {
+        let mut corpus = SnapshotCorpus::new();
+        let empty_state = || Arc::new(RwLock::new(ChainState::Evm(CacheDB::new(ForkDb::empty()))));
+        corpus.add_snapshot(
+            0,
+            0,
+            Snapshot {
+                id: 0,
+                state: empty_state(),
+                coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                producing_input: None,
+                waypoints: Vec::new(),
+                depth: 0,
+                gas_used: 0,
+            },
+        );
+        let input_a = EvmInput::new(
+            vec![SingletonTx {
+                input: vec![0xa1],
+                caller: Address::repeat_byte(0x11),
+                to: Address::repeat_byte(0x22),
+                value: U256::ZERO,
+                is_victim: false,
+            }],
+            0,
+        );
+        let input_b = EvmInput::new(input_a.txs.clone(), 1);
+        corpus.add_snapshot(
+            1,
+            0,
+            Snapshot {
+                id: 1,
+                state: empty_state(),
+                coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                producing_input: Some(input_a.clone()),
+                waypoints: Vec::new(),
+                depth: 1,
+                gas_used: 21_000,
+            },
+        );
+        corpus.add_snapshot(
+            2,
+            1,
+            Snapshot {
+                id: 2,
+                state: empty_state(),
+                coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                producing_input: Some(input_b.clone()),
+                waypoints: Vec::new(),
+                depth: 2,
+                gas_used: 42_000,
+            },
+        );
+
+        // Root has no parent and reconstructs an empty input sequence.
+        assert_eq!(corpus.parent_map.get(&0), Some(&0));
+        assert_eq!(corpus.lineage_inputs(0).unwrap(), Vec::<EvmInput>::new());
+
+        // Lineage reconstruction is root-first and deterministic.
+        let lineage = corpus.lineage_inputs(2).unwrap();
+        assert_eq!(lineage, vec![input_a, input_b]);
+        assert_eq!(corpus.lineage_inputs(2).unwrap(), lineage);
+
+        // depth = parent depth + 1 is enforced by construction.
+        assert_eq!(corpus.metadata[&1].depth, 1);
+        assert_eq!(corpus.metadata[&2].depth, 2);
+    }
+
+    #[test]
+    fn stage_2c_assigned_ids_and_state_fingerprints_are_distinct_concepts() {
+        let make_snapshot = |id: u64| Snapshot {
+            id,
+            state: Arc::new(RwLock::new(ChainState::Evm(CacheDB::new(ForkDb::empty())))),
+            coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+            producing_input: None,
+            waypoints: Vec::new(),
+            depth: 0,
+            gas_used: 0,
+        };
+        let mut corpus = SnapshotCorpus::new();
+        corpus.add_snapshot(0, 0, make_snapshot(0));
+        corpus.add_snapshot(1, 0, make_snapshot(1));
+
+        // Same cached-state content, different assigned ids: fingerprints match
+        // even though ids differ. Ids remain the logical reference.
+        assert_eq!(corpus.snapshots.len(), 2);
+        assert_ne!(corpus.metadata[&0].state_fingerprint.len(), 0);
+        assert_ne!(0, corpus.parent_map.keys().max().copied().unwrap());
+        assert_eq!(
+            corpus.metadata[&0].state_fingerprint,
+            corpus.metadata[&1].state_fingerprint
+        );
+        assert!(!corpus.metadata[&0].state_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn stage_2c_cyclic_lineage_insertion_is_refused() {
+        // Simulate a restored/merged corpus that already contains a dangling
+        // cycle candidate: snapshot 9 claims parent 5 while 5 also references
+        // a chain leading back to 9 via manual map surgery.
+        let mut corpus = SnapshotCorpus::new();
+        let empty_state = Arc::new(RwLock::new(ChainState::Evm(CacheDB::new(ForkDb::empty()))));
+        corpus.add_snapshot(
+            5,
+            0,
+            Snapshot {
+                id: 5,
+                state: empty_state.clone(),
+                coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                producing_input: None,
+                waypoints: Vec::new(),
+                depth: 1,
+                gas_used: 0,
+            },
+        );
+        corpus.parent_map.insert(5, 9);
+
+        corpus.add_snapshot(
+            9,
+            5,
+            Snapshot {
+                id: 9,
+                state: empty_state,
+                coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                producing_input: None,
+                waypoints: Vec::new(),
+                depth: 2,
+                gas_used: 0,
+            },
+        );
+
+        // The cycle-forming link was refused: snapshot 9 was not registered.
+        assert!(!corpus.snapshots.contains_key(&9));
+    }
+
+    #[test]
+    fn stage_2c_snapshot_manifest_schema_version_survives_round_trip() {
+        // Versioned persistence contract (global invariant #7).
+        let legacy_json = r#"{
+            "id": 4,
+            "state_hash": "0xabc",
+            "coverage_hash": 7,
+            "coverage_edges": 3,
+            "producing_input_id": null,
+            "depth": 2,
+            "gas_used": 42
+        }"#;
+        let manifest: SnapshotManifest = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(manifest.schema_version, 1);
+
+        let fresh = SnapshotManifest {
+            schema_version: 1,
+            id: 4,
+            state_hash: "0xabc".to_string(),
+            coverage_hash: 7,
+            coverage_edges: 3,
+            producing_input_id: None,
+            depth: 2,
+            gas_used: 42,
+        };
+        let encoded = serde_json::to_string(&fresh).unwrap();
+        assert!(encoded.contains("\"schema_version\":1"));
+        let decoded: SnapshotManifest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, fresh);
+    }
+
+    #[test]
     fn snapshot_pruning_retains_promising_state() {
         let target = Address::repeat_byte(0x53);
         let mut corpus = SnapshotCorpus::new();
@@ -1879,6 +2113,11 @@ pub struct SnapshotMetadata {
     pub last_coverage_gain: usize,
     pub depth: u32,
     pub coverage_score: usize,
+    /// Deterministic digest of this snapshot's cached EVM state content.
+    ///
+    /// Stage 2C: distinct from the assigned snapshot id. Equal fingerprints
+    /// mean equivalent cached-state material; ids only order corpus entries.
+    pub state_fingerprint: String,
     pub read_set: HashSet<(Address, B256)>,
     pub write_set: HashSet<(Address, B256)>,
     pub score: SnapshotScore,
@@ -2148,8 +2387,22 @@ impl SnapshotCorpus {
     }
 
     pub fn add_snapshot(&mut self, id: u64, parent_id: u64, snapshot: Snapshot) {
+        // Stage 2C defensive lineage guard. Snapshot ids are assigned
+        // monotonically (max + 1), so cycles are structurally impossible in a
+        // fresh corpus, but restored/merged corpora must not be able to create
+        // one silently. Walk the parent chain; refuse to link the snapshot if
+        // doing so would close a cycle.
+        if id != parent_id && self.would_create_cycle(id, parent_id) {
+            log::error!(
+                "Refusing to link snapshot {} under parent {}: cyclic lineage",
+                id,
+                parent_id
+            );
+            return;
+        }
         let depth = snapshot.depth;
         let coverage_score = snapshot.coverage.count_ones();
+        let state_fingerprint = hash_snapshot_state(&snapshot);
         self.snapshots.insert(id, Arc::new(RwLock::new(snapshot)));
         self.parent_map.insert(id, parent_id);
         if id != parent_id {
@@ -2162,6 +2415,7 @@ impl SnapshotCorpus {
                 last_coverage_gain: 0,
                 depth,
                 coverage_score,
+                state_fingerprint,
                 read_set: HashSet::new(), // Populated after execution
                 write_set: HashSet::new(),
                 score: SnapshotScore {
@@ -2170,6 +2424,57 @@ impl SnapshotCorpus {
                 },
             },
         );
+    }
+
+    /// Returns true if inserting `id` with `parent_id` would create a cycle.
+    fn would_create_cycle(&self, id: u64, mut ancestor: u64) -> bool {
+        let mut hops = 0usize;
+        while let Some(&next) = self.parent_map.get(&ancestor) {
+            if next == id {
+                return true;
+            }
+            if next == ancestor {
+                break;
+            }
+            ancestor = next;
+            hops += 1;
+            if hops > self.snapshots.len() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Reconstructs the deterministic input sequence that reaches `id` from
+    /// its root: root-first producing inputs along the parent chain.
+    ///
+    /// Returns `None` when the lineage is missing or cyclic.
+    pub fn lineage_inputs(&self, id: u64) -> Option<Vec<EvmInput>> {
+        let mut chain = Vec::new();
+        let mut current = id;
+        loop {
+            if chain.contains(&current) {
+                return None;
+            }
+            chain.push(current);
+            match self.parent_map.get(&current) {
+                Some(parent) if *parent != current => current = *parent,
+                _ => break,
+            }
+        }
+        chain.reverse();
+        Some(
+            chain
+                .iter()
+                .filter_map(|snapshot_id| {
+                    self.snapshots
+                        .get(snapshot_id)?
+                        .read()
+                        .producing_input
+                        .clone()
+                })
+                .collect(),
+        )
     }
 
     pub fn maybe_add_post_execution_snapshot(

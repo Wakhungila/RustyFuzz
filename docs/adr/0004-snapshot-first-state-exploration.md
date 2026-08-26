@@ -2,7 +2,19 @@
 
 ## Status
 
-Accepted as target direction. Not implemented in Stage 1.
+Accepted as target direction.
+
+CURRENT (Stage 2C): snapshot identity made explicit in the monolith —
+`SnapshotId` documented as an assigned logical reference, distinct from the
+new dependency-neutral `rustyfuzz_core::StateFingerprint` (deterministic state
+content digest, stored per snapshot in corpus metadata). Ancestry is
+parent-reference + semantic producing input, with cycle rejection on snapshot
+insertion and deterministic lineage reconstruction (`SnapshotCorpus::
+lineage_inputs`). Snapshot manifests carry `schema_version`. Restoration is
+defined and tested as: cloned cached chain state + identical block env ->
+equivalent execution; determinism only under identical environment
+provenance. Scheduler policy unchanged. Full ObservationBundle consolidation
+and corpus/scheduler separation remain future work.
 
 ## Context
 

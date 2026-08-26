@@ -65,6 +65,9 @@ Known current architecture problems:
   selected neutral types have been bridged to `rustyfuzz-core`.
 - There are duplicate finding lifecycle models in source and older docs.
 - Runtime paths are reconstructed in multiple modules; there is no `RunLayout`.
+- Stage 2C (CURRENT): snapshot identity explicit (assigned ids vs
+  `StateFingerprint` content digests), ancestry with cycle guards,
+  versioned snapshot manifests; selection/scheduler policy untouched.
 - Satori is useful but coupled to one provider path and runtime layout.
 - SVM and SGX are not production backends.
 

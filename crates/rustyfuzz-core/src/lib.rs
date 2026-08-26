@@ -24,4 +24,4 @@ pub use execution::ExecutionStatus;
 pub use finding::{EvidenceKind, EvidenceRef};
 pub use ids::{CampaignId, EvidenceId, FindingId, InputId, OracleId, SnapshotId};
 pub use metadata::TestcaseMetadata;
-pub use snapshot::SnapshotMetadata;
+pub use snapshot::{SnapshotMetadata, StateFingerprint};

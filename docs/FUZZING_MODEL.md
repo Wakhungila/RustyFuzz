@@ -15,7 +15,11 @@ Current important implementation details:
   and mutation provenance were moved to `EvmTestcaseMetadata`. During campaigns,
   guidance flows through `EvmTestcaseMetadataStore` keyed by semantic `InputId`
   (`rustyfuzz-input-id-v1`); persisted inputs no longer contain feedback fields.
-- `SnapshotCorpus` exists in the current EVM corpus implementation.
+- `SnapshotCorpus` exists in the current EVM corpus implementation. Stage 2C
+  (CURRENT) gives it explicit identity semantics: monotonic assigned
+  SnapshotIds are separate from `StateFingerprint` state digests, lineage is
+  parent+semantic-input based with cycle rejection, and manifests are schema-
+  versioned.
 - Sequence mutation and snapshot scoring are implemented inside the monolith.
 - Exploration may use explicit synthetic fallback paths for smoke/benchmark modes.
 - Proof/replay paths are stricter but still live inside coupled modules.
