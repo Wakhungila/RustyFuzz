@@ -28,7 +28,7 @@ impl EconomicState {
 
     /// Record a token transfer event (called by oracle during trace analysis)
     pub fn record_transfer(&mut self, token: Address, from: Address, to: Address, amount: U256) {
-        let entry = self.balances.entry(token).or_insert_with(HashMap::new);
+        let entry = self.balances.entry(token).or_default();
 
         // Deduct from sender
         let from_bal = entry.entry(from).or_insert(U256::ZERO);
@@ -104,16 +104,14 @@ impl ProfitReport {
 }
 
 /// Detects price manipulation by comparing spot vs expected price
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct PriceAnalyzer {
     pub initial_prices: HashMap<Address, U256>, // Pair -> Price
 }
 
 impl PriceAnalyzer {
     pub fn new() -> Self {
-        Self {
-            initial_prices: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn record_initial_price(&mut self, pair: Address, price: U256) {

@@ -95,6 +95,17 @@ struct CampaignTelemetry {
     last_report: Mutex<(Instant, u64)>,
 }
 
+struct ExecutionTelemetryRecord<'a> {
+    core_id: usize,
+    tx_count: usize,
+    findings: usize,
+    campaign_score: u64,
+    corpus_size: usize,
+    coverage_edges: usize,
+    state_novelty_score: u64,
+    mutation_strategies: &'a [String],
+}
+
 struct CampaignBudget {
     max_execs: Option<u64>,
     deadline: Option<Instant>,
@@ -175,17 +186,17 @@ impl CampaignTelemetry {
         }
     }
 
-    fn record_execution(
-        &self,
-        core_id: usize,
-        tx_count: usize,
-        findings: usize,
-        campaign_score: u64,
-        corpus_size: usize,
-        coverage_edges: usize,
-        state_novelty_score: u64,
-        mutation_strategies: &[String],
-    ) {
+    fn record_execution(&self, record: ExecutionTelemetryRecord<'_>) {
+        let ExecutionTelemetryRecord {
+            core_id,
+            tx_count,
+            findings,
+            campaign_score,
+            corpus_size,
+            coverage_edges,
+            state_novelty_score,
+            mutation_strategies,
+        } = record;
         let total = self.executions.fetch_add(1, Ordering::Relaxed) + 1;
         if mutation_strategies
             .iter()
@@ -1153,16 +1164,16 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                         .iter()
                         .map(|result| result.coverage_edges)
                         .sum();
-                    telemetry.record_execution(
-                        core_id.0,
-                        input.txs.len(),
-                        findings.len(),
-                        campaign_score.total,
-                        0,
+                    telemetry.record_execution(ExecutionTelemetryRecord {
+                        core_id: core_id.0,
+                        tx_count: input.txs.len(),
+                        findings: findings.len(),
+                        campaign_score: campaign_score.total,
+                        corpus_size: 0,
                         coverage_edges,
-                        report.novelty_score(),
-                        &mutation_strategies,
-                    );
+                        state_novelty_score: report.novelty_score(),
+                        mutation_strategies: &mutation_strategies,
+                    });
 
                     if report.interesting {
                         unsafe {
@@ -1885,16 +1896,16 @@ async fn run_single_process_campaign(
             .iter()
             .map(|result| result.coverage_edges)
             .sum();
-        telemetry.record_execution(
+        telemetry.record_execution(ExecutionTelemetryRecord {
             core_id,
-            input.txs.len(),
-            findings.len(),
-            campaign_score.total,
-            0,
+            tx_count: input.txs.len(),
+            findings: findings.len(),
+            campaign_score: campaign_score.total,
+            corpus_size: 0,
             coverage_edges,
-            report.novelty_score(),
-            &mutation_strategies,
-        );
+            state_novelty_score: report.novelty_score(),
+            mutation_strategies: &mutation_strategies,
+        });
 
         if report.interesting {
             unsafe {
@@ -2079,20 +2090,14 @@ fn discover_target_bytecode_analysis(
     db: &CacheDB<ForkDb>,
     target: Option<Address>,
 ) -> Option<BytecodeAnalysisReport> {
-    let Some(target) = target else {
-        return None;
-    };
+    let target = target?;
     let account = db
         .cache
         .accounts
         .get(&target)
         .and_then(|account| account.info());
-    let Some(account) = account else {
-        return None;
-    };
-    let Some(code) = account.code else {
-        return None;
-    };
+    let account = account?;
+    let code = account.code?;
     Some(analyze_bytecode(code.original_byte_slice()))
 }
 
@@ -2655,7 +2660,7 @@ fn maybe_promote_artifact(
     let high_confidence = artifact
         .findings
         .iter()
-        .map(|finding| protocol_finding_confidence(finding))
+        .map(protocol_finding_confidence)
         .max()
         .unwrap_or_default()
         >= 80;
@@ -2916,8 +2921,26 @@ mod tests {
     #[test]
     fn telemetry_distinguishes_mutations_from_seed_replays() {
         let telemetry = CampaignTelemetry::new();
-        telemetry.record_execution(0, 1, 0, 0, 1, 0, 0, &["seed_or_imported".to_string()]);
-        telemetry.record_execution(0, 1, 0, 0, 1, 0, 0, &["abi_word_mutation".to_string()]);
+        telemetry.record_execution(ExecutionTelemetryRecord {
+            core_id: 0,
+            tx_count: 1,
+            findings: 0,
+            campaign_score: 0,
+            corpus_size: 1,
+            coverage_edges: 0,
+            state_novelty_score: 0,
+            mutation_strategies: &["seed_or_imported".to_string()],
+        });
+        telemetry.record_execution(ExecutionTelemetryRecord {
+            core_id: 0,
+            tx_count: 1,
+            findings: 0,
+            campaign_score: 0,
+            corpus_size: 1,
+            coverage_edges: 0,
+            state_novelty_score: 0,
+            mutation_strategies: &["abi_word_mutation".to_string()],
+        });
 
         assert_eq!(telemetry.executions(), 2);
         assert_eq!(telemetry.seed_replays(), 1);
@@ -2998,21 +3021,25 @@ mod tests {
         };
         use std::collections::BTreeMap;
 
-        let mut seed_profile = TargetProfile::default();
-        seed_profile.protocol_types = vec![ProtocolType::Erc20Token];
-        seed_profile.confidence = 95;
+        let seed_profile = TargetProfile {
+            protocol_types: vec![ProtocolType::Erc20Token],
+            confidence: 95,
+            ..Default::default()
+        };
 
-        let mut bytecode_profile = TargetProfile::default();
-        bytecode_profile.protocol_types = vec![
-            ProtocolType::ProxyUpgradeable,
-            ProtocolType::AccessControlHeavy,
-            ProtocolType::AccountingHeavy,
-        ];
-        bytecode_profile.confidence = 88;
-        bytecode_profile.recommended_invariant_families = vec![
-            "access-control".to_string(),
-            "generic-accounting".to_string(),
-        ];
+        let bytecode_profile = TargetProfile {
+            protocol_types: vec![
+                ProtocolType::ProxyUpgradeable,
+                ProtocolType::AccessControlHeavy,
+                ProtocolType::AccountingHeavy,
+            ],
+            confidence: 88,
+            recommended_invariant_families: vec![
+                "access-control".to_string(),
+                "generic-accounting".to_string(),
+            ],
+            ..Default::default()
+        };
 
         let report = BytecodeAnalysisReport {
             code_len: 32,

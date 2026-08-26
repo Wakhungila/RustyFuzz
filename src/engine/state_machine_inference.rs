@@ -92,7 +92,7 @@ impl StateMachineInference {
         // Extract state values from storage diffs
         for (_, s, old, new) in storage_diffs {
             if s == &slot {
-                state_sequence.push((old.clone(), new.clone()));
+                state_sequence.push((*old, *new));
                 states.entry(Self::state_name(new)).or_insert(*new);
             }
         }

@@ -177,9 +177,11 @@ async fn run_benchmark_contract(
         None
     };
 
-    let mut hardened_defi = HardenedDefiConfig::default();
-    hardened_defi.enabled = false;
-    hardened_defi.single_process = true;
+    let hardened_defi = HardenedDefiConfig {
+        enabled: false,
+        single_process: true,
+        ..Default::default()
+    };
 
     run_fuzz_campaign(FuzzConfig {
         rpc_url: "http://127.0.0.1:0".to_string(),

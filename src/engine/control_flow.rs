@@ -141,11 +141,7 @@ impl ControlFlowAnalysis {
             let opcode = bytecode[pc];
             let _opcode_str = Self::opcode_name(opcode);
 
-            if Self::is_block_terminator(opcode) {
-                pc += 1;
-            } else {
-                pc += 1;
-            }
+            pc += 1;
         }
 
         cfg.compute_reachability();
@@ -165,10 +161,6 @@ impl ControlFlowAnalysis {
             0xF4 => "DELEGATECALL".to_string(),
             _ => format!("0x{:02x}", opcode),
         }
-    }
-
-    fn is_block_terminator(opcode: u8) -> bool {
-        matches!(opcode, 0x56 | 0x57 | 0x00 | 0xFD | 0xFE | 0xFF) // JUMP, JUMPI, STOP, REVERT, SELFDESTRUCT, INVALID
     }
 
     fn compute_security_issues(&mut self) {

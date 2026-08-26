@@ -454,80 +454,6 @@ impl HalmosVerifier {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::common::oracle::{EvidenceGrade, RejectionReason};
-    use crate::common::types::SingletonTx;
-    use revm::state::AccountInfo;
-
-    fn addr(byte: u8) -> Address {
-        Address::repeat_byte(byte)
-    }
-
-    #[test]
-    fn realism_verifier_rejects_synthetic_funding_dependency() {
-        let caller = addr(0x41);
-        let target = addr(0x42);
-        let input = EvmInput {
-            txs: vec![SingletonTx {
-                caller,
-                to: target,
-                value: U256::from(1),
-                input: Vec::new(),
-                is_victim: false,
-            }],
-            base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
-        };
-        let base = ChainState::Evm(CacheDB::new(ForkDb::empty()));
-        let report = RealismVerifier::new(1024).prove(&base, &BlockEnv::default(), &input);
-
-        assert!(!report.success);
-        assert_eq!(report.status, FindingStatus::Rejected);
-        assert_eq!(report.evidence_grade, EvidenceGrade::Heuristic);
-        assert_eq!(
-            report.rejection_reasons,
-            vec![RejectionReason::MissingBalance]
-        );
-    }
-
-    #[test]
-    fn realism_verifier_proves_exact_sequence_with_real_balance() {
-        let caller = addr(0x51);
-        let target = addr(0x52);
-        let mut db = CacheDB::new(ForkDb::empty());
-        db.insert_account_info(
-            caller,
-            AccountInfo {
-                balance: U256::from(10u128.pow(30)),
-                ..AccountInfo::default()
-            },
-        );
-        let input = EvmInput {
-            txs: vec![SingletonTx {
-                caller,
-                to: target,
-                value: U256::from(1),
-                input: Vec::new(),
-                is_victim: false,
-            }],
-            base_snapshot_id: 0,
-            waypoints: Vec::new(),
-            mutation_provenance: Vec::new(),
-        };
-        let base = ChainState::Evm(db);
-        let report = RealismVerifier::new(1024).prove(&base, &BlockEnv::default(), &input);
-
-        assert!(report.success, "{report:?}");
-        assert_eq!(report.status, FindingStatus::Proved);
-        assert_eq!(report.evidence_grade, EvidenceGrade::RealisticForkProof);
-        assert!(report.rejection_reasons.is_empty());
-        assert!(report.execution.is_some());
-    }
-}
-
 #[async_trait]
 impl SymbolicVerifier for HalmosVerifier {
     async fn verify(&self, input: &EvmInput, vuln_desc: &str) -> Result<bool> {
@@ -618,5 +544,79 @@ contract HalmosHarness is Test {{
 "#,
             self.contract_path, vuln_desc, cheatcodes
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::oracle::{EvidenceGrade, RejectionReason};
+    use crate::common::types::SingletonTx;
+    use revm::state::AccountInfo;
+
+    fn addr(byte: u8) -> Address {
+        Address::repeat_byte(byte)
+    }
+
+    #[test]
+    fn realism_verifier_rejects_synthetic_funding_dependency() {
+        let caller = addr(0x41);
+        let target = addr(0x42);
+        let input = EvmInput {
+            txs: vec![SingletonTx {
+                caller,
+                to: target,
+                value: U256::from(1),
+                input: Vec::new(),
+                is_victim: false,
+            }],
+            base_snapshot_id: 0,
+            waypoints: Vec::new(),
+            mutation_provenance: Vec::new(),
+        };
+        let base = ChainState::Evm(CacheDB::new(ForkDb::empty()));
+        let report = RealismVerifier::new(1024).prove(&base, &BlockEnv::default(), &input);
+
+        assert!(!report.success);
+        assert_eq!(report.status, FindingStatus::Rejected);
+        assert_eq!(report.evidence_grade, EvidenceGrade::Heuristic);
+        assert_eq!(
+            report.rejection_reasons,
+            vec![RejectionReason::MissingBalance]
+        );
+    }
+
+    #[test]
+    fn realism_verifier_proves_exact_sequence_with_real_balance() {
+        let caller = addr(0x51);
+        let target = addr(0x52);
+        let mut db = CacheDB::new(ForkDb::empty());
+        db.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(10u128.pow(30)),
+                ..AccountInfo::default()
+            },
+        );
+        let input = EvmInput {
+            txs: vec![SingletonTx {
+                caller,
+                to: target,
+                value: U256::from(1),
+                input: Vec::new(),
+                is_victim: false,
+            }],
+            base_snapshot_id: 0,
+            waypoints: Vec::new(),
+            mutation_provenance: Vec::new(),
+        };
+        let base = ChainState::Evm(db);
+        let report = RealismVerifier::new(1024).prove(&base, &BlockEnv::default(), &input);
+
+        assert!(report.success, "{report:?}");
+        assert_eq!(report.status, FindingStatus::Proved);
+        assert_eq!(report.evidence_grade, EvidenceGrade::RealisticForkProof);
+        assert!(report.rejection_reasons.is_empty());
+        assert!(report.execution.is_some());
     }
 }

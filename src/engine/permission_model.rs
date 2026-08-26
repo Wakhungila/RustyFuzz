@@ -64,7 +64,7 @@ impl PermissionModelAnalyzer {
         if checks_owner || checks_msg_sender {
             self.inferred_permissions
                 .entry(selector.to_string())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push("Owner".to_string());
         }
 
@@ -124,18 +124,14 @@ impl PermissionModelAnalyzer {
             if sensitive_prefixes
                 .iter()
                 .any(|prefix| selector.starts_with(prefix))
+                && !self.inferred_permissions.contains_key(selector)
             {
-                if !self.inferred_permissions.contains_key(selector) {
-                    self.anomalies.push(PermissionAnomaly {
-                        selector: selector.clone(),
-                        kind: PermissionAnomalyKind::UnguardedAdminFunction,
-                        severity: "critical".to_string(),
-                        evidence: format!(
-                            "Sensitive function '{}' has no permission checks",
-                            selector
-                        ),
-                    });
-                }
+                self.anomalies.push(PermissionAnomaly {
+                    selector: selector.clone(),
+                    kind: PermissionAnomalyKind::UnguardedAdminFunction,
+                    severity: "critical".to_string(),
+                    evidence: format!("Sensitive function '{}' has no permission checks", selector),
+                });
             }
         }
 

@@ -1359,7 +1359,7 @@ fn install_campaign_watchdog(
         } else {
             max_execs.map(|execs| {
                 let execution_scaled = execs.saturating_div(100).saturating_mul(2);
-                execution_scaled.max(90).min(3600)
+                execution_scaled.clamp(90, 3600)
             })
         }
     })?;
@@ -1831,14 +1831,13 @@ fn print_prove_live_banner(
     duration_secs: u64,
 ) {
     println!(
-        "\x1b[38;5;209m{}\x1b[0m",
-        r#"
+        "\x1b[38;5;209m
   :::====  :::  === :::===  :::==== ::: === :::===== :::  === :::===== :::=====
 :::  === :::  === :::     :::==== ::: === :::      :::  ===      ===      ===
 =======  ===  ===  =====    ===    =====  ======   ===  ===    ===      ===  
 === ===  ===  ===     ===   ===     ===   ===      ===  ===  ===      ===    
 ===  ===  ======  ======    ===     ===   ===       ======  ======== ========/     
-"#
+\x1b[0m"
     );
     println!(
         "🦐 RustyFuzz prove-live | campaign={} | target={} | fork_block={} | duration={}s",
@@ -1964,25 +1963,31 @@ mod tests {
             std::env::temp_dir().join(format!("rustyfuzz-prove-live-exit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
 
-        let mut summary = PromotionCampaignSummary::default();
-        summary.confirmed_findings = 1;
-        write_summary(&base, summary.clone());
+        let summary = PromotionCampaignSummary {
+            confirmed_findings: 1,
+            ..Default::default()
+        };
+        write_summary(&base, summary);
         assert_eq!(
             prove_live_exit_code(base.to_str().unwrap()).unwrap(),
             Some(10)
         );
 
-        summary.confirmed_findings = 0;
-        summary.candidate_findings = 1;
-        summary.rejected_candidates = 0;
-        write_summary(&base, summary.clone());
+        let summary = PromotionCampaignSummary {
+            candidate_findings: 1,
+            rejected_candidates: 0,
+            ..Default::default()
+        };
+        write_summary(&base, summary);
         assert_eq!(
             prove_live_exit_code(base.to_str().unwrap()).unwrap(),
             Some(11)
         );
 
-        summary.candidate_findings = 0;
-        summary.rejected_candidates = 1;
+        let summary = PromotionCampaignSummary {
+            rejected_candidates: 1,
+            ..Default::default()
+        };
         write_summary(&base, summary);
         assert_eq!(
             prove_live_exit_code(base.to_str().unwrap()).unwrap(),

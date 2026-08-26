@@ -470,7 +470,7 @@ fn synthesize_invariants(
         });
     }
 
-    hypotheses.sort_by(|a, b| b.confidence.cmp(&a.confidence));
+    hypotheses.sort_by_key(|hypothesis| std::cmp::Reverse(hypothesis.confidence));
     hypotheses.dedup_by(|a, b| a.family == b.family && a.evidence == b.evidence);
     hypotheses
 }

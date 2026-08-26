@@ -848,7 +848,7 @@ fn preceding_push_as_usize(instructions: &[Instruction]) -> Option<usize> {
         .rev()
         .skip(1)
         .find(|instruction| (0x60..=0x7f).contains(&instruction.opcode))
-        .and_then(|instruction| const_from_push(instruction))
+        .and_then(const_from_push)
         .and_then(|value| usize::try_from(value).ok())
 }
 
@@ -1067,7 +1067,7 @@ fn stack_effect(opcode: u8) -> (usize, usize) {
         0x38 | 0x3d | 0x3f | 0x40 | 0x41 => (0, 1),
         0x3e => (3, 0),
         0x50 => (1, 0),
-        0x51 | 0x52 | 0x53 => (1, 1),
+        0x51..=0x53 => (1, 1),
         0x56 => (1, 0),
         0xfd | 0xf3 => (2, 0),
         0xff => (1, 0),

@@ -173,14 +173,15 @@ impl TemporalConstraintChecker {
                 let indices: Vec<_> = self
                     .function_call_sequence
                     .iter()
-                    .enumerate()
-                    .filter_map(|(_idx, (tx_idx, sel))| {
-                        if sel == selector {
-                            Some(*tx_idx as usize)
-                        } else {
-                            None
-                        }
-                    })
+                    .filter_map(
+                        |(tx_idx, sel)| {
+                            if sel == selector {
+                                Some(*tx_idx)
+                            } else {
+                                None
+                            }
+                        },
+                    )
                     .collect();
                 self.violations.push(TemporalViolation {
                     constraint_id: constraint.id.clone(),
@@ -205,13 +206,13 @@ impl TemporalConstraintChecker {
         // Flag common initialization-related selectors to help identify must-precede constraints
         let mut init_patterns = Vec::new();
         for (tx_idx, (_, sel)) in self.function_call_sequence.iter().enumerate() {
-            if sel.contains("initialize") || sel.contains("init") || sel.contains("setup") {
-                if tx_idx > 0 {
-                    init_patterns.push(format!(
-                        "Potential initialization selector '{}' called at non-zero index {}",
-                        sel, tx_idx
-                    ));
-                }
+            if (sel.contains("initialize") || sel.contains("init") || sel.contains("setup"))
+                && tx_idx > 0
+            {
+                init_patterns.push(format!(
+                    "Potential initialization selector '{}' called at non-zero index {}",
+                    sel, tx_idx
+                ));
             }
         }
         init_patterns

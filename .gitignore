@@ -43,6 +43,8 @@
 !/docs/oracle-design.md
 !/docs/proof-model.md
 !/docs/snapshot-scoring.md
+!/docs/reengineering/
+!/docs/reengineering/**
 /crashes/
 /findings/
 /artifacts/

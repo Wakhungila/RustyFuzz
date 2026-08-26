@@ -79,10 +79,9 @@ impl StateTransitionChecker {
             let is_allowed = sm.transitions.iter().any(|t| {
                 t.from == old_state
                     && t.to == new_state
-                    && (t.trigger_selector.is_none()
-                        || t.trigger_selector
-                            .as_ref()
-                            .map_or(true, |sel| sel == function_selector))
+                    && t.trigger_selector
+                        .as_ref()
+                        .is_none_or(|sel| sel == function_selector)
             });
 
             let is_forbidden = sm

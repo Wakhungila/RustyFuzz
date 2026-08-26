@@ -25,8 +25,7 @@ impl OrderingConstraintMutator {
             return MutationResult::Skipped;
         }
 
-        let constraint_idx =
-            (rand.below(NonZero::new(self.temporal_constraints.len()).unwrap()) - 1) as usize;
+        let constraint_idx = rand.below(NonZero::new(self.temporal_constraints.len()).unwrap()) - 1;
         let constraint = &self.temporal_constraints[constraint_idx];
 
         match constraint.functions.as_slice() {
@@ -94,7 +93,7 @@ impl OrderingConstraintMutator {
         // Create gap between related functions by inserting dummy transactions
         let gap_size = (rand.below(NonZero::new(3).unwrap())) + 1; // 1-3 dummy txs
 
-        let insert_pos = (rand.below(NonZero::new(input.txs.len()).unwrap()) - 1) as usize;
+        let insert_pos = rand.below(NonZero::new(input.txs.len()).unwrap()) - 1;
 
         for _ in 0..gap_size {
             // Create dummy transaction (e.g., no-op or unrelated call)
@@ -113,7 +112,7 @@ impl OrderingConstraintMutator {
             return MutationResult::Skipped;
         }
 
-        let idx = (rand.below(NonZero::new(input.txs.len()).unwrap()) - 1) as usize;
+        let idx = rand.below(NonZero::new(input.txs.len()).unwrap()) - 1;
         let tx = input.txs[idx].clone();
         input.txs.insert(idx + 1, tx);
 

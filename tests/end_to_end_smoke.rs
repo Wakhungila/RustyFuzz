@@ -21,12 +21,14 @@ async fn synthetic_abi_smoke_campaign_does_not_promote_findings() {
     let report_dir = root.join("reports");
     let target = Address::from_str("0x1111111111111111111111111111111111111111").expect("target");
 
-    let mut hardened = HardenedDefiConfig::default();
-    hardened.enabled = false;
-    hardened.single_process = true;
-    hardened.deterministic = true;
-    hardened.rng_seed = Some(1);
-    hardened.max_template_sequences = 1;
+    let hardened = HardenedDefiConfig {
+        enabled: false,
+        single_process: true,
+        deterministic: true,
+        rng_seed: Some(1),
+        max_template_sequences: 1,
+        ..Default::default()
+    };
 
     let config = Config {
         rpc_url: "not-a-url".to_string(),

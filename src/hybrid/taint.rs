@@ -481,30 +481,28 @@ impl<'a, DB: Database> Inspector<DB> for TaintInspector<'a> {
             }
 
             // SSTORE - store to storage
-            0x55 => {
-                if stack_len >= 2 {
-                    let value_state = self.tracker.stack_taint.pop().unwrap_or_default();
-                    let key_state = self.tracker.stack_taint.pop().unwrap_or_default();
+            0x55 if stack_len >= 2 => {
+                let value_state = self.tracker.stack_taint.pop().unwrap_or_default();
+                let key_state = self.tracker.stack_taint.pop().unwrap_or_default();
 
-                    // Record flows for tainted key or value
-                    if key_state.is_tainted() {
-                        for mark in &key_state.marks {
-                            self.tracker.record_flow(
-                                mark.source.clone(),
-                                TaintSink::StorageKey,
-                                mark.propagation_path.clone(),
-                            );
-                        }
+                // Record flows for tainted key or value
+                if key_state.is_tainted() {
+                    for mark in &key_state.marks {
+                        self.tracker.record_flow(
+                            mark.source.clone(),
+                            TaintSink::StorageKey,
+                            mark.propagation_path.clone(),
+                        );
                     }
+                }
 
-                    if value_state.is_tainted() {
-                        for mark in &value_state.marks {
-                            self.tracker.record_flow(
-                                mark.source.clone(),
-                                TaintSink::StorageValue,
-                                mark.propagation_path.clone(),
-                            );
-                        }
+                if value_state.is_tainted() {
+                    for mark in &value_state.marks {
+                        self.tracker.record_flow(
+                            mark.source.clone(),
+                            TaintSink::StorageValue,
+                            mark.propagation_path.clone(),
+                        );
                     }
                 }
             }

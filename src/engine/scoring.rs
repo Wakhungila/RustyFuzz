@@ -340,10 +340,8 @@ impl CampaignScorer {
                     key_expression,
                     base_slot_expression,
                     ..
-                } => {
-                    if key_expression.is_some() || base_slot_expression.is_some() {
-                        mapping_backed += 1;
-                    }
+                } if key_expression.is_some() || base_slot_expression.is_some() => {
+                    mapping_backed += 1;
                 }
                 _ => {}
             }

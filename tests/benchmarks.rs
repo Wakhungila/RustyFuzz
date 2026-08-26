@@ -1063,8 +1063,10 @@ fn benchmark_reentrancy_detection() {
     let target_addr = addr(0x11);
 
     // Setup: A contract state where storage was modified at depth > 1
-    let mut acc_info = AccountInfo::default();
-    acc_info.code = Some(Bytecode::new_raw(vec![0x00].into()));
+    let acc_info = AccountInfo {
+        code: Some(Bytecode::new_raw(vec![0x00].into())),
+        ..Default::default()
+    };
     db.insert_account_info(target_addr, acc_info);
 
     let before = new_evm_snapshot(0, db.clone());

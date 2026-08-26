@@ -3,7 +3,7 @@ use crate::satori::fsutil::{collect_files, read_lossy_limited, sha256_hex, write
 use crate::satori::ingest::foundry::is_foundry_project;
 use crate::satori::ingest::hardhat::is_hardhat_project;
 use crate::satori::types::{ProjectModel, ProjectType, ProtocolType, SourceFile};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub fn ingest_project(root: &Path, run_dir: &Path) -> SatoriResult<ProjectModel> {
     let root = root.canonicalize()?;
@@ -102,7 +102,7 @@ fn source_file(root: &Path, file: &Path, extension: &str) -> SatoriResult<Source
     })
 }
 
-fn is_doc_file(path: &PathBuf) -> bool {
+fn is_doc_file(path: &Path) -> bool {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -119,6 +119,7 @@ fn is_doc_file(path: &PathBuf) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn satori_ingests_fixture_sources() {

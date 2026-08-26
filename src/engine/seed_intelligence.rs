@@ -318,7 +318,7 @@ impl SeedIntelligence {
             });
         }
 
-        out.sort_by(|a, b| b.confidence_score.cmp(&a.confidence_score));
+        out.sort_by_key(|candidate| std::cmp::Reverse(candidate.confidence_score));
         out.truncate(self.config.max_candidates);
         Ok(out)
     }
@@ -896,7 +896,7 @@ impl SeedIntelligence {
                 tags,
             });
         }
-        out.sort_by(|a, b| b.confidence_score.cmp(&a.confidence_score));
+        out.sort_by_key(|candidate| std::cmp::Reverse(candidate.confidence_score));
         out.truncate(self.config.max_candidates);
         Ok(out)
     }

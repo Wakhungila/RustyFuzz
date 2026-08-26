@@ -867,11 +867,9 @@ impl EvmMutator {
                     b[idx] = rand.next() as u8;
                 }
             }
-            DynSolValue::String(s) => {
-                if !s.is_empty() {
-                    let idx = rand.below(NonZero::new(s.len()).unwrap());
-                    s.replace_range(idx..idx + 1, &((rand.next() as u8) as char).to_string());
-                }
+            DynSolValue::String(s) if !s.is_empty() => {
+                let idx = rand.below(NonZero::new(s.len()).unwrap());
+                s.replace_range(idx..idx + 1, &((rand.next() as u8) as char).to_string());
             }
             _ => {} // Extend for arrays, bools, etc.
         }

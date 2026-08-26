@@ -437,7 +437,7 @@ pub fn evaluate_search_objectives(
                     .to_string(),
         });
     }
-    hits.sort_by(|left, right| right.score.cmp(&left.score));
+    hits.sort_by_key(|hit| std::cmp::Reverse(hit.score));
     hits
 }
 

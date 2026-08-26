@@ -98,7 +98,7 @@ pub fn ingest_abi(
         });
     }
 
-    functions.sort_by(|a, b| a.selector.cmp(&b.selector));
+    functions.sort_by_key(|function| function.selector);
     let classified_selectors = functions
         .iter()
         .filter(|function| function.classification != SelectorClassification::Unknown)

@@ -681,7 +681,7 @@ fn recent_flows_from_seeds(seeds: &[MainnetSeed]) -> Vec<RecentValidFlow> {
     for seed in ordered.iter().take(16) {
         flows.push(flow_from_seeds(std::slice::from_ref(seed)));
     }
-    flows.sort_by(|a, b| b.confidence.cmp(&a.confidence));
+    flows.sort_by_key(|flow| std::cmp::Reverse(flow.confidence));
     flows.dedup_by(|a, b| a.seed_ids == b.seed_ids);
     flows.truncate(32);
     flows
