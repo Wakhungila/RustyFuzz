@@ -56,20 +56,45 @@ jobs:
       - name: Integration tests
         run: cargo test --test benchmarks
 
-  # Memory leak detection with sanitizers
+  # Memory leak detection with sanitizers.
+  # Per-crate scopes match the locally proven gates; full-workspace ASan is a
+  # known issue (tests/end_to_end_smoke.rs trips an ASan runtime check) and is
+  # deliberately not a gate. See docs/reengineering/STAGE_2A_CORE_EXTRACTION.md.
   sanitizers:
-    name: Sanitizer Tests
+    name: Sanitizers (${{ matrix.scope }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        scope: [root-lib, bins, benchmarks, core, engine, evm, artifacts]
+    env:
+      RUSTFLAGS: -Zsanitizer=address
+      ASAN_OPTIONS: detect_leaks=1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly-2026-08-01
         with:
           components: rust-src
-      - name: Run with address sanitizer
-        run: cargo +nightly-2026-08-01 test --lib --target x86_64-unknown-linux-gnu -Zbuild-std
-        env:
-          RUSTFLAGS: -Zsanitizer=address
-          ASAN_OPTIONS: detect_leaks=1
+      - name: Root library tests
+        if: matrix.scope == 'root-lib'
+        run: cargo +nightly-2026-08-01 test -p rusty-fuzz --lib --target x86_64-unknown-linux-gnu -Zbuild-std
+      - name: Binary tests
+        if: matrix.scope == 'bins'
+        run: cargo +nightly-2026-08-01 test -p rusty-fuzz --bins --target x86_64-unknown-linux-gnu -Zbuild-std
+      - name: Benchmark integration tests
+        if: matrix.scope == 'benchmarks'
+        run: cargo +nightly-2026-08-01 test -p rusty-fuzz --test benchmarks --target x86_64-unknown-linux-gnu -Zbuild-std
+      - name: rustyfuzz-core
+        if: matrix.scope == 'core'
+        run: cargo +nightly-2026-08-01 test -p rustyfuzz-core --lib --target x86_64-unknown-linux-gnu -Zbuild-std
+      - name: rustyfuzz-engine
+        if: matrix.scope == 'engine'
+        run: cargo +nightly-2026-08-01 test -p rustyfuzz-engine --lib --target x86_64-unknown-linux-gnu -Zbuild-std
+      - name: rustyfuzz-evm
+        if: matrix.scope == 'evm'
+        run: cargo +nightly-2026-08-01 test -p rustyfuzz-evm --lib --target x86_64-unknown-linux-gnu -Zbuild-std
+      - name: rustyfuzz-artifacts
+        if: matrix.scope == 'artifacts'
+        run: cargo +nightly-2026-08-01 test -p rustyfuzz-artifacts --lib --target x86_64-unknown-linux-gnu -Zbuild-std
 
   # Benchmark regression detection
   benchmark-regression:

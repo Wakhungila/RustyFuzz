@@ -110,6 +110,37 @@ mod tests {
     }
 
     #[test]
+    fn reader_never_observes_partial_file_during_overwrite() {
+        // Simulate an interrupted write: the temp file existing alone must not
+        // affect the previous complete artifact at the destination.
+        let dir =
+            std::env::temp_dir().join(format!("rustyfuzz-fsutil-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("manifest.json");
+        write_atomic(&path, b"{\"complete\":true}").unwrap();
+
+        // A crashed writer left a temp file behind.
+        let tmp = dir.join(".manifest.json.tmp");
+        std::fs::write(&tmp, b"{\"partial\":").unwrap();
+
+        // Readers see the previous complete file.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"complete\":true}"
+        );
+
+        // The next successful write cleans up and replaces atomically.
+        write_atomic(&path, b"{\"complete\":true,\"v\":2}").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"complete\":true,\"v\":2}"
+        );
+        assert!(!tmp.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn json_write_round_trips_typed_value() {
         let dir =
             std::env::temp_dir().join(format!("rustyfuzz-fsutil-json-{}", std::process::id()));
