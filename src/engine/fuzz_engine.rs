@@ -45,10 +45,10 @@ use parking_lot::{Mutex, RwLock};
 use revm::database::CacheDB;
 use revm::primitives::{Address, U256};
 use revm::state::AccountInfo;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -80,227 +80,11 @@ fn mutational_stage_iterations(config: &Config) -> NonZeroUsize {
     }
 }
 
-struct CampaignTelemetry {
-    start: Instant,
-    executions: AtomicU64,
-    mutated_inputs: AtomicU64,
-    seed_replays: AtomicU64,
-    artifacts: AtomicU64,
-    oracle_findings: AtomicU64,
-    state_novelty: AtomicU64,
-    best_score: AtomicU64,
-    max_coverage_edges: AtomicU64,
-    mutation_strategies: Mutex<BTreeMap<String, u64>>,
-    concolic_hint_stats: Arc<ConcolicHintStats>,
-    last_report: Mutex<(Instant, u64)>,
-}
-
-struct ExecutionTelemetryRecord<'a> {
-    core_id: usize,
-    tx_count: usize,
-    findings: usize,
-    campaign_score: u64,
-    corpus_size: usize,
-    coverage_edges: usize,
-    state_novelty_score: u64,
-    mutation_strategies: &'a [String],
-}
-
-struct CampaignBudget {
-    max_execs: Option<u64>,
-    deadline: Option<Instant>,
-    reserved_execs: AtomicU64,
-}
-
-impl CampaignBudget {
-    fn new(max_execs: Option<u64>, duration_secs: Option<u64>, workers: usize) -> Self {
-        let max_execs = max_execs.map(|execs| {
-            let workers = workers.max(1) as u64;
-            execs.div_ceil(workers).max(1)
-        });
-        let shutdown_grace = campaign_shutdown_grace();
-        Self {
-            max_execs,
-            deadline: duration_secs.map(|secs| {
-                Instant::now() + Duration::from_secs(secs.saturating_sub(shutdown_grace))
-            }),
-            reserved_execs: AtomicU64::new(0),
-        }
-    }
-
-    fn reserve_execution(&self) -> bool {
-        if self.time_exhausted() {
-            return false;
-        }
-        let Some(max_execs) = self.max_execs else {
-            return true;
-        };
-        loop {
-            let current = self.reserved_execs.load(Ordering::Relaxed);
-            if current >= max_execs {
-                return false;
-            }
-            if self
-                .reserved_execs
-                .compare_exchange_weak(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return true;
-            }
-        }
-    }
-
-    fn exhausted(&self) -> bool {
-        self.time_exhausted()
-            || self
-                .max_execs
-                .is_some_and(|max_execs| self.reserved_execs.load(Ordering::Relaxed) >= max_execs)
-    }
-
-    fn reserved(&self) -> u64 {
-        self.reserved_execs.load(Ordering::Relaxed)
-    }
-
-    fn time_exhausted(&self) -> bool {
-        self.deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-    }
-}
-
-impl CampaignTelemetry {
-    fn new() -> Self {
-        let now = Instant::now();
-        Self {
-            start: now,
-            executions: AtomicU64::new(0),
-            mutated_inputs: AtomicU64::new(0),
-            seed_replays: AtomicU64::new(0),
-            artifacts: AtomicU64::new(0),
-            oracle_findings: AtomicU64::new(0),
-            state_novelty: AtomicU64::new(0),
-            best_score: AtomicU64::new(0),
-            max_coverage_edges: AtomicU64::new(0),
-            mutation_strategies: Mutex::new(BTreeMap::new()),
-            concolic_hint_stats: Arc::new(ConcolicHintStats::default()),
-            last_report: Mutex::new((now, 0)),
-        }
-    }
-
-    fn record_execution(&self, record: ExecutionTelemetryRecord<'_>) {
-        let ExecutionTelemetryRecord {
-            core_id,
-            tx_count,
-            findings,
-            campaign_score,
-            corpus_size,
-            coverage_edges,
-            state_novelty_score,
-            mutation_strategies,
-        } = record;
-        let total = self.executions.fetch_add(1, Ordering::Relaxed) + 1;
-        if mutation_strategies
-            .iter()
-            .any(|strategy| strategy != "seed_or_imported")
-        {
-            self.mutated_inputs.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.seed_replays.fetch_add(1, Ordering::Relaxed);
-        }
-        if findings > 0 {
-            self.oracle_findings
-                .fetch_add(findings as u64, Ordering::Relaxed);
-        }
-        if state_novelty_score > 0 {
-            self.state_novelty
-                .fetch_add(state_novelty_score, Ordering::Relaxed);
-        }
-        self.best_score.fetch_max(campaign_score, Ordering::Relaxed);
-        self.max_coverage_edges
-            .fetch_max(coverage_edges as u64, Ordering::Relaxed);
-        if !mutation_strategies.is_empty() {
-            let mut counts = self.mutation_strategies.lock();
-            for strategy in mutation_strategies {
-                *counts.entry(strategy.clone()).or_default() += 1;
-            }
-        }
-
-        let now = Instant::now();
-        let mut last = self.last_report.lock();
-        let elapsed = now.duration_since(last.0);
-        if elapsed < CAMPAIGN_TELEMETRY_INTERVAL {
-            return;
-        }
-
-        let delta_execs = total.saturating_sub(last.1);
-        let interval_execs_per_sec = delta_execs as f64 / elapsed.as_secs_f64().max(0.001);
-        let total_execs_per_sec =
-            total as f64 / now.duration_since(self.start).as_secs_f64().max(0.001);
-        let mutation_mix = {
-            let counts = self.mutation_strategies.lock();
-            counts
-                .iter()
-                .map(|(strategy, count)| format!("{strategy}:{count}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        let concolic = self.concolic_hint_stats.snapshot();
-        log::info!(
-            "RustyFuzz telemetry: core={}, executions={}, mutated_inputs={}, seed_replays={}, execs_per_sec_30s={:.3}, execs_per_sec_avg={:.3}, corpus_size={}, coverage_edges_last={}, state_novelty_count={}, oracle_findings={}, persisted_artifacts={}, best_score={}, txs_last={}, score_last={}, mutation_strategy_mix=[{}], concolic_hints={{generated:{},deduplicated:{},applied:{},successful:{}}}",
-            core_id,
-            total,
-            self.mutated_inputs.load(Ordering::Relaxed),
-            self.seed_replays.load(Ordering::Relaxed),
-            interval_execs_per_sec,
-            total_execs_per_sec,
-            corpus_size,
-            coverage_edges,
-            self.state_novelty.load(Ordering::Relaxed),
-            self.oracle_findings.load(Ordering::Relaxed),
-            self.artifacts.load(Ordering::Relaxed),
-            self.best_score.load(Ordering::Relaxed),
-            tx_count,
-            campaign_score,
-            mutation_mix,
-            concolic.generated,
-            concolic.deduplicated,
-            concolic.applied,
-            concolic.successful
-        );
-        *last = (now, total);
-    }
-
-    fn record_artifact(&self) {
-        self.artifacts.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn execution_count(&self) -> u64 {
-        self.executions.load(Ordering::Relaxed)
-    }
-
-    fn artifact_count(&self) -> u64 {
-        self.artifacts.load(Ordering::Relaxed)
-    }
-
-    fn coverage_edges(&self) -> u64 {
-        self.max_coverage_edges.load(Ordering::Relaxed)
-    }
-
-    fn mutated_inputs(&self) -> u64 {
-        self.mutated_inputs.load(Ordering::Relaxed)
-    }
-
-    fn seed_replays(&self) -> u64 {
-        self.seed_replays.load(Ordering::Relaxed)
-    }
-
-    fn executions(&self) -> u64 {
-        self.executions.load(Ordering::Relaxed)
-    }
-
-    fn artifacts(&self) -> u64 {
-        self.artifacts.load(Ordering::Relaxed)
-    }
-}
+use rustyfuzz_engine::campaign::budget::CampaignBudget;
+use rustyfuzz_engine::campaign::telemetry::{
+    CampaignTelemetry, ExecutionTelemetryRecord, CAMPAIGN_TELEMETRY_INTERVAL,
+};
+use rustyfuzz_engine::events::{CampaignEvent, EventSink};
 
 // LibAFL 0.15.4 imports.
 use libafl::events::ClientDescription;
@@ -320,7 +104,6 @@ type EvmLauncherManager =
 
 const STATE_NOVELTY_MAP_SLOTS: usize = 2_048;
 const CAMPAIGN_SCORE_MAP_SLOTS: usize = 1_024;
-const CAMPAIGN_TELEMETRY_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn log_bounded_campaign_progress(
@@ -675,6 +458,9 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 let promotion_stats = Arc::new(PromotionCampaignStats::default());
                 let pending_campaign_score = Arc::new(RwLock::new(None));
                 let testcase_metadata_store = EvmTestcaseMetadataStore::default();
+                let (event_sink, _event_receiver) =
+                    EventSink::bounded(rustyfuzz_engine::events::DEFAULT_EVENT_SINK_CAPACITY);
+                let event_sink = Arc::new(event_sink);
                 let campaign_scorer = Arc::new(CampaignScorer::default());
                 let protocol_oracles = Arc::new(ProtocolOraclePack::default());
                 let evm_executor = Arc::new(EvmExecutor::new());
@@ -1068,6 +854,10 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                                 input.txs.len(),
                                 report.novelty_score()
                             );
+                            event_sink.emit(CampaignEvent::NewSnapshot {
+                                id: snapshot_id,
+                                parent: snap_id,
+                            });
                         }
                     }
 
@@ -1277,6 +1067,9 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                             Ok(outcome) => {
                                 if outcome.created_new {
                                     telemetry.record_artifact();
+                                    event_sink.emit(CampaignEvent::CandidateFinding {
+                                        input_id: outcome.record.input_id.clone(),
+                                    });
                                     log::info!(
                                         "Persisted campaign artifact: input_id={}, fork_cache_id={}, reason={}, score={}, findings={}",
                                         outcome.record.input_id,
@@ -1426,6 +1219,9 @@ async fn run_single_process_campaign(
     let promotion_stats = Arc::new(PromotionCampaignStats::default());
     let pending_campaign_score = Arc::new(RwLock::new(None));
     let testcase_metadata_store = EvmTestcaseMetadataStore::default();
+    let (event_sink, _event_receiver) =
+        EventSink::bounded(rustyfuzz_engine::events::DEFAULT_EVENT_SINK_CAPACITY);
+    let event_sink = Arc::new(event_sink);
     let campaign_scorer = Arc::new(CampaignScorer::default());
     let protocol_oracles = Arc::new(ProtocolOraclePack::default());
     let evm_executor = Arc::new(EvmExecutor::new());
@@ -1823,6 +1619,10 @@ async fn run_single_process_campaign(
                     input.txs.len(),
                     report.novelty_score()
                 );
+                event_sink.emit(CampaignEvent::NewSnapshot {
+                    id: snapshot_id,
+                    parent: snap_id,
+                });
             }
         }
         let mut findings = protocol_oracles.evaluate(&execution);
@@ -1981,6 +1781,9 @@ async fn run_single_process_campaign(
                 Ok(outcome) => {
                     if outcome.created_new {
                         telemetry.record_artifact();
+                        event_sink.emit(CampaignEvent::CandidateFinding {
+                            input_id: outcome.record.input_id.clone(),
+                        });
                         log::info!(
                             "Persisted campaign artifact: input_id={}, fork_cache_id={}, reason={}, score={}, findings={}",
                             outcome.record.input_id,
@@ -2081,13 +1884,6 @@ fn campaign_execution_timeout() -> Duration {
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_EXECUTION_TIMEOUT)
-}
-
-fn campaign_shutdown_grace() -> u64 {
-    std::env::var("RUSTYFUZZ_CAMPAIGN_SHUTDOWN_GRACE_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(15)
 }
 
 fn startup_rpc_timeout() -> Duration {

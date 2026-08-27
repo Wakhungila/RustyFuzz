@@ -10,6 +10,7 @@ use crate::evm::fuzz::EvmInput;
 use crate::evm::fuzz::MutationProvenance;
 use crate::evm::trace::ExecutionTrace;
 use revm::primitives::U256;
+pub use rustyfuzz_engine::scoring::CampaignScore;
 use serde::{Deserialize, Serialize};
 
 /// ProfitReport: Tracks profit and loss from execution sequences.
@@ -24,24 +25,6 @@ pub struct ProfitReport {
     pub net: U256,
     /// Breakdown by actor address
     pub by_actor: std::collections::HashMap<revm::primitives::Address, (U256, U256)>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CampaignScore {
-    pub total: u64,
-    pub economic_pressure: u64,
-    pub invariant_pressure: u64,
-    pub counterexample_pressure: u64,
-    pub oracle_pressure: u64,
-    pub state_pressure: u64,
-    pub exploration_pressure: u64,
-    pub explanation: Vec<String>,
-}
-
-impl CampaignScore {
-    pub fn is_interesting(&self) -> bool {
-        self.total > 0
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -15,6 +15,9 @@ Current important implementation details:
   and mutation provenance were moved to `EvmTestcaseMetadata`. During campaigns,
   guidance flows through `EvmTestcaseMetadataStore` keyed by semantic `InputId`
   (`rustyfuzz-input-id-v1`); persisted inputs no longer contain feedback fields.
+- Stage 3 (CURRENT): campaign budget/telemetry/scheduler and the semantic
+  input model live in `rustyfuzz-engine`; cold-path outputs flow through a
+  bounded non-blocking event sink.
 - `SnapshotCorpus` exists in the current EVM corpus implementation. Stage 2C
   (CURRENT) gives it explicit identity semantics: monotonic assigned
   SnapshotIds are separate from `StateFingerprint` state digests, lineage is

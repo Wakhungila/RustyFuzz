@@ -5864,6 +5864,7 @@ dependencies = [
  "reqwest 0.13.3",
  "revm",
  "rustyfuzz-core",
+ "rustyfuzz-engine",
  "rustyfuzz-evm",
  "serde",
  "serde_json",
@@ -5886,6 +5887,21 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "rustyfuzz-engine"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "libafl",
+ "libafl_bolts",
+ "log",
+ "parking_lot",
+ "rustyfuzz-core",
+ "rustyfuzz-evm",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

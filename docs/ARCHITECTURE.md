@@ -65,6 +65,10 @@ Known current architecture problems:
   selected neutral types have been bridged to `rustyfuzz-core`.
 - There are duplicate finding lifecycle models in source and older docs.
 - Runtime paths are reconstructed in multiple modules; there is no `RunLayout`.
+- Stage 3 (CURRENT): `rustyfuzz-engine` crate owns the input model,
+  scheduler, budget, telemetry, concolic stats, and a bounded event
+  sink; harness runtimes remain in the root fuzzer pending the worker
+  boundary split (TODO(stage-4)).
 - Stage 2C (CURRENT): snapshot identity explicit (assigned ids vs
   `StateFingerprint` content digests), ancestry with cycle guards,
   versioned snapshot manifests; selection/scheduler policy untouched.

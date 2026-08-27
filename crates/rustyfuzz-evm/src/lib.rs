@@ -17,3 +17,8 @@ pub use executor::{EvmExecutor, ExecutionMode};
 pub use fork_db::{EvmCacheDb, ForkDb};
 pub use inspector::MAP_SIZE;
 pub use transaction::SingletonTx;
+
+/// Keccak-256, re-exported so downstream crates hash identity material with
+/// the exact same primitive the backend uses (no second implementation).
+pub use revm::primitives::keccak256;
+pub use revm::primitives::U256;

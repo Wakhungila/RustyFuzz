@@ -1,7 +1,6 @@
 use crate::common::types::{ComparisonOperand, SymbolicExpression, TaintSource, Waypoint};
 use revm::primitives::U256;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,48 +28,8 @@ pub enum ConcolicRepairTarget {
     TxValue,
 }
 
-#[derive(Debug, Default)]
-pub struct ConcolicHintStats {
-    generated: AtomicU64,
-    deduplicated: AtomicU64,
-    applied: AtomicU64,
-    successful: AtomicU64,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ConcolicHintStatsSnapshot {
-    pub generated: u64,
-    pub deduplicated: u64,
-    pub applied: u64,
-    pub successful: u64,
-}
-
-impl ConcolicHintStats {
-    pub fn record_generated(&self, count: u64) {
-        self.generated.fetch_add(count, Ordering::Relaxed);
-    }
-
-    pub fn record_deduplicated(&self, count: u64) {
-        self.deduplicated.fetch_add(count, Ordering::Relaxed);
-    }
-
-    pub fn record_applied(&self) {
-        self.applied.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_successful(&self) {
-        self.successful.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn snapshot(&self) -> ConcolicHintStatsSnapshot {
-        ConcolicHintStatsSnapshot {
-            generated: self.generated.load(Ordering::Relaxed),
-            deduplicated: self.deduplicated.load(Ordering::Relaxed),
-            applied: self.applied.load(Ordering::Relaxed),
-            successful: self.successful.load(Ordering::Relaxed),
-        }
-    }
-}
+// Stage 3: stats live in `rustyfuzz-engine::concolic_stats`.
+pub use rustyfuzz_engine::concolic_stats::{ConcolicHintStats, ConcolicHintStatsSnapshot};
 
 /// Concolic solver for generating input mutations based on execution constraints.
 ///
