@@ -45,6 +45,33 @@ pub struct ProtocolFinding {
     pub evidence: String,
 }
 
+impl ProtocolFinding {
+    /// Adapts a legacy pack finding into the canonical [`rustyfuzz_core::
+    /// OracleSignal`] shape (Stage 4B).
+    ///
+    /// Detection logic is untouched: this is a pure mapping for downstream
+    /// consumers that speak the canonical signal model. Severity hints are
+    /// carried verbatim; strength defaults to heuristic because pack findings
+    /// are snapshot-diff heuristics until deterministic replay backs them.
+    ///
+    /// TODO(stage-4): retire once oracle packs emit `OracleSignal` directly.
+    pub fn to_signal(&self) -> rustyfuzz_core::OracleSignal {
+        let rule_id = rustyfuzz_core::OracleId::new(format!(
+            "pack.{}",
+            format!("{:?}", self.pack).to_ascii_lowercase()
+        ))
+        .unwrap_or_else(|_| rustyfuzz_core::OracleId::new("pack.unknown").expect("static id"));
+        rustyfuzz_core::OracleSignal::heuristic(
+            rule_id,
+            format!("{:?}", self.vuln),
+            self.evidence.clone(),
+        )
+        .with_severity(format!("{:?}", self.severity))
+        .with_tx_index(self.tx_index)
+        .with_target(self.target.map(|address| address.to_string()))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProtocolSeverity {
     Info,
@@ -960,9 +987,47 @@ pub fn summarize_findings_by_pack(
 }
 
 #[cfg(test)]
+mod stage_4b_tests {
+    use super::*;
+
+    /// Trust-boundary invariant (invariant #5): pack findings adapt to the
+    /// canonical signal model as heuristic evidence — never as proofs.
+    #[test]
+    fn protocol_findings_adapt_to_heuristic_signals_with_stable_rule_ids() {
+        let finding = ProtocolFinding {
+            pack: ProtocolOraclePackKind::Erc4626,
+            vuln: VulnType::VaultInflation,
+            severity: ProtocolSeverity::High,
+            tx_index: Some(2),
+            target: Some(revm::primitives::Address::repeat_byte(0x44)),
+            evidence: "share price anomaly".to_string(),
+        };
+        let signal = finding.to_signal();
+        assert_eq!(signal.strength, rustyfuzz_core::SignalStrength::Heuristic);
+        assert_eq!(signal.rule_id.as_str(), "pack.erc4626");
+        assert_eq!(signal.severity_hint, "High");
+        assert_eq!(signal.tx_index, Some(2));
+        assert!(signal
+            .target
+            .as_deref()
+            .is_some_and(|t| t.starts_with("0x")));
+        // Deterministic rule id across repeated adaptation.
+        assert_eq!(finding.to_signal().rule_id, signal.rule_id);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::common::types::{CallKind, ExecutionStatus, TxExecutionResult};
+
+    #[test]
+    fn oracle_fixture_helpers_build_deterministic_observations() {
+        let observation = call([0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(observation.caller, addr(0x01));
+        assert_eq!(observation.target, addr(0xaa));
+        assert_eq!(observation.input, vec![0xde, 0xad, 0xbe, 0xef]);
+    }
 
     fn addr(byte: u8) -> Address {
         Address::repeat_byte(byte)
@@ -985,6 +1050,13 @@ mod tests {
             created_address: None,
             result: None,
         }
+    }
+
+    #[test]
+    fn oracle_execution_fixture_is_deterministic() {
+        let result = execution(vec![call([0xde, 0xad, 0xbe, 0xef])], Vec::new());
+        assert_eq!(result.total_gas_used, 21_000);
+        assert_eq!(result.call_trace.len(), 1);
     }
 
     fn execution(

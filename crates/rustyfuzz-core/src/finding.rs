@@ -116,6 +116,86 @@ impl FindingIdentity {
     }
 }
 
+/// Strength class of the evidence behind an [`OracleSignal`] (Stage 4B).
+///
+/// Deliberately separate from finding status/lifecycle: an oracle can never be
+/// "proved", it can only produce signals backed by evidence of some strength.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+pub enum SignalStrength {
+    /// Pattern/heuristic observation without deterministic backing.
+    #[default]
+    Heuristic,
+    /// Backed by a deterministic replay of the producing input.
+    DeterministicReplay,
+    /// Backed by replay against recorded realistic fork state.
+    RealisticForkReplay,
+    /// Reproduces in a committed regression fixture.
+    RegressionFixture,
+}
+
+/// Typed oracle output (Stage 4B): oracles produce *signals*, never proofs.
+///
+/// Canonical shape every RustyFuzz oracle moves toward; legacy snapshot-diff
+/// oracles adapt via `ProtocolFinding`/`OracleObservation` bridges rather than
+/// changing their detection logic.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OracleSignal {
+    /// Stable rule identifier (pack/rule naming, e.g. `erc4626.inflation`).
+    pub rule_id: OracleId,
+    /// Semantic vulnerability category as reported by the oracle.
+    pub category: String,
+    /// Severity hint attached by the oracle policy.
+    pub severity_hint: String,
+    /// Index of the decisive transaction in the sequence, when applicable.
+    pub tx_index: Option<usize>,
+    /// Involved contract, when known.
+    pub target: Option<String>,
+    /// Human-readable evidence summary (detail lives in typed evidence refs
+    /// over time; strings here remain compatibility-shaped for artifacts).
+    pub evidence: String,
+    /// Strength of the backing evidence at signal time.
+    pub strength: SignalStrength,
+}
+
+impl OracleSignal {
+    /// Convenience constructor defaulting to heuristic strength.
+    pub fn heuristic(
+        rule_id: OracleId,
+        category: impl Into<String>,
+        evidence: impl Into<String>,
+    ) -> Self {
+        Self {
+            rule_id,
+            category: category.into(),
+            severity_hint: String::new(),
+            tx_index: None,
+            target: None,
+            evidence: evidence.into(),
+            strength: SignalStrength::Heuristic,
+        }
+    }
+
+    /// Builder-style severity assignment.
+    pub fn with_severity(mut self, severity_hint: impl Into<String>) -> Self {
+        self.severity_hint = severity_hint.into();
+        self
+    }
+
+    /// Builder-style transaction-index assignment.
+    pub fn with_tx_index(mut self, tx_index: Option<usize>) -> Self {
+        self.tx_index = tx_index;
+        self
+    }
+
+    /// Builder-style target assignment.
+    pub fn with_target(mut self, target: Option<String>) -> Self {
+        self.target = target;
+        self
+    }
+}
+
 /// Stable category for evidence references.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum EvidenceKind {
@@ -206,6 +286,24 @@ mod tests {
         let mut c = build();
         c.evidence_fingerprint = "other".to_string();
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn oracle_signals_carry_strength_and_never_claim_proved() {
+        use super::{OracleSignal, SignalStrength};
+
+        let signal = OracleSignal::heuristic(
+            OracleId::new("erc4626.inflation").unwrap(),
+            "VaultInflation",
+            "share price dropped after donation",
+        )
+        .with_severity("High");
+
+        assert_eq!(signal.strength, SignalStrength::Heuristic);
+        assert_eq!(signal.severity_hint, "High");
+        // Strength ladder is ordered: replay-backed outranks heuristic.
+        assert!(SignalStrength::DeterministicReplay > SignalStrength::Heuristic);
+        assert!(SignalStrength::RegressionFixture > SignalStrength::RealisticForkReplay);
     }
 
     #[test]

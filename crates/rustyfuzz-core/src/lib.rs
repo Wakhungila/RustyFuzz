@@ -17,13 +17,16 @@ pub mod execution;
 pub mod finding;
 pub mod ids;
 pub mod metadata;
+pub mod proposal;
 pub mod snapshot;
 
 pub use error::{CoreError, CoreResult};
 pub use execution::ExecutionStatus;
 pub use finding::{
-    EvidenceKind, EvidenceRef, FindingIdentity, FindingLifecycle, IllegalTransition,
+    EvidenceKind, EvidenceRef, FindingIdentity, FindingLifecycle, IllegalTransition, OracleSignal,
+    SignalStrength,
 };
 pub use ids::{CampaignId, EvidenceId, FindingId, InputId, OracleId, SnapshotId};
 pub use metadata::TestcaseMetadata;
+pub use proposal::{AiProposal, ProposalKind, ProposalValidation};
 pub use snapshot::{SnapshotMetadata, StateFingerprint};

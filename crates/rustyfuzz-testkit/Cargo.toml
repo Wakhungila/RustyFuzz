@@ -1,0 +1,8 @@
+[package]
+name = "rustyfuzz-testkit"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic test fixtures and helpers for RustyFuzz crates."
+
+[dev-dependencies]
+# Production crates may NOT depend on testkit; testkit depends on them.
