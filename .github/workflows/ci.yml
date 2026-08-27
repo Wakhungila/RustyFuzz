@@ -64,6 +64,7 @@ jobs:
     name: Sanitizers (${{ matrix.scope }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         scope: [root-lib, bins, benchmarks, core, engine, evm, artifacts]
     env:
@@ -71,8 +72,9 @@ jobs:
       ASAN_OPTIONS: detect_leaks=1
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly-2026-08-01
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-08-01
           components: rust-src
       - name: Root library tests
         if: matrix.scope == 'root-lib'

@@ -18,6 +18,14 @@
 /saved-runs/
 /reports/*
 !/reports/satori_baseline.md
+
+# ─────────────────────────────────────────────────────────────
+# Bounty/audit workspaces — never commit these again.
+# (historical copies remain in git history by policy)
+# ─────────────────────────────────────────────────────────────
+/audits/
+**/audits/
+**/saved-runs/
 /seeds/
 /crashes/
 /findings/
