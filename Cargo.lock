@@ -5863,6 +5863,7 @@ dependencies = [
  "rayon",
  "reqwest 0.13.3",
  "revm",
+ "rustyfuzz-artifacts",
  "rustyfuzz-core",
  "rustyfuzz-engine",
  "rustyfuzz-evm",
@@ -5878,6 +5879,16 @@ dependencies = [
  "tracing-subscriber 0.3.23",
  "url",
  "z3",
+]
+
+[[package]]
+name = "rustyfuzz-artifacts"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "rustyfuzz-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

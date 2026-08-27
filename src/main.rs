@@ -476,6 +476,18 @@ async fn main() -> anyhow::Result<()> {
                 .as_ref()
                 .map(|id| format!("{}/{}", config.report_dir, id))
                 .unwrap_or_else(|| config.report_dir.clone());
+            // Stage 4A: capture provenance before config values are moved into
+            // the engine Config. Additive only; campaign behavior unchanged.
+            let manifest_run_id = sanitized_campaign_id
+                .clone()
+                .unwrap_or_else(|| format!("run-{}", chrono::Utc::now().timestamp_millis()));
+            let manifest_fork_block = config.fork_block;
+            let manifest_rpc = rustyfuzz_artifacts::sanitize_rpc_endpoint(&config.rpc_url);
+            let manifest_rng_seed = hardened_defi_config.rng_seed;
+            let manifest_deterministic = hardened_defi_config.deterministic;
+            let manifest_synthetic_fallback = !no_synthetic_fallback
+                && (config.allow_synthetic_fallback || allow_synthetic_fallback);
+            let manifest_cfg_hash = format!("{:x}", config_fingerprint(&config));
             let fuzz_config = rusty_fuzz::engine::fuzz_engine::Config {
                 rpc_url: config.rpc_url.clone(),
                 fork_block: config.fork_block.unwrap_or(0),
@@ -516,6 +528,40 @@ async fn main() -> anyhow::Result<()> {
                     promotion_limit,
                 },
             };
+            let run_layout = rustyfuzz_artifacts::RunLayout::new(
+                std::path::Path::new(".rustyfuzz"),
+                &manifest_run_id,
+            );
+            if let Err(err) = run_layout.materialize() {
+                log::warn!("could not materialize run layout: {err}");
+            }
+            let mut run_manifest = rustyfuzz_artifacts::RunManifest::v1(
+                &manifest_run_id,
+                env!("CARGO_PKG_VERSION"),
+                &manifest_cfg_hash,
+                if unbounded { "unbounded" } else { "bounded" },
+            );
+            run_manifest.git_revision = option_env!("RUSTYFUZZ_GIT_REV").map(str::to_string);
+            run_manifest.fork_block = manifest_fork_block;
+            run_manifest.rpc_endpoint_sanitized = Some(manifest_rpc);
+            run_manifest.rng_seed = manifest_rng_seed;
+            if manifest_deterministic {
+                run_manifest
+                    .assumptions
+                    .push("deterministic=true".to_string());
+            }
+            if manifest_synthetic_fallback {
+                run_manifest
+                    .assumptions
+                    .push("synthetic_fallback=true".to_string());
+            }
+            let manifest_path = run_layout.config_file();
+            if let Err(err) = run_manifest.persist(&manifest_path) {
+                log::warn!("could not persist run manifest: {err}");
+            } else {
+                log::info!("run manifest persisted at {}", manifest_path.display());
+            }
+
             let watchdog_done =
                 install_campaign_watchdog(wall_timeout_secs, max_execs, duration_secs, unbounded);
             let result = rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await;
@@ -1883,6 +1929,26 @@ fn execution_coverage_material(
         material.extend_from_slice(&execution.final_coverage_hash.to_be_bytes());
     }
     material
+}
+
+/// Deterministic fingerprint of the effective configuration for run manifests.
+///
+/// Hashes the serialized shape of non-secret config fields; secrets (the RPC
+/// URL credentials) are excluded by hashing the sanitized endpoint instead.
+fn config_fingerprint(config: &rusty_fuzz::config::Config) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rustyfuzz_artifacts::sanitize_rpc_endpoint(&config.rpc_url).hash(&mut hasher);
+    config.chain.hash(&mut hasher);
+    config.target_contract.hash(&mut hasher);
+    config.fork_block.hash(&mut hasher);
+    config.mainnet_seed_bundle.hash(&mut hasher);
+    config.target_abi.hash(&mut hasher);
+    config.target_invariant_manifest.hash(&mut hasher);
+    config.require_seed_bundle.hash(&mut hasher);
+    config.require_rpc_fork.hash(&mut hasher);
+    config.allow_synthetic_fallback.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]

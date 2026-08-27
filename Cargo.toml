@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/rustyfuzz-core", "crates/rustyfuzz-evm", "crates/rustyfuzz-engine"]
+members = [".", "crates/rustyfuzz-core", "crates/rustyfuzz-evm", "crates/rustyfuzz-engine", "crates/rustyfuzz-artifacts"]
 resolver = "2"
 
 [package]
@@ -42,6 +42,7 @@ sgx      = []
 rustyfuzz-core = { path = "crates/rustyfuzz-core" }
 rustyfuzz-evm = { path = "crates/rustyfuzz-evm" }
 rustyfuzz-engine = { path = "crates/rustyfuzz-engine" }
+rustyfuzz-artifacts = { path = "crates/rustyfuzz-artifacts" }
 libafl       = { version = "0.15.4", features = ["prelude"] }
 libafl_bolts = { version = "0.15.4", features = ["prelude"] }
 log          = "0.4.29"

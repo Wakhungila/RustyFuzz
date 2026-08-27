@@ -1,0 +1,11 @@
+[package]
+name = "rustyfuzz-artifacts"
+version = "0.1.0"
+edition = "2021"
+description = "Artifact run layouts, versioned manifests, and safe persistence helpers for RustyFuzz."
+
+[dependencies]
+rustyfuzz-core = { path = "../rustyfuzz-core" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+log = "0.4.29"
