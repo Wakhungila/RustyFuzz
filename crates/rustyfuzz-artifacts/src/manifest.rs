@@ -46,7 +46,8 @@ pub struct RunManifest {
     /// Fork block when forking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_block: Option<u64>,
-    /// RPC origin WITHOUT credentials/query — host[:port] only.
+    /// RPC origin WITHOUT credentials/query — `scheme://host` or
+    /// `scheme://host:port` only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc_endpoint_sanitized: Option<String>,
     /// Hashes of ABI / bytecode material used.
