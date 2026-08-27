@@ -4,8 +4,9 @@ A stateful EVM fuzzer for smart contract security research. RustyFuzz executes t
 
 ## Project Status
 
-RustyFuzz is at **v0.2 release candidate** following the staged re-engineering
-(see [docs/reengineering/V0_2_REENGINEERING_REPORT.md](docs/reengineering/V0_2_REENGINEERING_REPORT.md)).
+RustyFuzz is at **v0.2 release candidate** following a staged re-engineering
+(workspace crates, semantic input identity, canonical finding lifecycle,
+versioned artifacts — see `docs/adr/` for the architectural decisions).
 
 Status boundaries:
 
@@ -1126,7 +1127,7 @@ Priority engineering tasks:
 4. Semantic invariants: Convert oracle evidence into replay assertions for semantic deltas
 5. Frontier-driven scheduling: Use branch-distance and expression metadata for energy assignment
 6. Differential replay hardening: Rich diff reports for gas, output, storage, call traces
-7. Repository/workspace migration: follow `docs/reengineering/STAGE_2_PLAN.md`
+7. Repository/workspace migration decisions: see `docs/adr/0002-cargo-workspace-boundaries.md`
 
 ## Technical Limitations
 
