@@ -77,9 +77,17 @@ documented rather than forced for aesthetics.
   serde/serde_json/log; engine = libafl/core/evm utilities; evm = revm stack.
 - reqwest reaches rustyfuzz-evm via ForkDb remote fetching — improvement
   path noted in ADR debt (inject provider), not churned now.
-- Future-incompat warnings: single transitive offender
-  `proc-macro-error2 v2.0.1` (via thiserror-adjacent macro deps);
-  upstream-owned, documented here.
+- Future-incompat warnings (final state after a workspace `cargo update`
+  refreshed the lockfile — alloy moved to 2.4.1, proc-macro-error3 replaced
+  the old offender):
+  - **Remaining offender: `nix v0.30.1`** (trailing-semicolon-in-macro lint,
+    rustc issue #79813). It is pinned EXACTLY (`version = "0.30.1"`, not a
+    range) by `libafl 0.15.4` / `libafl_bolts 0.15.4`, so neither
+    `cargo update` nor a version-changing `[patch.crates-io]` can move it —
+    cargo rejects the patch as version-incompatible with libafl's
+    requirement (verified). Upstream-owned; resolves when LibAFL relaxes its
+    pin or is upgraded.
+  - No other offenders remain.
 
 ## 5.10 Documentation
 

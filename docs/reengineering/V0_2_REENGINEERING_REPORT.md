@@ -79,8 +79,11 @@ full-workspace ASan exclusion (`end_to_end_smoke.rs` runtime check) persists.
 ## Known Debt / Unsupported
 
 SVM/SGX unsupported by design. Harness closures remain monolithic pending
-worker-boundary redesign. Satori single-provider. proc-macro-error2
-future-incompat warning is upstream-owned. Time-to-signal measurement needs
+worker-boundary redesign. Satori single-provider. `nix v0.30.1`
+future-incompat warning is upstream-owned and UNFIXABLE locally:
+libafl/libafl_bolts pin nix exactly at 0.30.1, so cargo rejects any
+version-changing patch (the previous proc-macro-error2 offender was
+cleared by a lockfile refresh alongside alloy 2.4.1). Time-to-signal measurement needs
 per-target forks (documented honestly).
 
 ## Verdict
