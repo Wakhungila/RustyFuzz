@@ -34,7 +34,6 @@ use std::str::FromStr;
 use std::sync::atomic::Ordering;
 
 /// Executes a non-Satori command against the loaded config.
-#[tokio::main]
 pub async fn run(command: Command) -> anyhow::Result<()> {
     let config = rusty_fuzz::config::Config::load("config.toml")?;
     let _config_ref = &config;

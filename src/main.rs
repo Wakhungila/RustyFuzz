@@ -23,5 +23,5 @@ async fn main() -> anyhow::Result<()> {
         other => other,
     };
 
-    cli::handlers::run(command)
+    cli::handlers::run(command).await
 }
