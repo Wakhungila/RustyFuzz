@@ -4,14 +4,61 @@ A stateful EVM fuzzer for smart contract security research. RustyFuzz executes t
 
 ## Project Status
 
-RustyFuzz v0.1 is currently a single-crate EVM-first fuzzer. The codebase has working REVM execution, LibAFL integration, fork caching, ABI-aware mutation, coverage/state feedback, replay-oriented artifacts, benchmark fixtures, and Satori research tooling.
+RustyFuzz is at **v0.2 release candidate** following the staged re-engineering
+(see [docs/reengineering/V0_2_REENGINEERING_REPORT.md](docs/reengineering/V0_2_REENGINEERING_REPORT.md)).
 
 Status boundaries:
 
-- **Working today**: default EVM build, tests, benchmark smoke tests, Z3/LLM/notifier feature checks, SGX status shim, and pinned sanitizer library tests.
-- **Experimental**: Satori/AI research workflow, hybrid taint/concolic components, benchmark orchestration, and promotion/reporting paths that still need architectural separation.
-- **Unsupported**: SVM production fuzzing, SGX production execution, and `--no-default-features` builds in the current monolith.
-- **Planned for v0.2**: a staged workspace extraction with `rustyfuzz-core`, `rustyfuzz-evm`, `rustyfuzz-engine`, `rustyfuzz-oracles`, `rustyfuzz-artifacts`, `rustyfuzz-ai`, `rustyfuzz-cli`, and `rustyfuzz-testkit`.
+- **Working today**: EVM fuzzing campaigns (bounded/unbounded), semantic
+  input identity with corpus deduplication, snapshot state exploration,
+  replay/minimize/promote pipeline with deterministic proof gating, versioned
+  run manifests under `.rustyfuzz/`, per-crate CI incl. sanitizers.
+- **Workspace layout**: production crates are `rustyfuzz-core` (neutral
+  domain), `rustyfuzz-evm` (REVM backend), `rustyfuzz-engine` (input model,
+  scheduler, budget/telemetry/events), `rustyfuzz-artifacts` (run layouts),
+  plus the root binary. `rustyfuzz-testkit` holds test-only fixtures.
+- **Experimental**: Satori/AI research workflow (proposals are never proofs;
+  validation seam in `rustyfuzz-core::proposal`), hybrid taint/concolic
+  components, notifier paths.
+- **Unsupported**: SVM production fuzzing, SGX execution, and
+  `--no-default-features` root build (documented decision; neutral crates do
+  build independently).
+
+### Running a deterministic local campaign
+
+```bash
+cargo run --release -- fuzz --deterministic --rng-seed 42 \
+  --contract $TARGET --max-execs 100000 --cores 1
+```
+
+The run manifest (`.rustyfuzz/runs/<id>/config.json`) records seed, fork
+block, sanitized RPC endpoint, and assumptions.
+
+### Replaying a persisted input
+
+```bash
+cargo run --release -- replay <corpus-id-or-file>
+```
+
+Replay executes the stored semantic input against its base snapshot / fork
+cache; `ReplayVerifier::verify_deterministic` double-executes to confirm
+equality. Determinism holds for identical environment provenance only.
+
+### Inspecting artifacts
+
+Inputs, manifests, crash records, and reports live under `.rustyfuzz/`
+and the configured corpus dir; every JSON schema carries `schema_version`.
+
+### Adding an oracle / mutator / AI provider / fixture
+
+- Oracle: implement the pack pattern in `src/common/oracle/` (see packs.rs);
+  signals adapt to `rustyfuzz_core::OracleSignal` via `to_signal()`.
+- Mutator: named strategy buckets live on `EvmMutator`; counters record
+  attempts/mutations automatically when routed through dispatch.
+- AI provider: Satori calls stay behind the `llm` feature; results must enter
+  through `AiProposal::unvalidated()` + explicit `validate()`.
+- Benchmark fixture: add a manifest under `benchmarks/` fixtures dirs used by
+  `tests/benchmarks.rs` blind-rediscovery.
 
 Canonical project docs start at [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), and [docs/reengineering/BASELINE.md](docs/reengineering/BASELINE.md).
 
