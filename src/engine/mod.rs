@@ -19,7 +19,10 @@ pub mod foundry_ingest;
 pub mod fuzz_engine;
 pub mod invariant_manifest;
 pub mod minimizer;
-pub mod ordering_mutations;
+// OrderingConstraintMutator is regression-tested but not exposed until formal
+// specs are deliberately routed into the active mutation pipeline.
+#[cfg(test)]
+mod ordering_mutations;
 pub mod permission_model;
 pub mod promotion;
 pub mod proof;
