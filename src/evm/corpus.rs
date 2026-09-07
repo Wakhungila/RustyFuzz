@@ -13,12 +13,14 @@ use anyhow::Context;
 use libafl_bolts::rands::Rand;
 use parking_lot::RwLock;
 use revm::primitives::{Address, B256, U256};
+use rustyfuzz_core::SnapshotId;
 use rustyfuzz_evm::fork_db::{EvmCacheDb, ForkDb, ForkDbCacheSnapshot};
 use rustyfuzz_evm::inspector::MAP_SIZE;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
-use std::num::NonZero;
+use std::num::{NonZero, NonZeroU128};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -26,6 +28,38 @@ use std::time::Duration;
 // use bitvec::bitvec; // Unused
 use bitvec::prelude::{BitVec, Lsb0};
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotError {
+    IdMismatch { expected: u64, actual: u64 },
+    DuplicateSnapshot { id: u64 },
+    MissingParent { id: u64, parent_id: u64 },
+    CyclicLineage { id: u64, parent_id: u64 },
+}
+
+impl fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SnapshotError::IdMismatch { expected, actual } => write!(
+                f,
+                "snapshot id mismatch: requested id {expected}, snapshot payload id {actual}"
+            ),
+            SnapshotError::DuplicateSnapshot { id } => {
+                write!(f, "snapshot id {id} already exists")
+            }
+            SnapshotError::MissingParent { id, parent_id } => write!(
+                f,
+                "snapshot {id} references missing parent snapshot {parent_id}"
+            ),
+            SnapshotError::CyclicLineage { id, parent_id } => write!(
+                f,
+                "snapshot {id} under parent {parent_id} would create cyclic lineage"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CorpusEntryMetadata {
@@ -1014,9 +1048,47 @@ mod artifact_tests {
         OracleObservation, SingletonTx, StorageAccess, StorageDiff, TxExecutionResult, Waypoint,
     };
     use crate::evm::seed_ingester::{MainnetSeed, SeedMetadata};
+    use libafl_bolts::rands::{Rand, RomuDuoJrRand};
     use revm::database::CacheDB;
     use revm::primitives::U256;
+    use std::num::NonZeroUsize;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Debug)]
+    struct ScriptedRand {
+        draws: Vec<usize>,
+        cursor: usize,
+    }
+
+    impl ScriptedRand {
+        fn new(draws: impl Into<Vec<usize>>) -> Self {
+            Self {
+                draws: draws.into(),
+                cursor: 0,
+            }
+        }
+    }
+
+    impl Rand for ScriptedRand {
+        fn set_seed(&mut self, _seed: u64) {
+            self.cursor = 0;
+        }
+
+        fn next(&mut self) -> u64 {
+            0
+        }
+
+        fn below(&mut self, upper_bound_excl: NonZeroUsize) -> usize {
+            let value = self.draws.get(self.cursor).copied().unwrap_or(0);
+            self.cursor += 1;
+            assert!(
+                value < upper_bound_excl.get(),
+                "scripted draw {value} is outside 0..{}",
+                upper_bound_excl.get()
+            );
+            value
+        }
+    }
 
     fn temp_corpus_root(name: &str) -> PathBuf {
         let suffix = SystemTime::now()
@@ -1072,6 +1144,38 @@ mod artifact_tests {
                 trace_source: None,
             },
         }
+    }
+
+    fn snapshot_with_coverage(id: u64, coverage_edges: usize, depth: u32) -> Snapshot {
+        let mut coverage = bitvec::bitvec![u8, Lsb0; 0; 16];
+        for idx in 0..coverage_edges.min(coverage.len()) {
+            coverage.set(idx, true);
+        }
+        Snapshot {
+            id,
+            state: Arc::new(RwLock::new(ChainState::Evm(CacheDB::new(ForkDb::empty())))),
+            coverage,
+            producing_input: None,
+            waypoints: Vec::new(),
+            depth,
+            gas_used: 0,
+        }
+    }
+
+    fn insert_snapshot(
+        corpus: &mut SnapshotCorpus,
+        id: u64,
+        parent_id: u64,
+        coverage_edges: usize,
+        depth: u32,
+    ) {
+        corpus
+            .add_snapshot(
+                id,
+                parent_id,
+                snapshot_with_coverage(id, coverage_edges, depth),
+            )
+            .expect("insert test snapshot");
     }
 
     fn scored_execution(
@@ -1178,19 +1282,21 @@ mod artifact_tests {
             base_snapshot_id: 0,
         };
         let mut corpus = SnapshotCorpus::new();
-        corpus.add_snapshot(
-            0,
-            0,
-            Snapshot {
-                id: 0,
-                state: Arc::new(RwLock::new(ChainState::Evm(CacheDB::new(ForkDb::empty())))),
-                coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
-                producing_input: None,
-                waypoints: Vec::new(),
-                depth: 0,
-                gas_used: 0,
-            },
-        );
+        corpus
+            .add_snapshot(
+                0,
+                0,
+                Snapshot {
+                    id: 0,
+                    state: Arc::new(RwLock::new(ChainState::Evm(CacheDB::new(ForkDb::empty())))),
+                    coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                    producing_input: None,
+                    waypoints: Vec::new(),
+                    depth: 0,
+                    gas_used: 0,
+                },
+            )
+            .expect("insert root snapshot");
         let execution = SequenceExecutionResult {
             tx_results: vec![TxExecutionResult {
                 tx_index: 0,
@@ -1321,19 +1427,21 @@ mod artifact_tests {
     fn class_weighted_snapshot_energy_prioritizes_known_bug_shape() {
         let target = Address::repeat_byte(0x54);
         let mut corpus = SnapshotCorpus::new();
-        corpus.add_snapshot(
-            0,
-            0,
-            Snapshot {
-                id: 0,
-                state: Arc::new(RwLock::new(ChainState::Evm(CacheDB::new(ForkDb::empty())))),
-                coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
-                producing_input: None,
-                waypoints: Vec::new(),
-                depth: 0,
-                gas_used: 0,
-            },
-        );
+        corpus
+            .add_snapshot(
+                0,
+                0,
+                Snapshot {
+                    id: 0,
+                    state: Arc::new(RwLock::new(ChainState::Evm(CacheDB::new(ForkDb::empty())))),
+                    coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                    producing_input: None,
+                    waypoints: Vec::new(),
+                    depth: 0,
+                    gas_used: 0,
+                },
+            )
+            .expect("insert root snapshot");
         let input = EvmInput {
             txs: vec![SingletonTx {
                 input: vec![0xb6, 0xb5, 0x5f, 0x25],
@@ -1458,19 +1566,21 @@ mod artifact_tests {
     fn stage_2c_ancestry_reconstruction_is_deterministic() {
         let mut corpus = SnapshotCorpus::new();
         let empty_state = || Arc::new(RwLock::new(ChainState::Evm(CacheDB::new(ForkDb::empty()))));
-        corpus.add_snapshot(
-            0,
-            0,
-            Snapshot {
-                id: 0,
-                state: empty_state(),
-                coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
-                producing_input: None,
-                waypoints: Vec::new(),
-                depth: 0,
-                gas_used: 0,
-            },
-        );
+        corpus
+            .add_snapshot(
+                0,
+                0,
+                Snapshot {
+                    id: 0,
+                    state: empty_state(),
+                    coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                    producing_input: None,
+                    waypoints: Vec::new(),
+                    depth: 0,
+                    gas_used: 0,
+                },
+            )
+            .expect("insert root snapshot");
         let input_a = EvmInput::new(
             vec![SingletonTx {
                 input: vec![0xa1],
@@ -1482,32 +1592,36 @@ mod artifact_tests {
             0,
         );
         let input_b = EvmInput::new(input_a.txs.clone(), 1);
-        corpus.add_snapshot(
-            1,
-            0,
-            Snapshot {
-                id: 1,
-                state: empty_state(),
-                coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
-                producing_input: Some(input_a.clone()),
-                waypoints: Vec::new(),
-                depth: 1,
-                gas_used: 21_000,
-            },
-        );
-        corpus.add_snapshot(
-            2,
-            1,
-            Snapshot {
-                id: 2,
-                state: empty_state(),
-                coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
-                producing_input: Some(input_b.clone()),
-                waypoints: Vec::new(),
-                depth: 2,
-                gas_used: 42_000,
-            },
-        );
+        corpus
+            .add_snapshot(
+                1,
+                0,
+                Snapshot {
+                    id: 1,
+                    state: empty_state(),
+                    coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                    producing_input: Some(input_a.clone()),
+                    waypoints: Vec::new(),
+                    depth: 1,
+                    gas_used: 21_000,
+                },
+            )
+            .expect("insert child snapshot");
+        corpus
+            .add_snapshot(
+                2,
+                1,
+                Snapshot {
+                    id: 2,
+                    state: empty_state(),
+                    coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                    producing_input: Some(input_b.clone()),
+                    waypoints: Vec::new(),
+                    depth: 2,
+                    gas_used: 42_000,
+                },
+            )
+            .expect("insert grandchild snapshot");
 
         // Root has no parent and reconstructs an empty input sequence.
         assert_eq!(corpus.parent_map.get(&0), Some(&0));
@@ -1535,8 +1649,12 @@ mod artifact_tests {
             gas_used: 0,
         };
         let mut corpus = SnapshotCorpus::new();
-        corpus.add_snapshot(0, 0, make_snapshot(0));
-        corpus.add_snapshot(1, 0, make_snapshot(1));
+        corpus
+            .add_snapshot(0, 0, make_snapshot(0))
+            .expect("insert root snapshot");
+        corpus
+            .add_snapshot(1, 0, make_snapshot(1))
+            .expect("insert child snapshot");
 
         // Same cached-state content, different assigned ids: fingerprints match
         // even though ids differ. Ids remain the logical reference.
@@ -1557,37 +1675,227 @@ mod artifact_tests {
         // a chain leading back to 9 via manual map surgery.
         let mut corpus = SnapshotCorpus::new();
         let empty_state = Arc::new(RwLock::new(ChainState::Evm(CacheDB::new(ForkDb::empty()))));
-        corpus.add_snapshot(
-            5,
-            0,
-            Snapshot {
-                id: 5,
-                state: empty_state.clone(),
-                coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
-                producing_input: None,
-                waypoints: Vec::new(),
-                depth: 1,
-                gas_used: 0,
-            },
-        );
+        corpus
+            .add_snapshot(
+                0,
+                0,
+                Snapshot {
+                    id: 0,
+                    state: empty_state.clone(),
+                    coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                    producing_input: None,
+                    waypoints: Vec::new(),
+                    depth: 0,
+                    gas_used: 0,
+                },
+            )
+            .expect("insert root snapshot");
+        corpus
+            .add_snapshot(
+                5,
+                0,
+                Snapshot {
+                    id: 5,
+                    state: empty_state.clone(),
+                    coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                    producing_input: None,
+                    waypoints: Vec::new(),
+                    depth: 1,
+                    gas_used: 0,
+                },
+            )
+            .expect("insert snapshot before corruption");
         corpus.parent_map.insert(5, 9);
 
-        corpus.add_snapshot(
-            9,
-            5,
-            Snapshot {
-                id: 9,
-                state: empty_state,
-                coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
-                producing_input: None,
-                waypoints: Vec::new(),
-                depth: 2,
-                gas_used: 0,
-            },
-        );
+        let err = corpus
+            .add_snapshot(
+                9,
+                5,
+                Snapshot {
+                    id: 9,
+                    state: empty_state,
+                    coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                    producing_input: None,
+                    waypoints: Vec::new(),
+                    depth: 2,
+                    gas_used: 0,
+                },
+            )
+            .expect_err("cyclic insertion must fail");
 
         // The cycle-forming link was refused: snapshot 9 was not registered.
+        assert_eq!(
+            err,
+            SnapshotError::CyclicLineage {
+                id: 9,
+                parent_id: 5
+            }
+        );
         assert!(!corpus.snapshots.contains_key(&9));
+    }
+
+    #[test]
+    fn snapshot_insertion_rejects_missing_parent_duplicate_and_id_mismatch() {
+        let mut corpus = SnapshotCorpus::new();
+
+        assert_eq!(
+            corpus
+                .add_snapshot(1, 0, snapshot_with_coverage(1, 0, 1))
+                .expect_err("missing parent must fail"),
+            SnapshotError::MissingParent {
+                id: 1,
+                parent_id: 0
+            }
+        );
+
+        insert_snapshot(&mut corpus, 0, 0, 0, 0);
+        assert_eq!(
+            corpus
+                .add_snapshot(0, 0, snapshot_with_coverage(0, 0, 0))
+                .expect_err("duplicate id must fail"),
+            SnapshotError::DuplicateSnapshot { id: 0 }
+        );
+        assert_eq!(
+            corpus
+                .add_snapshot(1, 0, snapshot_with_coverage(99, 0, 1))
+                .expect_err("payload id mismatch must fail"),
+            SnapshotError::IdMismatch {
+                expected: 1,
+                actual: 99
+            }
+        );
+    }
+
+    #[test]
+    fn pruning_uses_no_novelty_streak_and_protects_roots() {
+        let mut corpus = SnapshotCorpus::new();
+        insert_snapshot(&mut corpus, 0, 0, 0, 0);
+        insert_snapshot(&mut corpus, 1, 0, 1, 1);
+        insert_snapshot(&mut corpus, 2, 0, 1, 1);
+
+        corpus.update_metadata(0, 0);
+        corpus.update_metadata(0, 0);
+        assert_eq!(corpus.metadata[&0].executions_since_novelty, 2);
+
+        corpus.update_metadata(1, 1);
+        assert_eq!(corpus.metadata[&1].executions_since_novelty, 1);
+        corpus.prune_dead_ends(2);
+        assert!(corpus.snapshots.contains_key(&1));
+
+        corpus.update_metadata(1, 1);
+        assert_eq!(corpus.metadata[&1].executions_since_novelty, 2);
+        corpus.update_metadata(2, 2);
+        assert_eq!(corpus.metadata[&2].executions_since_novelty, 0);
+        corpus.prune_dead_ends(2);
+
+        assert!(corpus.snapshots.contains_key(&0));
+        assert!(!corpus.snapshots.contains_key(&1));
+        assert!(corpus.snapshots.contains_key(&2));
+    }
+
+    #[test]
+    fn retain_keeps_requested_descendant_ancestry_closure() {
+        let mut corpus = SnapshotCorpus::new();
+        insert_snapshot(&mut corpus, 0, 0, 0, 0);
+        insert_snapshot(&mut corpus, 1, 0, 1, 1);
+        insert_snapshot(&mut corpus, 2, 1, 1, 2);
+        insert_snapshot(&mut corpus, 3, 2, 1, 3);
+        insert_snapshot(&mut corpus, 4, 1, 1, 2);
+
+        corpus.retain(&HashSet::from([3]));
+
+        assert_eq!(
+            corpus.sorted_snapshot_ids(),
+            vec![0, 1, 2, 3],
+            "requested descendant and all ancestors should remain"
+        );
+        assert_eq!(corpus.parent_map.get(&3), Some(&2));
+        assert_eq!(corpus.children_map.get(&1), Some(&vec![2]));
+        assert_eq!(corpus.children_map.get(&2), Some(&vec![3]));
+        assert!(!corpus
+            .children_map
+            .values()
+            .any(|children| children.contains(&4)));
+    }
+
+    #[test]
+    fn retain_empty_set_still_protects_required_roots() {
+        let mut corpus = SnapshotCorpus::new();
+        insert_snapshot(&mut corpus, 0, 0, 0, 0);
+        insert_snapshot(&mut corpus, 1, 0, 1, 1);
+
+        corpus.retain(&HashSet::new());
+
+        assert_eq!(corpus.sorted_snapshot_ids(), vec![0]);
+        assert_eq!(corpus.parent_map.get(&0), Some(&0));
+        assert!(corpus.children_map.is_empty());
+    }
+
+    #[test]
+    fn seeded_snapshot_selection_is_deterministic_across_insertion_order() {
+        let mut ascending = SnapshotCorpus::new();
+        insert_snapshot(&mut ascending, 0, 0, 0, 0);
+        insert_snapshot(&mut ascending, 1, 0, 1, 1);
+        insert_snapshot(&mut ascending, 2, 0, 1, 1);
+        insert_snapshot(&mut ascending, 3, 0, 1, 1);
+
+        let mut shuffled = SnapshotCorpus::new();
+        insert_snapshot(&mut shuffled, 0, 0, 0, 0);
+        insert_snapshot(&mut shuffled, 3, 0, 1, 1);
+        insert_snapshot(&mut shuffled, 1, 0, 1, 1);
+        insert_snapshot(&mut shuffled, 2, 0, 1, 1);
+
+        let mut left_rand = RomuDuoJrRand::with_seed(0x5eed);
+        let mut right_rand = RomuDuoJrRand::with_seed(0x5eed);
+        let left = (0..32)
+            .map(|_| ascending.select_snapshot(&mut left_rand).unwrap())
+            .collect::<Vec<_>>();
+        let right = (0..32)
+            .map(|_| shuffled.select_snapshot(&mut right_rand).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn weighted_selection_handles_energy_larger_than_usize_without_overflow() {
+        let mut corpus = SnapshotCorpus::new();
+        insert_snapshot(&mut corpus, 0, 0, 0, 0);
+        insert_snapshot(&mut corpus, 1, 0, 1, 1);
+        corpus.metadata.get_mut(&1).unwrap().coverage_score = usize::MAX;
+        corpus.metadata.get_mut(&1).unwrap().score = SnapshotScore {
+            new_coverage: u64::MAX,
+            branch_distance: u64::MAX,
+            comparison_distance: u64::MAX,
+            oracle_proximity: u64::MAX,
+            asset_delta_proximity: u64::MAX,
+            storage_slot_sensitivity: u64::MAX,
+            call_depth_novelty: u64::MAX,
+            selector_novelty: u64::MAX,
+            revert_reason_novelty: u64::MAX,
+            event_novelty: u64::MAX,
+            state_transition_rarity: u64::MAX,
+        };
+        let weights = SnapshotScoreWeights {
+            new_coverage: u64::MAX,
+            branch_distance: u64::MAX,
+            comparison_distance: u64::MAX,
+            oracle_proximity: u64::MAX,
+            asset_delta_proximity: u64::MAX,
+            storage_slot_sensitivity: u64::MAX,
+            call_depth_novelty: u64::MAX,
+            selector_novelty: u64::MAX,
+            revert_reason_novelty: u64::MAX,
+            event_novelty: u64::MAX,
+            state_transition_rarity: u64::MAX,
+        };
+
+        let energy = corpus.snapshot_energy_with_weights(1, &weights).unwrap();
+        assert!(energy > usize::MAX as u128);
+        assert_eq!(
+            corpus.select_snapshot_with_weights(&mut ScriptedRand::new([]), &weights),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1625,19 +1933,21 @@ mod artifact_tests {
     fn snapshot_pruning_retains_promising_state() {
         let target = Address::repeat_byte(0x53);
         let mut corpus = SnapshotCorpus::new();
-        corpus.add_snapshot(
-            0,
-            0,
-            Snapshot {
-                id: 0,
-                state: Arc::new(RwLock::new(ChainState::Evm(CacheDB::new(ForkDb::empty())))),
-                coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
-                producing_input: None,
-                waypoints: Vec::new(),
-                depth: 0,
-                gas_used: 0,
-            },
-        );
+        corpus
+            .add_snapshot(
+                0,
+                0,
+                Snapshot {
+                    id: 0,
+                    state: Arc::new(RwLock::new(ChainState::Evm(CacheDB::new(ForkDb::empty())))),
+                    coverage: bitvec::bitvec![u8, Lsb0; 0; 8],
+                    producing_input: None,
+                    waypoints: Vec::new(),
+                    depth: 0,
+                    gas_used: 0,
+                },
+            )
+            .expect("insert root snapshot");
         let input = EvmInput {
             txs: vec![SingletonTx {
                 input: vec![0xaa, 0xbb, 0xcc, 0xdd],
@@ -2110,7 +2420,9 @@ pub struct SnapshotCorpus {
 
 pub struct SnapshotMetadata {
     pub visits: usize,
-    pub last_coverage_gain: usize,
+    /// Number of consecutive executions from this snapshot that did not
+    /// improve the snapshot's coverage score.
+    pub executions_since_novelty: usize,
     pub depth: u32,
     pub coverage_score: usize,
     /// Deterministic digest of this snapshot's cached EVM state content.
@@ -2386,19 +2698,31 @@ impl SnapshotCorpus {
         }
     }
 
-    pub fn add_snapshot(&mut self, id: u64, parent_id: u64, snapshot: Snapshot) {
+    pub fn add_snapshot(
+        &mut self,
+        id: u64,
+        parent_id: u64,
+        snapshot: Snapshot,
+    ) -> Result<SnapshotId, SnapshotError> {
         // Stage 2C defensive lineage guard. Snapshot ids are assigned
         // monotonically (max + 1), so cycles are structurally impossible in a
         // fresh corpus, but restored/merged corpora must not be able to create
         // one silently. Walk the parent chain; refuse to link the snapshot if
         // doing so would close a cycle.
+        if snapshot.id != id {
+            return Err(SnapshotError::IdMismatch {
+                expected: id,
+                actual: snapshot.id,
+            });
+        }
+        if self.snapshots.contains_key(&id) {
+            return Err(SnapshotError::DuplicateSnapshot { id });
+        }
+        if id != parent_id && !self.snapshots.contains_key(&parent_id) {
+            return Err(SnapshotError::MissingParent { id, parent_id });
+        }
         if id != parent_id && self.would_create_cycle(id, parent_id) {
-            log::error!(
-                "Refusing to link snapshot {} under parent {}: cyclic lineage",
-                id,
-                parent_id
-            );
-            return;
+            return Err(SnapshotError::CyclicLineage { id, parent_id });
         }
         let depth = snapshot.depth;
         let coverage_score = snapshot.coverage.count_ones();
@@ -2412,7 +2736,7 @@ impl SnapshotCorpus {
             id,
             SnapshotMetadata {
                 visits: 0,
-                last_coverage_gain: 0,
+                executions_since_novelty: 0,
                 depth,
                 coverage_score,
                 state_fingerprint,
@@ -2424,6 +2748,7 @@ impl SnapshotCorpus {
                 },
             },
         );
+        Ok(SnapshotId::new(id))
     }
 
     /// Returns true if inserting `id` with `parent_id` would create a cycle.
@@ -2516,10 +2841,16 @@ impl SnapshotCorpus {
             gas_used: execution.total_gas_used,
         };
         snapshot.apply_waypoint_backpressure();
-        self.add_snapshot(id, parent_id, snapshot);
+        let inserted_id = match self.add_snapshot(id, parent_id, snapshot) {
+            Ok(inserted_id) => inserted_id,
+            Err(err) => {
+                log::error!("failed to insert post-execution snapshot: {err}");
+                return None;
+            }
+        };
         self.update_snapshot_metadata_from_execution(id, execution);
         self.prune_to_limit(max_snapshots.max(1));
-        Some(id)
+        Some(inserted_id.get())
     }
 
     fn update_snapshot_metadata_from_execution(
@@ -2569,18 +2900,19 @@ impl SnapshotCorpus {
 
     fn prune_to_limit(&mut self, max_snapshots: usize) {
         while self.snapshots.len() > max_snapshots {
-            let Some((&id, _)) =
-                self.metadata
-                    .iter()
-                    .filter(|(id, _)| **id != 0)
-                    .min_by_key(|(_, metadata)| {
-                        (
-                            metadata.score.total(&SnapshotScoreWeights::default()),
-                            metadata.coverage_score,
-                            metadata.write_set.len(),
-                            std::cmp::Reverse(metadata.visits),
-                        )
-                    })
+            let Some((&id, _)) = self
+                .metadata
+                .iter()
+                .filter(|(id, _)| !self.is_root(**id))
+                .min_by_key(|(id, metadata)| {
+                    (
+                        metadata.score.total(&SnapshotScoreWeights::default()),
+                        metadata.coverage_score,
+                        metadata.write_set.len(),
+                        std::cmp::Reverse(metadata.visits),
+                        **id,
+                    )
+                })
             else {
                 break;
             };
@@ -2609,48 +2941,51 @@ impl SnapshotCorpus {
                 weighted_ids.push((*id, energy));
             }
         }
+        weighted_ids.sort_unstable_by_key(|(id, _)| *id);
 
-        let total_energy: usize = weighted_ids.iter().map(|(_, e)| *e).sum();
+        let total_energy = weighted_ids
+            .iter()
+            .fold(0u128, |acc, (_, energy)| acc.saturating_add(*energy));
         if total_energy == 0 {
             // Fallback to random if no coverage yet
-            let keys: Vec<u64> = self.snapshots.keys().cloned().collect();
+            let keys = self.sorted_snapshot_ids();
             return Some(keys[rand.below(NonZero::new(keys.len()).unwrap())]);
         }
 
-        let mut p = rand.below(NonZero::new(total_energy).unwrap());
+        let mut p = random_weight(rand, total_energy);
         for (id, energy) in weighted_ids {
             if p < energy {
                 return Some(id);
             }
-            p -= energy;
+            p = p.saturating_sub(energy);
         }
 
-        self.snapshots.keys().next().cloned()
+        self.sorted_snapshot_ids().into_iter().next()
     }
 
     pub fn snapshot_energy_with_weights(
         &self,
         id: u64,
         weights: &SnapshotScoreWeights,
-    ) -> Option<usize> {
+    ) -> Option<u128> {
         let meta = self.metadata.get(&id)?;
         let snap = self.snapshots.get(&id)?.read();
         let gap_intersection = (snap.coverage.clone() & self.priority_gap_map.clone()).count_ones();
         Some(
-            meta.coverage_score
-                .saturating_add(gap_intersection * 10)
-                .saturating_add(meta.score.total(weights) as usize),
+            (meta.coverage_score as u128)
+                .saturating_add((gap_intersection as u128).saturating_mul(10))
+                .saturating_add(meta.score.total(weights) as u128),
         )
     }
 
     pub fn update_metadata(&mut self, id: u64, new_coverage: usize) {
         if let Some(meta) = self.metadata.get_mut(&id) {
-            meta.visits += 1;
+            meta.visits = meta.visits.saturating_add(1);
             if new_coverage > meta.coverage_score {
-                meta.last_coverage_gain = 0;
+                meta.executions_since_novelty = 0;
                 meta.coverage_score = new_coverage;
             } else {
-                meta.last_coverage_gain += 1;
+                meta.executions_since_novelty = meta.executions_since_novelty.saturating_add(1);
             }
         }
     }
@@ -2658,48 +2993,118 @@ impl SnapshotCorpus {
     /// Pruning logic: If a state branch hasn't yielded new coverage in N visits,
     /// we prune it to keep the search space efficient.
     pub fn prune_dead_ends(&mut self, threshold: usize) {
+        if threshold == 0 {
+            return;
+        }
         let to_remove: Vec<u64> = self
             .metadata
             .iter()
-            .filter(|(_, meta)| meta.visits > threshold && meta.last_coverage_gain == 0)
+            .filter(|(id, meta)| !self.is_root(**id) && meta.executions_since_novelty >= threshold)
             .map(|(id, _)| *id)
-            .collect();
+            .collect::<Vec<_>>();
 
+        let mut to_remove = to_remove;
+        to_remove.sort_unstable();
         for id in to_remove {
             self.prune_recursive(id);
         }
     }
 
     pub fn retain(&mut self, ids: &HashSet<u64>) {
-        // To ensure no orphaned states remain, if we remove a snapshot,
-        // we must also remove all its descendants.
-        let all_ids: Vec<u64> = self.snapshots.keys().cloned().collect();
-        for id in all_ids {
-            if !ids.contains(&id) && self.snapshots.contains_key(&id) {
-                self.prune_recursive(id);
-            }
-        }
-
-        self.snapshots.retain(|id, _| ids.contains(id));
-        self.parent_map.retain(|id, _| ids.contains(id));
-        self.metadata.retain(|id, _| ids.contains(id));
-        self.children_map.retain(|id, _| ids.contains(id));
+        let keep = self.ancestry_closure(ids);
+        self.snapshots.retain(|id, _| keep.contains(id));
+        self.parent_map
+            .retain(|id, parent| keep.contains(id) && keep.contains(parent));
+        self.metadata.retain(|id, _| keep.contains(id));
+        self.rebuild_children_map();
     }
 
     /// Recursively removes a snapshot and all its descendants from the corpus.
     pub fn prune_recursive(&mut self, id: u64) {
+        if self.is_root(id) {
+            return;
+        }
         if let Some(children) = self.children_map.remove(&id) {
             for child_id in children {
                 self.prune_recursive(child_id);
+            }
+        }
+        if let Some(parent_id) = self.parent_map.get(&id).copied() {
+            if let Some(siblings) = self.children_map.get_mut(&parent_id) {
+                siblings.retain(|child_id| *child_id != id);
             }
         }
         self.snapshots.remove(&id);
         self.parent_map.remove(&id);
         self.metadata.remove(&id);
     }
+
+    fn sorted_snapshot_ids(&self) -> Vec<u64> {
+        let mut keys: Vec<u64> = self.snapshots.keys().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    fn is_root(&self, id: u64) -> bool {
+        matches!(self.parent_map.get(&id), Some(parent_id) if *parent_id == id)
+    }
+
+    fn ancestry_closure(&self, ids: &HashSet<u64>) -> HashSet<u64> {
+        let mut keep = HashSet::new();
+        for &requested_id in ids {
+            let mut current = requested_id;
+            let mut seen = HashSet::new();
+            loop {
+                if !self.snapshots.contains_key(&current) || !seen.insert(current) {
+                    break;
+                }
+                keep.insert(current);
+                match self.parent_map.get(&current) {
+                    Some(parent_id) if *parent_id != current => current = *parent_id,
+                    _ => break,
+                }
+            }
+        }
+        for (&id, &parent_id) in &self.parent_map {
+            if id == parent_id {
+                keep.insert(id);
+            }
+        }
+        keep
+    }
+
+    fn rebuild_children_map(&mut self) {
+        let mut children_map: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut edges: Vec<(u64, u64)> = self
+            .parent_map
+            .iter()
+            .map(|(id, parent_id)| (*id, *parent_id))
+            .collect();
+        edges.sort_unstable();
+        for (id, parent_id) in edges {
+            if id != parent_id {
+                children_map.entry(parent_id).or_default().push(id);
+            }
+        }
+        self.children_map = children_map;
+    }
+
     pub fn get_snapshot(&self, id: u64) -> Option<Arc<RwLock<Snapshot>>> {
         self.snapshots.get(&id).cloned()
     }
+}
+
+fn random_weight<R: Rand>(rand: &mut R, total_energy: u128) -> u128 {
+    debug_assert!(total_energy > 0);
+    if let Ok(total_energy) = usize::try_from(total_energy) {
+        if let Some(bound) = NonZero::new(total_energy) {
+            return rand.below(bound) as u128;
+        }
+    }
+
+    let bound = NonZeroU128::new(total_energy).expect("positive total energy");
+    let sample = ((rand.next() as u128) << 64) | rand.next() as u128;
+    sample % bound.get()
 }
 
 fn meaningful_snapshot_execution(execution: &SequenceExecutionResult) -> bool {

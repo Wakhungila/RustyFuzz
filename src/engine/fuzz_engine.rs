@@ -440,7 +440,13 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     )?;
 
                 let mut initial_snapshot_corpus = SnapshotCorpus::new();
-                initial_snapshot_corpus.add_snapshot(0, 0, new_evm_snapshot(0, initial_db.clone()));
+                initial_snapshot_corpus
+                    .add_snapshot(0, 0, new_evm_snapshot(0, initial_db.clone()))
+                    .map_err(|err| {
+                        libafl::Error::unknown(format!(
+                            "failed to initialize root snapshot: {err}"
+                        ))
+                    })?;
                 let snapshot_corpus = Arc::new(RwLock::new(initial_snapshot_corpus));
 
                 let persistent_corpus =
@@ -1203,7 +1209,7 @@ async fn run_single_process_campaign(
         .ok_or_else(|| anyhow::anyhow!("cannot start EVM campaign without a target contract"))?;
 
     let mut initial_snapshot_corpus = SnapshotCorpus::new();
-    initial_snapshot_corpus.add_snapshot(0, 0, new_evm_snapshot(0, initial_db.clone()));
+    initial_snapshot_corpus.add_snapshot(0, 0, new_evm_snapshot(0, initial_db.clone()))?;
     let snapshot_corpus = Arc::new(RwLock::new(initial_snapshot_corpus));
 
     let persistent_corpus = Arc::new(PersistentCorpus::new(&config.corpus_dir).map_err(|err| {
