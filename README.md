@@ -10,6 +10,9 @@ versioned artifacts — see `docs/adr/` for the architectural decisions).
 
 Status boundaries:
 
+Reliability changes and their remaining limits are tracked in
+[production hardening notes](docs/reengineering/PRODUCTION_HARDENING.md).
+
 - **Working today**: EVM fuzzing campaigns (bounded/unbounded), semantic
   input identity with corpus deduplication, snapshot state exploration,
   replay/minimize/promote pipeline with deterministic proof gating, versioned

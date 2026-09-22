@@ -33,6 +33,8 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HardenedDefiConfig {
     #[serde(default)]
+    pub checkpoint: Option<crate::engine::checkpoint::CheckpointConfig>,
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub single_process: bool,
@@ -67,6 +69,7 @@ pub struct HardenedDefiConfig {
 impl Default for HardenedDefiConfig {
     fn default() -> Self {
         Self {
+            checkpoint: None,
             enabled: false,
             single_process: false,
             deterministic: false,

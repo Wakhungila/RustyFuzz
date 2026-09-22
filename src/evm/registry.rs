@@ -8,18 +8,19 @@ use revm::primitives::{Address, U256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZero;
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GlobalAccountRegistry {
     pub contracts: HashSet<Address>,
     /// Directed Call Graph: Caller -> { Callee1, Callee2, ... }
     pub call_graph: HashMap<Address, HashSet<Address>>,
     pub erc20_balance_slots: HashMap<Address, U256>, // token_address -> balance_slot
     pub erc20_total_supply_slots: HashMap<Address, U256>, // token_address -> total_supply_slot
+    #[serde(skip)]
     pub etherscan_abi_fetcher: Option<EtherscanAbiFetcher>,
     pub target_models: HashMap<Address, TargetModel>,
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TargetModel {
     pub observed_selectors: HashSet<[u8; 4]>,
     pub callers: HashSet<Address>,

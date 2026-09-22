@@ -19,13 +19,16 @@ pub struct StrategyCounters {
     inner: Mutex<BTreeMap<String, StrategyCounts>>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StrategyCounts {
     pub attempted: u64,
     pub mutated: u64,
 }
 
 impl StrategyCounters {
+    pub fn restore(&self, saved: BTreeMap<String, StrategyCounts>) {
+        *self.inner.lock() = saved;
+    }
     pub fn record_attempted(&self, strategy: &str) {
         let mut counts = self.inner.lock();
         counts.entry(strategy.to_string()).or_default().attempted += 1;
@@ -56,6 +59,20 @@ pub struct CampaignTelemetry {
     last_report: Mutex<(Instant, u64)>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct TelemetryCheckpoint {
+    pub executions: u64,
+    pub mutated_inputs: u64,
+    pub seed_replays: u64,
+    pub artifacts: u64,
+    pub oracle_findings: u64,
+    pub state_novelty: u64,
+    pub best_score: u64,
+    pub max_coverage_edges: u64,
+    pub mutation_strategies: BTreeMap<String, u64>,
+    pub concolic: ConcolicHintStatsSnapshot,
+}
+
 pub struct ExecutionTelemetryRecord<'a> {
     pub core_id: usize,
     pub tx_count: usize,
@@ -74,6 +91,40 @@ impl Default for CampaignTelemetry {
 }
 
 impl CampaignTelemetry {
+    pub fn checkpoint(&self) -> TelemetryCheckpoint {
+        TelemetryCheckpoint {
+            executions: self.executions.load(Ordering::Relaxed),
+            mutated_inputs: self.mutated_inputs.load(Ordering::Relaxed),
+            seed_replays: self.seed_replays.load(Ordering::Relaxed),
+            artifacts: self.artifacts.load(Ordering::Relaxed),
+            oracle_findings: self.oracle_findings.load(Ordering::Relaxed),
+            state_novelty: self.state_novelty.load(Ordering::Relaxed),
+            best_score: self.best_score.load(Ordering::Relaxed),
+            max_coverage_edges: self.max_coverage_edges.load(Ordering::Relaxed),
+            mutation_strategies: self.mutation_strategies.lock().clone(),
+            concolic: self.concolic_hint_stats.snapshot(),
+        }
+    }
+
+    pub fn restore(&self, saved: TelemetryCheckpoint) {
+        self.executions.store(saved.executions, Ordering::Relaxed);
+        self.mutated_inputs
+            .store(saved.mutated_inputs, Ordering::Relaxed);
+        self.seed_replays
+            .store(saved.seed_replays, Ordering::Relaxed);
+        self.artifacts.store(saved.artifacts, Ordering::Relaxed);
+        self.oracle_findings
+            .store(saved.oracle_findings, Ordering::Relaxed);
+        self.state_novelty
+            .store(saved.state_novelty, Ordering::Relaxed);
+        self.best_score.store(saved.best_score, Ordering::Relaxed);
+        self.max_coverage_edges
+            .store(saved.max_coverage_edges, Ordering::Relaxed);
+        *self.mutation_strategies.lock() = saved.mutation_strategies;
+        self.concolic_hint_stats.restore(saved.concolic);
+        *self.last_report.lock() = (Instant::now(), saved.executions);
+    }
+
     pub fn new() -> Self {
         let now = Instant::now();
         Self {

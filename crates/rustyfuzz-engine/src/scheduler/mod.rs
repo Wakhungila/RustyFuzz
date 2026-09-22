@@ -48,6 +48,13 @@ pub struct RustyFuzzScheduler {
 }
 
 impl RustyFuzzScheduler {
+    pub fn checkpoint(&self) -> (u64, u64) {
+        (self.queue_cycles, self.runs_in_current_cycle)
+    }
+
+    pub fn restore(&mut self, counters: (u64, u64)) {
+        (self.queue_cycles, self.runs_in_current_cycle) = counters;
+    }
     pub fn new() -> Self {
         Self {
             queue_cycles: 0,

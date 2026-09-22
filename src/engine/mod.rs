@@ -21,12 +21,14 @@ pub mod invariant_manifest;
 pub mod minimizer;
 // OrderingConstraintMutator is regression-tested but not exposed until formal
 // specs are deliberately routed into the active mutation pipeline.
+pub mod checkpoint;
 #[cfg(test)]
 mod ordering_mutations;
 pub mod permission_model;
 pub mod promotion;
 pub mod proof;
 pub mod protocol_model;
+pub mod provenance;
 pub mod scheduler;
 pub mod scoring;
 pub mod seed_intelligence;

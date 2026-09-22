@@ -28,8 +28,7 @@ evm      = [
     "dep:alloy-json-abi",
     "dep:reqwest"
 ]
-svm      = ["dep:solana-sdk", "dep:solana-client", "dep:solana-rpc-client-api",
-             "dep:mollusk-svm", "dep:borsh"]
+svm      = []
 z3       = ["dep:z3"]
 llm      = ["dep:reqwest"]
 notifier = ["dep:reqwest"]
@@ -88,27 +87,6 @@ optional = true
 # Dependencies remain optional for future reconstruction, but the crate root
 # currently emits a controlled compile error when `svm` is enabled.
 # ─────────────────────────────────────────────────────────────────────────────
-[dependencies.solana-sdk]
-version  = "^4.0.1"
-optional = true
-
-[dependencies.solana-client]
-version  = "^3.1.14"
-optional = true
-
-[dependencies.solana-rpc-client-api]
-version  = "^3.1.14"
-optional = true
-
-[dependencies.mollusk-svm]
-version  = "0.12.1-agave-4.0"
-optional = true
-
-[dependencies.borsh]
-version  = "1.6.1"
-features = ["derive"]
-optional = true
-
 # ─────────────────────────────────────────────────────────────────────────────
 # ASYNC RUNTIME
 # ─────────────────────────────────────────────────────────────────────────────
@@ -204,9 +182,8 @@ version = "0.15.7"
 # OPTIONAL: Z3 concolic solver
 #   Linux:  sudo apt install libz3-dev
 #   macOS:  brew install z3
-# ─────────────────────────────────────────────────────────────────────────────
 [dependencies.z3]
-version  = "0.20.0"
+version  = "0.21.0"
 optional = true
 
 # ─────────────────────────────────────────────────────────────────────────────

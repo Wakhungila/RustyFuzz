@@ -42,31 +42,31 @@ impl From<serde_json::Error> for FsUtilError {
 
 /// Writes `bytes` to `path` atomically via temp file + rename + best-effort
 /// parent fsync.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), FsUtilError> {
+pub fn write_atomic(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> Result<(), FsUtilError> {
+    let path = path.as_ref();
+    let bytes = bytes.as_ref();
     let parent = path
         .parent()
-        .ok_or_else(|| FsUtilError::Io(std::io::Error::other("artifact path has no parent")))?;
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| FsUtilError::Io(std::io::Error::other("non-utf8 artifact file name")))?;
 
-    // Unique temp suffix; uniqueness only matters for concurrent writers to
-    // the same destination, which RustyFuzz serializes per run.
-    let tmp = parent.join(format!(".{file_name}.tmp"));
-    {
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
+    // Exclusive creation prevents collisions and following pre-existing symlinks.
+    // Each writer owns its temporary file; Drop cleans it up on every error path.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&format!(".{file_name}."))
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    for chunk in bytes.chunks(64 * 1024) {
+        tmp.write_all(chunk)?;
     }
-    match fs::rename(&tmp, path) {
-        Ok(()) => {}
-        Err(err) => {
-            let _ = fs::remove_file(&tmp);
-            return Err(err.into());
-        }
-    }
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)
+        .map_err(|err| FsUtilError::Io(err.error))?;
     sync_parent_best_effort(parent);
     Ok(())
 }
@@ -86,6 +86,67 @@ fn sync_parent_best_effort(parent: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_writers_publish_only_complete_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.json");
+        let payloads: Vec<Vec<u8>> = (0..8).map(|i| vec![b'a' + i; 65536]).collect();
+        write_atomic(&path, &payloads[0]).unwrap();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    let bytes = fs::read(&path).unwrap();
+                    assert!(payloads.contains(&bytes), "reader observed torn artifact");
+                }
+            });
+            let writers: Vec<_> = payloads
+                .iter()
+                .map(|payload| {
+                    let path = &path;
+                    scope.spawn(move || {
+                        for _ in 0..20 {
+                            write_atomic(path, payload).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            let results: Vec<_> = writers.into_iter().map(|writer| writer.join()).collect();
+            done.store(true, std::sync::atomic::Ordering::Release);
+            reader.join().unwrap();
+            for result in results {
+                result.unwrap();
+            }
+        });
+        assert!(payloads.contains(&fs::read(&path).unwrap()));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_publish_cleans_up_its_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("directory");
+        fs::create_dir(&destination).unwrap();
+        assert!(write_atomic(&destination, b"payload").is_err());
+        assert!(destination.is_dir());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preexisting_temp_symlink_cannot_redirect_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join(".artifact.json.tmp")).unwrap();
+        write_atomic(dir.path().join("artifact.json"), b"new artifact").unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+        assert_eq!(
+            fs::read(dir.path().join("artifact.json")).unwrap(),
+            b"new artifact"
+        );
+    }
 
     #[test]
     fn atomic_write_leaves_no_temp_and_reads_back() {
@@ -130,13 +191,13 @@ mod tests {
             "{\"complete\":true}"
         );
 
-        // The next successful write cleans up and replaces atomically.
+        // A new writer must not touch a temporary file owned by another writer.
         write_atomic(&path, b"{\"complete\":true,\"v\":2}").unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "{\"complete\":true,\"v\":2}"
         );
-        assert!(!tmp.exists());
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"{\"partial\":");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

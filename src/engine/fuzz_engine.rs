@@ -92,12 +92,13 @@ use libafl::prelude::{
     EventConfig, ExitKind, Fuzzer, InMemoryCorpus, InProcessExecutor, Launcher, SimpleMonitor,
     StdFuzzer, StdMapObserver, StdMutationalStage, StdState,
 };
+use libafl::{HasFeedback, HasScheduler};
 use libafl_bolts::ownedref::OwnedMutSlice;
 use libafl_bolts::prelude::*;
 use libafl_bolts::shmem::{ShMemProvider, StdShMem, StdShMemProvider};
 use libafl_bolts::tuples::tuple_list;
 
-type EvmCampaignState =
+pub(crate) type EvmCampaignState =
     StdState<InMemoryCorpus<EvmInput>, EvmInput, StdRand, InMemoryCorpus<EvmInput>>;
 type EvmLauncherManager =
     LlmpRestartingEventManager<(), EvmInput, EvmCampaignState, StdShMem, StdShMemProvider>;
@@ -129,7 +130,7 @@ fn log_bounded_campaign_progress(
     *last_report = Instant::now();
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Config {
     pub rpc_url: String,
     pub fork_block: u64,
@@ -213,6 +214,7 @@ impl Config {
 
 pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
+    let checkpoint_session = super::checkpoint::CheckpointSession::open(&config)?;
     let start_time = Instant::now();
 
     // Ensure state isolation before starting the campaign
@@ -226,9 +228,12 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
     log::info!("Initializing RustyFuzz v0.15.4 Campaign...");
 
-    let (mut initial_db, initial_env, synthetic_fork_mode) = if let Some(bytecode) =
-        config.in_memory_bytecode.as_ref()
+    let (mut initial_db, initial_env, synthetic_fork_mode) = if let Some(saved) = checkpoint_session
+        .as_ref()
+        .and_then(|session| session.saved.as_ref())
     {
+        (saved.snapshots.initial_db()?, saved.block_env.clone(), true)
+    } else if let Some(bytecode) = config.in_memory_bytecode.as_ref() {
         let target = config
             .target_contract
             .ok_or_else(|| anyhow::anyhow!("in-memory fuzz campaigns require a target contract"))?;
@@ -406,8 +411,11 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
             launcher_fallback_env,
             launcher_fallback_actor_set,
             launcher_fallback_synthetic_fork_mode,
-            launcher_fallback_bytecode_selectors,
-            launcher_fallback_bytecode_analysis,
+            InitialBytecode {
+                selectors: launcher_fallback_bytecode_selectors,
+                analysis: launcher_fallback_bytecode_analysis,
+            },
+            checkpoint_session,
         )
         .await;
     }
@@ -765,11 +773,14 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     "edges",
                     unsafe { OwnedMutSlice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE) },
                 );
-                let budget = Arc::new(CampaignBudget::new(
+                let worker_index = cores.ids.iter().position(|id| *id == description.core_id())
+                    .ok_or_else(|| libafl::Error::unknown("worker core is absent from campaign topology"))?;
+                let budget = Arc::new(CampaignBudget::for_worker(
                     config.max_execs,
                     config.duration_secs,
                     broker_worker_count,
-                ));
+                    worker_index,
+                ).ok_or_else(|| libafl::Error::unknown("invalid campaign worker topology"))?);
 
                 let mut harness = |input: &EvmInput| {
                     if !budget.reserve_execution() {
@@ -985,6 +996,23 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                         state_novelty_score: report.novelty_score(),
                         mutation_strategies: &mutation_strategies,
                     });
+                    if let Err(error) = super::provenance::persist(
+                        config.corpus_dir.as_ref(),
+                        super::provenance::PersistRequest {
+                            execution_index: telemetry.execution_count(),
+                            budget_consumed: budget.reserved(),
+                            input,
+                            execution: &execution,
+                            coverage_edges,
+                            state_novelty_score: report.novelty_score(),
+                            campaign_score: &campaign_score,
+                            findings: &findings,
+                            mutation_strategies: &mutation_strategies,
+                        },
+                    ) {
+                        log::error!("execution provenance persistence failed: {error:#}");
+                        return ExitKind::Crash;
+                    }
 
                     if report.interesting {
                         unsafe {
@@ -1174,12 +1202,20 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 launcher_fallback_env,
                 launcher_fallback_actor_set,
                 launcher_fallback_synthetic_fork_mode,
-                launcher_fallback_bytecode_selectors,
-                launcher_fallback_bytecode_analysis,
+                InitialBytecode {
+                    selectors: launcher_fallback_bytecode_selectors,
+                    analysis: launcher_fallback_bytecode_analysis,
+                },
+                None,
             )
             .await
         }
     }
+}
+
+struct InitialBytecode {
+    selectors: Vec<[u8; 4]>,
+    analysis: Option<BytecodeAnalysisReport>,
 }
 
 async fn run_single_process_campaign(
@@ -1188,9 +1224,15 @@ async fn run_single_process_campaign(
     initial_env: revm::context::BlockEnv,
     hardened_actor_set: Option<ActorSet>,
     synthetic_fork_mode: bool,
-    bytecode_selectors: Vec<[u8; 4]>,
-    bytecode_analysis: Option<BytecodeAnalysisReport>,
+    bytecode: InitialBytecode,
+    mut checkpoint_session: Option<super::checkpoint::CheckpointSession>,
 ) -> anyhow::Result<()> {
+    let InitialBytecode {
+        selectors: bytecode_selectors,
+        analysis: bytecode_analysis,
+    } = bytecode;
+    anyhow::ensure!(checkpoint_session.is_none() || synthetic_fork_mode,
+        "live-RPC checkpointing is not implemented; refusing to checkpoint an online fork as offline");
     let start_time = Instant::now();
     let execution_timeout = campaign_execution_timeout();
     log::info!(
@@ -1364,6 +1406,15 @@ async fn run_single_process_campaign(
         &mut objective,
     )?;
 
+    let mut restored_checkpoint = checkpoint_session
+        .as_mut()
+        .and_then(|session| session.saved.take());
+    if let Some(saved) = &restored_checkpoint {
+        state = postcard::from_bytes(&saved.state)
+            .map_err(|err| anyhow::anyhow!("restore LibAFL state: {err}"))?;
+        feedback = saved.feedback.clone();
+    }
+    let resumed = restored_checkpoint.is_some();
     let mut direct_seed_inputs = Vec::new();
     if state.corpus().count() == 0 {
         let mut inserted_seed_count = 0usize;
@@ -1518,6 +1569,26 @@ async fn run_single_process_campaign(
     );
 
     let concolic_hints = Arc::new(Mutex::new(Vec::new()));
+    let mut scheduler = RustyFuzzScheduler::with_pending_score(pending_campaign_score.clone());
+    let mut restored_map = None;
+    let mut restored_strategies = None;
+    let budget = if let Some(saved) = restored_checkpoint.take() {
+        *snapshot_corpus.write() = saved.snapshots.restore();
+        *state_novelty_feedback.write() = saved.novelty;
+        *dataflow_registry.write() = saved.dataflow;
+        *account_registry.write() = saved.accounts;
+        testcase_metadata_store.restore(saved.metadata);
+        *concolic_hints.lock() = saved.hints;
+        scheduler.restore(saved.scheduler);
+        *pending_campaign_score.write() = saved.pending_score;
+        restored_strategies = Some(saved.strategies);
+        telemetry.restore(saved.telemetry);
+        restored_map = Some(saved.raw_coverage);
+        CampaignBudget::restore(saved.budget).map_err(anyhow::Error::msg)?
+    } else {
+        CampaignBudget::new(config.max_execs, config.duration_secs, 1)
+    };
+    let budget = Arc::new(budget);
     let mutator = EvmMutator::with_concolic_hints_and_stats(
         abi_registry,
         account_registry.clone(),
@@ -1525,27 +1596,27 @@ async fn run_single_process_campaign(
         telemetry.concolic_hint_stats.clone(),
         testcase_metadata_store.clone(),
     );
+    let strategy_counters = mutator.strategy_counters.clone();
+    if let Some(saved) = restored_strategies {
+        strategy_counters.restore(saved);
+    }
     let mut stages = tuple_list!(StdMutationalStage::with_max_iterations(
         mutator,
         mutational_stage_iterations(&config),
     ),);
-    let mut fuzzer = StdFuzzer::new(
-        RustyFuzzScheduler::with_pending_score(pending_campaign_score.clone()),
-        feedback,
-        objective,
-    );
+    let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
     let mut shmem_provider = StdShMemProvider::new()?;
     let mut shmem = shmem_provider.new_shmem(MAP_SIZE)?;
     let coverage_map_ptr = shmem.as_mut_ptr();
+    if let Some(map) = restored_map {
+        unsafe {
+            std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE).copy_from_slice(&map);
+        }
+    }
     let observer = StdMapObserver::from_mut_slice("edges", unsafe {
         OwnedMutSlice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE)
     });
-    let budget = Arc::new(CampaignBudget::new(
-        config.max_execs,
-        config.duration_secs,
-        1,
-    ));
 
     let mut harness = |input: &EvmInput| {
         if !budget.reserve_execution() {
@@ -1738,6 +1809,23 @@ async fn run_single_process_campaign(
             state_novelty_score: report.novelty_score(),
             mutation_strategies: &mutation_strategies,
         });
+        if let Err(error) = super::provenance::persist(
+            config.corpus_dir.as_ref(),
+            super::provenance::PersistRequest {
+                execution_index: telemetry.execution_count(),
+                budget_consumed: budget.reserved(),
+                input,
+                execution: &execution,
+                coverage_edges,
+                state_novelty_score: report.novelty_score(),
+                campaign_score: &campaign_score,
+                findings: &findings,
+                mutation_strategies: &mutation_strategies,
+            },
+        ) {
+            log::error!("execution provenance persistence failed: {error:#}");
+            return ExitKind::Crash;
+        }
 
         if report.interesting {
             unsafe {
@@ -1821,6 +1909,56 @@ async fn run_single_process_campaign(
         ExitKind::Ok
     };
 
+    let capture = |state: &EvmCampaignState,
+                   feedback: &EvmCoverageFeedback,
+                   scheduler: &RustyFuzzScheduler|
+     -> anyhow::Result<_> {
+        let saved = super::checkpoint::Checkpoint {
+            state: postcard::to_stdvec(state)?,
+            feedback: feedback.clone(),
+            raw_coverage: unsafe {
+                std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE).to_vec()
+            },
+            snapshots: super::checkpoint::SavedSnapshots::capture(&snapshot_corpus.read()),
+            novelty: state_novelty_feedback.read().clone(),
+            dataflow: dataflow_registry.read().clone(),
+            accounts: account_registry.read().clone(),
+            metadata: testcase_metadata_store.checkpoint(),
+            hints: concolic_hints.lock().clone(),
+            scheduler: scheduler.checkpoint(),
+            budget: budget.checkpoint(),
+            pending_score: pending_campaign_score.read().clone(),
+            strategies: strategy_counters.snapshot(),
+            telemetry: telemetry.checkpoint(),
+            block_env: initial_env.clone(),
+        };
+        let mut corpus_ids = Vec::new();
+        for id in state.corpus().ids() {
+            let testcase = state.corpus().get(id)?.borrow();
+            let input = testcase
+                .input()
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("checkpoint corpus input not loaded"))?;
+            anyhow::ensure!(
+                snapshot_corpus
+                    .read()
+                    .snapshots
+                    .contains_key(&input.base_snapshot_id),
+                "checkpoint corpus references missing snapshot"
+            );
+            corpus_ids.push(input.semantic_input_hash());
+        }
+        Ok((saved, corpus_ids, feedback.checkpoint_coverage().to_vec()))
+    };
+    if let Some(session) = checkpoint_session.as_mut() {
+        let (saved, ids, coverage) = capture(
+            &state,
+            fuzzer.feedback(),
+            HasScheduler::<EvmInput, EvmCampaignState>::scheduler(&fuzzer),
+        )?;
+        session.publish(&saved, ids, coverage, resumed)?;
+    }
+
     if config.max_execs.is_some() || config.duration_secs.is_some() {
         log::info!(
             "Running mutational hard-bounded single-process campaign: max_execs={:?}, duration_secs={:?}, seed_pool={}, corpus_size={}",
@@ -1840,6 +1978,16 @@ async fn run_single_process_campaign(
         let mut bounded_progress_report = Instant::now();
         while !budget.exhausted() {
             let _ = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
+            if let Some(session) = checkpoint_session.as_mut() {
+                if session.due(budget.reserved()) || budget.exhausted() {
+                    let (saved, ids, coverage) = capture(
+                        &state,
+                        fuzzer.feedback(),
+                        HasScheduler::<EvmInput, EvmCampaignState>::scheduler(&fuzzer),
+                    )?;
+                    session.publish(&saved, ids, coverage, false)?;
+                }
+            }
             log_bounded_campaign_progress(
                 "single-mutational",
                 &mut bounded_progress_report,
@@ -1860,7 +2008,21 @@ async fn run_single_process_campaign(
         execution_timeout,
     )?;
 
-    fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
+    if let Some(session) = checkpoint_session.as_mut() {
+        loop {
+            fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
+            if session.due(budget.reserved()) {
+                let (saved, ids, coverage) = capture(
+                    &state,
+                    fuzzer.feedback(),
+                    HasScheduler::<EvmInput, EvmCampaignState>::scheduler(&fuzzer),
+                )?;
+                session.publish(&saved, ids, coverage, false)?;
+            }
+        }
+    } else {
+        fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
+    }
 
     write_final_campaign_summary(&config, &promotion_stats, &telemetry);
     Ok(())

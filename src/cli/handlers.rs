@@ -212,9 +212,12 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 std::path::Path::new(".rustyfuzz"),
                 &manifest_run_id,
             );
-            if let Err(err) = run_layout.materialize() {
-                log::warn!("could not materialize run layout: {err}");
-            }
+            run_layout.materialize().map_err(|err| {
+                anyhow::anyhow!(
+                    "cannot create run artifacts at {}: {err}",
+                    run_layout.root().display()
+                )
+            })?;
             let mut run_manifest = rustyfuzz_artifacts::RunManifest::v1(
                 &manifest_run_id,
                 env!("CARGO_PKG_VERSION"),
@@ -236,11 +239,13 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     .push("synthetic_fallback=true".to_string());
             }
             let manifest_path = run_layout.config_file();
-            if let Err(err) = run_manifest.persist(&manifest_path) {
-                log::warn!("could not persist run manifest: {err}");
-            } else {
-                log::info!("run manifest persisted at {}", manifest_path.display());
-            }
+            run_manifest.persist(&manifest_path).map_err(|err| {
+                anyhow::anyhow!(
+                    "cannot persist run manifest at {}: {err}",
+                    manifest_path.display()
+                )
+            })?;
+            log::info!("run manifest persisted at {}", manifest_path.display());
 
             let watchdog_done =
                 install_campaign_watchdog(wall_timeout_secs, max_execs, duration_secs, unbounded);

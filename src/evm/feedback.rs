@@ -55,7 +55,7 @@ impl StateNoveltyReport {
 /// This is independent from coverage novelty: two executions can share the same
 /// path but write a new slot, reach a new state transition, or touch a new
 /// protocol edge.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EvmStateNoveltyFeedback {
     seen_transition_hashes: HashSet<u64>,
     seen_slot_hashes: HashSet<u64>,
@@ -273,18 +273,22 @@ impl Fnv64 {
 
 /// Feedback that tracks EVM edge coverage using the shared coverage map
 /// EvmCoverageFeedback: Tracks which contracts have been touched during fuzzing.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EvmCoverageFeedback {
     pub touched_addresses: HashSet<Address>,
     virgin: Vec<u8>,
-    observer_name: &'static str,
+    observer_name: String,
 }
 
 impl EvmCoverageFeedback {
+    pub fn checkpoint_coverage(&self) -> &[u8] {
+        &self.virgin
+    }
     pub fn new() -> Self {
         Self {
             touched_addresses: HashSet::new(),
             virgin: vec![0; MAP_SIZE],
-            observer_name: "edges",
+            observer_name: "edges".into(),
         }
     }
 
@@ -292,7 +296,7 @@ impl EvmCoverageFeedback {
         Self {
             touched_addresses: HashSet::new(),
             virgin: vec![0; map_size],
-            observer_name: "edges",
+            observer_name: "edges".into(),
         }
     }
 
@@ -323,7 +327,7 @@ impl Default for EvmCoverageFeedback {
         Self {
             touched_addresses: HashSet::new(),
             virgin: vec![0; MAP_SIZE],
-            observer_name: "edges",
+            observer_name: "edges".into(),
         }
     }
 }
@@ -357,7 +361,7 @@ where
     ) -> Result<bool, libafl::Error> {
         #[allow(deprecated)]
         let observer = observers
-            .match_name::<StdMapObserver<'_, u8, false>>(self.observer_name)
+            .match_name::<StdMapObserver<'_, u8, false>>(&self.observer_name)
             .ok_or_else(|| libafl::Error::key_not_found("edges map observer"))?;
         Ok(self.observe_coverage(observer.as_slice()))
     }

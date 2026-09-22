@@ -1,8 +1,8 @@
 chain = "evm"
-rpc_url = "https://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"   # or any good RPC
+rpc_url = "https://archive-rpc.example.invalid"   # replace with an archive RPC via environment/config management
 fork_block = 22000000  
 target_contract = "0x0000000000000000000000000000000000001337"   # Contract Address
-fuzzer_address = "0x0000000000000000000000000000000000001337"    # Fuzzing Address or your wallet address
+fuzzer_address = "0x0000000000000000000000000000000000000000"    # replace with a campaign caller
 max_depth = 5
 initial_seeds = 50
 timeout_secs = 60
@@ -15,6 +15,9 @@ llm_enabled = false
 
 [hardened_defi]
 enabled = false
+single_process = true
+deterministic = true
+rng_seed = 42
 historical_seed_file = "seeds/example_historical_seed.json"
 max_template_sequences = 128
 enable_actor_model = true
@@ -22,3 +25,8 @@ enable_economic_delta = true
 enable_protocol_invariants = true
 enable_exploit_templates = true
 min_persist_confidence = 0.70
+
+[hardened_defi.checkpoint]
+directory = ".rustyfuzz/checkpoints/example"
+every_execs = 1000
+resume = false

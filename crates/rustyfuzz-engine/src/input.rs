@@ -231,6 +231,13 @@ impl EvmTestcaseMetadata {
 const MAX_METADATA_STORE_ENTRIES: usize = 65_536;
 
 impl EvmTestcaseMetadataStore {
+    pub fn checkpoint(&self) -> HashMap<InputId, EvmTestcaseMetadata> {
+        self.inner.lock().clone()
+    }
+
+    pub fn restore(&self, entries: HashMap<InputId, EvmTestcaseMetadata>) {
+        *self.inner.lock() = entries;
+    }
     /// Merges metadata into the store for the input's semantic identity.
     ///
     /// Deterministic same-id semantics:

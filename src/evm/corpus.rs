@@ -13,6 +13,7 @@ use anyhow::Context;
 use libafl_bolts::rands::Rand;
 use parking_lot::RwLock;
 use revm::primitives::{Address, B256, U256};
+use rustyfuzz_artifacts::fsutil::write_atomic;
 use rustyfuzz_core::SnapshotId;
 use rustyfuzz_evm::fork_db::{EvmCacheDb, ForkDb, ForkDbCacheSnapshot};
 use rustyfuzz_evm::inspector::MAP_SIZE;
@@ -28,6 +29,20 @@ use std::time::Duration;
 // use bitvec::bitvec; // Unused
 use bitvec::prelude::{BitVec, Lsb0};
 use serde::{Deserialize, Serialize};
+
+/// Owns only locks successfully created by this process. Release on both
+/// success and error so a failed disk write does not poison later attempts.
+struct ArtifactLock {
+    file: Option<fs::File>,
+    path: PathBuf,
+}
+
+impl Drop for ArtifactLock {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotError {
@@ -214,7 +229,92 @@ impl PersistentCorpus {
         fs::create_dir_all(root.join("campaign_artifacts"))?;
         fs::create_dir_all(root.join("campaign_artifacts").join("index"))?;
         fs::create_dir_all(root.join("campaign_artifacts").join("summaries"))?;
+        Self::validate_published_artifacts(&root)?;
         Ok(Self { root })
+    }
+
+    fn validate_published_artifacts(root: &Path) -> anyhow::Result<()> {
+        let index_dir = root.join("campaign_artifacts").join("index");
+        for entry in fs::read_dir(&index_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = fs::read(&path)
+                .with_context(|| format!("read campaign artifact index {}", path.display()))?;
+            let record: CampaignArtifactRecord = serde_json::from_slice(&bytes)
+                .with_context(|| format!("validate campaign artifact index {}", path.display()))?;
+            let input_id = &record.input_id;
+            let members = [
+                (
+                    root.join("inputs").join(format!("{input_id}.json")),
+                    "input",
+                ),
+                (
+                    root.join("inputs").join(format!("{input_id}.meta.json")),
+                    "input metadata",
+                ),
+                (
+                    root.join("fork_cache")
+                        .join(format!("{}.json", record.fork_cache_id)),
+                    "fork cache",
+                ),
+                (
+                    root.join("campaign_artifacts")
+                        .join(format!("{input_id}.json")),
+                    "artifact record",
+                ),
+                (
+                    root.join("campaign_artifacts")
+                        .join("summaries")
+                        .join(format!("{input_id}.md")),
+                    "artifact summary",
+                ),
+            ];
+            for (member, label) in members {
+                let member_bytes = fs::read(&member).with_context(|| {
+                    format!(
+                        "recover campaign artifact {input_id}: read {label} {}",
+                        member.display()
+                    )
+                })?;
+                if label != "artifact summary" {
+                    match label {
+                        "input" => {
+                            EvmInput::split_legacy_json(&member_bytes).with_context(|| {
+                                format!("recover campaign artifact {input_id}: validate {label}")
+                            })?;
+                        }
+                        "input metadata" => {
+                            serde_json::from_slice::<CorpusEntryMetadata>(&member_bytes)
+                                .with_context(|| {
+                                    format!(
+                                        "recover campaign artifact {input_id}: validate {label}"
+                                    )
+                                })?;
+                        }
+                        "fork cache" => {
+                            serde_json::from_slice::<ForkDbCacheSnapshot>(&member_bytes)
+                                .with_context(|| {
+                                    format!(
+                                        "recover campaign artifact {input_id}: validate {label}"
+                                    )
+                                })?;
+                        }
+                        "artifact record" => {
+                            serde_json::from_slice::<CampaignArtifactRecord>(&member_bytes)
+                                .with_context(|| {
+                                    format!(
+                                        "recover campaign artifact {input_id}: validate {label}"
+                                    )
+                                })?;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn persist_input(
@@ -307,8 +407,8 @@ impl PersistentCorpus {
         metadata.id = id.clone();
         let input_path = self.root.join("inputs").join(format!("{id}.json"));
         let meta_path = self.root.join("inputs").join(format!("{id}.meta.json"));
-        fs::write(input_path, serde_json::to_vec_pretty(input)?)?;
-        fs::write(meta_path, serde_json::to_vec_pretty(&metadata)?)?;
+        write_atomic(input_path, serde_json::to_vec_pretty(input)?)?;
+        write_atomic(meta_path, serde_json::to_vec_pretty(&metadata)?)?;
         Ok(metadata)
     }
 
@@ -364,7 +464,7 @@ impl PersistentCorpus {
     ) -> anyhow::Result<ForkDbCacheSnapshot> {
         let snapshot = fork_db.cache_snapshot();
         let path = self.root.join("fork_cache").join(format!("{id}.json"));
-        fs::write(path, serde_json::to_vec_pretty(&snapshot)?)?;
+        write_atomic(path, serde_json::to_vec_pretty(&snapshot)?)?;
         Ok(snapshot)
     }
 
@@ -462,12 +562,14 @@ impl PersistentCorpus {
                     .with_context(|| format!("acquire artifact lock {}", lock_path.display()))?
             }
         };
-        let _lock_file = lock_file;
+        let _lock = ArtifactLock {
+            file: Some(lock_file),
+            path: lock_path,
+        };
 
         if let Ok(bytes) = fs::read(&index_path) {
             if let Ok(existing) = serde_json::from_slice::<CampaignArtifactRecord>(&bytes) {
                 if existing.score.total >= request.score.total {
-                    let _ = fs::remove_file(&lock_path);
                     return Ok(CampaignArtifactOutcome {
                         record: existing,
                         created_new: false,
@@ -489,7 +591,6 @@ impl PersistentCorpus {
         if let Ok(bytes) = fs::read(&record_path) {
             if let Ok(existing) = serde_json::from_slice::<CampaignArtifactRecord>(&bytes) {
                 if existing.score.total >= request.score.total {
-                    let _ = fs::remove_file(&lock_path);
                     return Ok(CampaignArtifactOutcome {
                         record: existing,
                         created_new: false,
@@ -531,18 +632,16 @@ impl PersistentCorpus {
             }),
         };
         let record_bytes = serde_json::to_vec_pretty(&record)?;
-        let tmp_index_path = index_path.with_extension("json.tmp");
-        fs::write(&record_path, &record_bytes)?;
-        fs::write(&tmp_index_path, &record_bytes)?;
-        fs::rename(&tmp_index_path, &index_path)?;
-        fs::write(
+        write_atomic(&record_path, &record_bytes)?;
+        write_atomic(
             self.root
                 .join("campaign_artifacts")
                 .join("summaries")
                 .join(format!("{}.md", record.input_id)),
             triage_markdown(&record),
         )?;
-        let _ = fs::remove_file(&lock_path);
+        // Publish the discovery index only after every dependent artifact.
+        write_atomic(&index_path, &record_bytes)?;
         Ok(CampaignArtifactOutcome {
             record,
             created_new: true,
@@ -566,17 +665,17 @@ impl PersistentCorpus {
         let bundle_dir = self.root.join("mainnet_seeds").join(id);
         fs::create_dir_all(bundle_dir.join("inputs"))?;
 
-        fs::write(
+        write_atomic(
             bundle_dir.join("manifest.json"),
             serde_json::to_vec_pretty(bundle)?,
         )?;
-        fs::write(
+        write_atomic(
             bundle_dir.join("fork_cache.json"),
             serde_json::to_vec_pretty(&bundle.fork_cache)?,
         )?;
 
         for seed in &bundle.seeds {
-            fs::write(
+            write_atomic(
                 bundle_dir.join("inputs").join(format!("{}.json", seed.id)),
                 serde_json::to_vec_pretty(&seed.input)?,
             )?;
@@ -671,7 +770,7 @@ impl PersistentCorpus {
             input_id: metadata.id.clone(),
             reason: reason.to_string(),
         };
-        fs::write(
+        write_atomic(
             self.root
                 .join("crashes")
                 .join(format!("{}.json", &fingerprint[2..18])),
@@ -702,7 +801,7 @@ impl PersistentCorpus {
             depth: snapshot.depth,
             gas_used: snapshot.gas_used,
         };
-        fs::write(
+        write_atomic(
             self.root
                 .join("snapshots")
                 .join(format!("{}.manifest.json", snapshot.id)),
@@ -779,7 +878,7 @@ impl PersistentCorpus {
             }
         }
 
-        fs::write(&path, report)?;
+        write_atomic(&path, report)?;
         Ok(path)
     }
 }
@@ -2118,6 +2217,36 @@ mod artifact_tests {
         let base = EvmCacheDb::new(ForkDb::empty());
         let coverage = vec![1u8; 8];
 
+        // Inject a persistence failure after lock acquisition. Retrying after
+        // repairing the filesystem must not be blocked by our abandoned lock.
+        let fork_cache = root.join("fork_cache");
+        fs::remove_dir(&fork_cache).unwrap();
+        fs::write(&fork_cache, b"blocked").unwrap();
+        assert!(corpus
+            .persist_campaign_artifact(CampaignArtifactRequest {
+                input: &input,
+                execution: &execution,
+                coverage: &coverage,
+                state_novelty_score: 1,
+                base_fork_state: &base,
+                score: &score,
+                findings: &[],
+                exploit_candidate: None,
+                block_number: 1,
+                target: Some(target),
+                reason: "high-score-non-success-status",
+            })
+            .is_err());
+        assert!(fs::read_dir(root.join("campaign_artifacts/index"))
+            .unwrap()
+            .all(|entry| entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_none_or(|ext| ext != "lock")));
+        fs::remove_file(&fork_cache).unwrap();
+        fs::create_dir(&fork_cache).unwrap();
+
         let first = corpus
             .persist_campaign_artifact(CampaignArtifactRequest {
                 input: &input,
@@ -2154,6 +2283,84 @@ mod artifact_tests {
         assert_eq!(first.record.input_id, second.record.input_id);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn truncated_published_artifact_fails_next_corpus_start() {
+        let root = temp_corpus_root("artifact-recovery");
+        let corpus = PersistentCorpus::new(&root).expect("corpus");
+        let target = Address::repeat_byte(0xaa);
+        let input = EvmInput {
+            txs: vec![SingletonTx {
+                input: vec![0xde, 0xad],
+                caller: Address::repeat_byte(0x13),
+                to: target,
+                value: U256::ZERO,
+                is_victim: false,
+            }],
+            base_snapshot_id: 0,
+        };
+        let execution = SequenceExecutionResult {
+            tx_results: vec![TxExecutionResult {
+                tx_index: 0,
+                status: ExecutionStatus::Success,
+                gas_used: 1,
+                output: Vec::new(),
+                coverage_hash: 1,
+                coverage_edges: 1,
+                storage_reads: Vec::new(),
+                storage_writes: Vec::new(),
+                storage_diffs: Vec::new(),
+                call_trace: Vec::new(),
+                waypoints: Vec::new(),
+            }],
+            total_gas_used: 1,
+            final_coverage_hash: 1,
+            storage_reads: Vec::new(),
+            storage_writes: Vec::new(),
+            storage_diffs: Vec::new(),
+            call_trace: Vec::new(),
+            oracle_observations: Vec::new(),
+        };
+        let score = CampaignScore {
+            total: 1,
+            economic_pressure: 0,
+            invariant_pressure: 0,
+            counterexample_pressure: 0,
+            oracle_pressure: 0,
+            state_pressure: 0,
+            exploration_pressure: 0,
+            explanation: vec!["recovery".to_string()],
+        };
+        let base = EvmCacheDb::new(ForkDb::empty());
+        let record = corpus
+            .persist_campaign_artifact(CampaignArtifactRequest {
+                input: &input,
+                execution: &execution,
+                coverage: &[1],
+                state_novelty_score: 1,
+                base_fork_state: &base,
+                score: &score,
+                findings: &[],
+                exploit_candidate: None,
+                block_number: 1,
+                target: Some(target),
+                reason: "recovery-test",
+            })
+            .expect("artifact");
+        fs::write(
+            root.join("fork_cache")
+                .join(format!("{}.json", record.record.fork_cache_id)),
+            b"{\"truncated\":",
+        )
+        .unwrap();
+
+        let error = match PersistentCorpus::new(&root) {
+            Ok(_) => panic!("corruption was silently accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("fork cache"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2418,6 +2625,7 @@ pub struct SnapshotCorpus {
     pub priority_gap_map: BitVec<u8, Lsb0>, // Edges identified as "uncovered" by Forge
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SnapshotMetadata {
     pub visits: usize,
     /// Number of consecutive executions from this snapshot that did not

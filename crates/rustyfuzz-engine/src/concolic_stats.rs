@@ -10,7 +10,7 @@ pub struct ConcolicHintStats {
     successful: AtomicU64,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConcolicHintStatsSnapshot {
     pub generated: u64,
     pub deduplicated: u64,
@@ -19,6 +19,13 @@ pub struct ConcolicHintStatsSnapshot {
 }
 
 impl ConcolicHintStats {
+    pub fn restore(&self, saved: ConcolicHintStatsSnapshot) {
+        self.generated.store(saved.generated, Ordering::Relaxed);
+        self.deduplicated
+            .store(saved.deduplicated, Ordering::Relaxed);
+        self.applied.store(saved.applied, Ordering::Relaxed);
+        self.successful.store(saved.successful, Ordering::Relaxed);
+    }
     pub fn record_generated(&self, count: u64) {
         self.generated.fetch_add(count, Ordering::Relaxed);
     }
