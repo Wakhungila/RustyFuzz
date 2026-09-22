@@ -1,0 +1,12 @@
+id = "negative-erc4626-zero-donation"
+class = "erc4626_share_inflation"
+mode = "executable_evm"
+target = "0x6200000000000000000000000000000000000201"
+fixture = "benchmarks/historical/negative_controls/fixtures/erc4626-zero-donation.json"
+expected_invariant = "attacker donation changes victim share price"
+expected_selectors = ["deposit(uint256,address)", "redeem(uint256,address,address)"]
+expected_attacker = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+success_criteria = ["expected_finding", "share_price_manipulation"]
+poc_generation = "not_required"
+max_duration_secs = 30
+notes = "Negative near-miss: donation amount is zero."

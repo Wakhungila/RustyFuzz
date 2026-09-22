@@ -727,6 +727,11 @@ impl ProtocolOraclePack {
         let mut saw_vote = false;
         let mut saw_flashloan_like_call = false;
         for call in &execution.call_trace {
+            // Rejected governance attempts are evidence that guards held, not
+            // successful votes/queues/executions. Begin frames are not outcomes.
+            if !call.success || call.phase != CallPhase::End {
+                continue;
+            }
             let sel = selector(call);
             saw_vote |= sel == Some(GOVERNOR_CAST_VOTE);
             saw_flashloan_like_call |= call.input.starts_with(&[0x5c, 0x19, 0xe9, 0x51]);
@@ -737,6 +742,9 @@ impl ProtocolOraclePack {
                     .iter()
                     .filter(|prior| {
                         prior.tx_index <= call.tx_index
+                            && prior.target == call.target
+                            && prior.success
+                            && prior.phase == CallPhase::End
                             && selector(prior) == Some(GOVERNOR_CAST_VOTE)
                     })
                     .count();
@@ -786,8 +794,14 @@ impl ProtocolOraclePack {
             }
         }
 
-        let proposed = calls_with_selectors(execution, &[GOVERNOR_PROPOSE]).len();
-        let executed = calls_with_selectors(execution, &[GOVERNOR_EXECUTE]).len();
+        let proposed = calls_with_selectors(execution, &[GOVERNOR_PROPOSE])
+            .into_iter()
+            .filter(|call| call.success)
+            .count();
+        let executed = calls_with_selectors(execution, &[GOVERNOR_EXECUTE])
+            .into_iter()
+            .filter(|call| call.success)
+            .count();
         if executed > proposed && executed > 0 {
             findings.push(ProtocolFinding {
                 pack: ProtocolOraclePackKind::Governance,

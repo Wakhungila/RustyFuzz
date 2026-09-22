@@ -65,6 +65,7 @@ pub enum VulnerabilityClass {
 #[serde(rename_all = "snake_case")]
 pub enum BenchmarkMode {
     LocalFixture,
+    ExecutableEvm,
     MainnetFork,
     BlindRediscovery,
     ArtifactReplay,
@@ -772,6 +773,8 @@ pub enum BenchmarkFailureKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BenchmarkValidationResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<super::executable_fixture::ExecutableEvidence>,
     pub benchmark_id: String,
     #[serde(rename = "class")]
     pub vulnerability_class: VulnerabilityClass,
@@ -948,6 +951,31 @@ impl ValidationRunner {
             );
         }
         match manifest.mode {
+            BenchmarkMode::ExecutableEvm => {
+                let execute = || -> Result<BenchmarkValidationResult> {
+                    let path = Path::new(manifest.fixture.as_deref().context("missing executable fixture path")?);
+                    let fixture = super::executable_fixture::ExecutableFixture::load(path)?;
+                    anyhow::ensure!(Some(fixture.target) == manifest.target_address(), "fixture target differs from manifest target");
+                    let (execution, mut evidence) = fixture.execute(path)?;
+                    let findings = ProtocolOraclePack::default().evaluate(&execution);
+                    let (matching, unmatched): (Vec<_>, Vec<_>) = findings.iter().cloned()
+                        .partition(|finding| manifest.vulnerability_class.matches_finding(finding));
+                    evidence.matching_signals = matching;
+                    evidence.unmatched_signals = unmatched;
+                    let observation = ValidationObservation { findings,
+                        executions: Some(execution.tx_results.len() as u64), ..Default::default() };
+                    let mut result = self.evaluate_observation(manifest, &observation);
+                    // Negative controls measure raw oracle false positives, not
+                    // proof-generation success. No proof/candidate is constructed.
+                    result.found = !evidence.matching_signals.is_empty();
+                    result.status = if result.found { ValidationStatus::Found } else { ValidationStatus::NotFound };
+                    result.reason = format!("executed {} EVM transactions; {} matching signals; {} unmatched signals",
+                        evidence.transactions.len(), evidence.matching_signals.len(), evidence.unmatched_signals.len());
+                    result.runtime = Some(evidence);
+                    Ok(result)
+                };
+                execute().unwrap_or_else(|err| self.failed_result(manifest, format!("executable fixture failed: {err:#}")))
+            }
             BenchmarkMode::LocalFixture => {
                 let Some(fixture_path) = manifest.fixture.as_deref() else {
                     return self.skipped_result(
@@ -1119,6 +1147,7 @@ impl ValidationRunner {
         );
 
         BenchmarkValidationResult {
+            runtime: None,
             benchmark_id: manifest.id.clone(),
             vulnerability_class: manifest.vulnerability_class.clone(),
             target_profile: validation_target_profile(manifest, candidate, proof),
@@ -1200,6 +1229,7 @@ impl ValidationRunner {
     ) -> BenchmarkValidationResult {
         let failure_kind = skipped_failure_kind(status.clone());
         BenchmarkValidationResult {
+            runtime: None,
             benchmark_id: manifest.id.clone(),
             vulnerability_class: manifest.vulnerability_class.clone(),
             target_profile: if manifest.target_profile_expectation.is_empty() {
@@ -1257,6 +1287,7 @@ impl ValidationRunner {
         reason: String,
     ) -> BenchmarkValidationResult {
         BenchmarkValidationResult {
+            runtime: None,
             benchmark_id: manifest.id.clone(),
             vulnerability_class: manifest.vulnerability_class.clone(),
             target_profile: if manifest.target_profile_expectation.is_empty() {
@@ -1383,12 +1414,14 @@ impl ValidationRunner {
         {
             replay_findings.push(synthetic_class_finding(manifest, &replay_execution));
         }
-        observation.proof = observation.exploit_candidate.as_ref().map(|candidate| {
-            let proof =
-                ProofCarryingFinding::from_candidate(candidate, &execution, &replay_findings);
-            let replay_result = proof.verify_against(&replay_execution, &replay_findings);
-            proof.with_replay_result(replay_result)
-        });
+        if matches!(fixture.outcome, SyntheticBenchmarkOutcome::Found) {
+            observation.proof = observation.exploit_candidate.as_ref().map(|candidate| {
+                let proof =
+                    ProofCarryingFinding::from_candidate(candidate, &execution, &replay_findings);
+                let replay_result = proof.verify_against(&replay_execution, &replay_findings);
+                proof.with_replay_result(replay_result)
+            });
+        }
         observation.proof_status = observation
             .proof
             .as_ref()
@@ -1454,6 +1487,10 @@ impl ValidationRunner {
         } else {
             observation.findings.clear();
             observation.exploit_candidate = None;
+            observation.proof = None;
+            observation.proof_status = None;
+            observation.artifact_path = None;
+            observation.foundry_poc_path = None;
         }
 
         Ok(observation)

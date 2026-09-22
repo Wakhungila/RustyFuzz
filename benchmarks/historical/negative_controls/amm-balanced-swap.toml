@@ -1,0 +1,12 @@
+id = "negative-amm-balanced-swap"
+class = "amm_invariant_violation"
+mode = "executable_evm"
+target = "0x6200000000000000000000000000000000000301"
+fixture = "benchmarks/historical/negative_controls/fixtures/amm-balanced-swap.json"
+expected_invariant = "swap breaks reserve product and extracts attacker profit"
+expected_selectors = ["swap(uint256,uint256,address,bytes)", "getReserves()"]
+expected_attacker = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+success_criteria = ["expected_finding", "reserve_manipulation", "invariant_violation"]
+poc_generation = "not_required"
+max_duration_secs = 30
+notes = "Negative near-miss: prefunded constant-product swap preserves k (no fee model)."

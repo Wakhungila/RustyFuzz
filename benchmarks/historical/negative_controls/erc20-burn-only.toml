@@ -1,0 +1,12 @@
+id = "negative-erc20-burn-only"
+class = "erc20_mint_inflation"
+mode = "executable_evm"
+target = "0x6200000000000000000000000000000000000102"
+fixture = "benchmarks/historical/negative_controls/fixtures/erc20-burn-only.json"
+expected_invariant = "unauthorized mint increases attacker balance and total supply"
+expected_selectors = ["burn(uint256)", "balanceOf(address)", "totalSupply()"]
+expected_attacker = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+success_criteria = ["expected_finding", "invariant_violation"]
+poc_generation = "not_required"
+max_duration_secs = 30
+notes = "Negative safe control: burn-only token has no mint path."

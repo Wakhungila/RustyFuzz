@@ -1,0 +1,12 @@
+id = "negative-erc20-owner-mint"
+class = "erc20_mint_inflation"
+mode = "executable_evm"
+target = "0x6200000000000000000000000000000000000101"
+fixture = "benchmarks/historical/negative_controls/fixtures/erc20-owner-mint.json"
+expected_invariant = "unauthorized mint increases attacker balance and total supply"
+expected_selectors = ["mint(address,uint256)", "balanceOf(address)", "totalSupply()"]
+expected_attacker = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+success_criteria = ["expected_finding", "invariant_violation"]
+poc_generation = "not_required"
+max_duration_secs = 30
+notes = "Negative near-miss: owner-only mint is authorized."

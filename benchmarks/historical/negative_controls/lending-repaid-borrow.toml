@@ -1,0 +1,12 @@
+id = "negative-lending-repaid-borrow"
+class = "liquidation_abuse"
+mode = "executable_evm"
+target = "0x6200000000000000000000000000000000000402"
+fixture = "benchmarks/historical/negative_controls/fixtures/lending-repaid-borrow.json"
+expected_invariant = "healthy account cannot be liquidated for attacker profit"
+expected_selectors = ["borrow(uint256)", "repay(address,uint256,uint256,address)"]
+expected_attacker = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+success_criteria = ["expected_finding", "invariant_violation"]
+poc_generation = "not_required"
+max_duration_secs = 30
+notes = "Negative safe control: borrow and repay conserve debt accounting."

@@ -1,0 +1,12 @@
+id = "negative-lending-healthy-liquidation"
+class = "liquidation_abuse"
+mode = "executable_evm"
+target = "0x6200000000000000000000000000000000000401"
+fixture = "benchmarks/historical/negative_controls/fixtures/lending-healthy-liquidation.json"
+expected_invariant = "healthy account cannot be liquidated for attacker profit"
+expected_selectors = ["liquidationCall(address,address,address,uint256,bool)", "debt()"]
+expected_attacker = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+success_criteria = ["expected_finding", "invariant_violation"]
+poc_generation = "not_required"
+max_duration_secs = 30
+notes = "Negative near-miss: liquidation selector exists but health checks reject it."

@@ -9,6 +9,7 @@ pub mod control_flow;
 pub mod corpus_minimizer;
 pub mod dependency;
 pub mod economic_delta;
+pub mod executable_fixture;
 pub mod exploit_coverage;
 pub mod exploit_path;
 pub mod exploit_synthesizer;

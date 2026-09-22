@@ -43,6 +43,70 @@ fn test_db() -> CacheDB<ForkDb> {
 }
 
 #[test]
+fn negative_control_pack_has_two_controls_per_oracle_and_no_false_positives() {
+    use rusty_fuzz::engine::benchmark::{ValidationRunner, ValidationStatus};
+    use std::collections::BTreeMap;
+
+    let manifests = ValidationRunner::load_manifests("benchmarks/historical/negative_controls")
+        .expect("negative-control manifests load");
+    assert_eq!(manifests.len(), 10);
+    let report = ValidationRunner.run_manifests(&manifests);
+    assert_eq!(report.summary.total, 10);
+    assert_eq!(report.summary.executed, 10);
+    assert_eq!(report.summary.found, 0);
+    assert_eq!(report.summary.not_found, 10);
+    assert_eq!(report.summary.failed_execution, 0);
+
+    let mut counts = BTreeMap::new();
+    for result in &report.benchmarks {
+        assert_eq!(result.status, ValidationStatus::NotFound);
+        assert!(
+            !result.found,
+            "negative control fired: {}",
+            result.benchmark_id
+        );
+        assert_eq!(result.proof_status, None);
+        assert!(result.proof.is_none());
+        assert!(result.artifact_path.is_none());
+        assert!(!result.foundry_poc_generated);
+        assert!(result.exploit_path_length.is_none());
+        assert!(result.synthesized_sequence.is_empty());
+        let runtime = result
+            .runtime
+            .as_ref()
+            .expect("real EVM execution evidence");
+        assert_eq!(runtime.schema_version, 1);
+        assert!(runtime.matching_signals.is_empty());
+        assert!(!runtime.transactions.is_empty());
+        assert!(runtime
+            .transactions
+            .iter()
+            .all(|tx| tx.gas_used >= 21_000 && tx.coverage_edges > 0 && tx.call_traces > 0));
+        *counts
+            .entry(format!("{:?}", result.vulnerability_class))
+            .or_insert(0) += 1;
+    }
+    assert_eq!(counts.len(), 5);
+    assert_eq!(counts.values().copied().collect::<Vec<_>>(), vec![2; 5]);
+    assert!(report.benchmarks.iter().any(|r| r
+        .runtime
+        .as_ref()
+        .unwrap()
+        .transactions
+        .iter()
+        .any(|t| t.storage_diffs > 0)));
+    let owner = report
+        .benchmarks
+        .iter()
+        .find(|r| r.benchmark_id == "negative-erc20-owner-mint")
+        .unwrap();
+    assert!(
+        !owner.runtime.as_ref().unwrap().unmatched_signals.is_empty(),
+        "cross-pack bridge heuristics must remain visible"
+    );
+}
+
+#[test]
 fn executor_commits_successful_state_changes_and_coverage() {
     let caller = addr(0xaa);
     let target = addr(0xbb);
@@ -2162,4 +2226,126 @@ fn simulate_value_mutation(value: U256) -> U256 {
         2 => value.saturating_sub(U256::from(rng.random::<u64>())),
         _ => value.saturating_mul(U256::from(rng.random_range(1..100))),
     }
+}
+
+fn execute_negative_family(family: &str) {
+    use rusty_fuzz::engine::{benchmark::ValidationRunner, executable_fixture::ExecutableFixture};
+    let manifests =
+        ValidationRunner::load_manifests("benchmarks/historical/negative_controls").unwrap();
+    let controls: Vec<_> = manifests
+        .iter()
+        .filter(|m| m.id.starts_with(&format!("negative-{family}-")))
+        .collect();
+    assert_eq!(controls.len(), 2);
+    for manifest in controls {
+        let path = std::path::Path::new(manifest.fixture.as_ref().unwrap());
+        let fixture = ExecutableFixture::load(path).unwrap();
+        let (execution, evidence) = fixture.execute(path).unwrap();
+        assert_eq!(execution.tx_results.len(), fixture.transactions.len());
+        assert!(execution.total_gas_used > 21_000);
+        assert!(!execution.call_trace.is_empty());
+        assert!(evidence.transactions.iter().all(|tx| tx.coverage_edges > 0));
+        let findings = ProtocolOraclePack::default().evaluate(&execution);
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| manifest.vulnerability_class.matches_finding(finding)),
+            "{}: {findings:?}",
+            manifest.id
+        );
+    }
+}
+#[test]
+fn executable_erc20_controls_run_bytecode() {
+    execute_negative_family("erc20");
+}
+#[test]
+fn executable_erc4626_controls_run_bytecode() {
+    execute_negative_family("erc4626");
+}
+#[test]
+fn executable_amm_controls_run_bytecode() {
+    execute_negative_family("amm");
+}
+#[test]
+fn executable_lending_controls_run_bytecode() {
+    execute_negative_family("lending");
+}
+#[test]
+fn executable_governance_controls_run_bytecode() {
+    execute_negative_family("governance");
+}
+
+#[test]
+fn governance_reverted_execute_does_not_count_as_takeover() {
+    use rusty_fuzz::engine::executable_fixture::ExecutableFixture;
+    let path = std::path::Path::new(
+        "benchmarks/historical/negative_controls/fixtures/governance-delayed-execute.json",
+    );
+    let fixture = ExecutableFixture::load(path).unwrap();
+    let (execution, _) = fixture.execute(path).unwrap();
+    assert_eq!(
+        execution.tx_results[3].status,
+        rusty_fuzz::common::types::ExecutionStatus::Revert
+    );
+    assert_eq!(
+        execution.tx_results[4].status,
+        rusty_fuzz::common::types::ExecutionStatus::Success
+    );
+    assert!(execution.tx_results[3]
+        .storage_diffs
+        .iter()
+        .all(|d| d.old_value == d.new_value));
+    assert!(!ProtocolOraclePack::default()
+        .evaluate(&execution)
+        .iter()
+        .any(|f| matches!(f.vuln, VulnType::GovernanceTakeover)));
+}
+
+#[test]
+fn executable_matching_signal_is_found_without_a_proof() {
+    use rusty_fuzz::engine::{
+        benchmark::{ValidationRunner, ValidationStatus},
+        executable_fixture::ExecutableFixture,
+    };
+    let mut manifest = ValidationRunner::load_manifests(
+        "benchmarks/historical/negative_controls/governance-quorum.toml",
+    )
+    .unwrap()
+    .remove(0);
+    let mut fixture =
+        ExecutableFixture::load(std::path::Path::new(manifest.fixture.as_ref().unwrap())).unwrap();
+    // A deliberately unsafe independent witness: every execute call succeeds
+    // and commits a write without any authorization, vote, or delay check.
+    fixture
+        .accounts
+        .iter_mut()
+        .find(|a| a.address == fixture.target)
+        .unwrap()
+        .runtime_bytecode = "0x600160005500".into();
+    let mut tx = fixture.transactions.pop().unwrap();
+    tx.expected_status = rusty_fuzz::common::types::ExecutionStatus::Success;
+    tx.expected_storage.clear();
+    fixture.transactions = vec![tx];
+    fixture.expected_safe_behavior = "deliberately unsafe oracle liveness regression".into();
+    let path = std::env::temp_dir().join(format!(
+        "rustyfuzz-unsafe-control-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+    manifest.fixture = Some(path.display().to_string());
+    let report = ValidationRunner.run_manifests(&[manifest]);
+    std::fs::remove_file(path).unwrap();
+    let result = &report.benchmarks[0];
+    assert_eq!(result.status, ValidationStatus::Found);
+    assert!(result.found);
+    assert!(!result.runtime.as_ref().unwrap().matching_signals.is_empty());
+    assert!(
+        result.proof.is_none() && result.proof_status.is_none() && result.artifact_path.is_none()
+    );
+    assert!(!result.foundry_poc_generated);
 }

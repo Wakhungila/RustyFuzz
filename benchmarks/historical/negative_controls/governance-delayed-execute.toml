@@ -1,0 +1,12 @@
+id = "negative-governance-delayed-execute"
+class = "governance_timelock_bypass"
+mode = "executable_evm"
+target = "0x6200000000000000000000000000000000000501"
+fixture = "benchmarks/historical/negative_controls/fixtures/governance-delayed-execute.json"
+expected_invariant = "timelock delay cannot be bypassed"
+expected_selectors = ["queue(uint256)", "execute(uint256)"]
+expected_attacker = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+success_criteria = ["expected_finding", "invariant_violation"]
+poc_generation = "not_required"
+max_duration_secs = 30
+notes = "Negative near-miss: queue and execute exist but delay is enforced."

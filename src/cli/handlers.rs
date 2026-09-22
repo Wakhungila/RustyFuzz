@@ -965,7 +965,18 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         } => {
             let manifests = ValidationRunner::load_manifests(&benchmarks)?;
             let runner = ValidationRunner;
-            let block_env = campaign_block_env(&config).await.ok();
+            let needs_rpc = manifests.iter().any(|manifest| {
+                matches!(
+                    manifest.mode,
+                    rusty_fuzz::engine::benchmark::BenchmarkMode::MainnetFork
+                        | rusty_fuzz::engine::benchmark::BenchmarkMode::BlindRediscovery
+                )
+            });
+            let block_env = if needs_rpc {
+                campaign_block_env(&config).await.ok()
+            } else {
+                None
+            };
             let report_dir = output
                 .as_deref()
                 .and_then(|path| std::path::Path::new(path).parent())
