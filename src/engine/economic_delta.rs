@@ -662,20 +662,20 @@ impl SelectorContext {
             return Self::Unknown;
         };
         match selector {
-            [0xd0, 0xe3, 0x0d, 0xb0] => Self::Deposit,   // deposit()
-            [0xb6, 0xb5, 0x5f, 0x25] => Self::Deposit,   // deposit(uint256,address)
-            [0x2e, 0x1a, 0x7d, 0x4d] => Self::Withdraw,  // withdraw(uint256)
-            [0xba, 0x08, 0x7f, 0x8b] => Self::Redeem,    // redeem(uint256,address,address)
-            [0x94, 0xbf, 0x80, 0x4d] => Self::Mint,      // mint(uint256,address)
-            [0xc5, 0xeb, 0xea, 0xec] => Self::Borrow,    // borrow(uint256)
-            [0x57, 0x3a, 0x53, 0x97] => Self::Repay,     // repay(uint256)
-            [0x00, 0xa7, 0x18, 0xa9] => Self::Liquidate, // liquidate(address,address,uint256,uint256)
+            [0xd0, 0xe3, 0x0d, 0xb0] => Self::Deposit, // deposit()
+            [0xb6, 0xb5, 0x5f, 0x25] | [0x6e, 0x55, 0x3f, 0x65] => Self::Deposit, // deposit(uint256) / deposit(uint256,address)
+            [0x2e, 0x1a, 0x7d, 0x4d] => Self::Withdraw, // withdraw(uint256)
+            [0xba, 0x08, 0x76, 0x52] => Self::Redeem,   // redeem(uint256,address,address)
+            [0x94, 0xbf, 0x80, 0x4d] => Self::Mint,     // mint(uint256,address)
+            [0xc5, 0xeb, 0xea, 0xec] => Self::Borrow,   // borrow(uint256)
+            [0x37, 0x1f, 0xd8, 0xe6] | [0x57, 0x3a, 0xde, 0x81] => Self::Repay, // repay(uint256)
+            [0x00, 0xa7, 0x18, 0xa9] => Self::Liquidate, // liquidationCall(address,address,address,uint256,bool)
             [0x09, 0x5e, 0xa7, 0xb3] => Self::Approve,   // approve(address,uint256)
             [0xa9, 0x05, 0x9c, 0xbb] => Self::Transfer,  // transfer(address,uint256)
             [0x23, 0xb8, 0x72, 0xdd] => Self::Transfer,  // transferFrom(address,address,uint256)
             [0x38, 0xed, 0x17, 0x39] => Self::Swap,      // swapExactTokensForTokens
-            [0x7f, 0xf3, 0x6a, 0xb5] => Self::Swap,      // swap(uint256,uint256,address,bytes)
-            [0x83, 0x42, 0x1d, 0x72] => Self::Donate,    // donateToReserves(uint256,uint256)
+            [0x02, 0x2c, 0x0d, 0x9f] => Self::Swap,      // swap(uint256,uint256,address,bytes)
+            [0x36, 0xf0, 0x22, 0xaa] => Self::Donate,    // donateToReserves(uint256,uint256)
             _ => Self::Unknown,
         }
     }
@@ -1053,6 +1053,36 @@ fn ratio_bps(numerator: U256, denominator: U256) -> Option<U256> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn economic_context_uses_canonical_selectors() {
+        for (signature, context) in [
+            ("deposit(uint256,address)", super::SelectorContext::Deposit),
+            (
+                "redeem(uint256,address,address)",
+                super::SelectorContext::Redeem,
+            ),
+            ("repay(uint256)", super::SelectorContext::Repay),
+            (
+                "repay(address,uint256,uint256,address)",
+                super::SelectorContext::Repay,
+            ),
+            (
+                "swap(uint256,uint256,address,bytes)",
+                super::SelectorContext::Swap,
+            ),
+            (
+                "donateToReserves(uint256,uint256)",
+                super::SelectorContext::Donate,
+            ),
+        ] {
+            let hash = revm::primitives::keccak256(signature.as_bytes());
+            assert_eq!(
+                super::SelectorContext::from_calldata(&hash[..4]),
+                context,
+                "{signature}"
+            );
+        }
+    }
     use super::*;
     use crate::common::types::{
         CallKind, CallObservation, CallPhase, ExecutionStatus, SingletonTx, TxExecutionResult,

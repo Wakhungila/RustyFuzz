@@ -1,4 +1,4 @@
-model = "o3"
+model = "big-pickle"
 max_critical_functions = 8
 max_hypotheses_per_function = 2
 min_confidence = 0.40

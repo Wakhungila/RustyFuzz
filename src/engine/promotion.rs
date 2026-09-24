@@ -14,8 +14,9 @@ use crate::evm::fuzz::EvmInput;
 use revm::context::BlockEnv;
 use revm::database::CacheDB;
 use revm::primitives::Address;
+use rustyfuzz_artifacts::fsutil::{write_atomic, write_json_atomic};
 use rustyfuzz_evm::executor::EvmExecutor;
-use rustyfuzz_evm::fork_db::EvmCacheDb;
+use rustyfuzz_evm::fork_db::{EvmCacheDb, ForkCacheProvenance, ForkDb};
 use rustyfuzz_evm::inspector::MAP_SIZE;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -67,6 +68,8 @@ pub struct PromotionConfig {
     #[serde(default)]
     pub no_synthetic_proof: bool,
     #[serde(default)]
+    pub no_promotion: bool,
+    #[serde(default)]
     pub require_foundry_poc: bool,
     #[serde(default)]
     pub require_minimized: bool,
@@ -87,6 +90,7 @@ impl Default for PromotionConfig {
             require_poc_for_confirmed: true,
             strict_proof: false,
             no_synthetic_proof: false,
+            no_promotion: false,
             require_foundry_poc: false,
             require_minimized: false,
             reject_heuristics: false,
@@ -95,6 +99,14 @@ impl Default for PromotionConfig {
             promotion_limit: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromotionEvidenceHashes {
+    pub original_replay: String,
+    pub minimized_input: String,
+    pub minimized_replay: String,
+    pub generated_poc: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +132,8 @@ pub struct FindingPromotionRecord {
     pub poc_status: String,
     #[serde(default)]
     pub evidence_hash: Option<String>,
+    #[serde(default)]
+    pub evidence_hashes: Option<PromotionEvidenceHashes>,
     pub synthetic_mode: bool,
     pub caveats: Vec<String>,
     pub artifact_paths: BTreeMap<String, String>,
@@ -191,6 +205,10 @@ pub struct PromotionCampaignSummary {
     pub minimization_attempts: u64,
     pub minimization_reduced: u64,
     pub minimization_not_reducible: u64,
+    #[serde(default)]
+    pub promotion_failures: u64,
+    #[serde(default)]
+    pub promotion_pending: u64,
 }
 
 #[derive(Debug, Default)]
@@ -206,6 +224,8 @@ pub struct PromotionCampaignStats {
     minimization_attempts: AtomicU64,
     minimization_reduced: AtomicU64,
     minimization_not_reducible: AtomicU64,
+    promotion_failures: AtomicU64,
+    promotion_pending: AtomicU64,
 }
 
 impl PromotionCampaignStats {
@@ -213,11 +233,37 @@ impl PromotionCampaignStats {
         self.promoted_findings.load(Ordering::Relaxed)
     }
 
+    pub fn promotion_failure_count(&self) -> u64 {
+        self.promotion_failures.load(Ordering::Relaxed)
+    }
+
+    pub fn promotion_pending_count(&self) -> u64 {
+        self.promotion_pending.load(Ordering::Relaxed)
+    }
+
     pub fn reserve_promotion(&self, finding_id: &str) -> bool {
         self.promoted_ids
             .lock()
             .expect("promotion id lock poisoned")
             .insert(finding_id.to_string())
+    }
+
+    pub fn release_promotion(&self, finding_id: &str) {
+        self.promoted_ids
+            .lock()
+            .expect("promotion id lock poisoned")
+            .remove(finding_id);
+    }
+
+    pub fn record_pending(&self) {
+        self.promotion_pending.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_failure(&self, pending: bool) {
+        self.promotion_failures.fetch_add(1, Ordering::Relaxed);
+        if pending {
+            self.promotion_pending.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn record(&self, record: &FindingPromotionRecord) {
@@ -296,8 +342,25 @@ impl PromotionCampaignStats {
             minimization_attempts: self.minimization_attempts.load(Ordering::Relaxed),
             minimization_reduced: self.minimization_reduced.load(Ordering::Relaxed),
             minimization_not_reducible: self.minimization_not_reducible.load(Ordering::Relaxed),
+            promotion_failures: self.promotion_failures.load(Ordering::Relaxed),
+            promotion_pending: self.promotion_pending.load(Ordering::Relaxed),
         }
     }
+}
+
+fn validate_promotion_provenance(
+    provenance: &ForkCacheProvenance,
+    expected_block: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !provenance.provider_sanitized.is_empty()
+            && provenance.chain_id.is_some()
+            && provenance.block_number == Some(expected_block)
+            && provenance.block_hash.is_some()
+            && provenance.cache_id.is_some(),
+        "promotion requires valid live-RPC fork provenance"
+    );
+    Ok(())
 }
 
 pub struct PromotionRequest<'a> {
@@ -316,11 +379,25 @@ pub fn promote_finding_artifact(
     request: PromotionRequest<'_>,
 ) -> anyhow::Result<FindingPromotionRecord> {
     anyhow::ensure!(
+        !request.config.no_promotion,
+        "refusing promotion while no-promotion mode is active"
+    );
+    rustyfuzz_evm::rpc_url::validate_production_rpc_url(request.rpc_url)
+        .map_err(|error| anyhow::anyhow!("invalid promotion RPC URL: {error}"))?;
+    anyhow::ensure!(
+        !request.synthetic_mode,
+        "refusing to promote synthetic fallback evidence"
+    );
+    anyhow::ensure!(
         !request.artifact.findings.is_empty(),
         "refusing to promote score-only artifact input_id={} without oracle/protocol finding evidence",
         request.artifact.input_id
     );
     let finding = request.artifact.findings.first().cloned();
+    let cached_fork = request
+        .corpus
+        .load_fork_cache(&request.artifact.fork_cache_id)?;
+    validate_promotion_provenance(&cached_fork.provenance, request.fork_block)?;
     let finding_id = finding_id(request.campaign_id, &request.artifact.input_id);
     let finding_dir = request.report_dir.join("findings").join(&finding_id);
     fs::create_dir_all(&finding_dir)?;
@@ -330,9 +407,27 @@ pub fn promote_finding_artifact(
         caveats.push("synthetic fallback evidence; non-production and cannot be confirmed".into());
     }
     let input = request.corpus.load_input(&request.artifact.input_id)?;
-    let fork_db = request
-        .corpus
-        .load_offline_fork_db(&request.artifact.fork_cache_id)?;
+    let fork_db = if request.synthetic_mode {
+        request
+            .corpus
+            .load_offline_fork_db(&request.artifact.fork_cache_id)?
+    } else {
+        let live_fork = ForkDb::new(request.rpc_url, request.fork_block);
+        let observed = live_fork.refresh_remote_provenance()?;
+        let chain_id = observed
+            .chain_id
+            .ok_or_else(|| anyhow::anyhow!("live fork provenance is missing chain id"))?;
+        let block_hash = observed
+            .block_hash
+            .ok_or_else(|| anyhow::anyhow!("live fork provenance is missing block hash"))?;
+        request.corpus.load_online_fork_db(
+            &request.artifact.fork_cache_id,
+            request.fork_block,
+            &observed.provider_sanitized,
+            chain_id,
+            &block_hash,
+        )?
+    };
     let base_db: EvmCacheDb = CacheDB::new(fork_db.clone());
     let verifier = ReplayVerifier::new(MAP_SIZE);
     let replay_result = verifier.verify_deterministic(
@@ -347,7 +442,11 @@ pub fn promote_finding_artifact(
     let mut minimize_status = "not_run".to_string();
     let mut poc_status = "not_run".to_string();
     let mut evidence_hash = None;
+    let mut evidence_hashes = None;
     let mut minimized_input = input.clone();
+    let mut minimized_replay_execution = None;
+    let mut minimized_replay_hash = None;
+    let mut generated_poc_hash = None;
     let mut realism_proof = None;
     let mut policy_rejections = Vec::new();
 
@@ -364,10 +463,11 @@ pub fn promote_finding_artifact(
                 .map(|result| result.after.token_balances)
                 .unwrap_or_default();
             let replay_findings = ProtocolOraclePack::default().evaluate(&execution);
-            let replay_report = replay_report(&input, &execution, &replay_findings, final_balances);
-            evidence_hash = Some(hash_json(&replay_report)?);
+            let replay_report_value =
+                replay_report(&input, &execution, &replay_findings, final_balances);
             let replay_path = finding_dir.join("replay.json");
-            write_json(&replay_path, &replay_report)?;
+            write_json(&replay_path, &replay_report_value)?;
+            evidence_hash = Some(hash_file(&replay_path)?);
             artifact_paths.insert("replay".to_string(), replay_path.display().to_string());
             replay_status = "success".to_string();
             lifecycle_stage = FindingLifecycleStage::Replayed;
@@ -426,6 +526,50 @@ pub fn promote_finding_artifact(
             }
 
             if minimize_status == "reduced" || minimize_status == "not_reducible" {
+                let minimized_replay = verifier.verify_deterministic(
+                    &ChainState::Evm(base_db.clone()),
+                    request.block_env,
+                    &minimized_input,
+                );
+                match minimized_replay {
+                    Ok(execution) => {
+                        let minimized_findings = ProtocolOraclePack::default().evaluate(&execution);
+                        let minimized_report = replay_report(
+                            &minimized_input,
+                            &execution,
+                            &minimized_findings,
+                            Vec::new(),
+                        );
+                        let minimized_replay_path = finding_dir.join("minimized_replay.json");
+                        write_json(&minimized_replay_path, &minimized_report)?;
+                        minimized_replay_hash = Some(hash_file(&minimized_replay_path)?);
+                        artifact_paths.insert(
+                            "minimized_replay".to_string(),
+                            minimized_replay_path.display().to_string(),
+                        );
+                        minimized_replay_execution = Some(execution);
+                    }
+                    Err(error) => {
+                        let minimized_replay_path = finding_dir.join("minimized_replay.json");
+                        write_json(
+                            &minimized_replay_path,
+                            &serde_json::json!({
+                                "success": false,
+                                "error": error.to_string(),
+                            }),
+                        )?;
+                        artifact_paths.insert(
+                            "minimized_replay".to_string(),
+                            minimized_replay_path.display().to_string(),
+                        );
+                        caveats.push(format!("minimized sequence replay failed: {error:#}"));
+                    }
+                }
+            }
+
+            if (minimize_status == "reduced" || minimize_status == "not_reducible")
+                && minimized_replay_execution.is_some()
+            {
                 if let Some(finding) = finding.as_ref() {
                     let poc_dir = request
                         .config
@@ -437,13 +581,14 @@ pub fn promote_finding_artifact(
                     match synthesize_foundry_poc_with_findings(
                         &minimized_input,
                         &finding.vuln,
-                        Some(&execution),
+                        minimized_replay_execution.as_ref(),
                         &request.artifact.findings,
                         poc_dir,
                         request.rpc_url,
                         request.fork_block,
                     ) {
                         Ok(path) => {
+                            generated_poc_hash = Some(hash_file(Path::new(&path))?);
                             let validation = validate_foundry_poc(
                                 Path::new(&path),
                                 &request.artifact.findings,
@@ -480,6 +625,22 @@ pub fn promote_finding_artifact(
                         "manual assertion required; no replayed oracle finding available".into(),
                     );
                 }
+            }
+
+            if let (Some(original_replay), Some(minimized_replay), Some(generated_poc)) = (
+                evidence_hash.clone(),
+                minimized_replay_hash,
+                generated_poc_hash,
+            ) {
+                let minimized_input_path = artifact_paths
+                    .get("minimized_input")
+                    .ok_or_else(|| anyhow::anyhow!("minimized input evidence path is missing"))?;
+                evidence_hashes = Some(PromotionEvidenceHashes {
+                    original_replay,
+                    minimized_input: hash_file(Path::new(minimized_input_path))?,
+                    minimized_replay,
+                    generated_poc,
+                });
             }
 
             let realism = RealismVerifier::new(MAP_SIZE).prove(
@@ -609,6 +770,8 @@ pub fn promote_finding_artifact(
     rejection_reasons.sort();
     rejection_reasons.dedup();
 
+    require_replay_for_report(request.config, &replay_status)?;
+
     let record = FindingPromotionRecord {
         finding_id: finding_id.clone(),
         campaign_id: request.campaign_id.to_string(),
@@ -633,6 +796,7 @@ pub fn promote_finding_artifact(
         minimize_status,
         poc_status,
         evidence_hash,
+        evidence_hashes,
         synthetic_mode: request.synthetic_mode,
         caveats,
         artifact_paths,
@@ -641,9 +805,9 @@ pub fn promote_finding_artifact(
     let finding_json = finding_dir.join("finding.json");
     write_json(&finding_json, &record)?;
     let finding_md = finding_dir.join("finding.md");
-    fs::write(
+    write_atomic(
         &finding_md,
-        finding_markdown(&record, finding.as_ref(), &minimized_input),
+        finding_markdown(&record, finding.as_ref(), &minimized_input).as_bytes(),
     )?;
     log::info!(
         "Promoted finding: id={}, stage={:?}, confidence={}, report={}",
@@ -719,21 +883,6 @@ fn validate_foundry_poc(
         };
     }
 
-    if std::env::var("ETH_RPC_URL").unwrap_or_default().is_empty() {
-        return PocValidationReport {
-            success: false,
-            static_assertions_present,
-            transaction_replay_assertions_present,
-            invariant_hook_present,
-            forge_status: "skipped_missing_eth_rpc_url".to_string(),
-            forge_command: None,
-            stdout_snippet: String::new(),
-            stderr_snippet: "ETH_RPC_URL is required by generated fork-replay PoCs".to_string(),
-            reason: "static PoC validation passed; forge runtime validation needs ETH_RPC_URL"
-                .to_string(),
-        };
-    }
-
     let command = format!("forge test --match-path {}", poc_path.display());
     match Command::new("forge")
         .arg("test")
@@ -794,14 +943,34 @@ pub fn write_campaign_summary(
 ) -> anyhow::Result<()> {
     fs::create_dir_all(report_dir)?;
     let json_path = report_dir.join("campaign_summary.json");
-    write_json(&json_path, summary)?;
     let md_path = report_dir.join("campaign_summary.md");
-    fs::write(&md_path, campaign_summary_markdown(summary))?;
+    write_json_atomic(&json_path, summary).map_err(anyhow::Error::from)?;
+    write_atomic(&md_path, campaign_summary_markdown(summary).as_bytes())
+        .map_err(anyhow::Error::from)?;
+    fs::File::open(report_dir)?.sync_all()?;
     log::info!(
         "Campaign promotion summary written: {}, {}",
         json_path.display(),
         md_path.display()
     );
+    Ok(())
+}
+
+pub fn write_campaign_status(report_dir: &Path, status: &impl Serialize) -> anyhow::Result<()> {
+    fs::create_dir_all(report_dir)?;
+    let status_path = report_dir.join("campaign_status.json");
+    write_json_atomic(&status_path, status).map_err(anyhow::Error::from)?;
+    fs::File::open(report_dir)?.sync_all()?;
+    Ok(())
+}
+
+fn require_replay_for_report(config: &PromotionConfig, replay_status: &str) -> anyhow::Result<()> {
+    if config.require_replay_for_report {
+        anyhow::ensure!(
+            replay_status == "success",
+            "replay is required before writing a finding report"
+        );
+    }
     Ok(())
 }
 
@@ -925,15 +1094,18 @@ fn sanitize_component(value: &str) -> String {
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
-    fs::write(path, serde_json::to_vec_pretty(value)?)?;
+    write_json_atomic(path, value)?;
     Ok(())
 }
 
-fn hash_json(value: &impl Serialize) -> anyhow::Result<String> {
-    let bytes = serde_json::to_vec(value)?;
+fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn hash_file(path: &Path) -> anyhow::Result<String> {
+    Ok(hash_bytes(&fs::read(path)?))
 }
 
 fn finding_markdown(
@@ -1266,6 +1438,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replay_report_gate_rejects_failed_replay_when_enabled() {
+        let config = PromotionConfig {
+            require_replay_for_report: true,
+            ..PromotionConfig::default()
+        };
+        assert!(require_replay_for_report(&config, "failed").is_err());
+        assert!(require_replay_for_report(&config, "success").is_ok());
+        let mut optional = config;
+        optional.require_replay_for_report = false;
+        assert!(require_replay_for_report(&optional, "failed").is_ok());
+    }
+
+    #[test]
     fn confidence_caps_follow_lifecycle() {
         assert_eq!(
             confidence_for(
@@ -1351,6 +1536,7 @@ mod tests {
             minimize_status: "reduced".to_string(),
             poc_status: "validated".to_string(),
             evidence_hash: Some("sha256:test".to_string()),
+            evidence_hashes: None,
             synthetic_mode: false,
             caveats: Vec::new(),
             artifact_paths: BTreeMap::new(),
@@ -1403,6 +1589,7 @@ mod tests {
             minimize_status: "not_reducible".to_string(),
             poc_status: "generated_unvalidated".to_string(),
             evidence_hash: Some("sha256:abc".to_string()),
+            evidence_hashes: None,
             synthetic_mode: false,
             caveats: Vec::new(),
             artifact_paths: BTreeMap::new(),

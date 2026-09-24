@@ -1,3 +1,4 @@
+use crate::common::fs_security::{contained_path, validate_filesystem_identifier};
 use crate::common::oracle::{FindingStatus, ProtocolFinding, ProtocolSeverity};
 use crate::common::types::{
     ChainState, ExecutionStatus, SequenceExecutionResult, Snapshot, Waypoint,
@@ -15,7 +16,7 @@ use parking_lot::RwLock;
 use revm::primitives::{Address, B256, U256};
 use rustyfuzz_artifacts::fsutil::write_atomic;
 use rustyfuzz_core::SnapshotId;
-use rustyfuzz_evm::fork_db::{EvmCacheDb, ForkDb, ForkDbCacheSnapshot};
+use rustyfuzz_evm::fork_db::{validate_block_hash, EvmCacheDb, ForkDb, ForkDbCacheSnapshot};
 use rustyfuzz_evm::inspector::MAP_SIZE;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -187,6 +188,37 @@ pub struct PersistentCorpus {
     root: PathBuf,
 }
 
+fn safe_corpus_path(
+    root: &Path,
+    area: &str,
+    identifier: &str,
+    suffix: &str,
+) -> anyhow::Result<PathBuf> {
+    validate_filesystem_identifier(identifier).map_err(anyhow::Error::msg)?;
+    let path = root.join(area).join(format!("{identifier}{suffix}"));
+    contained_path(root, &path).map_err(anyhow::Error::msg)
+}
+
+fn ensure_corpus_directory(root: &Path, path: &Path) -> anyhow::Result<()> {
+    let safe_path = contained_path(root, path).map_err(anyhow::Error::msg)?;
+    if safe_path.exists() {
+        anyhow::ensure!(
+            safe_path.is_dir(),
+            "corpus path is not a directory: {}",
+            safe_path.display()
+        );
+    } else {
+        fs::create_dir_all(&safe_path)?;
+    }
+    let canonical_root = fs::canonicalize(root)?;
+    let canonical_path = fs::canonicalize(&safe_path)?;
+    anyhow::ensure!(
+        canonical_path.starts_with(&canonical_root),
+        "corpus directory escapes its canonical root"
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SeedBundleStatus {
     Loaded {
@@ -222,13 +254,14 @@ pub enum SeedBundleStatus {
 impl PersistentCorpus {
     pub fn new(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(root.join("inputs"))?;
-        fs::create_dir_all(root.join("crashes"))?;
-        fs::create_dir_all(root.join("fork_cache"))?;
-        fs::create_dir_all(root.join("mainnet_seeds"))?;
-        fs::create_dir_all(root.join("campaign_artifacts"))?;
-        fs::create_dir_all(root.join("campaign_artifacts").join("index"))?;
-        fs::create_dir_all(root.join("campaign_artifacts").join("summaries"))?;
+        fs::create_dir_all(&root)?;
+        ensure_corpus_directory(&root, &root.join("inputs"))?;
+        ensure_corpus_directory(&root, &root.join("crashes"))?;
+        ensure_corpus_directory(&root, &root.join("fork_cache"))?;
+        ensure_corpus_directory(&root, &root.join("mainnet_seeds"))?;
+        ensure_corpus_directory(&root, &root.join("campaign_artifacts"))?;
+        ensure_corpus_directory(&root, &root.join("campaign_artifacts").join("index"))?;
+        ensure_corpus_directory(&root, &root.join("campaign_artifacts").join("summaries"))?;
         Self::validate_published_artifacts(&root)?;
         Ok(Self { root })
     }
@@ -247,27 +280,23 @@ impl PersistentCorpus {
             let input_id = &record.input_id;
             let members = [
                 (
-                    root.join("inputs").join(format!("{input_id}.json")),
+                    safe_corpus_path(root, "inputs", input_id, ".json")?,
                     "input",
                 ),
                 (
-                    root.join("inputs").join(format!("{input_id}.meta.json")),
+                    safe_corpus_path(root, "inputs", input_id, ".meta.json")?,
                     "input metadata",
                 ),
                 (
-                    root.join("fork_cache")
-                        .join(format!("{}.json", record.fork_cache_id)),
+                    safe_corpus_path(root, "fork_cache", &record.fork_cache_id, ".json")?,
                     "fork cache",
                 ),
                 (
-                    root.join("campaign_artifacts")
-                        .join(format!("{input_id}.json")),
+                    safe_corpus_path(root, "campaign_artifacts", input_id, ".json")?,
                     "artifact record",
                 ),
                 (
-                    root.join("campaign_artifacts")
-                        .join("summaries")
-                        .join(format!("{input_id}.md")),
+                    safe_corpus_path(root, "campaign_artifacts/summaries", input_id, ".md")?,
                     "artifact summary",
                 ),
             ];
@@ -386,11 +415,11 @@ impl PersistentCorpus {
     ) -> anyhow::Result<CorpusEntryMetadata> {
         let full_hash = metadata.input_hash.trim_start_matches("0x").to_string();
         let prefix = &full_hash[..16];
-        let input_path = self.root.join("inputs").join(format!("{prefix}.json"));
-        let meta_path = self.root.join("inputs").join(format!("{prefix}.meta.json"));
+        let prefix_input_path = safe_corpus_path(&self.root, "inputs", prefix, ".json")?;
+        let prefix_meta_path = safe_corpus_path(&self.root, "inputs", prefix, ".meta.json")?;
 
-        let id = if input_path.exists() {
-            let existing_full = fs::read_to_string(&meta_path)
+        let id = if prefix_input_path.exists() {
+            let existing_full = fs::read_to_string(&prefix_meta_path)
                 .ok()
                 .and_then(|bytes| serde_json::from_str::<CorpusEntryMetadata>(&bytes).ok())
                 .map(|existing| existing.input_hash)
@@ -405,8 +434,8 @@ impl PersistentCorpus {
         };
 
         metadata.id = id.clone();
-        let input_path = self.root.join("inputs").join(format!("{id}.json"));
-        let meta_path = self.root.join("inputs").join(format!("{id}.meta.json"));
+        let input_path = safe_corpus_path(&self.root, "inputs", &id, ".json")?;
+        let meta_path = safe_corpus_path(&self.root, "inputs", &id, ".meta.json")?;
         write_atomic(input_path, serde_json::to_vec_pretty(input)?)?;
         write_atomic(meta_path, serde_json::to_vec_pretty(&metadata)?)?;
         Ok(metadata)
@@ -422,7 +451,8 @@ impl PersistentCorpus {
         &self,
         id: &str,
     ) -> anyhow::Result<(EvmInput, EvmTestcaseMetadata)> {
-        let bytes = fs::read(self.root.join("inputs").join(format!("{id}.json")))?;
+        let path = safe_corpus_path(&self.root, "inputs", id, ".json")?;
+        let bytes = fs::read(path)?;
         EvmInput::split_legacy_json(&bytes)
             .map_err(|err| anyhow::Error::new(err).context("deserialize persisted EvmInput"))
     }
@@ -433,6 +463,31 @@ impl PersistentCorpus {
     /// or metadata moves fully into LibAFL testcase state.
     pub fn load_input(&self, id: &str) -> anyhow::Result<EvmInput> {
         Ok(self.load_input_with_metadata(id)?.0)
+    }
+
+    pub fn resolve_input_id(&self, input: &EvmInput) -> anyhow::Result<String> {
+        let input_hash = input.semantic_input_hash();
+        let input_dir = self.root.join("inputs");
+        for entry in fs::read_dir(input_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json")
+                || path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".meta.json"))
+            {
+                continue;
+            }
+            let metadata_path = path.with_extension("meta.json");
+            let Ok(bytes) = fs::read(&metadata_path) else {
+                continue;
+            };
+            let metadata: CorpusEntryMetadata = serde_json::from_slice(&bytes)?;
+            if metadata.input_hash == input_hash {
+                return Ok(metadata.id);
+            }
+        }
+        anyhow::bail!("persisted corpus entry for semantic input hash is missing")
     }
 
     pub fn len(&self) -> anyhow::Result<usize> {
@@ -463,8 +518,9 @@ impl PersistentCorpus {
         fork_db: &ForkDb,
     ) -> anyhow::Result<ForkDbCacheSnapshot> {
         let snapshot = fork_db.cache_snapshot();
-        let path = self.root.join("fork_cache").join(format!("{id}.json"));
-        write_atomic(path, serde_json::to_vec_pretty(&snapshot)?)?;
+        let path = safe_corpus_path(&self.root, "fork_cache", id, ".json")?;
+        write_atomic(&path, serde_json::to_vec_pretty(&snapshot)?)
+            .with_context(|| format!("persist fork cache id={id:?} path={}", path.display()))?;
         Ok(snapshot)
     }
 
@@ -502,12 +558,22 @@ impl PersistentCorpus {
         request: CampaignArtifactRequest<'_>,
     ) -> anyhow::Result<CampaignArtifactOutcome> {
         let artifact_key = artifact_equivalence_key(&request)?;
-        let index_path = self
-            .root
-            .join("campaign_artifacts")
-            .join("index")
-            .join(format!("{artifact_key}.json"));
-        let lock_path = index_path.with_extension("lock");
+        validate_filesystem_identifier(&artifact_key).map_err(anyhow::Error::msg)?;
+        let index_path = safe_corpus_path(
+            &self.root,
+            "campaign_artifacts/index",
+            &artifact_key,
+            ".json",
+        )?;
+        let lock_path = contained_path(
+            &self.root,
+            &self
+                .root
+                .join("campaign_artifacts")
+                .join("index")
+                .join(format!("{artifact_key}.lock")),
+        )
+        .map_err(anyhow::Error::msg)?;
         if let Ok(bytes) = fs::read(&index_path) {
             if let Ok(existing) = serde_json::from_slice::<CampaignArtifactRecord>(&bytes) {
                 if existing.score.total >= request.score.total {
@@ -584,10 +650,9 @@ impl PersistentCorpus {
             request.coverage,
             request.state_novelty_score,
         )?;
-        let record_path = self
-            .root
-            .join("campaign_artifacts")
-            .join(format!("{}.json", metadata.id));
+        validate_filesystem_identifier(&metadata.id).map_err(anyhow::Error::msg)?;
+        let record_path =
+            safe_corpus_path(&self.root, "campaign_artifacts", &metadata.id, ".json")?;
         if let Ok(bytes) = fs::read(&record_path) {
             if let Ok(existing) = serde_json::from_slice::<CampaignArtifactRecord>(&bytes) {
                 if existing.score.total >= request.score.total {
@@ -634,10 +699,12 @@ impl PersistentCorpus {
         let record_bytes = serde_json::to_vec_pretty(&record)?;
         write_atomic(&record_path, &record_bytes)?;
         write_atomic(
-            self.root
-                .join("campaign_artifacts")
-                .join("summaries")
-                .join(format!("{}.md", record.input_id)),
+            safe_corpus_path(
+                &self.root,
+                "campaign_artifacts/summaries",
+                &record.input_id,
+                ".md",
+            )?,
             triage_markdown(&record),
         )?;
         // Publish the discovery index only after every dependent artifact.
@@ -648,13 +715,108 @@ impl PersistentCorpus {
         })
     }
 
+    pub fn list_campaign_artifacts(&self) -> anyhow::Result<Vec<CampaignArtifactRecord>> {
+        let index_dir = self.root.join("campaign_artifacts").join("index");
+        let mut records = fs::read_dir(index_dir)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .map(|path| {
+                fs::read(&path)
+                    .with_context(|| format!("read campaign artifact index {}", path.display()))
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<CampaignArtifactRecord>(&bytes)
+                            .with_context(|| format!("decode campaign artifact {}", path.display()))
+                    })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        records.sort_by(|left, right| left.input_id.cmp(&right.input_id));
+        records.dedup_by(|left, right| left.input_id == right.input_id);
+        Ok(records)
+    }
+
     pub fn load_fork_cache(&self, id: &str) -> anyhow::Result<ForkDbCacheSnapshot> {
-        let bytes = fs::read(self.root.join("fork_cache").join(format!("{id}.json")))?;
-        Ok(serde_json::from_slice(&bytes)?)
+        let path = safe_corpus_path(&self.root, "fork_cache", id, ".json")?;
+        let bytes = fs::read(path)?;
+        let snapshot: ForkDbCacheSnapshot = serde_json::from_slice(&bytes)?;
+        snapshot
+            .verify_content_digest()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok(snapshot)
     }
 
     pub fn load_offline_fork_db(&self, id: &str) -> anyhow::Result<ForkDb> {
         Ok(ForkDb::from_cache_snapshot(self.load_fork_cache(id)?))
+    }
+
+    pub fn load_online_fork_db(
+        &self,
+        id: &str,
+        expected_block: u64,
+        expected_provider: &str,
+        expected_chain_id: u64,
+        observed_block_hash: &str,
+    ) -> anyhow::Result<ForkDb> {
+        let snapshot = self.load_fork_cache(id)?;
+        anyhow::ensure!(
+            !snapshot.provenance.provider_sanitized.is_empty(),
+            "online fork cache is missing provider provenance"
+        );
+        anyhow::ensure!(
+            snapshot.provenance.provider_sanitized == expected_provider,
+            "online fork cache provider does not match the live provider"
+        );
+        anyhow::ensure!(
+            snapshot.provenance.chain_id == Some(expected_chain_id),
+            "online fork cache chain id is missing or does not match the live chain"
+        );
+        anyhow::ensure!(
+            snapshot.provenance.block_number == Some(expected_block),
+            "online fork cache is missing the expected block number"
+        );
+        let block_hash = snapshot
+            .provenance
+            .block_hash
+            .as_deref()
+            .context("online fork cache is missing a pinned block hash")?;
+        validate_block_hash(block_hash)
+            .map_err(|error| anyhow::anyhow!("online fork cache block hash is invalid: {error}"))?;
+        validate_block_hash(observed_block_hash)
+            .map_err(|error| anyhow::anyhow!("live block hash is invalid: {error}"))?;
+        anyhow::ensure!(
+            snapshot.provenance.fetched_at_unix.is_some(),
+            "online fork cache is missing a fetch timestamp"
+        );
+        anyhow::ensure!(
+            snapshot
+                .provenance
+                .cache_id
+                .as_deref()
+                .is_some_and(|cache_id| !cache_id.is_empty()),
+            "online fork cache is missing a cache id"
+        );
+        snapshot
+            .ensure_consistent(
+                Some(expected_block),
+                Some(observed_block_hash),
+                None,
+                None,
+                true,
+            )
+            .map_err(|error| anyhow::anyhow!("fork cache is not replay-consistent: {error}"))?;
+        Ok(ForkDb::from_cache_snapshot(snapshot))
+    }
+
+    pub fn validate_seed_bundle_id(id: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Self::valid_seed_bundle_id(id),
+            "seed bundle id contains unsupported path characters"
+        );
+        Ok(())
+    }
+
+    fn valid_seed_bundle_id(id: &str) -> bool {
+        validate_filesystem_identifier(id).is_ok()
     }
 
     pub fn persist_mainnet_seed_bundle(
@@ -662,58 +824,69 @@ impl PersistentCorpus {
         id: &str,
         bundle: &MainnetSeedBundle,
     ) -> anyhow::Result<()> {
-        let bundle_dir = self.root.join("mainnet_seeds").join(id);
-        fs::create_dir_all(bundle_dir.join("inputs"))?;
+        anyhow::ensure!(
+            Self::valid_seed_bundle_id(id),
+            "seed bundle id contains unsupported path characters"
+        );
+        let bundle_path = self.root.join("mainnet_seeds").join(id);
+        ensure_corpus_directory(&self.root, &bundle_path.join("inputs"))?;
 
         write_atomic(
-            bundle_dir.join("manifest.json"),
+            contained_path(&self.root, &bundle_path.join("manifest.json"))
+                .map_err(anyhow::Error::msg)?,
             serde_json::to_vec_pretty(bundle)?,
         )?;
         write_atomic(
-            bundle_dir.join("fork_cache.json"),
+            contained_path(&self.root, &bundle_path.join("fork_cache.json"))
+                .map_err(anyhow::Error::msg)?,
             serde_json::to_vec_pretty(&bundle.fork_cache)?,
         )?;
 
         for seed in &bundle.seeds {
-            write_atomic(
-                bundle_dir.join("inputs").join(format!("{}.json", seed.id)),
-                serde_json::to_vec_pretty(&seed.input)?,
-            )?;
+            validate_filesystem_identifier(&seed.id).map_err(anyhow::Error::msg)?;
+            let seed_path = contained_path(
+                &self.root,
+                &bundle_path.join("inputs").join(format!("{}.json", seed.id)),
+            )
+            .map_err(anyhow::Error::msg)?;
+            write_atomic(seed_path, serde_json::to_vec_pretty(&seed.input)?)?;
         }
 
         Ok(())
     }
 
     pub fn load_mainnet_seed_bundle(&self, id: &str) -> anyhow::Result<MainnetSeedBundle> {
+        anyhow::ensure!(
+            Self::valid_seed_bundle_id(id),
+            "seed bundle id contains unsupported path characters"
+        );
         let path = self
             .resolve_mainnet_seed_bundle_manifest_path(id)
-            .unwrap_or_else(|| self.mainnet_seed_bundle_manifest_path(id));
+            .unwrap_or(self.safe_mainnet_seed_bundle_manifest_path(id)?);
         let bytes = fs::read(path)?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 
-    pub fn mainnet_seed_bundle_manifest_path(&self, id: &str) -> PathBuf {
-        self.root
+    fn safe_mainnet_seed_bundle_manifest_path(&self, id: &str) -> anyhow::Result<PathBuf> {
+        Self::validate_seed_bundle_id(id)?;
+        let path = self
+            .root
             .join("mainnet_seeds")
             .join(id)
-            .join("manifest.json")
+            .join("manifest.json");
+        contained_path(&self.root, &path).map_err(anyhow::Error::msg)
     }
 
     fn resolve_mainnet_seed_bundle_manifest_path(&self, id: &str) -> Option<PathBuf> {
-        let local = self.mainnet_seed_bundle_manifest_path(id);
+        let local = self.safe_mainnet_seed_bundle_manifest_path(id).ok()?;
         if local.exists() {
             return Some(local);
         }
-
         let global = self
             .root
             .parent()
             .map(|parent| parent.join("mainnet_seeds").join(id).join("manifest.json"))?;
-        if global != local && global.exists() {
-            Some(global)
-        } else {
-            None
-        }
+        (global != local && global.exists()).then_some(global)
     }
 
     pub fn inspect_mainnet_seed_bundle(
@@ -724,7 +897,23 @@ impl PersistentCorpus {
         let Some(id) = id else {
             return SeedBundleStatus::Disabled;
         };
-        let local_path = self.mainnet_seed_bundle_manifest_path(id);
+        if !Self::valid_seed_bundle_id(id) {
+            return SeedBundleStatus::Invalid {
+                bundle_id: id.to_string(),
+                path: self.root.join("mainnet_seeds").join("<invalid>"),
+                error: "seed bundle id contains unsupported path characters".to_string(),
+            };
+        }
+        let local_path = match self.safe_mainnet_seed_bundle_manifest_path(id) {
+            Ok(path) => path,
+            Err(error) => {
+                return SeedBundleStatus::Invalid {
+                    bundle_id: id.to_string(),
+                    path: self.root.join("mainnet_seeds").join("<invalid>"),
+                    error: error.to_string(),
+                }
+            }
+        };
         let Some(path) = self.resolve_mainnet_seed_bundle_manifest_path(id) else {
             return SeedBundleStatus::Missing {
                 bundle_id: id.to_string(),
@@ -763,6 +952,7 @@ impl PersistentCorpus {
         metadata: &CorpusEntryMetadata,
         reason: &str,
     ) -> anyhow::Result<CrashRecord> {
+        validate_filesystem_identifier(&metadata.id).map_err(anyhow::Error::msg)?;
         let material = format!("{}:{reason}", metadata.path_hash);
         let fingerprint = format!("0x{}", hex::encode(revm::primitives::keccak256(material)));
         let record = CrashRecord {
@@ -771,9 +961,7 @@ impl PersistentCorpus {
             reason: reason.to_string(),
         };
         write_atomic(
-            self.root
-                .join("crashes")
-                .join(format!("{}.json", &fingerprint[2..18])),
+            safe_corpus_path(&self.root, "crashes", &fingerprint[2..18], ".json")?,
             serde_json::to_vec_pretty(&record)?,
         )?;
         Ok(record)
@@ -784,7 +972,7 @@ impl PersistentCorpus {
         snapshot: &Snapshot,
         producing_input_id: Option<String>,
     ) -> anyhow::Result<SnapshotManifest> {
-        fs::create_dir_all(self.root.join("snapshots"))?;
+        ensure_corpus_directory(&self.root, &self.root.join("snapshots"))?;
         let manifest = SnapshotManifest {
             schema_version: 1,
             id: snapshot.id,
@@ -802,9 +990,14 @@ impl PersistentCorpus {
             gas_used: snapshot.gas_used,
         };
         write_atomic(
-            self.root
-                .join("snapshots")
-                .join(format!("{}.manifest.json", snapshot.id)),
+            contained_path(
+                &self.root,
+                &self
+                    .root
+                    .join("snapshots")
+                    .join(format!("{}.manifest.json", snapshot.id)),
+            )
+            .map_err(anyhow::Error::msg)?,
             serde_json::to_vec_pretty(&manifest)?,
         )?;
         Ok(manifest)
@@ -821,7 +1014,8 @@ impl PersistentCorpus {
             .trim_start_matches("0x")
             .to_string();
         let report_id = &input_hash[..16];
-        let path = self.root.join(format!("repro_{report_id}.md"));
+        let path = contained_path(&self.root, &self.root.join(format!("repro_{report_id}.md")))
+            .map_err(anyhow::Error::msg)?;
 
         let mut report = String::new();
         report.push_str("# RustyFuzz Reproduction\n\n");
@@ -1543,7 +1737,7 @@ mod artifact_tests {
             .expect("insert root snapshot");
         let input = EvmInput {
             txs: vec![SingletonTx {
-                input: vec![0xb6, 0xb5, 0x5f, 0x25],
+                input: vec![0x6e, 0x55, 0x3f, 0x65],
                 caller: Address::repeat_byte(0x13),
                 to: target,
                 value: U256::ZERO,
@@ -1553,7 +1747,7 @@ mod artifact_tests {
         };
         let accounting_like = scored_execution(
             target,
-            [0xb6, 0xb5, 0x5f, 0x25],
+            [0x6e, 0x55, 0x3f, 0x65],
             None,
             true,
             1,
@@ -2549,6 +2743,234 @@ mod artifact_tests {
     }
     fn corpus_root_input_id(input: &EvmInput) -> String {
         input.semantic_input_hash().trim_start_matches("0x")[..16].to_string()
+    }
+
+    #[test]
+    fn online_fork_loader_requires_provenance_and_expected_block() {
+        let root = temp_corpus_root("online-fork-loader");
+        let corpus = PersistentCorpus::new(&root).expect("create corpus");
+
+        let offline = ForkDb::new_offline("0x10");
+        corpus
+            .persist_fork_cache("offline", &offline)
+            .expect("persist offline cache");
+        let provider = "https://rpc.example";
+        let chain_id = 1;
+        let block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(corpus
+            .load_online_fork_db("offline", 16, provider, chain_id, block_hash)
+            .is_err());
+
+        let online = ForkDb::new(provider, 17);
+        online.set_provenance_chain(chain_id, Some(block_hash.to_string()), 1);
+        corpus
+            .persist_fork_cache("wrong-block", &online)
+            .expect("persist online cache");
+        assert!(corpus
+            .load_online_fork_db(
+                "wrong-block",
+                16,
+                &online.provenance().provider_sanitized,
+                chain_id,
+                block_hash,
+            )
+            .is_err());
+
+        fs::remove_dir_all(root).expect("remove corpus");
+    }
+
+    #[test]
+    fn online_fork_loader_rejects_each_partial_provenance_field() {
+        use rustyfuzz_evm::fork_db::{ForkCacheProvenance, ForkDbCacheSnapshot};
+
+        let root = temp_corpus_root("online-fork-partial-provenance");
+        let corpus = PersistentCorpus::new(&root).expect("create corpus");
+        let provider = "https://rpc.example";
+        let chain_id = 1;
+        let block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let complete = ForkCacheProvenance {
+            provider_sanitized: provider.to_string(),
+            chain_id: Some(chain_id),
+            block_number: Some(16),
+            block_hash: Some(block_hash.to_string()),
+            fetched_at_unix: Some(1),
+            cache_id: Some("fc_test".to_string()),
+        };
+        let mut snapshot = ForkDbCacheSnapshot {
+            block_tag: "0x10".to_string(),
+            accounts: vec![],
+            code_by_hash: vec![],
+            storage: vec![],
+            block_hashes: vec![],
+            provenance: complete.clone(),
+            content_digest: String::new(),
+        };
+        snapshot.content_digest = snapshot.calculate_content_digest().expect("digest");
+        let persist = |id: &str, provenance: ForkCacheProvenance| {
+            let mut snapshot = snapshot.clone();
+            snapshot.provenance = provenance;
+            snapshot.content_digest = snapshot.calculate_content_digest().expect("digest");
+            write_atomic(
+                root.join("fork_cache").join(format!("{id}.json")),
+                serde_json::to_vec(&snapshot).expect("encode snapshot"),
+            )
+            .expect("persist snapshot");
+        };
+        persist("complete", complete.clone());
+        assert!(corpus
+            .load_online_fork_db("complete", 16, provider, chain_id, block_hash)
+            .is_ok());
+
+        let partial = [
+            (
+                "no-provider",
+                ForkCacheProvenance {
+                    provider_sanitized: String::new(),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "no-chain",
+                ForkCacheProvenance {
+                    chain_id: None,
+                    ..complete.clone()
+                },
+            ),
+            (
+                "no-block",
+                ForkCacheProvenance {
+                    block_number: None,
+                    ..complete.clone()
+                },
+            ),
+            (
+                "no-hash",
+                ForkCacheProvenance {
+                    block_hash: None,
+                    ..complete.clone()
+                },
+            ),
+            (
+                "no-timestamp",
+                ForkCacheProvenance {
+                    fetched_at_unix: None,
+                    ..complete.clone()
+                },
+            ),
+            (
+                "no-cache-id",
+                ForkCacheProvenance {
+                    cache_id: None,
+                    ..complete.clone()
+                },
+            ),
+        ];
+        for (id, provenance) in partial {
+            persist(id, provenance);
+            assert!(
+                corpus
+                    .load_online_fork_db(id, 16, provider, chain_id, block_hash)
+                    .is_err(),
+                "{id}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fork_cache_loader_rejects_tampered_complete_snapshot() {
+        let root = temp_corpus_root("fork-cache-digest");
+        let corpus = PersistentCorpus::new(&root).expect("create corpus");
+        corpus
+            .persist_fork_cache("cache", &ForkDb::new_offline("0x10"))
+            .expect("persist cache");
+        let path = root.join("fork_cache").join("cache.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read cache")).expect("decode cache");
+        value["block_tag"] = serde_json::Value::String("0x11".to_string());
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("encode tampered cache"),
+        )
+        .expect("tamper cache");
+        assert!(corpus.load_fork_cache("cache").is_err());
+        fs::remove_dir_all(root).expect("remove corpus");
+    }
+
+    #[test]
+    fn seed_bundle_rejects_path_traversal_ids() {
+        let root = temp_corpus_root("seed-bundle-path-validation");
+        let corpus = PersistentCorpus::new(&root).expect("corpus");
+        assert!(corpus
+            .persist_mainnet_seed_bundle(
+                "../escape",
+                &seed_bundle(Address::repeat_byte(0xaa), vec![])
+            )
+            .is_err());
+        assert!(matches!(
+            corpus.inspect_mainnet_seed_bundle(Some("../escape"), Address::repeat_byte(0xaa)),
+            SeedBundleStatus::Invalid { .. }
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn corpus_rejects_input_fork_and_artifact_path_ids() {
+        let root = temp_corpus_root("corpus-path-validation");
+        let corpus = PersistentCorpus::new(&root).expect("corpus");
+        assert!(corpus.load_input_with_metadata("../escape").is_err());
+        assert!(corpus.load_fork_cache("../escape").is_err());
+        let snapshot = ForkDb::new_offline("0x1");
+        assert!(corpus.persist_fork_cache("../escape", &snapshot).is_err());
+        let mut metadata = CorpusEntryMetadata {
+            id: "../escape".to_string(),
+            input_hash: "0x01".to_string(),
+            path_hash: 1,
+            state_hash: 0,
+            state_novelty_score: 0,
+            coverage_edges: 0,
+            gas_used: 0,
+            crash_fingerprint: None,
+            frontier: CorpusFrontierMetadata::default(),
+        };
+        assert!(corpus.persist_crash(&metadata, "test").is_err());
+        metadata.id = "input-1".to_string();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corpus_rejects_preexisting_symlinked_storage_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_corpus_root("preexisting-symlink");
+        let outside = root.with_extension("outside");
+        fs::create_dir_all(&root).expect("root directory");
+        fs::create_dir_all(&outside).expect("outside directory");
+        symlink(&outside, root.join("inputs")).expect("inputs symlink");
+        assert!(PersistentCorpus::new(&root).is_err());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn nested_campaign_corpus_loads_global_seed_bundle() {
+        let root = temp_corpus_root("seed-bundle-global-lookup");
+        let target = Address::repeat_byte(0xaa);
+        let global = PersistentCorpus::new(&root).expect("global corpus");
+        global
+            .persist_mainnet_seed_bundle("shared", &seed_bundle(target, vec![seed(target)]))
+            .expect("persist bundle");
+        let nested = PersistentCorpus::new(root.join("campaign-a")).expect("nested corpus");
+        assert_eq!(
+            nested
+                .load_mainnet_seed_bundle("shared")
+                .expect("load bundle")
+                .target,
+            target
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

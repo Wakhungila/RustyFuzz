@@ -12,6 +12,40 @@ use revm::primitives::{Address, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
 
 use rustyfuzz_evm::fork_db::{EvmCacheDb, ForkDb};
+use rustyfuzz_evm::rpc_url::{
+    resolve_rpc_url_for_current_process, test_loopback_allowed, validate_production_rpc_url,
+    validate_rpc_url,
+};
+
+#[cfg(feature = "evm")]
+pub fn configured_provider(url: reqwest::Url) -> anyhow::Result<impl Provider> {
+    let url =
+        validate_rpc_url(url.as_str(), test_loopback_allowed()).map_err(anyhow::Error::msg)?;
+    let (url, addresses) =
+        resolve_rpc_url_for_current_process(url.as_str()).map_err(anyhow::Error::msg)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("RPC URL must contain a host"))?;
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, &addresses);
+    if let Ok(api_key) = std::env::var("RUSTYFUZZ_RPC_API_KEY") {
+        if !api_key.trim().is_empty() {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {api_key}"))
+            {
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(reqwest::header::AUTHORIZATION, value);
+                builder = builder.default_headers(headers);
+            }
+        }
+    }
+    let client = builder
+        .build()
+        .map_err(|_| anyhow::anyhow!("RPC client configuration failed"))?;
+    Ok(ProviderBuilder::new().connect_reqwest(client, url))
+}
 
 #[cfg(feature = "evm")]
 pub async fn create_fork_db(
@@ -19,17 +53,43 @@ pub async fn create_fork_db(
     block_number: u64,
     target_contract: Option<Address>,
 ) -> anyhow::Result<EvmCacheDb> {
-    let url: reqwest::Url = rpc_url.parse().context("Invalid RPC URL")?;
-    let provider = ProviderBuilder::new().connect_http(url);
-    let mut db = CacheDB::new(ForkDb::new(rpc_url.to_string(), block_number));
+    let url = validate_production_rpc_url(rpc_url).map_err(anyhow::Error::msg)?;
+    let provider = configured_provider(url)?;
+    let fork = ForkDb::new(rpc_url.to_string(), block_number);
+    let provenance_db = fork.clone();
+    let provenance = tokio::task::spawn_blocking(move || provenance_db.refresh_remote_provenance())
+        .await
+        .context("fork provenance worker failed")?
+        .context("failed to establish live fork provenance")?;
+    anyhow::ensure!(
+        !provenance.provider_sanitized.is_empty(),
+        "live fork provenance is missing a provider"
+    );
+    anyhow::ensure!(
+        provenance.chain_id.is_some(),
+        "live fork provenance is missing a chain id"
+    );
+    anyhow::ensure!(
+        provenance.block_number == Some(block_number),
+        "live fork provenance is missing the requested block number"
+    );
+    let block_hash = provenance
+        .block_hash
+        .as_deref()
+        .context("live fork provenance is missing a block hash")?;
+    rustyfuzz_evm::fork_db::validate_block_hash(block_hash)
+        .context("live fork provenance has an invalid block hash")?;
+    let mut db = CacheDB::new(fork);
 
     if let Some(target) = target_contract {
         let code = provider
             .get_code_at(target)
             .block_id(BlockId::number(block_number))
             .await
-            .with_context(|| {
-                format!("failed to fetch bytecode for target {target} at block {block_number}")
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Alloy RPC request failed while fetching target bytecode at block {block_number}"
+                )
             })?;
 
         anyhow::ensure!(
@@ -48,12 +108,13 @@ pub async fn create_fork_db(
 
 #[cfg(feature = "evm")]
 pub async fn create_fork_block_env(rpc_url: &str, block_number: u64) -> anyhow::Result<BlockEnv> {
-    let url: reqwest::Url = rpc_url.parse().context("Invalid RPC URL")?;
-    let provider = ProviderBuilder::new().connect_http(url);
+    let url = validate_production_rpc_url(rpc_url).map_err(anyhow::Error::msg)?;
+    let provider = configured_provider(url)?;
 
     let block = provider
         .get_block_by_number(BlockNumberOrTag::Number(block_number))
-        .await?
+        .await
+        .map_err(|_| anyhow::anyhow!("Alloy RPC block request failed"))?
         .context("Block not found")?;
 
     let header = block.header;

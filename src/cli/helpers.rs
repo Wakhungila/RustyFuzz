@@ -1,9 +1,10 @@
 #![allow(clippy::too_many_lines)]
 
 use alloy::primitives::keccak256;
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::Provider;
 use revm::database_interface::DatabaseRef;
 use revm::primitives::{Address, U256};
+use rusty_fuzz::common::fs_security::validate_job_bounds;
 use rusty_fuzz::config::Config;
 use rusty_fuzz::engine::abi_ingest::ingest_abi_file;
 use rusty_fuzz::engine::fork_setup::ForkSetupDiscoverer;
@@ -11,11 +12,14 @@ use rusty_fuzz::engine::invariant_manifest::TargetInvariantManifest;
 use rusty_fuzz::engine::promotion::{PromotionCampaignSummary, PromotionConfig};
 use rusty_fuzz::evm::corpus::PersistentCorpus;
 use rusty_fuzz::evm::etherscan_abi_fetcher::EtherscanAbiFetcher;
+use rusty_fuzz::evm::fork::configured_provider;
 use rusty_fuzz::evm::fork::create_fork_block_env;
 use rusty_fuzz::evm::seed_ingester::{
     seed_abi_functions, MainnetSeedConfig, SeedIngester, SeedScanMode,
 };
 use rustyfuzz_evm::fork_db::ForkDb;
+use rustyfuzz_evm::rpc_url::validate_production_rpc_url;
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::str::FromStr;
 use std::sync::{
@@ -23,6 +27,7 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
+use uuid::Uuid;
 
 pub fn load_replay_input(
     corpus: &PersistentCorpus,
@@ -64,7 +69,7 @@ pub fn ensure_evm_chain(config: &Config) -> anyhow::Result<()> {
 }
 
 pub fn sanitize_campaign_id(id: &str) -> String {
-    let sanitized = id
+    let mut sanitized = id
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
@@ -75,10 +80,18 @@ pub fn sanitize_campaign_id(id: &str) -> String {
         })
         .collect::<String>();
     if sanitized.is_empty() {
-        "campaign".to_string()
-    } else {
-        sanitized
+        sanitized.push_str("campaign");
     }
+    sanitized.truncate(48);
+    if sanitized == id {
+        return sanitized;
+    }
+    let digest = Sha256::digest(id.as_bytes());
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{sanitized}-{}", &digest[..16])
 }
 
 pub fn resolve_campaign_bounds(
@@ -87,6 +100,7 @@ pub fn resolve_campaign_bounds(
     unbounded: bool,
 ) -> anyhow::Result<(Option<u64>, Option<u64>)> {
     if unbounded || max_execs.is_some() || duration_secs.is_some() {
+        validate_job_bounds(max_execs, duration_secs).map_err(anyhow::Error::msg)?;
         return Ok((max_execs, duration_secs));
     }
     anyhow::bail!(
@@ -94,12 +108,27 @@ pub fn resolve_campaign_bounds(
     );
 }
 
+pub struct CampaignWatchdog {
+    cancellation: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+}
+
+impl CampaignWatchdog {
+    pub fn cancellation(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancellation)
+    }
+
+    pub fn complete(&self) {
+        self.done.store(true, Ordering::SeqCst);
+    }
+}
+
 pub fn install_campaign_watchdog(
     wall_timeout_secs: Option<u64>,
     max_execs: Option<u64>,
     duration_secs: Option<u64>,
     unbounded: bool,
-) -> Option<Arc<AtomicBool>> {
+) -> Option<CampaignWatchdog> {
     let timeout_secs = wall_timeout_secs.or_else(|| {
         if unbounded {
             None
@@ -116,19 +145,21 @@ pub fn install_campaign_watchdog(
         return None;
     }
 
+    let cancellation = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
+    let watchdog_cancellation = Arc::clone(&cancellation);
     let watchdog_done = Arc::clone(&done);
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(timeout_secs));
         if !watchdog_done.load(Ordering::SeqCst) {
             eprintln!(
-                "fuzz campaign exceeded wall-clock timeout of {timeout_secs}s; exiting with code 124"
+                "fuzz campaign exceeded wall-clock timeout of {timeout_secs}s; requesting cooperative cancellation"
             );
             let _ = std::io::stderr().flush();
-            std::process::exit(124);
+            watchdog_cancellation.store(true, Ordering::SeqCst);
         }
     });
-    Some(done)
+    Some(CampaignWatchdog { cancellation, done })
 }
 
 pub fn target_address(cli_target: Option<&str>, config: &Config) -> anyhow::Result<Address> {
@@ -189,23 +220,20 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
         options.chain
     );
 
+    validate_job_bounds(options.max_execs, Some(options.duration_secs))
+        .map_err(anyhow::Error::msg)?;
     let target = Address::from_str(options.target.trim())?;
     let rpc_url = options.rpc_url.unwrap_or_else(|| config.rpc_url.clone());
-    let url: reqwest::Url = rpc_url.parse()?;
-    let provider = ProviderBuilder::new().connect_http(url);
-    let latest_block = provider.get_block_number().await?;
+    let url = validate_production_rpc_url(&rpc_url).map_err(anyhow::Error::msg)?;
+    let provider = configured_provider(url)?;
+    let latest_block = provider
+        .get_block_number()
+        .await
+        .map_err(|_| anyhow::anyhow!("Alloy RPC latest-block request failed"))?;
     let fork_block = options.block.or(config.fork_block).unwrap_or(latest_block);
-    let campaign_id = options.campaign_id.unwrap_or_else(|| {
-        format!(
-            "prove-live-{}-{fork_block}",
-            target
-                .to_string()
-                .trim_start_matches("0x")
-                .chars()
-                .take(8)
-                .collect::<String>()
-        )
-    });
+    let campaign_id = options
+        .campaign_id
+        .unwrap_or_else(|| format!("prove-live-{}-{fork_block}-{}", target, Uuid::new_v4()));
     let campaign_id = sanitize_campaign_id(&campaign_id);
     let campaign_corpus_dir = format!("{}/prove-live/{}", config.corpus_dir, campaign_id);
     let campaign_report_dir = format!("{}/prove-live/{}", config.report_dir, campaign_id);
@@ -224,8 +252,9 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
                 .explorer_url
                 .clone()
                 .unwrap_or_else(|| default_explorer_api_url(&options.chain).to_string());
-            EtherscanAbiFetcher::new(api_key, explorer_url)
-        });
+            EtherscanAbiFetcher::new(api_key, explorer_url).map_err(anyhow::Error::msg)
+        })
+        .transpose()?;
 
     let fetched_abi_path = if options.abi.is_none() {
         if let Some(fetcher) = abi_fetcher.as_ref() {
@@ -311,6 +340,25 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
     let seed_bundle_id = if options.skip_seed_discovery || options.max_seeds == 0 {
         println!("\x1b[33m[seed]\x1b[0m skipped seed discovery");
         None
+    } else if let Some(bundle_id) = config.mainnet_seed_bundle.as_deref() {
+        let source_corpus = PersistentCorpus::new(&config.corpus_dir)?;
+        let bundle = source_corpus.load_mainnet_seed_bundle(bundle_id)?;
+        anyhow::ensure!(
+            bundle.target == target,
+            "configured seed bundle target does not match requested target"
+        );
+        anyhow::ensure!(
+            bundle.fork_block == fork_block,
+            "configured seed bundle fork block does not match requested fork block"
+        );
+        let campaign_corpus = PersistentCorpus::new(&campaign_corpus_dir)?;
+        campaign_corpus.persist_mainnet_seed_bundle(bundle_id, &bundle)?;
+        println!(
+            "\x1b[36m[seed]\x1b[0m loaded persisted bundle `{}`: {} seeds",
+            bundle_id,
+            bundle.seeds.len()
+        );
+        Some(bundle_id.to_string())
     } else {
         let bundle_id = format!("{campaign_id}-seeds");
         let fork_db = ForkDb::new(rpc_url.clone(), fork_block);
@@ -398,6 +446,7 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
         }
     };
 
+    let require_seed_bundle = seed_bundle_id.is_some();
     let mut hardened = config.hardened_defi.clone();
     hardened.enabled = true;
     hardened.single_process = true;
@@ -425,7 +474,7 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
         mainnet_seed_bundle: seed_bundle_id,
         in_memory_bytecode: None,
         cores: None,
-        require_seed_bundle: false,
+        require_seed_bundle,
         require_rpc_fork: true,
         allow_synthetic_fallback: false,
         hardened_defi: hardened,
@@ -435,9 +484,12 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
         duration_secs: Some(options.duration_secs),
         artifact_limit: Some(options.artifact_limit),
         campaign_id: Some(campaign_id.clone()),
+        paths_are_isolated: true,
         min_finding_confidence: options.min_finding_confidence,
+
         promotion: PromotionConfig {
             enabled: true,
+            no_promotion: false,
             require_replay_for_report: true,
             require_poc_for_confirmed: true,
             strict_proof: options.strict_proof,
@@ -450,25 +502,29 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
             promotion_limit: Some(options.promotion_limit),
         },
     };
-    let watchdog_done = install_campaign_watchdog(
+    let watchdog = install_campaign_watchdog(
         options.wall_timeout_secs,
         options.max_execs,
         Some(options.duration_secs),
         false,
     );
-    let result = rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await;
-    if let Some(done) = watchdog_done {
-        done.store(true, Ordering::SeqCst);
+    let cancellation = watchdog.as_ref().map(|watchdog| watchdog.cancellation());
+    let result = rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign_with_cancellation(
+        fuzz_config,
+        cancellation,
+    )
+    .await;
+    if let Some(watchdog) = watchdog {
+        watchdog.complete();
     }
     result?;
     println!(
         "\x1b[32m[done]\x1b[0m proof campaign `{}` finished. Reports: {}",
         campaign_id, campaign_report_dir
     );
-    if let Some(exit_code) = prove_live_exit_code(&campaign_report_dir)? {
-        std::process::exit(exit_code);
-    }
-    Ok(())
+    let exit_code = prove_live_exit_code(&campaign_report_dir)?
+        .ok_or_else(|| anyhow::anyhow!("campaign summary is missing after proof run"))?;
+    std::process::exit(exit_code);
 }
 
 pub fn prove_live_exit_code(report_dir: &str) -> anyhow::Result<Option<i32>> {
@@ -614,11 +670,26 @@ fn default_explorer_api_url(chain: &str) -> &'static str {
 
 pub async fn campaign_block_env(config: &Config) -> anyhow::Result<revm::context::BlockEnv> {
     let Some(fork_block) = config.fork_block else {
+        // No pin configured: latest/default env is intentional, not a fallback.
         return Ok(Default::default());
     };
-    create_fork_block_env(&config.rpc_url, fork_block)
-        .await
-        .or_else(|_| Ok(Default::default()))
+    // Gate 4: provider errors fail closed unless synthetic fallback is explicit.
+    match create_fork_block_env(&config.rpc_url, fork_block).await {
+        Ok(env) => Ok(env),
+        Err(err) => {
+            if config.require_rpc_fork || !config.allow_synthetic_fallback {
+                Err(anyhow::anyhow!(
+                    "live block env fetch failed for fork_block={fork_block} rpc_host={} and synthetic fallback is disabled: {err:#}",
+                    sanitize_rpc_for_display(&config.rpc_url)
+                ))
+            } else {
+                log::warn!(
+                    "block env fetch failed; using default BlockEnv because synthetic fallback is allowed: {err:#}"
+                );
+                Ok(Default::default())
+            }
+        }
+    }
 }
 
 pub fn execution_coverage_material(

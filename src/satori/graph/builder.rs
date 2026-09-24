@@ -1,5 +1,5 @@
 use crate::satori::error::SatoriResult;
-use crate::satori::fsutil::write_json;
+use crate::satori::fsutil::write_json_in_run;
 use crate::satori::types::{GraphEdge, GraphNode, ProjectModel, SatoriGraph, StaticAnalysisBundle};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -64,6 +64,6 @@ pub fn build_graph(
             });
         }
     }
-    write_json(run_dir.join("graph.json"), &graph)?;
+    write_json_in_run(run_dir, Path::new("graph.json"), &graph)?;
     Ok(graph)
 }

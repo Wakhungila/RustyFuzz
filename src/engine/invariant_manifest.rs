@@ -591,6 +591,8 @@ mod tests {
             objective: "price manipulation".to_string(),
             success_condition: "local replay".to_string(),
             max_depth: 2,
+            max_execs: 256,
+            duration_secs: 60,
             fork_rpc_url: None,
             fork_block: None,
             abi_hints: Vec::new(),

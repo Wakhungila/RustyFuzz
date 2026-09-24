@@ -1,7 +1,6 @@
 use crate::satori::error::SatoriResult;
-use crate::satori::fsutil::read_json;
 use crate::satori::pipeline::{
-    build_report_for_existing_run, ingest_graph_packets, run_model_audit,
+    build_report_for_existing_run, ingest_graph_packets, revalidate_existing_run, run_model_audit,
 };
 use crate::satori::types::SatoriConfig;
 use clap::{ArgAction, Subcommand};
@@ -22,12 +21,12 @@ pub enum SatoriCommand {
     },
     Model {
         path: PathBuf,
-        #[arg(long, default_value = "o3")]
+        #[arg(long, default_value = "big-pickle")]
         model: String,
     },
     Hunt {
         path: PathBuf,
-        #[arg(long, default_value = "o3")]
+        #[arg(long, default_value = "big-pickle")]
         model: String,
         #[arg(long, default_value_t = 8)]
         max_critical_functions: usize,
@@ -41,7 +40,7 @@ pub enum SatoriCommand {
     },
     Audit {
         path: PathBuf,
-        #[arg(long, default_value = "o3")]
+        #[arg(long, default_value = "big-pickle")]
         model: String,
         #[arg(long, default_value_t = 8)]
         max_critical_functions: usize,
@@ -157,13 +156,23 @@ pub async fn run(command: SatoriCommand) -> SatoriResult<()> {
             );
         }
         SatoriCommand::Validate { run_id } => {
-            let _run: crate::satori::types::SatoriRun =
-                read_json(PathBuf::from("satori/runs").join(&run_id).join("run.json"))?;
-            let report = build_report_for_existing_run(&run_id)?;
+            let report = revalidate_existing_run(&run_id).await?;
             println!(
-                "Satori validation/report refresh complete: run_id={}, verdicts={}",
+                "Satori validation complete: run_id={}, verdicts={}, confirmed={}",
                 report.run_id,
-                report.validation_verdicts.len()
+                report.validation_verdicts.len(),
+                report
+                    .validation_verdicts
+                    .iter()
+                    .filter(|verdict| {
+                        matches!(
+                            verdict.status,
+                            crate::satori::types::ValidationStatus::ValidatedLocal
+                                | crate::satori::types::ValidationStatus::ValidatedMinimized
+                                | crate::satori::types::ValidationStatus::ValidatedEconomicImpact
+                        )
+                    })
+                    .count()
             );
         }
         SatoriCommand::Report { run_id } => {

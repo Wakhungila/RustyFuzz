@@ -6,7 +6,7 @@ use alloy::rpc::types::eth::{BlockTransactions, Filter};
 use anyhow::Context;
 use revm::database_interface::DatabaseRef;
 use revm::primitives::{keccak256, Address, B256, U256};
-use rustyfuzz_evm::fork_db::{ForkDb, ForkDbCacheSnapshot};
+use rustyfuzz_evm::fork_db::{ForkCacheProvenance, ForkDb, ForkDbCacheSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,6 +20,7 @@ const DEFAULT_RETRY_BACKOFF_MS: u64 = 250;
 const LOG_SCAN_CHUNK_BLOCKS: u64 = 10;
 const DIRECT_MATCH: &str = "direct";
 const ADDRESS_HINT_MATCH: &str = "address-hint";
+const REQUIRED_SEED_PROVENANCE_PREFIX: &str = "rustyfuzz:required-seed";
 
 /// Controls deterministic mainnet seed ingestion. Every range is walked from
 /// newest to oldest, then normalized before being returned.
@@ -199,7 +200,7 @@ impl<P: Provider> SeedIngester<P> {
             .provider
             .get_block_number()
             .await
-            .context("failed to fetch latest block number")?;
+            .map_err(|_| anyhow::anyhow!("Alloy RPC latest-block request failed"))?;
         let config = MainnetSeedConfig::new(latest_block, target, max_seeds);
         let fork_db = ForkDb::new_offline(format!("0x{latest_block:x}"));
         Ok(self
@@ -218,11 +219,17 @@ impl<P: Provider> SeedIngester<P> {
         config: &MainnetSeedConfig,
         fork_db: &ForkDb,
     ) -> anyhow::Result<MainnetSeedBundle> {
+        let provenance_db = fork_db.clone();
+        tokio::task::spawn_blocking(move || provenance_db.refresh_remote_provenance())
+            .await
+            .context("seed provenance worker failed")?
+            .map_err(anyhow::Error::new)
+            .context("failed to establish seed bundle provenance")?;
         let latest_block = self
             .provider
             .get_block_number()
             .await
-            .context("failed to fetch latest block number")?;
+            .map_err(|_| anyhow::anyhow!("Alloy RPC latest-block request failed"))?;
         let start_block = resume_start_block(config)
             .transpose()?
             .flatten()
@@ -246,7 +253,7 @@ impl<P: Provider> SeedIngester<P> {
         let discovered_accounts = discover_accounts_from_seeds(&seeds, fork_db)?;
         let fork_cache = fork_db.cache_snapshot();
         let scan = SeedScanManifest {
-            chain_id: None,
+            chain_id: fork_db.provenance().chain_id,
             start_block: Some(start_block),
             end_block: Some(start_block.saturating_sub(config.search_depth.saturating_sub(1))),
             search_depth: config.search_depth,
@@ -383,9 +390,9 @@ impl<P: Provider> SeedIngester<P> {
                 .provider
                 .get_logs(&filter)
                 .await
-                .with_context(|| {
-                    format!(
-                        "failed to fetch target logs with eth_getLogs for block range [{chunk_from}, {chunk_to}]"
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Alloy RPC request failed for eth_getLogs at block range [{chunk_from}, {chunk_to}]"
                     )
                 })?;
             write_seed_scan_cursor(config, chunk_from)?;
@@ -396,7 +403,12 @@ impl<P: Provider> SeedIngester<P> {
                 let Some(hash) = log.transaction_hash else {
                     continue;
                 };
-                let Some(tx) = self.provider.get_transaction_by_hash(hash).await? else {
+                let Some(tx) = self
+                    .provider
+                    .get_transaction_by_hash(hash)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Alloy RPC transaction request failed"))?
+                else {
                     continue;
                 };
                 let envelope = &*tx.inner;
@@ -445,12 +457,11 @@ impl<P: Provider> SeedIngester<P> {
             .await
         {
             Ok(trace) => seeds_from_debug_trace_value(config, &trace),
-            Err(err) => {
+            Err(_) => {
                 log::warn!(
-                    "debug_traceBlockByNumber unavailable for seed scan block {} target {}: {}",
+                    "debug_traceBlockByNumber unavailable for seed scan block {} target {}; provider details redacted",
                     block_num,
-                    config.target,
-                    err
+                    config.target
                 );
                 Vec::new()
             }
@@ -462,12 +473,12 @@ impl<P: Provider> SeedIngester<P> {
         block_num: u64,
         config: &MainnetSeedConfig,
     ) -> anyhow::Result<Option<alloy::rpc::types::eth::Block>> {
-        let mut last_error = None;
+        let mut request_failed = false;
         for attempt in 0..config.max_retries.max(1) {
             match self.provider.get_block_by_number(block_num.into()).await {
                 Ok(block) => return Ok(block),
-                Err(err) => {
-                    last_error = Some(err);
+                Err(_) => {
+                    request_failed = true;
                     if attempt + 1 < config.max_retries.max(1) {
                         let delay_ms = retry_backoff_delay_ms(config.retry_backoff_ms, attempt);
                         log::warn!(
@@ -482,9 +493,11 @@ impl<P: Provider> SeedIngester<P> {
                 }
             }
         }
-        Err(last_error
-            .map(anyhow::Error::new)
-            .unwrap_or_else(|| anyhow::anyhow!("failed to fetch block {block_num}")))
+        if request_failed {
+            Err(anyhow::anyhow!("Alloy RPC block request failed"))
+        } else {
+            Err(anyhow::anyhow!("failed to fetch block {block_num}"))
+        }
         .with_context(|| format!("failed to fetch block {block_num}"))
     }
 }
@@ -498,6 +511,140 @@ pub fn normalize_seeds(mut seeds: Vec<MainnetSeed>) -> Vec<MainnetSeed> {
     });
     seeds.dedup_by(|a, b| a.id == b.id);
     seeds
+}
+
+pub fn validate_seed_content_hashes(bundle: &MainnetSeedBundle) -> anyhow::Result<()> {
+    for seed in &bundle.seeds {
+        if is_generated_seed_id(&seed.id) {
+            let expected = stable_seed_id(&seed.input, &seed.metadata);
+            anyhow::ensure!(
+                seed.id == expected,
+                "mainnet seed `{}` content hash does not match its input",
+                seed.id
+            );
+        }
+        if let Some(provenance) = seed.metadata.provenance.as_deref() {
+            if let Some(sequence_hash) = provenance.strip_prefix(REQUIRED_SEED_PROVENANCE_PREFIX) {
+                let sequence_hash = sequence_hash.strip_prefix(':').unwrap_or(sequence_hash);
+                anyhow::ensure!(
+                    sequence_hash == seed.input.semantic_input_hash(),
+                    "required seed `{}` provenance does not match its content hash",
+                    seed.id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_mainnet_seed_bundle(
+    bundle: &MainnetSeedBundle,
+    campaign_target: Address,
+    campaign_block: u64,
+    campaign_provenance: &ForkCacheProvenance,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bundle.target == campaign_target,
+        "mainnet seed bundle target {} does not match campaign target {}",
+        bundle.target,
+        campaign_target
+    );
+    anyhow::ensure!(
+        bundle.fork_block == campaign_block,
+        "mainnet seed bundle block {} does not match campaign block {}",
+        bundle.fork_block,
+        campaign_block
+    );
+    bundle
+        .fork_cache
+        .verify_content_digest()
+        .map_err(|error| anyhow::anyhow!("mainnet seed bundle fork cache integrity: {error}"))?;
+    if !is_synthetic_mainnet_seed_bundle(bundle) {
+        let provenance = &bundle.fork_cache.provenance;
+        anyhow::ensure!(
+            !provenance.provider_sanitized.trim().is_empty(),
+            "non-synthetic mainnet seed bundle is missing provider provenance"
+        );
+        anyhow::ensure!(
+            provenance.chain_id.is_some(),
+            "non-synthetic mainnet seed bundle is missing chain ID provenance"
+        );
+        anyhow::ensure!(
+            provenance.block_number.is_some(),
+            "non-synthetic mainnet seed bundle is missing block number provenance"
+        );
+        anyhow::ensure!(
+            provenance.block_hash.is_some(),
+            "non-synthetic mainnet seed bundle is missing block hash provenance"
+        );
+    }
+    if let Some(chain_id) = bundle.scan.as_ref().and_then(|scan| scan.chain_id) {
+        anyhow::ensure!(
+            campaign_provenance.chain_id == Some(chain_id),
+            "mainnet seed bundle chain id {} does not match campaign chain {:?}",
+            chain_id,
+            campaign_provenance.chain_id
+        );
+    }
+    if let Some(chain_id) = bundle.fork_cache.provenance.chain_id {
+        anyhow::ensure!(
+            campaign_provenance.chain_id == Some(chain_id),
+            "mainnet seed bundle provenance chain id {} does not match campaign chain {:?}",
+            chain_id,
+            campaign_provenance.chain_id
+        );
+    }
+    let bundle_provider = bundle.fork_cache.provenance.provider_sanitized.trim();
+    if !bundle_provider.is_empty() {
+        let campaign_provider = campaign_provenance.provider_sanitized.trim();
+        anyhow::ensure!(
+            !campaign_provider.is_empty()
+                && rustyfuzz_artifacts::sanitize_rpc_endpoint(bundle_provider)
+                    == rustyfuzz_artifacts::sanitize_rpc_endpoint(campaign_provider),
+            "mainnet seed bundle provider does not match campaign provider"
+        );
+    }
+    if let Some(block_number) = bundle.fork_cache.provenance.block_number {
+        anyhow::ensure!(
+            campaign_provenance.block_number == Some(block_number),
+            "mainnet seed bundle provenance block {} does not match campaign block {:?}",
+            block_number,
+            campaign_provenance.block_number
+        );
+    }
+    if let Some(block_hash) = bundle.fork_cache.provenance.block_hash.as_deref() {
+        anyhow::ensure!(
+            campaign_provenance
+                .block_hash
+                .as_deref()
+                .is_some_and(|campaign_hash| campaign_hash.eq_ignore_ascii_case(block_hash)),
+            "mainnet seed bundle block hash does not match campaign block hash"
+        );
+    }
+    validate_seed_content_hashes(bundle)
+}
+
+fn is_synthetic_mainnet_seed_bundle(bundle: &MainnetSeedBundle) -> bool {
+    let provenance = &bundle.fork_cache.provenance;
+    provenance.provider_sanitized.is_empty()
+        && provenance.chain_id.is_none()
+        && provenance.block_number.is_none()
+        && provenance.block_hash.is_none()
+        && provenance.fetched_at_unix.is_none()
+        && provenance.cache_id.is_none()
+        && !bundle.seeds.is_empty()
+        && bundle.seeds.iter().all(|seed| {
+            seed.metadata
+                .provenance
+                .as_deref()
+                .is_some_and(|value| value.starts_with(REQUIRED_SEED_PROVENANCE_PREFIX))
+        })
+}
+
+fn is_generated_seed_id(id: &str) -> bool {
+    id.strip_prefix("seed-").is_some_and(|digest| {
+        digest.len() == 16 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
 }
 
 pub fn seed_abi_functions(
@@ -684,6 +831,7 @@ fn collect_trace_call_seeds(
         seed.metadata.internal_caller = internal_caller;
         seed.metadata.trace_path = Some(trace_path.clone());
         seed.metadata.trace_source = Some(trace_source.to_string());
+        seed.id = stable_seed_id(&seed.input, &seed.metadata);
         out.push(seed);
     }
 
@@ -760,6 +908,7 @@ fn collect_log_only_trace_seed(
     seed.metadata.internal_caller = Some(caller);
     seed.metadata.trace_path = Some("logs".to_string());
     seed.metadata.trace_source = Some(trace_source.to_string());
+    seed.id = stable_seed_id(&seed.input, &seed.metadata);
     out.push(seed);
 }
 
@@ -1201,6 +1350,105 @@ mod tests {
         );
         assert_eq!(seeds[0].metadata.trace_path.as_deref(), Some("logs"));
         assert_eq!(seeds[0].metadata.trace_source.as_deref(), Some("logs-only"));
+    }
+
+    #[test]
+    fn campaign_validation_rejects_mismatched_seed_content_and_fork_provenance() {
+        let target = Address::repeat_byte(0x81);
+        let config = MainnetSeedConfig::new(10, target, 1);
+        let mut seed = seed_from_parts(
+            &config,
+            10,
+            0,
+            0,
+            Address::repeat_byte(0x82),
+            target,
+            U256::ZERO,
+            vec![0xde, 0xad, 0xbe, 0xef],
+            DIRECT_MATCH,
+            "test",
+        );
+        let fork_db = ForkDb::new("https://api.example.com/v2/key", 10);
+        fork_db.set_provenance_chain(1, Some("0xabc".to_string()), 1);
+        let mut bundle = MainnetSeedBundle {
+            fork_block: 10,
+            target,
+            seeds: vec![seed.clone()],
+            discovered_accounts: Vec::new(),
+            fork_cache: fork_db.cache_snapshot(),
+            scan: None,
+        };
+        let mut campaign_provenance = fork_db.provenance();
+
+        validate_mainnet_seed_bundle(&bundle, target, 10, &campaign_provenance)
+            .expect("matching bundle provenance");
+
+        seed.input.txs[0].input[0] ^= 1;
+        bundle.seeds[0] = seed;
+        assert!(validate_seed_content_hashes(&bundle).is_err());
+
+        campaign_provenance.block_hash = Some("0xdef".to_string());
+        assert!(validate_mainnet_seed_bundle(&bundle, target, 10, &campaign_provenance).is_err());
+    }
+
+    #[test]
+    fn non_synthetic_seed_bundles_require_complete_provenance() {
+        let target = Address::repeat_byte(0x91);
+        let config = MainnetSeedConfig::new(10, target, 1);
+        let seed = seed_from_parts(
+            &config,
+            10,
+            0,
+            0,
+            Address::repeat_byte(0x92),
+            target,
+            U256::ZERO,
+            vec![0xde, 0xad, 0xbe, 0xef],
+            DIRECT_MATCH,
+            "rpc-block-scan",
+        );
+        let fork_db = ForkDb::new("https://api.example.com/v2/key", 10);
+        fork_db.set_provenance_chain(1, Some("0xabc".to_string()), 1);
+        let bundle = MainnetSeedBundle {
+            fork_block: 10,
+            target,
+            seeds: vec![seed],
+            discovered_accounts: Vec::new(),
+            fork_cache: fork_db.cache_snapshot(),
+            scan: None,
+        };
+        let campaign_provenance = fork_db.provenance();
+
+        for missing in 0..4 {
+            let mut incomplete = bundle.clone();
+            match missing {
+                0 => incomplete.fork_cache.provenance.provider_sanitized.clear(),
+                1 => incomplete.fork_cache.provenance.chain_id = None,
+                2 => incomplete.fork_cache.provenance.block_number = None,
+                3 => incomplete.fork_cache.provenance.block_hash = None,
+                _ => unreachable!(),
+            }
+            incomplete.fork_cache.content_digest = incomplete
+                .fork_cache
+                .calculate_content_digest()
+                .expect("digest serializes");
+            let error = validate_mainnet_seed_bundle(&incomplete, target, 10, &campaign_provenance)
+                .expect_err("missing non-synthetic provenance must fail");
+            assert!(error.to_string().contains("missing"));
+        }
+
+        let mut synthetic = bundle;
+        synthetic.fork_cache.provenance = ForkCacheProvenance::default();
+        synthetic.seeds[0].metadata.provenance = Some(format!(
+            "{REQUIRED_SEED_PROVENANCE_PREFIX}:{}",
+            synthetic.seeds[0].input.semantic_input_hash()
+        ));
+        synthetic.fork_cache.content_digest = synthetic
+            .fork_cache
+            .calculate_content_digest()
+            .expect("digest serializes");
+        validate_mainnet_seed_bundle(&synthetic, target, 10, &ForkCacheProvenance::default())
+            .expect("synthetic sequence bundle may omit live provenance");
     }
 
     #[test]

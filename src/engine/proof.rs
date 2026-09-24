@@ -265,7 +265,7 @@ mod tests {
     fn candidate() -> ExploitPathCandidate {
         ExploitPathCandidate {
             sequence: vec![SingletonTx {
-                input: vec![0xb6, 0xb5, 0x5f, 0x25],
+                input: vec![0x6e, 0x55, 0x3f, 0x65],
                 caller: Address::repeat_byte(0xaa),
                 to: Address::repeat_byte(0x11),
                 value: revm::primitives::U256::ZERO,
@@ -306,7 +306,7 @@ mod tests {
                     caller: Address::repeat_byte(0xaa),
                     target: Address::repeat_byte(0x11),
                     value: revm::primitives::U256::ZERO,
-                    input: vec![0xb6, 0xb5, 0x5f, 0x25],
+                    input: vec![0x6e, 0x55, 0x3f, 0x65],
                     output: Vec::new(),
                     gas_limit: 1,
                     gas_used: 1,

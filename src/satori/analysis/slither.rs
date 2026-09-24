@@ -1,7 +1,9 @@
 use crate::satori::error::SatoriResult;
+use crate::satori::fsutil::{ensure_dir, write_atomic_under};
 use crate::satori::types::{ProjectModel, ToolRun};
 use std::path::Path;
 use std::process::Command;
+use uuid::Uuid;
 
 pub fn run_slither_tool(project: &ProjectModel, run_dir: &Path) -> SatoriResult<ToolRun> {
     if Command::new("slither").arg("--version").output().is_err() {
@@ -17,14 +19,27 @@ pub fn run_slither_tool(project: &ProjectModel, run_dir: &Path) -> SatoriResult<
         });
     }
     let analysis_dir = run_dir.join("analysis");
-    std::fs::create_dir_all(&analysis_dir)?;
+    ensure_dir(&analysis_dir)?;
     let artifact = analysis_dir.join("slither.json");
+    let temporary = analysis_dir.join(format!(".slither.{}.tmp", Uuid::new_v4().simple()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
     let output = Command::new("slither")
         .arg(".")
         .arg("--json")
-        .arg(&artifact)
+        .arg(&temporary)
         .current_dir(&project.root)
         .output()?;
+    let persisted = if output.status.success() {
+        let bytes = std::fs::read(&temporary)?;
+        write_atomic_under(run_dir, &artifact, &bytes)?;
+        true
+    } else {
+        false
+    };
+    let _ = std::fs::remove_file(temporary);
     Ok(ToolRun {
         tool: "slither".to_string(),
         command: format!("slither . --json {}", artifact.display()),
@@ -39,6 +54,6 @@ pub fn run_slither_tool(project: &ProjectModel, run_dir: &Path) -> SatoriResult<
             .chars()
             .take(2_000)
             .collect(),
-        artifact: artifact.exists().then_some(artifact),
+        artifact: persisted.then_some(artifact),
     })
 }

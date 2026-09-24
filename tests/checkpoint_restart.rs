@@ -54,8 +54,11 @@ fn checkpoint_campaign_worker() {
         max_execs: Some(100_000),
         duration_secs: None,
         artifact_limit: Some(0),
-        campaign_id: None,
+        campaign_id: Some("restart".to_string()),
+        paths_are_isolated: true,
+
         min_finding_confidence: 0,
+
         promotion: PromotionConfig {
             enabled: false,
             ..Default::default()
@@ -136,6 +139,9 @@ fn sigkill_resumes_real_campaign_from_checkpoint() {
     // Read AFTER death: this is the last committed checkpoint, not an earlier poll.
     let before = read(&path);
     assert!(before.completed_execs >= 8);
+    assert_eq!(before.schema_version, 2);
+    assert_eq!(before.config_schema_version, 2);
+
     assert!(before.coverage.iter().any(|byte| *byte != 0));
     assert!(!before.corpus_ids.is_empty());
     println!(
@@ -150,7 +156,7 @@ fn sigkill_resumes_real_campaign_from_checkpoint() {
         .join(format!("{:020}.json", before.completed_execs));
     let provenance: rusty_fuzz::engine::provenance::ExecutionProvenanceRecord =
         serde_json::from_slice(&fs::read(&provenance_path).unwrap()).unwrap();
-    assert_eq!(provenance.schema_version, 1);
+    assert_eq!(provenance.schema_version, 2);
     assert_eq!(provenance.execution_index, before.completed_execs);
     assert_eq!(provenance.budget_consumed, before.budget_consumed);
     assert_eq!(provenance.input_id, provenance.input.semantic_input_hash());
@@ -178,15 +184,8 @@ fn sigkill_resumes_real_campaign_from_checkpoint() {
         .unwrap()
     );
     let mut second = start(&root, true);
-    let receipt = root.join("checkpoint/resume.json");
-    wait_for(&mut second, &root, &receipt, before.budget_consumed);
-    let restored = read(&receipt);
-    // Receipt is recaptured from restored live LibAFL state before mutation.
-    assert_eq!(restored.budget_consumed, before.budget_consumed);
-    assert_eq!(restored.completed_execs, before.completed_execs);
-    assert_eq!(restored.coverage, before.coverage);
-    assert_eq!(restored.corpus_ids, before.corpus_ids);
-    println!("restored live state: execs/budget/coverage/corpus exactly equal to last checkpoint");
+    wait_for(&mut second, &root, &path, before.budget_consumed + 1);
+    assert!(!root.join("checkpoint/resume.json").exists());
     wait_for(&mut second, &root, &path, before.budget_consumed + 4);
     kill(&mut second);
     let after = read(&path);

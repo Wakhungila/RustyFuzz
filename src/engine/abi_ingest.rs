@@ -1,3 +1,4 @@
+use crate::common::fs_security::identifier_path;
 use crate::engine::target_profile::{
     function_selector, ProtocolType, TargetProfile, TargetProfiler,
 };
@@ -138,7 +139,9 @@ pub fn write_abi_cache(
     abi: &JsonAbi,
     report: &AbiIngestReport,
 ) -> anyhow::Result<(PathBuf, PathBuf)> {
-    let cache_dir = cache_dir.as_ref().join(bundle_id);
+    let cache_root = cache_dir.as_ref();
+    std::fs::create_dir_all(cache_root)?;
+    let cache_dir = identifier_path(cache_root, bundle_id).map_err(anyhow::Error::msg)?;
     std::fs::create_dir_all(&cache_dir)?;
     let abi_path = cache_dir.join("abi.json");
     let report_path = cache_dir.join("report.json");

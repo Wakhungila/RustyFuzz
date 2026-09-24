@@ -5,27 +5,28 @@ use crate::common::types::{
 };
 use revm::primitives::{keccak256, Address, B256, U256};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 const ERC20_TRANSFER: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
 const ERC20_TRANSFER_FROM: [u8; 4] = [0x23, 0xb8, 0x72, 0xdd];
 const ERC20_APPROVE: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
+const ERC20_MINT: [u8; 4] = [0x40, 0xc1, 0x0f, 0x19];
 const ERC20_TOTAL_SUPPLY: [u8; 4] = [0x18, 0x16, 0x0d, 0xdd];
 
-const ERC4626_DEPOSIT: [u8; 4] = [0xb6, 0xb5, 0x5f, 0x25];
+const ERC4626_DEPOSIT: [u8; 4] = [0x6e, 0x55, 0x3f, 0x65];
 const ERC4626_MINT: [u8; 4] = [0x94, 0xbf, 0x80, 0x4d];
-const ERC4626_WITHDRAW: [u8; 4] = [0x2e, 0x1a, 0x7d, 0x4d];
-const ERC4626_REDEEM: [u8; 4] = [0xba, 0x08, 0x77, 0x52];
-const ERC4626_TOTAL_ASSETS: [u8; 4] = [0x01, 0xad, 0x8a, 0x86];
+const ERC4626_WITHDRAW: [u8; 4] = [0xb4, 0x60, 0xaf, 0x94];
+const ERC4626_REDEEM: [u8; 4] = [0xba, 0x08, 0x76, 0x52];
+const ERC4626_TOTAL_ASSETS: [u8; 4] = [0x01, 0xe1, 0xd1, 0x14];
 const ERC4626_CONVERT_TO_SHARES: [u8; 4] = [0xc6, 0xe6, 0xf5, 0x92];
 
 const UNISWAP_V2_SWAP: [u8; 4] = [0x02, 0x2c, 0x0d, 0x9f];
-const UNISWAP_V3_SWAP: [u8; 4] = [0xa4, 0x15, 0xbb, 0x22];
+const UNISWAP_V3_SWAP: [u8; 4] = [0x12, 0x8a, 0xcb, 0x08];
 const GET_RESERVES: [u8; 4] = [0x09, 0x02, 0xf1, 0xac];
 
-const AAVE_SUPPLY: [u8; 4] = [0x61, 0x7c, 0x03, 0xcb];
+const AAVE_SUPPLY: [u8; 4] = [0x61, 0x7b, 0xa0, 0x37];
 const AAVE_BORROW: [u8; 4] = [0xa4, 0x15, 0xbc, 0xad];
-const AAVE_REPAY: [u8; 4] = [0x57, 0x3a, 0xd8, 0xc5];
+const AAVE_REPAY: [u8; 4] = [0x57, 0x3a, 0xde, 0x81];
 const AAVE_LIQUIDATION_CALL: [u8; 4] = [0x00, 0xa7, 0x18, 0xa9];
 const COMPOUND_BORROW: [u8; 4] = [0xc5, 0xeb, 0xea, 0xec];
 const COMPOUND_REDEEM: [u8; 4] = [0xdb, 0x00, 0x6a, 0x75];
@@ -105,6 +106,7 @@ pub enum OracleBugClass {
     LiquidationAccounting,
     FeeBypassManipulation,
     ApprovalAllowanceAbuse,
+    MintPolicyViolation,
     UpgradeProxyMisconfiguration,
     RoundingAmplification,
 }
@@ -263,6 +265,17 @@ pub const ORACLE_SPECS: &[OracleSpec] = &[
         required_proof_artifact: RequiredProofArtifact::StorageDeltaAssertion,
     },
     OracleSpec {
+        name: "erc20-mint-policy-violation",
+        bug_class: OracleBugClass::MintPolicyViolation,
+        pack: ProtocolOraclePackKind::Erc20,
+        required_preconditions: &["explicit mint authorization policy is observed"],
+        required_state_observations: &["mint call", "supply or balance delta"],
+        positive_trigger_conditions: &["mint succeeds despite explicit policy denial"],
+        negative_rejection_rules: &["owner or delegated minter authorization is observed"],
+        minimum_evidence_grade: EvidenceGrade::RealisticForkProof,
+        required_proof_artifact: RequiredProofArtifact::StorageDeltaAssertion,
+    },
+    OracleSpec {
         name: "upgrade-proxy-misconfiguration",
         bug_class: OracleBugClass::UpgradeProxyMisconfiguration,
         pack: ProtocolOraclePackKind::ProxyUpgradeability,
@@ -307,12 +320,22 @@ pub fn oracle_spec_for_finding(finding: &ProtocolFinding) -> Option<&'static Ora
                 | (OracleBugClass::OraclePriceManipulation, VulnType::PriceOracleManipulation)
                 | (OracleBugClass::LiquidationAccounting, VulnType::AccountingDesync)
                 | (OracleBugClass::FeeBypassManipulation, VulnType::MevSandwichExploit)
-                | (OracleBugClass::ApprovalAllowanceAbuse, VulnType::Other(_))
                 | (
                     OracleBugClass::UpgradeProxyMisconfiguration,
                     VulnType::ProxyUpgradeabilityViolation,
                 )
                 | (OracleBugClass::RoundingAmplification, VulnType::RoundingLeakage) => true,
+                (OracleBugClass::ApprovalAllowanceAbuse, VulnType::Other(label))
+                    if label == "unbounded allowance mutation" =>
+                {
+                    true
+                }
+                (OracleBugClass::MintPolicyViolation, VulnType::Other(label))
+                    if label == "mint authorization policy violation" =>
+                {
+                    true
+                }
+
                 (OracleBugClass::LiquidationAccounting, VulnType::InvariantViolation(label)) => {
                     label.to_ascii_lowercase().contains("lending")
                 }
@@ -352,6 +375,83 @@ pub fn oracle_rejection_reasons_for_finding(finding: &ProtocolFinding) -> Vec<Re
     reasons.sort();
     reasons.dedup();
     reasons
+}
+
+enum MintAuthorization {
+    Authorized,
+    Denied { tx_index: usize, rule: &'static str },
+    Unknown,
+}
+
+fn mint_authorization_observation(
+    execution: &SequenceExecutionResult,
+    mint: &CallObservation,
+) -> MintAuthorization {
+    let can_mint = sig("canMint(address)");
+    let is_minter = sig("isMinter(address)");
+    let owner = sig("owner()");
+    let Some(prior) = execution
+        .call_trace
+        .iter()
+        .filter(|prior| {
+            prior.target == mint.target
+                && prior.tx_index < mint.tx_index
+                && prior.success
+                && prior.phase == CallPhase::End
+                && prior.kind != CallKind::DelegateCall
+                && matches!(selector(prior), Some(selector) if selector == can_mint || selector == is_minter || selector == owner)
+        })
+        .max_by_key(|prior| prior.tx_index)
+    else {
+        return MintAuthorization::Unknown;
+    };
+    let Some(selector) = selector(prior) else {
+        return MintAuthorization::Unknown;
+    };
+    let invalidated = execution.storage_diffs.iter().any(|diff| {
+        diff.address == mint.target
+            && diff.tx_index > prior.tx_index
+            && diff.tx_index < mint.tx_index
+            && diff.old_value != diff.new_value
+    }) || execution.storage_writes.iter().any(|write| {
+        write.address == mint.target
+            && write.tx_index > prior.tx_index
+            && write.tx_index < mint.tx_index
+    });
+    if invalidated {
+        return MintAuthorization::Unknown;
+    }
+    if selector == owner {
+        return match output_address(prior) {
+            Some(owner) if owner == mint.caller => MintAuthorization::Authorized,
+            _ => MintAuthorization::Unknown,
+        };
+    }
+    if prior.input.len() != 36
+        || prior.input[4..16] != [0; 12]
+        || prior.input[16..36] != mint.caller.as_slice()[..]
+    {
+        return MintAuthorization::Unknown;
+    }
+    match output_u256(prior) {
+        Some(value) if value.is_zero() => MintAuthorization::Denied {
+            tx_index: prior.tx_index,
+            rule: if selector == can_mint {
+                "canMint"
+            } else {
+                "isMinter"
+            },
+        },
+        Some(_) => MintAuthorization::Authorized,
+        None => MintAuthorization::Unknown,
+    }
+}
+
+fn output_address(call: &CallObservation) -> Option<Address> {
+    if call.output.len() < 32 || call.output[..12] != [0; 12] {
+        return None;
+    }
+    Some(Address::from_slice(&call.output[12..32]))
 }
 
 #[derive(Debug, Clone)]
@@ -484,6 +584,8 @@ impl ProtocolOraclePack {
         execution: &SequenceExecutionResult,
         findings: &mut Vec<ProtocolFinding>,
     ) {
+        self.evaluate_erc20_mint_inflation(execution, findings);
+
         let erc20_calls = calls_with_selectors(
             execution,
             &[ERC20_TRANSFER, ERC20_TRANSFER_FROM, ERC20_APPROVE],
@@ -525,6 +627,39 @@ impl ProtocolOraclePack {
                     evidence: "approve path wrote U256::MAX allowance-like value".to_string(),
                 });
             }
+        }
+    }
+
+    fn evaluate_erc20_mint_inflation(
+        &self,
+        execution: &SequenceExecutionResult,
+        findings: &mut Vec<ProtocolFinding>,
+    ) {
+        for call in calls_with_selectors(execution, &[ERC20_MINT]) {
+            if !call.success || call.phase != CallPhase::End || call.input.len() != 68 {
+                continue;
+            }
+            let policy = mint_authorization_observation(execution, call);
+            let MintAuthorization::Denied { tx_index, rule } = policy else {
+                continue;
+            };
+            let writes = writes_for_target(execution, call.target, call.tx_index);
+            if U256::from_be_slice(&call.input[36..68]).is_zero()
+                || !writes.iter().any(|diff| diff.new_value > diff.old_value)
+            {
+                continue;
+            }
+            findings.push(ProtocolFinding {
+                pack: ProtocolOraclePackKind::Erc20,
+                vuln: VulnType::Other("mint authorization policy violation".to_string()),
+                severity: ProtocolSeverity::High,
+                tx_index: Some(call.tx_index),
+                target: Some(call.target),
+                evidence: format!(
+                    "mint succeeded and increased storage despite {rule}({})=false at tx {}; explicit contract policy violation requires balance/supply replay confirmation",
+                    call.caller, tx_index
+                ),
+            });
         }
     }
 
@@ -580,21 +715,32 @@ impl ProtocolOraclePack {
                 });
             }
 
-            if selector(call) == Some(ERC4626_CONVERT_TO_SHARES)
-                && call.phase == CallPhase::End
-                && output_u256(call).is_some_and(|value| value.is_zero())
-                && !call
-                    .input
-                    .get(4..36)
-                    .is_some_and(|arg| U256::from_be_slice(arg).is_zero())
+            if selector(call) == Some(ERC4626_DEPOSIT)
+                && call.success
+                && call.input.len() == 68
+                && call.output.len() == 32
+                && output_u256(call) == Some(U256::ZERO)
+                && !U256::from_be_slice(&call.input[4..36]).is_zero()
+                && execution.call_trace.iter().any(|transfer| {
+                    transfer.tx_index == call.tx_index
+                        && transfer.caller == call.target
+                        && transfer.success
+                        && transfer.phase == CallPhase::End
+                        && selector(transfer) == Some(ERC20_TRANSFER_FROM)
+                        && transfer.input.len() == 100
+                        && transfer.input[48..68] == call.target.as_slice()[..]
+                        && transfer.input[68..100] == call.input[4..36]
+                        && (transfer.output.is_empty()
+                            || output_u256(transfer) == Some(U256::from(1)))
+                })
             {
                 findings.push(ProtocolFinding {
                     pack: ProtocolOraclePackKind::Erc4626,
-                    vuln: VulnType::RoundingLeakage,
-                    severity: ProtocolSeverity::Medium,
+                    vuln: VulnType::VaultInflation,
+                    severity: ProtocolSeverity::High,
                     tx_index: Some(call.tx_index),
                     target: Some(call.target),
-                    evidence: "convertToShares returned zero for nonzero asset input".to_string(),
+                    evidence: "nonzero ERC4626 deposit transferred assets into vault but returned zero shares; verify victim loss in replay".to_string(),
                 });
             }
         }
@@ -607,57 +753,24 @@ impl ProtocolOraclePack {
     ) {
         for call in calls_with_selectors(execution, &[UNISWAP_V2_SWAP, UNISWAP_V3_SWAP]) {
             let writes = writes_for_target(execution, call.target, call.tx_index);
-            if writes.len() >= 2 {
-                let mut deltas: Vec<_> = writes.iter().map(|diff| abs_delta(diff)).collect();
-                deltas.sort();
-                let max = *deltas.last().unwrap_or(&U256::ZERO);
-                let min = *deltas.first().unwrap_or(&U256::ZERO);
-                if !min.is_zero() && max / min > U256::from(100) {
-                    findings.push(ProtocolFinding {
-                        pack: ProtocolOraclePackKind::Amm,
-                        vuln: VulnType::UniswapV3LiquidityAsymmetry,
-                        severity: ProtocolSeverity::High,
-                        tx_index: Some(call.tx_index),
-                        target: Some(call.target),
-                        evidence: format!(
-                            "swap created asymmetric reserve/storage deltas max={max} min={min}"
-                        ),
-                    });
-                }
-            }
-        }
-
-        let reserve_reads = calls_with_selectors(execution, &[GET_RESERVES]);
-        let mut by_target: HashMap<Address, Vec<U256>> = HashMap::new();
-        for call in reserve_reads {
-            if let Some(value) = output_u256(call) {
-                by_target.entry(call.target).or_default().push(value);
-            }
-        }
-        for (target, values) in by_target {
-            for window in values.windows(2) {
-                let prev = window[0];
-                let curr = window[1];
-                let diff = if curr > prev {
-                    curr - prev
-                } else {
-                    prev - curr
-                };
-                if !prev.is_zero()
-                    && diff * U256::from(10_000) / prev > U256::from(self.price_move_threshold_bps)
-                {
-                    findings.push(ProtocolFinding {
-                        pack: ProtocolOraclePackKind::Amm,
-                        vuln: VulnType::PriceManipulation,
-                        severity: ProtocolSeverity::High,
-                        tx_index: None,
-                        target: Some(target),
-                        evidence: format!(
-                            "reserve view moved by more than {} bps",
-                            self.price_move_threshold_bps
-                        ),
-                    });
-                }
+            let committed_transfer = has_committed_token_transfer(execution, call);
+            let reserve_movement =
+                has_large_reserve_movement(execution, call, self.price_move_threshold_bps);
+            let reserve_product_break = has_reserve_product_break(execution, call);
+            if call.success
+                && committed_transfer
+                && !writes.is_empty()
+                && reserve_movement
+                && reserve_product_break
+            {
+                findings.push(ProtocolFinding {
+                    pack: ProtocolOraclePackKind::Amm,
+                    vuln: VulnType::UniswapV3LiquidityAsymmetry,
+                    severity: ProtocolSeverity::High,
+                    tx_index: Some(call.tx_index),
+                    target: Some(call.target),
+                    evidence: "successful swap committed a token transfer, reserve writes, and a reserve movement above the configured threshold; verify pool balance deltas in replay".to_string(),
+                });
             }
         }
     }
@@ -680,40 +793,31 @@ impl ProtocolOraclePack {
         );
         for call in calls {
             let writes = writes_for_target(execution, call.target, call.tx_index);
-            let large_decrease_without_repay =
-                writes.iter().any(|diff| {
-                    diff.old_value > diff.new_value
-                        && diff.old_value - diff.new_value >= self.large_diff_threshold
-                }) && !matches!(selector(call), Some(AAVE_REPAY | AAVE_LIQUIDATION_CALL));
-
-            if large_decrease_without_repay {
-                findings.push(ProtocolFinding {
-                    pack: ProtocolOraclePackKind::Lending,
-                    vuln: VulnType::AccountingDesync,
-                    severity: ProtocolSeverity::High,
-                    tx_index: Some(call.tx_index),
-                    target: Some(call.target),
-                    evidence:
-                        "large lending-market storage decrease outside repay/liquidation path"
-                            .to_string(),
-                });
-            }
-
+            let committed_transfer = has_committed_token_transfer(execution, call);
+            let token_transfer_target = committed_token_transfer_target(execution, call);
+            let has_debt_or_accounting_writes = execution.storage_diffs.iter().any(|diff| {
+                diff.tx_index == call.tx_index
+                    && diff.address != call.target
+                    && Some(diff.address) != token_transfer_target
+                    && !abs_delta(diff).is_zero()
+            });
             if matches!(selector(call), Some(AAVE_BORROW | COMPOUND_BORROW))
-                && writes.is_empty()
                 && call.success
-                && call.phase == CallPhase::End
+                && committed_transfer
+                && writes.is_empty()
+                && !has_debt_or_accounting_writes
             {
                 findings.push(ProtocolFinding {
                     pack: ProtocolOraclePackKind::Lending,
                     vuln: VulnType::InvariantViolation(
-                        "borrow succeeded without observed accounting writes".to_string(),
+                        "borrow transferred assets without observed debt accounting writes".to_string(),
                     ),
-                    severity: ProtocolSeverity::Medium,
+                    severity: ProtocolSeverity::High,
                     tx_index: Some(call.tx_index),
                     target: Some(call.target),
-                    evidence: "borrow-like call succeeded but no storage writes were observed"
-                        .to_string(),
+                    evidence:
+                        "successful borrow committed an asset transfer without observed debt accounting writes; verify borrower and protocol balance deltas in replay"
+                            .to_string(),
                 });
             }
         }
@@ -976,6 +1080,123 @@ fn abs_delta(diff: &StorageDiff) -> U256 {
     }
 }
 
+fn has_large_reserve_movement(
+    execution: &SequenceExecutionResult,
+    action: &CallObservation,
+    threshold_bps: u64,
+) -> bool {
+    let reads: Vec<(usize, (U256, U256))> = calls_with_selectors(execution, &[GET_RESERVES])
+        .into_iter()
+        .filter(|call| call.target == action.target)
+        .filter_map(|call| reserve_pair(call).map(|reserves| (call.tx_index, reserves)))
+        .collect();
+    reads.windows(2).any(|window| {
+        let (before_index, before) = window[0];
+        let (after_index, after) = window[1];
+        if before_index > action.tx_index || after_index < action.tx_index {
+            return false;
+        }
+        [before.0, before.1]
+            .into_iter()
+            .zip([after.0, after.1])
+            .any(|(previous, current)| {
+                if previous.is_zero() {
+                    return false;
+                }
+                let delta = if current > previous {
+                    current - previous
+                } else {
+                    previous - current
+                };
+                delta
+                    .checked_mul(U256::from(10_000))
+                    .map(|scaled| scaled / previous > U256::from(threshold_bps))
+                    .unwrap_or(false)
+            })
+    })
+}
+
+fn has_reserve_product_break(
+    execution: &SequenceExecutionResult,
+    action: &CallObservation,
+) -> bool {
+    let reads: Vec<(usize, (U256, U256))> = calls_with_selectors(execution, &[GET_RESERVES])
+        .into_iter()
+        .filter(|call| call.target == action.target)
+        .filter_map(|call| reserve_pair(call).map(|reserves| (call.tx_index, reserves)))
+        .collect();
+    reads.windows(2).any(|window| {
+        let (before_index, before) = window[0];
+        let (after_index, after) = window[1];
+        if before_index > action.tx_index || after_index < action.tx_index {
+            return false;
+        }
+        let Some(previous) = before.0.checked_mul(before.1) else {
+            return false;
+        };
+        let Some(current) = after.0.checked_mul(after.1) else {
+            return false;
+        };
+        if previous.is_zero() {
+            return false;
+        }
+        let delta = if current > previous {
+            current - previous
+        } else {
+            previous - current
+        };
+        delta
+            .checked_mul(U256::from(10_000))
+            .map(|scaled| scaled / previous > U256::from(100))
+            .unwrap_or(false)
+    })
+}
+
+fn reserve_pair(call: &CallObservation) -> Option<(U256, U256)> {
+    (call.output.len() >= 64).then(|| {
+        (
+            U256::from_be_slice(&call.output[..32]),
+            U256::from_be_slice(&call.output[32..64]),
+        )
+    })
+}
+
+fn transfer_amount_nonzero(call: &CallObservation) -> bool {
+    let amount_start = call.input.len().saturating_sub(32);
+    call.input.len() >= 68 && U256::from_be_slice(&call.input[amount_start..]) != U256::ZERO
+}
+
+fn committed_token_transfer_target(
+    execution: &SequenceExecutionResult,
+    action: &CallObservation,
+) -> Option<Address> {
+    execution
+        .call_trace
+        .iter()
+        .find(|transfer| {
+            transfer.tx_index == action.tx_index
+                && transfer.success
+                && transfer.phase == CallPhase::End
+                && transfer.caller == action.target
+                && matches!(
+                    selector(transfer),
+                    Some(ERC20_TRANSFER | ERC20_TRANSFER_FROM)
+                )
+                && ((transfer.input.len() == 68 && selector(transfer) == Some(ERC20_TRANSFER))
+                    || (transfer.input.len() == 100
+                        && selector(transfer) == Some(ERC20_TRANSFER_FROM)))
+                && transfer_amount_nonzero(transfer)
+        })
+        .map(|transfer| transfer.target)
+}
+
+fn has_committed_token_transfer(
+    execution: &SequenceExecutionResult,
+    action: &CallObservation,
+) -> bool {
+    committed_token_transfer_target(execution, action).is_some()
+}
+
 fn output_u256(call: &CallObservation) -> Option<U256> {
     (call.output.len() >= 32).then(|| U256::from_be_slice(&call.output[..32]))
 }
@@ -1032,6 +1253,34 @@ mod stage_4b_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selectors_match_canonical_abi_signatures() {
+        for (signature, expected) in [
+            (
+                "swap(address,bool,int256,uint160,bytes)",
+                super::UNISWAP_V3_SWAP,
+            ),
+            ("redeem(uint256)", super::COMPOUND_REDEEM),
+            ("deposit(uint256,address)", super::ERC4626_DEPOSIT),
+            ("mint(uint256,address)", super::ERC4626_MINT),
+            ("withdraw(uint256,address,address)", super::ERC4626_WITHDRAW),
+            ("redeem(uint256,address,address)", super::ERC4626_REDEEM),
+            ("convertToShares(uint256)", super::ERC4626_CONVERT_TO_SHARES),
+            ("totalAssets()", super::ERC4626_TOTAL_ASSETS),
+            ("supply(address,uint256,address,uint16)", super::AAVE_SUPPLY),
+            ("repay(address,uint256,uint256,address)", super::AAVE_REPAY),
+            (
+                "borrow(address,uint256,uint256,uint16,address)",
+                super::AAVE_BORROW,
+            ),
+        ] {
+            assert_eq!(
+                &revm::primitives::keccak256(signature.as_bytes())[..4],
+                &expected,
+                "{signature}"
+            );
+        }
+    }
     use super::*;
     use crate::common::types::{CallKind, ExecutionStatus, TxExecutionResult};
 
@@ -1114,6 +1363,9 @@ mod tests {
                 VulnType::InvariantViolation("lending health invariant".to_string())
             }
             OracleBugClass::FeeBypassManipulation => VulnType::MevSandwichExploit,
+            OracleBugClass::MintPolicyViolation => {
+                VulnType::Other("mint authorization policy violation".to_string())
+            }
             OracleBugClass::ApprovalAllowanceAbuse => {
                 VulnType::Other("unbounded allowance mutation".to_string())
             }
@@ -1132,7 +1384,7 @@ mod tests {
 
     #[test]
     fn oracle_specs_cover_required_bug_classes() {
-        assert_eq!(ORACLE_SPECS.len(), 12);
+        assert_eq!(ORACLE_SPECS.len(), 13);
         for spec in ORACLE_SPECS {
             assert!(!spec.required_preconditions.is_empty(), "{}", spec.name);
             assert!(
@@ -1235,5 +1487,315 @@ mod tests {
                 && finding.severity == ProtocolSeverity::Critical
                 && finding.evidence.contains("implementation slot mutated")
         }));
+    }
+
+    fn observation(
+        tx_index: usize,
+        caller: Address,
+        target: Address,
+        kind: CallKind,
+        success: bool,
+        input: Vec<u8>,
+        output: Vec<u8>,
+    ) -> CallObservation {
+        CallObservation {
+            tx_index,
+            depth: 0,
+            caller,
+            target,
+            value: U256::ZERO,
+            input,
+            output,
+            gas_limit: 100_000,
+            gas_used: 21_000,
+            success,
+            kind,
+            phase: CallPhase::End,
+            created_address: None,
+            result: None,
+        }
+    }
+
+    fn address_argument(selector: [u8; 4], caller: Address) -> Vec<u8> {
+        let mut input = selector.to_vec();
+        input.extend_from_slice(&[0; 12]);
+        input.extend_from_slice(caller.as_slice());
+        input
+    }
+
+    fn address_word(address: Address) -> Vec<u8> {
+        let mut output = vec![0; 12];
+        output.extend_from_slice(address.as_slice());
+        output
+    }
+
+    fn mint_observation(tx_index: usize, caller: Address, target: Address) -> CallObservation {
+        let mut input = ERC20_MINT.to_vec();
+        input.extend_from_slice(&[0; 12]);
+        input.extend_from_slice(target.as_slice());
+        input.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
+        observation(
+            tx_index,
+            caller,
+            target,
+            CallKind::Transaction,
+            true,
+            input,
+            Vec::new(),
+        )
+    }
+
+    fn increasing_diff(tx_index: usize, target: Address) -> StorageDiff {
+        StorageDiff {
+            tx_index,
+            address: target,
+            slot: B256::from(U256::from(7).to_be_bytes::<32>()),
+            old_value: U256::from(1),
+            new_value: U256::from(2),
+            pc: 0,
+        }
+    }
+
+    fn mint_violations(findings: &[ProtocolFinding]) -> bool {
+        findings.iter().any(|finding| {
+            finding.pack == ProtocolOraclePackKind::Erc20
+                && finding.vuln
+                    == VulnType::Other("mint authorization policy violation".to_string())
+        })
+    }
+
+    #[test]
+    fn owner_observation_authorizes_owner_mint_without_denied_probe() {
+        let target = addr(0xaa);
+        let owner = addr(0x01);
+        let owner_selector = sig("owner()");
+        let findings = ProtocolOraclePack::default().evaluate(&execution(
+            vec![
+                observation(
+                    0,
+                    owner,
+                    target,
+                    CallKind::StaticCall,
+                    true,
+                    owner_selector.to_vec(),
+                    address_word(owner),
+                ),
+                mint_observation(1, owner, target),
+            ],
+            vec![increasing_diff(1, target)],
+        ));
+        assert!(!mint_violations(&findings));
+    }
+
+    #[test]
+    fn delegated_minter_observation_authorizes_mint() {
+        let target = addr(0xaa);
+        let minter = addr(0x02);
+        let selector = sig("isMinter(address)");
+        let findings = ProtocolOraclePack::default().evaluate(&execution(
+            vec![
+                observation(
+                    0,
+                    minter,
+                    target,
+                    CallKind::StaticCall,
+                    true,
+                    address_argument(selector, minter),
+                    U256::from(1).to_be_bytes::<32>().to_vec(),
+                ),
+                mint_observation(1, minter, target),
+            ],
+            vec![increasing_diff(1, target)],
+        ));
+        assert!(!mint_violations(&findings));
+    }
+
+    #[test]
+    fn unknown_authorization_remains_unknown() {
+        let target = addr(0xaa);
+        let caller = addr(0x02);
+        let findings = ProtocolOraclePack::default().evaluate(&execution(
+            vec![mint_observation(0, caller, target)],
+            vec![increasing_diff(0, target)],
+        ));
+        assert!(!mint_violations(&findings));
+    }
+
+    #[test]
+    fn stale_denied_policy_does_not_survive_role_change() {
+        let target = addr(0xaa);
+        let caller = addr(0x02);
+        let selector = sig("canMint(address)");
+        let findings = ProtocolOraclePack::default().evaluate(&execution(
+            vec![
+                observation(
+                    0,
+                    caller,
+                    target,
+                    CallKind::StaticCall,
+                    true,
+                    address_argument(selector, caller),
+                    vec![0; 32],
+                ),
+                mint_observation(2, caller, target),
+            ],
+            vec![increasing_diff(1, target), increasing_diff(2, target)],
+        ));
+        assert!(!mint_violations(&findings));
+    }
+
+    #[test]
+    fn revoked_mint_invalidates_prior_authorized_observation() {
+        let target = addr(0xaa);
+        let caller = addr(0x02);
+        let selector = sig("canMint(address)");
+        let findings = ProtocolOraclePack::default().evaluate(&execution(
+            vec![
+                observation(
+                    0,
+                    caller,
+                    target,
+                    CallKind::StaticCall,
+                    true,
+                    address_argument(selector, caller),
+                    U256::from(1).to_be_bytes::<32>().to_vec(),
+                ),
+                mint_observation(2, caller, target),
+            ],
+            vec![increasing_diff(1, target), increasing_diff(2, target)],
+        ));
+        assert!(!mint_violations(&findings));
+    }
+
+    #[test]
+    fn rejected_or_delegated_authorization_observation_is_not_evidence() {
+        let target = addr(0xaa);
+        let caller = addr(0x02);
+        let selector = sig("canMint(address)");
+        let rejected = observation(
+            0,
+            caller,
+            target,
+            CallKind::StaticCall,
+            false,
+            address_argument(selector, caller),
+            vec![0; 32],
+        );
+        let delegated = observation(
+            0,
+            caller,
+            target,
+            CallKind::DelegateCall,
+            true,
+            address_argument(selector, caller),
+            vec![0; 32],
+        );
+        for policy in [rejected, delegated] {
+            let findings = ProtocolOraclePack::default().evaluate(&execution(
+                vec![policy, mint_observation(1, caller, target)],
+                vec![increasing_diff(1, target)],
+            ));
+            assert!(!mint_violations(&findings));
+        }
+    }
+
+    #[test]
+    fn authorization_observations_do_not_cross_tokens_or_callers() {
+        let target_a = addr(0xaa);
+        let target_b = addr(0xbb);
+        let caller = addr(0x02);
+        let other_caller = addr(0x03);
+        let selector = sig("canMint(address)");
+        let findings = ProtocolOraclePack::default().evaluate(&execution(
+            vec![
+                observation(
+                    0,
+                    caller,
+                    target_a,
+                    CallKind::StaticCall,
+                    true,
+                    address_argument(selector, caller),
+                    vec![0; 32],
+                ),
+                mint_observation(1, caller, target_b),
+                mint_observation(2, other_caller, target_a),
+            ],
+            vec![increasing_diff(1, target_b), increasing_diff(2, target_a)],
+        ));
+        assert!(!mint_violations(&findings));
+    }
+
+    #[test]
+    fn amm_evidence_requires_pool_correlated_transfer_and_reserve_reads() {
+        let pool = addr(0xaa);
+        let other_pool = addr(0xab);
+        let token = addr(0x90);
+        let reserve_output = |reserve0: U256, reserve1: U256| {
+            let mut output = reserve0.to_be_bytes::<32>().to_vec();
+            output.extend_from_slice(&reserve1.to_be_bytes::<32>());
+            output
+        };
+        let mut transfer_input = ERC20_TRANSFER.to_vec();
+        transfer_input.resize(68, 0);
+        let findings = ProtocolOraclePack::default().evaluate(&execution(
+            vec![
+                observation(
+                    0,
+                    addr(0x01),
+                    pool,
+                    CallKind::StaticCall,
+                    true,
+                    GET_RESERVES.to_vec(),
+                    reserve_output(U256::from(1_000_000), U256::from(1_000_000)),
+                ),
+                call(UNISWAP_V2_SWAP),
+                observation(
+                    1,
+                    addr(0x02),
+                    token,
+                    CallKind::Call,
+                    true,
+                    transfer_input,
+                    Vec::new(),
+                ),
+                observation(
+                    2,
+                    addr(0x01),
+                    pool,
+                    CallKind::StaticCall,
+                    true,
+                    GET_RESERVES.to_vec(),
+                    reserve_output(U256::from(1_200_000), U256::from(1_000_000)),
+                ),
+                observation(
+                    2,
+                    addr(0x01),
+                    other_pool,
+                    CallKind::StaticCall,
+                    true,
+                    GET_RESERVES.to_vec(),
+                    reserve_output(U256::from(1_000_000), U256::from(1_000_000)),
+                ),
+            ],
+            vec![increasing_diff(1, pool)],
+        ));
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.pack == ProtocolOraclePackKind::Amm));
+    }
+
+    #[test]
+    fn reserve_reads_without_swap_and_borrow_without_transfer_are_not_findings() {
+        let reserve_findings = ProtocolOraclePack::default()
+            .evaluate(&execution(vec![call(GET_RESERVES)], Vec::new()));
+        assert!(!reserve_findings
+            .iter()
+            .any(|finding| finding.pack == ProtocolOraclePackKind::Amm));
+
+        let borrow_findings =
+            ProtocolOraclePack::default().evaluate(&execution(vec![call(AAVE_BORROW)], Vec::new()));
+        assert!(!borrow_findings
+            .iter()
+            .any(|finding| finding.pack == ProtocolOraclePackKind::Lending));
     }
 }

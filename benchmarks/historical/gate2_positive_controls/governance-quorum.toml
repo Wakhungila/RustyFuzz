@@ -1,0 +1,12 @@
+id = "positive-governance-quorum"
+class = "governance_timelock_bypass"
+mode = "executable_evm"
+target = "0x6200000000000000000000000000000000000502"
+fixture = "benchmarks/historical/gate2_positive_controls/fixtures/governance-quorum.json"
+expected_invariant = "unauthorized proposal cannot execute without quorum"
+expected_selectors = ["propose(address[],uint256[],string[],bytes[],string)", "castVote(uint256,uint8)", "queue(uint256)", "execute(uint256)"]
+expected_attacker = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+success_criteria = ["expected_finding", "invariant_violation"]
+poc_generation = "not_required"
+max_duration_secs = 30
+notes = "Execute succeeds without proposal, vote, queue or delay."

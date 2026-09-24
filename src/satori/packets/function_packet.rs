@@ -1,5 +1,5 @@
 use crate::satori::error::SatoriResult;
-use crate::satori::fsutil::{sha256_hex, write_json};
+use crate::satori::fsutil::{sha256_hex, write_json_in_run};
 use crate::satori::graph::query::{related_functions, top_critical_functions};
 use crate::satori::memory::store::MemoryStore;
 use crate::satori::types::{
@@ -42,8 +42,11 @@ pub fn build_function_packets(
             target_function: function,
         };
         let key = sha256_hex(packet.target_function.id.as_bytes());
-        write_json(
-            run_dir.join(format!("packets/function_{key}.json")),
+        write_json_in_run(
+            run_dir,
+            Path::new("packets")
+                .join(format!("function_{key}.json"))
+                .as_path(),
             &packet,
         )?;
         packets.push(packet);

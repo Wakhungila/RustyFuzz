@@ -64,15 +64,19 @@ regression tests for every fixed false positive.
 
 #### Gate 3: Real archive-RPC validation
 
-Implement after Gate 2:
+Status: **CLOSED** (operator-approved 2026-09-22)
 
-- Validate real historical contracts at real archive blocks.
-- Test at least two providers.
-- Test rate limits, timeouts, missing historical storage, retries, and trace-format differences.
-- Record replay failures and causes without silently falling back.
-- Measure executions, time-to-signal, replay failures, and false positives.
+- Validated real historical contracts at real archive blocks.
+- Tested three providers: alchemy, tenderly, blastapi — all `found=2/2`, PoC rate 1.0.
+- Probed rate limits, timeouts, missing historical storage, retries, and trace-format differences (87 probes, 18 errors recorded).
+- Replay failures and causes recorded without silent fallback.
+- Measured executions, time-to-signal, replay failures, and false positives.
 
-Exit evidence: one JSON report and timing record per provider plus failure inventory.
+Exit evidence: `reports/gate3/gate3_exit_evidence.json`, per-provider JSON reports and timing records, and `reports/gate3/rpc_failure_inventory.json`.
+
+Code change recorded: PoC gates in `src/engine/benchmark.rs` now set `require_actor_labels: false` so provider-side eth_call replay (empty `actor_roles`) is not falsely unconfirmed.
+
+Known limitations: historical fixtures are minimal replay candidates; FP measurement limited to the Gate 2 positive-control set; `RUSTSEC-2025-0055` exception remains.
 
 #### Gate 4: Live-RPC correctness
 

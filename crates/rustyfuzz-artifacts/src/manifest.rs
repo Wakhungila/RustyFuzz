@@ -46,6 +46,15 @@ pub struct RunManifest {
     /// Fork block when forking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_block: Option<u64>,
+    /// Block hash at fetch time (reorg detection; Gate 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_block_hash: Option<String>,
+    /// Unix seconds when chain/fork state was first fetched (Gate 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_fetched_at_unix: Option<u64>,
+    /// Opaque fork-cache identity when a cache snapshot was used (Gate 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_cache_id: Option<String>,
     /// RPC origin WITHOUT credentials/query — `scheme://host` or
     /// `scheme://host:port` only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,6 +94,9 @@ impl RunManifest {
             backend: "evm".to_string(),
             chain_id: None,
             fork_block: None,
+            fork_block_hash: None,
+            rpc_fetched_at_unix: None,
+            fork_cache_id: None,
             rpc_endpoint_sanitized: None,
             abi_hash: None,
             bytecode_hash: None,

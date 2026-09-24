@@ -4,6 +4,7 @@ use rusty_fuzz::config::HardenedDefiConfig;
 use rusty_fuzz::engine::fuzz_engine::{run_fuzz_campaign, Config as FuzzConfig};
 use rusty_fuzz::engine::promotion::{PromotionCampaignSummary, PromotionConfig};
 use rusty_fuzz::evm::corpus::CampaignArtifactRecord;
+use rustyfuzz_artifacts::fsutil::write_atomic;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -202,8 +203,10 @@ async fn run_benchmark_contract(
         max_execs: Some(args.max_execs),
         duration_secs: None,
         artifact_limit: Some(100),
-        campaign_id: Some(format!("daedaluzz-{}", sanitize_name(&artifact.name))),
+        campaign_id: None,
+        paths_are_isolated: true,
         min_finding_confidence: 0,
+
         promotion: PromotionConfig::default(),
     })
     .await
@@ -493,7 +496,7 @@ fn write_reports(args: &Args, rows: &[BenchmarkRow]) -> anyhow::Result<()> {
     };
 
     let json_path = args.output_dir.join(format!("daedaluzz-{run_id}.json"));
-    fs::write(&json_path, serde_json::to_vec_pretty(&report)?)?;
+    write_atomic(&json_path, serde_json::to_vec_pretty(&report)?)?;
 
     let markdown_path = args.output_dir.join(format!("daedaluzz-{run_id}.md"));
     let mut markdown = String::new();
@@ -520,7 +523,7 @@ fn write_reports(args: &Args, rows: &[BenchmarkRow]) -> anyhow::Result<()> {
             row.seconds
         ));
     }
-    fs::write(&markdown_path, markdown)?;
+    write_atomic(&markdown_path, markdown.as_bytes())?;
 
     println!(
         "Benchmark reports written: {}, {}",

@@ -29,7 +29,7 @@ pub struct SatoriConfig {
 impl Default for SatoriConfig {
     fn default() -> Self {
         Self {
-            model: "o3".to_string(),
+            model: crate::satori::reasoning::zen_client::DEFAULT_MODEL.to_string(),
             max_critical_functions: 8,
             max_hypotheses_per_function: 2,
             min_confidence: 0.4,
@@ -314,9 +314,21 @@ pub struct RustyFuzzJobSpec {
     pub objective: String,
     pub success_condition: String,
     pub max_depth: usize,
+    #[serde(default = "default_job_max_execs")]
+    pub max_execs: u64,
+    #[serde(default = "default_job_duration_secs")]
+    pub duration_secs: u64,
     pub fork_rpc_url: Option<String>,
     pub fork_block: Option<u64>,
     pub abi_hints: Vec<String>,
+}
+
+fn default_job_max_execs() -> u64 {
+    256
+}
+
+fn default_job_duration_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

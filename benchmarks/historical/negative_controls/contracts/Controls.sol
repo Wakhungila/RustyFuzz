@@ -28,6 +28,7 @@ contract BurnOnlyToken {
 }
 contract OwnerMintToken is BurnOnlyToken {
     address constant OWNER = 0x1111111111111111111111111111111111111111;
+    function canMint(address caller) external pure returns (bool) { return caller == OWNER; }
     function mint(address to, uint256 amount) external {
         require(msg.sender == OWNER, "owner");
         balanceOf[to] += amount; totalSupply += amount;

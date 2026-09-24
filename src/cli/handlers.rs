@@ -5,11 +5,12 @@
 
 use super::commands::{Command, JobCommand};
 use super::helpers::*;
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::Provider;
 use libafl_bolts::core_affinity::Cores;
 
 use revm::database::CacheDB;
 use revm::primitives::Address;
+use rusty_fuzz::common::fs_security::{validate_filesystem_identifier, validate_job_bounds};
 use rusty_fuzz::common::oracle::{ProtocolOraclePack, ReentrancyOracle, VulnType};
 use rusty_fuzz::common::verifier::ReplayVerifier;
 use rusty_fuzz::engine::abi_ingest::{ingest_abi_file, write_abi_cache};
@@ -22,6 +23,7 @@ use rusty_fuzz::engine::minimizer::Minimizer;
 use rusty_fuzz::engine::promotion::{promote_finding_artifact, PromotionConfig, PromotionRequest};
 use rusty_fuzz::engine::seed_intelligence::SeedIntelligence;
 use rusty_fuzz::evm::corpus::{CampaignArtifactRecord, PersistentCorpus};
+use rusty_fuzz::evm::fork::configured_provider;
 use rusty_fuzz::evm::seed_ingester::{
     seed_abi_functions, MainnetSeed, MainnetSeedBundle, MainnetSeedConfig, SeedIngester,
     SeedMetadata, SeedScanMode,
@@ -29,9 +31,10 @@ use rusty_fuzz::evm::seed_ingester::{
 use rustyfuzz_evm::executor::EvmExecutor;
 use rustyfuzz_evm::fork_db::ForkDb;
 use rustyfuzz_evm::inspector::MAP_SIZE;
+use rustyfuzz_evm::rpc_url::validate_production_rpc_url;
 use std::io::Write;
 use std::str::FromStr;
-use std::sync::atomic::Ordering;
+use uuid::Uuid;
 
 /// Executes a non-Satori command against the loaded config.
 pub async fn run(command: Command) -> anyhow::Result<()> {
@@ -147,7 +150,9 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 promotion_enabled
             );
             std::io::stdout().flush()?;
-            let sanitized_campaign_id = campaign_id.as_deref().map(sanitize_campaign_id);
+            let campaign_id_value =
+                campaign_id.unwrap_or_else(|| format!("run-{}", Uuid::new_v4()));
+            let sanitized_campaign_id = Some(sanitize_campaign_id(&campaign_id_value));
             let campaign_corpus_dir = sanitized_campaign_id
                 .as_ref()
                 .map(|id| format!("{}/{}", config.corpus_dir, id))
@@ -160,7 +165,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             // the engine Config. Additive only; campaign behavior unchanged.
             let manifest_run_id = sanitized_campaign_id
                 .clone()
-                .unwrap_or_else(|| format!("run-{}", chrono::Utc::now().timestamp_millis()));
+                .expect("campaign identity is generated before manifest creation");
             let manifest_fork_block = config.fork_block;
             let manifest_rpc = rustyfuzz_artifacts::sanitize_rpc_endpoint(&config.rpc_url);
             let manifest_rng_seed = hardened_defi_config.rng_seed;
@@ -193,9 +198,12 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 duration_secs,
                 artifact_limit,
                 campaign_id: sanitized_campaign_id,
+                paths_are_isolated: true,
                 min_finding_confidence,
+
                 promotion: PromotionConfig {
                     enabled: promotion_enabled,
+                    no_promotion: no_promote_findings,
                     require_replay_for_report,
                     require_poc_for_confirmed,
                     strict_proof,
@@ -228,6 +236,35 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             run_manifest.fork_block = manifest_fork_block;
             run_manifest.rpc_endpoint_sanitized = Some(manifest_rpc);
             run_manifest.rng_seed = manifest_rng_seed;
+            // Gate 4: pin live chain provenance on the run manifest when a
+            // fork block is configured. Fail closed when RPC fork is required
+            // and synthetic fallback cannot absorb a probe failure.
+            if let Some(fork_block) = manifest_fork_block {
+                let rpc_url = config.rpc_url.clone();
+                let probe_result = tokio::task::spawn_blocking(move || {
+                    ForkDb::new(rpc_url, fork_block).refresh_remote_provenance()
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("fork provenance worker failed: {error}"))?;
+                match probe_result {
+                    Ok(prov) => {
+                        run_manifest.chain_id = prov.chain_id;
+                        run_manifest.fork_block_hash = prov.block_hash;
+                        run_manifest.rpc_fetched_at_unix = prov.fetched_at_unix;
+                        run_manifest.fork_cache_id = prov.cache_id;
+                    }
+                    Err(err) => {
+                        let require_rpc = config.require_rpc_fork || require_rpc_fork;
+                        let synthetic_ok = manifest_synthetic_fallback;
+                        if require_rpc && !synthetic_ok {
+                            return Err(anyhow::anyhow!(
+                                "live RPC provenance probe failed (fail-closed): {err}"
+                            ));
+                        }
+                        log::warn!("run manifest provenance probe skipped: {err}");
+                    }
+                }
+            }
             if manifest_deterministic {
                 run_manifest
                     .assumptions
@@ -247,11 +284,16 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             })?;
             log::info!("run manifest persisted at {}", manifest_path.display());
 
-            let watchdog_done =
+            let watchdog =
                 install_campaign_watchdog(wall_timeout_secs, max_execs, duration_secs, unbounded);
-            let result = rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await;
-            if let Some(done) = watchdog_done {
-                done.store(true, Ordering::SeqCst);
+            let cancellation = watchdog.as_ref().map(|watchdog| watchdog.cancellation());
+            let result = rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign_with_cancellation(
+                fuzz_config,
+                cancellation,
+            )
+            .await;
+            if let Some(watchdog) = watchdog {
+                watchdog.complete();
             }
             result?;
         }
@@ -369,9 +411,12 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     Default::default()
                 };
 
-                let url: reqwest::Url = rpc_url.parse()?;
-                let provider = ProviderBuilder::new().connect_http(url);
-                let latest_block = provider.get_block_number().await?;
+                let url = validate_production_rpc_url(rpc_url).map_err(anyhow::Error::msg)?;
+                let provider = configured_provider(url)?;
+                let latest_block = provider
+                    .get_block_number()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Alloy RPC latest-block request failed"))?;
                 let fork_block = config.fork_block.unwrap_or(latest_block);
                 let fork_db = ForkDb::new(rpc_url.to_string(), fork_block);
                 let ingester = SeedIngester::new(provider);
@@ -414,9 +459,11 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             }
 
             let target = target_address(target.as_deref(), &config)?;
+            PersistentCorpus::validate_seed_bundle_id(&bundle_id)?;
             let fork_block = config.fork_block.unwrap_or(0);
-            let url: reqwest::Url = config.rpc_url.parse()?;
-            let provider = ProviderBuilder::new().connect_http(url);
+
+            let url = validate_production_rpc_url(&config.rpc_url).map_err(anyhow::Error::msg)?;
+            let provider = configured_provider(url)?;
             let fork_db = ForkDb::new(config.rpc_url.clone(), fork_block);
             let ingester = SeedIngester::new(provider);
             let mut seed_config = MainnetSeedConfig::new(fork_block, target, max_seeds);
@@ -666,14 +713,31 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 ensure_evm_chain(&config)?;
                 let job: rusty_fuzz::satori::types::RustyFuzzJobSpec =
                     serde_json::from_str(&std::fs::read_to_string(&file)?)?;
+                validate_job_bounds(Some(job.max_execs), Some(job.duration_secs))
+                    .map_err(anyhow::Error::msg)?;
+                validate_filesystem_identifier(&job.job_id).map_err(anyhow::Error::msg)?;
+                if let Some(rpc_url) = job.fork_rpc_url.as_deref() {
+                    validate_production_rpc_url(rpc_url).map_err(anyhow::Error::msg)?;
+                }
                 let target_contract = job
                     .target_contract
                     .as_deref()
                     .or(config.target_contract.as_deref())
                     .map(Address::from_str)
                     .transpose()?;
-                let job_report_dir = format!("{}/jobs/{}", config.report_dir, job.job_id);
+                let job_path_id = job.job_id.clone();
+                let job_report_dir = format!("{}/jobs/{}", config.report_dir, job_path_id);
+                let job_corpus_dir = format!("{}/jobs/{}", config.corpus_dir, job_path_id);
+                let job_corpus = PersistentCorpus::new(&job_corpus_dir)?;
+                if let Some(bundle_id) =
+                    seed_bundle.as_ref().or(config.mainnet_seed_bundle.as_ref())
+                {
+                    let global_corpus = PersistentCorpus::new(&config.corpus_dir)?;
+                    let bundle = global_corpus.load_mainnet_seed_bundle(bundle_id)?;
+                    job_corpus.persist_mainnet_seed_bundle(bundle_id, &bundle)?;
+                }
                 std::fs::create_dir_all(&job_report_dir)?;
+
                 let invariant_manifest =
                     TargetInvariantManifest::generate(target_contract, None, None, Some(&job));
                 let invariant_path = format!("{job_report_dir}/invariants.toml");
@@ -685,8 +749,9 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     rpc_url: job.fork_rpc_url.unwrap_or_else(|| config.rpc_url.clone()),
                     fork_block: job.fork_block.or(config.fork_block).unwrap_or(0),
                     target_contract,
-                    corpus_dir: config.corpus_dir.clone(),
+                    corpus_dir: job_corpus_dir,
                     report_dir: job_report_dir,
+
                     foundry_harness: None,
                     mainnet_seed_bundle: seed_bundle.or(config.mainnet_seed_bundle.clone()),
                     in_memory_bytecode: None,
@@ -702,13 +767,16 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     },
                     target_invariant_manifest: Some(invariant_path),
                     abi_path: abi.or(config.target_abi.clone()),
-                    max_execs: None,
-                    duration_secs: None,
+                    max_execs: Some(job.max_execs),
+                    duration_secs: Some(job.duration_secs),
                     artifact_limit: None,
                     campaign_id: Some(job.job_id.clone()),
+                    paths_are_isolated: true,
                     min_finding_confidence: 0,
+
                     promotion: PromotionConfig {
                         enabled: true,
+                        no_promotion: false,
                         require_replay_for_report: true,
                         require_poc_for_confirmed: true,
                         strict_proof: true,
@@ -736,12 +804,26 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             let verifier = ReplayVerifier::new(MAP_SIZE);
             let execution = if live {
                 let input = load_replay_input(&corpus, &input)?;
-                let (execution, report) = verifier.compare_cached_vs_live(
-                    corpus.load_offline_fork_db(&fork_cache_id)?,
-                    ForkDb::new(config.rpc_url.clone(), config.fork_block.unwrap_or(0)),
-                    &block_env,
-                    &input,
+                let fork_block = config
+                    .fork_block
+                    .ok_or_else(|| anyhow::anyhow!("live replay requires --fork-block"))?;
+                let live_fork = ForkDb::new(config.rpc_url.clone(), fork_block);
+                let observed = live_fork.refresh_remote_provenance()?;
+                let chain_id = observed
+                    .chain_id
+                    .ok_or_else(|| anyhow::anyhow!("live replay provenance is missing chain id"))?;
+                let block_hash = observed.block_hash.ok_or_else(|| {
+                    anyhow::anyhow!("live replay provenance is missing block hash")
+                })?;
+                let cached_fork = corpus.load_online_fork_db(
+                    &fork_cache_id,
+                    fork_block,
+                    &observed.provider_sanitized,
+                    chain_id,
+                    &block_hash,
                 )?;
+                let (execution, report) =
+                    verifier.compare_cached_vs_live(cached_fork, live_fork, &block_env, &input)?;
                 println!("Differential replay report: {report:?}");
                 anyhow::ensure!(report.equivalent, "cached-vs-live replay mismatch");
                 execution
@@ -860,6 +942,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             let block_env = campaign_block_env(&config).await?;
             let promotion_config = PromotionConfig {
                 enabled: true,
+                no_promotion: false,
                 require_replay_for_report: true,
                 require_poc_for_confirmed: true,
                 strict_proof,
@@ -871,12 +954,14 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 poc_out,
                 promotion_limit: None,
             };
+            let campaign_id_value =
+                campaign_id.unwrap_or_else(|| format!("manual-promote-{}", Uuid::new_v4()));
             let record = promote_finding_artifact(PromotionRequest {
                 corpus: &corpus,
                 artifact: &artifact,
                 block_env: &block_env,
                 report_dir: std::path::Path::new(&config.report_dir),
-                campaign_id: campaign_id.as_deref().unwrap_or("manual-promote"),
+                campaign_id: &campaign_id_value,
                 fork_block: config.fork_block.unwrap_or(0),
                 rpc_url: &config.rpc_url,
                 synthetic_mode: false,

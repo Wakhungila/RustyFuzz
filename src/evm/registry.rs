@@ -48,59 +48,94 @@ impl GlobalAccountRegistry {
     pub fn auto_populate_abi(&self, registry: &mut AbiRegistry) {
         let common_sigs: BTreeMap<[u8; 4], Vec<DynSolType>> = [
             (
-                [0xa9, 0x05, 0x9c, 0xbb],
+                "transfer(address,uint256)",
                 vec![DynSolType::Address, DynSolType::Uint(256)],
-            ), // ERC20 transfer
+            ),
             (
-                [0x23, 0xb8, 0x72, 0xdd],
+                "transferFrom(address,address,uint256)",
                 vec![
                     DynSolType::Address,
                     DynSolType::Address,
                     DynSolType::Uint(256),
                 ],
-            ), // ERC20 transferFrom
+            ),
             (
-                [0x09, 0x5e, 0xa7, 0xb3],
+                "approve(address,uint256)",
                 vec![DynSolType::Address, DynSolType::Uint(256)],
-            ), // ERC20 approve
+            ),
             (
-                [0x81, 0x19, 0xc0, 0x65],
+                "initialize(address,uint256,bytes)",
                 vec![
                     DynSolType::Address,
                     DynSolType::Uint(256),
                     DynSolType::Bytes,
                 ],
-            ), // Proxy initialize
+            ),
             (
-                [0xb6, 0xb5, 0x5f, 0x25],
+                "deposit(uint256,address)",
                 vec![DynSolType::Uint(256), DynSolType::Address],
-            ), // Vault deposit
-            ([0x2e, 0x1a, 0x7d, 0x4d], vec![DynSolType::Uint(256)]), // Vault withdraw
-            ([0x42, 0x96, 0x69, 0x45], vec![DynSolType::Uint(256)]), // ERC721 safeMint
-            ([0x36, 0x44, 0x2b, 0x24], vec![]), // Proxy upgradeToAndCall (partial)
+            ),
+            ("deposit(uint256)", vec![DynSolType::Uint(256)]),
+            ("withdraw(uint256)", vec![DynSolType::Uint(256)]),
             (
-                [0x61, 0x7c, 0x03, 0xcb],
+                "withdraw(uint256,address,address)",
+                vec![
+                    DynSolType::Uint(256),
+                    DynSolType::Address,
+                    DynSolType::Address,
+                ],
+            ),
+            (
+                "redeem(uint256,address,address)",
+                vec![
+                    DynSolType::Uint(256),
+                    DynSolType::Address,
+                    DynSolType::Address,
+                ],
+            ),
+            ("safeMint(uint256)", vec![DynSolType::Uint(256)]),
+            (
+                "upgradeToAndCall(address,bytes)",
+                vec![DynSolType::Address, DynSolType::Bytes],
+            ),
+            (
+                "supply(address,uint256,address,uint16)",
                 vec![
                     DynSolType::Address,
                     DynSolType::Uint(256),
-                    DynSolType::Uint(256),
+                    DynSolType::Address,
                     DynSolType::Uint(16),
                 ],
-            ), // Aave V3 supply
+            ),
             (
-                [0xa4, 0x15, 0xbb, 0x22],
+                "repay(address,uint256,uint256,address)",
                 vec![
                     DynSolType::Address,
                     DynSolType::Uint(256),
                     DynSolType::Uint(256),
                     DynSolType::Address,
                 ],
-            ), // Uniswap V3 swap
-            ([0x01, 0xad, 0x8a, 0x86], vec![]), // totalAssets
-            ([0x18, 0x16, 0x0d, 0xdd], vec![]), // totalSupply
-            ([0x70, 0xa0, 0x82, 0x31], vec![DynSolType::Address]), // balanceOf
+            ),
+            (
+                "swap(address,bool,int256,uint160,bytes)",
+                vec![
+                    DynSolType::Address,
+                    DynSolType::Bool,
+                    DynSolType::Int(256),
+                    DynSolType::Uint(160),
+                    DynSolType::Bytes,
+                ],
+            ),
+            ("totalAssets()", vec![]),
+            ("totalSupply()", vec![]),
+            ("balanceOf(address)", vec![DynSolType::Address]),
+            ("canMint(address)", vec![DynSolType::Address]),
         ]
         .into_iter()
+        .map(|(signature, types)| {
+            let hash = revm::primitives::keccak256(signature.as_bytes());
+            ([hash[0], hash[1], hash[2], hash[3]], types)
+        })
         .collect();
 
         for (sel, types) in common_sigs {

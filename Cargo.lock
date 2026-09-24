@@ -4583,7 +4583,6 @@ dependencies = [
  "alloy-primitives",
  "anyhow",
  "async-trait",
- "bincode",
  "bitvec",
  "chrono",
  "clap",
@@ -4612,6 +4611,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.23",
  "url",
+ "uuid",
  "z3",
 ]
 
@@ -4663,6 +4663,7 @@ dependencies = [
  "rustyfuzz-core",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]

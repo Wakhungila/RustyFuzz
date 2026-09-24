@@ -31,10 +31,10 @@ use revm::context::BlockEnv;
 use revm::database::CacheDB;
 use revm::primitives::{keccak256, Address, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
-use rustyfuzz_evm::fork_db::{ForkDb, ForkDbCacheSnapshot};
+use rustyfuzz_artifacts::fsutil::write_atomic;
+use rustyfuzz_evm::fork_db::{ForkCacheProvenance, ForkDb, ForkDbCacheSnapshot};
 use rustyfuzz_evm::inspector::MAP_SIZE;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -725,6 +725,13 @@ impl Default for SyntheticBenchmarkFixture {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BenchmarkEvidenceClass {
+    #[default]
+    ProductionLive,
+    SyntheticRegression,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ValidationObservation {
     pub findings: Vec<ProtocolFinding>,
@@ -736,6 +743,7 @@ pub struct ValidationObservation {
     pub elapsed_secs: Option<f64>,
     pub artifact_path: Option<PathBuf>,
     pub foundry_poc_path: Option<PathBuf>,
+    pub synthetic_profile: bool,
     pub false_positive_notes: Vec<String>,
 }
 
@@ -773,6 +781,8 @@ pub enum BenchmarkFailureKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BenchmarkValidationResult {
+    #[serde(default)]
+    pub evidence_class: BenchmarkEvidenceClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<super::executable_fixture::ExecutableEvidence>,
     pub benchmark_id: String,
@@ -854,6 +864,7 @@ pub struct ValidationSummary {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ScoringCalibrationReport {
     pub benchmark_count: usize,
+    pub synthetic_regression_count: usize,
     pub pass_rate: f64,
     pub replay_success_rate: f64,
     pub minimized_success_rate: f64,
@@ -962,8 +973,8 @@ impl ValidationRunner {
                         .partition(|finding| manifest.vulnerability_class.matches_finding(finding));
                     evidence.matching_signals = matching;
                     evidence.unmatched_signals = unmatched;
-                    let observation = ValidationObservation { findings,
-                        executions: Some(execution.tx_results.len() as u64), ..Default::default() };
+                     let observation = ValidationObservation { findings,
+                         executions: Some(execution.tx_results.len() as u64), synthetic_profile: false, ..Default::default() };
                     let mut result = self.evaluate_observation(manifest, &observation);
                     // Negative controls measure raw oracle false positives, not
                     // proof-generation success. No proof/candidate is constructed.
@@ -1147,6 +1158,7 @@ impl ValidationRunner {
         );
 
         BenchmarkValidationResult {
+            evidence_class: evidence_class(manifest.mode.clone(), observation.synthetic_profile),
             runtime: None,
             benchmark_id: manifest.id.clone(),
             vulnerability_class: manifest.vulnerability_class.clone(),
@@ -1218,7 +1230,8 @@ impl ValidationRunner {
             }
         }
         let json = serde_json::to_string_pretty(report)?;
-        fs::write(output, json).with_context(|| format!("write report {}", output.display()))
+        write_atomic(output, json.as_bytes())
+            .with_context(|| format!("write report {}", output.display()))
     }
 
     fn skipped_result(
@@ -1229,6 +1242,7 @@ impl ValidationRunner {
     ) -> BenchmarkValidationResult {
         let failure_kind = skipped_failure_kind(status.clone());
         BenchmarkValidationResult {
+            evidence_class: evidence_class_for_manifest(manifest),
             runtime: None,
             benchmark_id: manifest.id.clone(),
             vulnerability_class: manifest.vulnerability_class.clone(),
@@ -1287,6 +1301,7 @@ impl ValidationRunner {
         reason: String,
     ) -> BenchmarkValidationResult {
         BenchmarkValidationResult {
+            evidence_class: evidence_class_for_manifest(manifest),
             runtime: None,
             benchmark_id: manifest.id.clone(),
             vulnerability_class: manifest.vulnerability_class.clone(),
@@ -1390,6 +1405,7 @@ impl ValidationRunner {
             elapsed_secs: fixture.time_to_signal_secs.or(Some(0.0)),
             artifact_path: None,
             foundry_poc_path: None,
+            synthetic_profile: true,
             false_positive_notes: fixture.false_positive_notes.clone(),
         };
         if let Some(notes) = &fixture.notes {
@@ -1557,17 +1573,36 @@ impl ValidationRunner {
 
         let started = std::time::Instant::now();
         let replay_verifier = ReplayVerifier::new(MAP_SIZE);
-        let explicit_fork_cache = live_fixture.fork_cache.or_else(|| {
-            live_fixture
-                .fork_cache_profile
-                .map(|profile| explicit_profile_fork_cache(manifest, profile).cache_snapshot())
-        });
-        let replay_snapshot = explicit_fork_cache.clone();
-        let mut replay_economic_delta = None;
-        let (execution, replay_backend) = if live_fixture.provider_replay_only {
-            let execution = provider_side_eth_call_replay(rpc_url, fork_block, &input)?;
-            (execution, "rpc-provider-eth-call".to_string())
-        } else if let Some(snapshot) = explicit_fork_cache {
+        let explicit_fork_cache = live_fixture
+            .fork_cache
+            .map(|snapshot| (snapshot, false))
+            .or_else(|| {
+                live_fixture.fork_cache_profile.map(|profile| {
+                    (
+                        explicit_profile_fork_cache(manifest, profile).cache_snapshot(),
+                        true,
+                    )
+                })
+            });
+        let minimization_snapshot = explicit_fork_cache
+            .as_ref()
+            .map(|(snapshot, _)| snapshot.clone());
+        let replay_economic_delta;
+        anyhow::ensure!(
+            !live_fixture.provider_replay_only,
+            "provider_replay_only is unsupported: independent eth_call requests do not preserve sequence state or prove an invariant; use local EVM replay with a pinned fork/cache"
+        );
+        let (execution, replay_backend, synthetic_profile) = if let Some((
+            snapshot,
+            synthetic_profile,
+        )) = explicit_fork_cache
+        {
+            snapshot
+                .verify_content_digest()
+                .map_err(|error| anyhow::anyhow!("cached fork snapshot integrity: {error}"))?;
+            if !synthetic_profile {
+                validate_cached_fork_snapshot(&snapshot, rpc_url, fork_block)?;
+            }
             let replay = replay_verifier.replay_with_economic_views(
                 &ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(snapshot))),
                 &block_env,
@@ -1575,47 +1610,37 @@ impl ValidationRunner {
                 manifest.target_address(),
             )?;
             replay_economic_delta = Some(replay.delta);
-            let execution = replay.execution;
-            (execution, "cached-fork-fixture".to_string())
+            let backend = if synthetic_profile {
+                "synthetic-fork-cache-profile"
+            } else {
+                "cached-fork-fixture"
+            };
+            (replay.execution, backend, synthetic_profile)
         } else {
-            match replay_verifier.replay_with_economic_views(
-                &ChainState::Evm(CacheDB::new(ForkDb::new(rpc_url.to_string(), fork_block))),
-                &block_env,
-                &input,
-                manifest.target_address(),
-            ) {
-                Ok(replay) => {
-                    replay_economic_delta = Some(replay.delta);
-                    (replay.execution, "rpc-live-fork".to_string())
-                }
-                Err(local_error) => {
-                    let execution = provider_side_eth_call_replay(rpc_url, fork_block, &input)
-                        .map_err(|remote_error| {
-                            anyhow::anyhow!(
-                                "RPC-backed live-fork replay failed for `{}` at block {}; local cause: {}; provider-side eth_call fallback cause: {}; provide a reachable archive RPC endpoint or a fixture fork_cache to prove this benchmark offline",
-                                manifest.id,
-                                fork_block,
-                                sanitize_report_error(&local_error.to_string()),
-                                sanitize_report_error(&remote_error.to_string()),
-                            )
-                        })?;
-                    (
-                        execution,
-                        format!(
-                            "rpc-provider-eth-call-fallback after local replay error: {}",
-                            sanitize_report_error(&local_error.to_string())
-                        ),
-                    )
-                }
-            }
+            let live_db = ForkDb::new(rpc_url.to_string(), fork_block);
+            let observed = live_db.refresh_remote_provenance().map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to establish live fork provenance for `{}` at block {}: {}",
+                    manifest.id,
+                    fork_block,
+                    sanitize_report_error(&error.to_string())
+                )
+            })?;
+            ensure_fork_provenance_complete(&observed, fork_block, "live fork")?;
+            let replay = replay_verifier.replay_with_economic_views(
+                    &ChainState::Evm(CacheDB::new(live_db)),
+                    &block_env,
+                    &input,
+                    manifest.target_address(),
+                ).map_err(|error| anyhow::anyhow!(
+                    "stateful EVM replay failed for `{}` at block {}: {}; no stateless provider fallback is permitted",
+                    manifest.id, fork_block, sanitize_report_error(&error.to_string())
+                ))?;
+            replay_economic_delta = Some(replay.delta);
+            (replay.execution, "rpc-live-fork", false)
         };
         let elapsed_secs = started.elapsed().as_secs_f64();
-        let mut findings = ProtocolOraclePack::default().evaluate(&execution);
-        if replay_backend.starts_with("rpc-provider-eth-call") {
-            findings.push(provider_side_historical_finding(
-                manifest, fork_block, &execution,
-            ));
-        }
+        let findings = ProtocolOraclePack::default().evaluate(&execution);
         let state_novelty = synthetic_state_novelty(&execution);
         let mut score = crate::engine::scoring::CampaignScorer::default().score(
             &input,
@@ -1655,7 +1680,8 @@ impl ValidationRunner {
                 &block_env,
                 rpc_url,
                 fork_block,
-                replay_snapshot.as_ref(),
+                minimization_snapshot.as_ref(),
+                synthetic_profile,
             );
         }
 
@@ -1672,6 +1698,7 @@ impl ValidationRunner {
             elapsed_secs: Some(elapsed_secs),
             artifact_path: None,
             foundry_poc_path: None,
+            synthetic_profile,
             false_positive_notes: vec![format!("live-fork benchmark from `{fixture_path}`")],
         };
 
@@ -1689,6 +1716,11 @@ impl ValidationRunner {
         observation
             .false_positive_notes
             .push(format!("replay backend: {replay_backend}"));
+        if synthetic_profile {
+            observation.false_positive_notes.push(
+                "explicit synthetic profile: not live or cached production evidence".to_string(),
+            );
+        }
 
         let replay_findings = findings.clone();
         observation.proof = observation.exploit_candidate.as_ref().map(|candidate| {
@@ -1705,6 +1737,7 @@ impl ValidationRunner {
             FindingConfirmationGate {
                 config: FindingConfirmationConfig {
                     require_protocol_assertion: false,
+                    require_actor_labels: false,
                     ..FindingConfirmationConfig::default()
                 },
             }
@@ -1855,30 +1888,64 @@ fn execute_blind_rediscovery_benchmark(
     let candidate_input = EvmInput::new(candidate.sequence.clone(), 0);
 
     let started = std::time::Instant::now();
-    let explicit_fork_cache = live_fixture.fork_cache.or_else(|| {
-        live_fixture
-            .fork_cache_profile
-            .map(|profile| explicit_profile_fork_cache(manifest, profile).cache_snapshot())
-    });
+    let explicit_fork_cache = live_fixture
+        .fork_cache
+        .map(|snapshot| (snapshot, false))
+        .or_else(|| {
+            live_fixture.fork_cache_profile.map(|profile| {
+                (
+                    explicit_profile_fork_cache(manifest, profile).cache_snapshot(),
+                    true,
+                )
+            })
+        });
     let replay_verifier = ReplayVerifier::new(MAP_SIZE);
     let block_env = context.block_env.clone().unwrap_or_default();
-    let (execution, replay_backend, replay_economic_delta) = if let Some(snapshot) =
+    let (execution, replay_backend, replay_economic_delta, synthetic_profile) = if let Some((
+        snapshot,
+        synthetic_profile,
+    )) =
         explicit_fork_cache
     {
+        snapshot
+            .verify_content_digest()
+            .map_err(|error| anyhow::anyhow!("cached fork snapshot integrity: {error}"))?;
+        if !synthetic_profile {
+            let expected_fork_block = fork_block.context("missing fork block for cached replay")?;
+            let expected_rpc_url = rpc_url.context("missing RPC URL for cached replay")?;
+            validate_cached_fork_snapshot(&snapshot, expected_rpc_url, expected_fork_block)?;
+        }
+
         let replay = replay_verifier.replay_with_economic_views(
             &ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(snapshot))),
             &block_env,
             &candidate_input,
             manifest.target_address(),
         )?;
+        let backend = if synthetic_profile {
+            "synthetic-fork-cache-profile"
+        } else {
+            "cached-fork-fixture"
+        };
         (
             replay.execution,
-            "cached-fork-fixture".to_string(),
+            backend.to_string(),
             Some(replay.delta),
+            synthetic_profile,
         )
     } else if let (Some(rpc_url), Some(fork_block)) = (rpc_url, fork_block) {
+        let live_db = ForkDb::new(rpc_url.to_string(), fork_block);
+        let observed = live_db.refresh_remote_provenance().map_err(|error| {
+            anyhow::anyhow!(
+                "failed to establish live fork provenance for `{}` at block {}: {}",
+                manifest.id,
+                fork_block,
+                sanitize_report_error(&error.to_string())
+            )
+        })?;
+        ensure_fork_provenance_complete(&observed, fork_block, "live fork")?;
         let replay = replay_verifier.replay_with_economic_views(
-            &ChainState::Evm(CacheDB::new(ForkDb::new(rpc_url.to_string(), fork_block))),
+            &ChainState::Evm(CacheDB::new(live_db)),
             &block_env,
             &candidate_input,
             manifest.target_address(),
@@ -1887,11 +1954,12 @@ fn execute_blind_rediscovery_benchmark(
             replay.execution,
             "rpc-live-fork".to_string(),
             Some(replay.delta),
+            false,
         )
     } else {
         return Err(anyhow::anyhow!(
-            "blind rediscovery benchmark requires either an explicit fork cache or rpc_url/fork_block in validation context"
-        ));
+                "blind rediscovery benchmark requires either an explicit fork cache or rpc_url/fork_block in validation context"
+            ));
     };
     let elapsed_secs = started.elapsed().as_secs_f64();
     let mut findings = ProtocolOraclePack::default().evaluate(&execution);
@@ -1930,6 +1998,7 @@ fn execute_blind_rediscovery_benchmark(
         elapsed_secs: Some(elapsed_secs),
         artifact_path: None,
         foundry_poc_path: None,
+        synthetic_profile,
         false_positive_notes: vec![
             format!("blind rediscovery benchmark from `{fixture_path}`"),
             format!(
@@ -1942,6 +2011,11 @@ fn execute_blind_rediscovery_benchmark(
             format!("replay backend: {replay_backend}"),
         ],
     };
+    if synthetic_profile {
+        observation
+            .false_positive_notes
+            .push("explicit synthetic profile: not live or cached production evidence".to_string());
+    }
 
     if !observation.findings.is_empty() {
         if let Some(candidate) = observation.exploit_candidate.as_mut() {
@@ -1980,6 +2054,7 @@ fn execute_blind_rediscovery_benchmark(
         FindingConfirmationGate {
             config: FindingConfirmationConfig {
                 require_protocol_assertion: false,
+                require_actor_labels: false,
                 ..FindingConfirmationConfig::default()
             },
         }
@@ -2257,207 +2332,6 @@ fn sequence_summary(candidate: &ExploitPathCandidate) -> Vec<String> {
         .collect()
 }
 
-fn provider_side_eth_call_replay(
-    rpc_url: &str,
-    fork_block: u64,
-    input: &EvmInput,
-) -> Result<SequenceExecutionResult> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(45))
-        .pool_max_idle_per_host(0)
-        .user_agent("rusty-fuzz-provider-replay/0.1")
-        .build()?;
-    let block_tag = format!("0x{fork_block:x}");
-    let mut tx_results = Vec::with_capacity(input.txs.len());
-    let mut call_trace = Vec::with_capacity(input.txs.len());
-
-    for (tx_index, tx) in input.txs.iter().enumerate() {
-        let mut call = serde_json::Map::new();
-        call.insert("from".to_string(), Value::String(tx.caller.to_string()));
-        call.insert("to".to_string(), Value::String(tx.to.to_string()));
-        call.insert(
-            "data".to_string(),
-            Value::String(format!("0x{}", hex::encode(&tx.input))),
-        );
-        if !tx.value.is_zero() {
-            call.insert(
-                "value".to_string(),
-                Value::String(format!("0x{:x}", tx.value)),
-            );
-        }
-
-        let response: Value = client
-            .post(rpc_url)
-            .json(&json!({
-                "jsonrpc": "2.0",
-                "id": tx_index + 1,
-                "method": "eth_call",
-                "params": [Value::Object(call), Value::String(block_tag.clone())],
-            }))
-            .send()
-            .map_err(|error| anyhow::anyhow!(sanitize_report_error(&error.to_string())))?
-            .error_for_status()
-            .map_err(|error| anyhow::anyhow!(sanitize_report_error(&error.to_string())))?
-            .json()?;
-
-        if let Some(error) = response.get("error") {
-            anyhow::bail!("provider eth_call returned JSON-RPC error: {error}");
-        }
-        let output_hex = response
-            .get("result")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("provider eth_call response missing result"))?;
-        let output = parse_hex_bytes_for_report(output_hex)?;
-        let coverage_hash = stable_provider_replay_hash(tx, &output);
-        let call = CallObservation {
-            tx_index,
-            depth: 0,
-            caller: tx.caller,
-            target: tx.to,
-            value: tx.value,
-            input: tx.input.clone(),
-            output: output.clone(),
-            gas_limit: 0,
-            gas_used: 0,
-            success: true,
-            kind: CallKind::Transaction,
-            phase: CallPhase::End,
-            created_address: None,
-            result: Some("provider_eth_call_success".to_string()),
-        };
-        call_trace.push(call.clone());
-        tx_results.push(TxExecutionResult {
-            tx_index,
-            status: ExecutionStatus::Success,
-            gas_used: 0,
-            output,
-            coverage_hash,
-            coverage_edges: 1,
-            storage_reads: Vec::new(),
-            storage_writes: Vec::new(),
-            storage_diffs: Vec::new(),
-            call_trace: vec![call],
-            waypoints: Vec::new(),
-        });
-    }
-
-    let final_coverage_hash = tx_results
-        .iter()
-        .fold(0xcbf29ce484222325u64, |acc, result| {
-            acc.wrapping_mul(0x100000001b3) ^ result.coverage_hash
-        });
-    Ok(SequenceExecutionResult {
-        total_gas_used: 0,
-        final_coverage_hash,
-        storage_reads: Vec::new(),
-        storage_writes: Vec::new(),
-        storage_diffs: Vec::new(),
-        call_trace,
-        oracle_observations: Vec::new(),
-        tx_results,
-    })
-}
-
-fn provider_side_historical_finding(
-    manifest: &BenchmarkManifest,
-    fork_block: u64,
-    execution: &SequenceExecutionResult,
-) -> ProtocolFinding {
-    let (pack, vuln, severity) = match manifest.vulnerability_class {
-        VulnerabilityClass::AccessControlBypass => (
-            ProtocolOraclePackKind::Governance,
-            VulnType::PrivilegeEscalation,
-            ProtocolSeverity::High,
-        ),
-        VulnerabilityClass::Erc20MintInflation => (
-            ProtocolOraclePackKind::Erc20,
-            VulnType::Other("erc20 mint inflation".to_string()),
-            ProtocolSeverity::High,
-        ),
-        VulnerabilityClass::GovernanceTimelockBypass => (
-            ProtocolOraclePackKind::Governance,
-            VulnType::GovernanceTakeover,
-            ProtocolSeverity::High,
-        ),
-        VulnerabilityClass::LiquidationAbuse => (
-            ProtocolOraclePackKind::Lending,
-            VulnType::InvariantViolation("lending health invariant".to_string()),
-            ProtocolSeverity::High,
-        ),
-        VulnerabilityClass::OracleManipulation => (
-            ProtocolOraclePackKind::Lending,
-            VulnType::PriceOracleManipulation,
-            ProtocolSeverity::High,
-        ),
-        VulnerabilityClass::AmmInvariantViolation => (
-            ProtocolOraclePackKind::Amm,
-            VulnType::PriceManipulation,
-            ProtocolSeverity::High,
-        ),
-        VulnerabilityClass::Erc4626ShareInflation | VulnerabilityClass::DonationInflationAttack => {
-            (
-                ProtocolOraclePackKind::Erc4626,
-                VulnType::VaultInflation,
-                ProtocolSeverity::High,
-            )
-        }
-        VulnerabilityClass::ApprovalAllowanceAbuse => (
-            ProtocolOraclePackKind::Erc20,
-            VulnType::MissingSignerCheck,
-            ProtocolSeverity::Medium,
-        ),
-        VulnerabilityClass::FeeAccountingMismatch
-        | VulnerabilityClass::RoundingPrecisionLoss
-        | VulnerabilityClass::StaleAccounting => (
-            ProtocolOraclePackKind::Erc20,
-            VulnType::AccountingDesync,
-            ProtocolSeverity::Medium,
-        ),
-        VulnerabilityClass::BridgeReplayFinalizationBug => (
-            ProtocolOraclePackKind::Governance,
-            VulnType::InvariantViolation("bridge replay/finalize invariant".to_string()),
-            ProtocolSeverity::High,
-        ),
-        VulnerabilityClass::Reentrancy => (
-            ProtocolOraclePackKind::Erc20,
-            VulnType::Reentrancy,
-            ProtocolSeverity::High,
-        ),
-    };
-
-    ProtocolFinding {
-        pack,
-        vuln,
-        severity,
-        tx_index: Some(0),
-        target: manifest.target_address(),
-        evidence: format!(
-            "provider-side eth_call replay succeeded for {} txs at historical fork block {}; expected_invariant={}; local storage diffs unavailable in provider fallback; this is real fork-state replay, not a synthetic cached runtime",
-            execution.tx_results.len(),
-            fork_block,
-            manifest
-                .expected_invariant
-                .as_deref()
-                .unwrap_or("manifest invariant")
-        ),
-    }
-}
-
-fn stable_provider_replay_hash(tx: &SingletonTx, output: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in tx
-        .input
-        .iter()
-        .chain(output.iter())
-        .chain(tx.to.as_slice().iter())
-        .chain(tx.caller.as_slice().iter())
-    {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
 fn synthesize_local_validation_poc(
     manifest: &BenchmarkManifest,
     input: &EvmInput,
@@ -2543,7 +2417,7 @@ contract RustyFuzzValidationPoC is Test {{
 "#,
     );
 
-    fs::write(&full_path, script.as_bytes())
+    write_atomic(&full_path, script.as_bytes())
         .with_context(|| format!("write validation PoC {}", full_path.display()))?;
     Ok(full_path)
 }
@@ -2569,19 +2443,6 @@ fn escape_solidity_string(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
-}
-
-fn parse_hex_bytes_for_report(value: &str) -> Result<Vec<u8>> {
-    let raw = value.strip_prefix("0x").unwrap_or(value);
-    if raw.is_empty() {
-        return Ok(Vec::new());
-    }
-    let padded = if raw.len().is_multiple_of(2) {
-        raw.to_string()
-    } else {
-        format!("0{raw}")
-    };
-    hex::decode(padded).map_err(Into::into)
 }
 
 fn sanitize_report_error(message: &str) -> String {
@@ -2611,6 +2472,70 @@ fn oracle_changing_return_runtime() -> Vec<u8> {
     ]
 }
 
+fn ensure_fork_provenance_complete(
+    provenance: &ForkCacheProvenance,
+    fork_block: u64,
+    evidence_kind: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !provenance.provider_sanitized.trim().is_empty(),
+        "{evidence_kind} provenance is missing provider"
+    );
+    anyhow::ensure!(
+        provenance.chain_id.is_some(),
+        "{evidence_kind} provenance is missing chain id"
+    );
+    anyhow::ensure!(
+        provenance.block_number.is_some(),
+        "{evidence_kind} provenance is missing block number"
+    );
+    anyhow::ensure!(
+        provenance.block_number == Some(fork_block),
+        "{evidence_kind} provenance block number does not match expected block {fork_block}"
+    );
+    anyhow::ensure!(
+        provenance
+            .block_hash
+            .as_deref()
+            .is_some_and(|block_hash| !block_hash.trim().is_empty()),
+        "{evidence_kind} provenance is missing block hash"
+    );
+    Ok(())
+}
+
+fn validate_cached_fork_snapshot(
+    snapshot: &ForkDbCacheSnapshot,
+    rpc_url: &str,
+    fork_block: u64,
+) -> anyhow::Result<()> {
+    ensure_fork_provenance_complete(&snapshot.provenance, fork_block, "cached fork fixture")?;
+    let live = ForkDb::new(rpc_url, fork_block);
+    let observed = live.refresh_remote_provenance()?;
+    ensure_fork_provenance_complete(
+        &observed,
+        fork_block,
+        "live provider used to verify cached fork fixture",
+    )?;
+    anyhow::ensure!(
+        snapshot.provenance.provider_sanitized == observed.provider_sanitized,
+        "cached fork provider does not match live provider"
+    );
+    anyhow::ensure!(
+        snapshot.provenance.chain_id == observed.chain_id,
+        "cached fork chain id does not match live chain"
+    );
+    snapshot
+        .ensure_consistent(
+            Some(fork_block),
+            observed.block_hash.as_deref(),
+            None,
+            None,
+            true,
+        )
+        .map_err(|error| anyhow::anyhow!("cached fork snapshot is inconsistent: {error}"))?;
+    Ok(())
+}
+
 fn live_minimized_status(
     manifest: &BenchmarkManifest,
     input: &EvmInput,
@@ -2618,11 +2543,24 @@ fn live_minimized_status(
     rpc_url: &str,
     fork_block: u64,
     fork_cache: Option<&ForkDbCacheSnapshot>,
+    synthetic_profile: bool,
 ) -> MinimizedSequenceStatus {
     if input.txs.len() <= 1 {
         return MinimizedSequenceStatus::Minimized;
     }
 
+    if let Some(snapshot) = fork_cache {
+        if let Err(error) = snapshot.verify_content_digest() {
+            log::warn!("cached fork snapshot rejected during minimization: {error}");
+            return MinimizedSequenceStatus::NeedsMinimization;
+        }
+        if !synthetic_profile {
+            if let Err(error) = validate_cached_fork_snapshot(snapshot, rpc_url, fork_block) {
+                log::warn!("cached fork snapshot rejected during minimization: {error}");
+                return MinimizedSequenceStatus::NeedsMinimization;
+            }
+        }
+    }
     let verifier = ReplayVerifier::new(MAP_SIZE);
     for idx in 0..input.txs.len() {
         let mut reduced = input.clone();
@@ -2748,6 +2686,24 @@ fn is_manifest_path(path: &Path) -> bool {
     )
 }
 
+fn evidence_class(mode: BenchmarkMode, synthetic_profile: bool) -> BenchmarkEvidenceClass {
+    if synthetic_profile || matches!(mode, BenchmarkMode::LocalFixture) {
+        BenchmarkEvidenceClass::SyntheticRegression
+    } else {
+        BenchmarkEvidenceClass::ProductionLive
+    }
+}
+
+fn evidence_class_for_manifest(manifest: &BenchmarkManifest) -> BenchmarkEvidenceClass {
+    let synthetic_profile = manifest
+        .fixture
+        .as_deref()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|raw| serde_json::from_str::<LiveBenchmarkFixture>(&raw).ok())
+        .is_some_and(|fixture| fixture.fork_cache_profile.is_some());
+    evidence_class(manifest.mode.clone(), synthetic_profile)
+}
+
 fn report_from_results(results: Vec<BenchmarkValidationResult>) -> ValidationReport {
     let mut summary = ValidationSummary {
         total: results.len(),
@@ -2757,7 +2713,7 @@ fn report_from_results(results: Vec<BenchmarkValidationResult>) -> ValidationRep
         if result.executed {
             summary.executed += 1;
         }
-        if result.found {
+        if result.found && result.evidence_class == BenchmarkEvidenceClass::ProductionLive {
             summary.found += 1;
         }
         match result.status {
@@ -2791,7 +2747,12 @@ fn report_from_results(results: Vec<BenchmarkValidationResult>) -> ValidationRep
             result.found,
         )
     }));
-    let calibration = calibration_from_results(&results);
+    let calibration_results = results
+        .iter()
+        .filter(|result| result.evidence_class == BenchmarkEvidenceClass::ProductionLive)
+        .cloned()
+        .collect::<Vec<_>>();
+    let calibration = calibration_from_results(&calibration_results, &results);
     ValidationReport {
         generated_at_unix_secs: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2804,7 +2765,10 @@ fn report_from_results(results: Vec<BenchmarkValidationResult>) -> ValidationRep
     }
 }
 
-fn calibration_from_results(results: &[BenchmarkValidationResult]) -> ScoringCalibrationReport {
+fn calibration_from_results(
+    results: &[BenchmarkValidationResult],
+    all_results: &[BenchmarkValidationResult],
+) -> ScoringCalibrationReport {
     let benchmark_count = results.len();
     let executed = results.iter().filter(|result| result.executed).count();
     let found = results.iter().filter(|result| result.found).count();
@@ -2853,17 +2817,29 @@ fn calibration_from_results(results: &[BenchmarkValidationResult]) -> ScoringCal
     }
     ScoringCalibrationReport {
         benchmark_count,
+        synthetic_regression_count: all_results
+            .iter()
+            .filter(|result| result.evidence_class == BenchmarkEvidenceClass::SyntheticRegression)
+            .count(),
         pass_rate: rate(found, benchmark_count),
         replay_success_rate: rate(replayed, executed),
         minimized_success_rate: rate(minimized, executed),
         poc_generation_rate: rate(poc, executed),
         average_time_to_signal_secs: average_f64(&times),
         average_executions_to_signal: average_u64(&execs),
-        useful_seed_sources: vec![
-            "benchmark seed hints".to_string(),
-            "manual selector hints".to_string(),
-            "synthetic local fixtures".to_string(),
-        ],
+        useful_seed_sources: {
+            let mut sources = Vec::new();
+            if results.iter().any(|result| result.runtime.is_some()) {
+                sources.push("executable EVM fixture transaction sequences".to_string());
+            }
+            if results.iter().any(|result| result.runtime.is_none()) {
+                sources.extend([
+                    "benchmark seed hints".to_string(),
+                    "manual selector hints".to_string(),
+                ]);
+            }
+            sources
+        },
         false_positive_budget_notes,
         threshold_recommendations,
     }
@@ -3353,7 +3329,7 @@ mod tests {
             expected_failure_kind: Some(BenchmarkFailureKind::Passed),
             expected_cli_exit: Some(0),
             max_duration_secs: Some(600),
-            seed_hints: vec!["0xb6b55f25".to_string()],
+            seed_hints: vec!["0x6e553f65".to_string()],
             notes: None,
         }
     }
@@ -3383,7 +3359,7 @@ mod tests {
                     caller: Address::repeat_byte(0xaa),
                     target: Address::repeat_byte(0x11),
                     value: U256::ZERO,
-                    input: vec![0xb6, 0xb5, 0x5f, 0x25],
+                    input: vec![0x6e, 0x55, 0x3f, 0x65],
                     output: Vec::new(),
                     gas_limit: 100_000,
                     gas_used: 42_000,
@@ -3413,7 +3389,7 @@ mod tests {
                 caller: Address::repeat_byte(0xaa),
                 target: Address::repeat_byte(0x11),
                 value: U256::ZERO,
-                input: vec![0xb6, 0xb5, 0x5f, 0x25],
+                input: vec![0x6e, 0x55, 0x3f, 0x65],
                 output: Vec::new(),
                 gas_limit: 100_000,
                 gas_used: 42_000,
@@ -3430,7 +3406,7 @@ mod tests {
     fn fixture_exploit_candidate() -> ExploitPathCandidate {
         ExploitPathCandidate {
             sequence: vec![SingletonTx {
-                input: vec![0xb6, 0xb5, 0x5f, 0x25],
+                input: vec![0x6e, 0x55, 0x3f, 0x65],
                 caller: Address::repeat_byte(0xaa),
                 to: Address::repeat_byte(0x11),
                 value: U256::ZERO,
@@ -3652,37 +3628,99 @@ success_criteria = ["expected_finding", "invariant_violation"]
     }
 
     #[test]
-    fn provider_side_historical_finding_is_labeled_as_real_replay_with_caveat() {
-        let manifest = live_manifest("fixture.json", VulnerabilityClass::AccessControlBypass);
-        let execution = SequenceExecutionResult {
-            tx_results: vec![TxExecutionResult {
-                tx_index: 0,
-                status: ExecutionStatus::Success,
-                gas_used: 0,
-                output: Vec::new(),
-                coverage_hash: 1,
-                coverage_edges: 1,
-                storage_reads: Vec::new(),
-                storage_writes: Vec::new(),
-                storage_diffs: Vec::new(),
-                call_trace: Vec::new(),
-                waypoints: Vec::new(),
-            }],
-            total_gas_used: 0,
-            final_coverage_hash: 1,
-            storage_reads: Vec::new(),
-            storage_writes: Vec::new(),
-            storage_diffs: Vec::new(),
-            call_trace: Vec::new(),
-            oracle_observations: Vec::new(),
+    fn cached_fork_snapshot_rejects_missing_live_provenance() {
+        let complete = ForkCacheProvenance {
+            provider_sanitized: "https://rpc.example".to_string(),
+            chain_id: Some(1),
+            block_number: Some(123),
+            block_hash: Some("0xabc".to_string()),
+            fetched_at_unix: Some(1),
+            cache_id: Some("cache".to_string()),
         };
+        let cases = [
+            (
+                "provider",
+                ForkCacheProvenance {
+                    provider_sanitized: String::new(),
+                    ..complete.clone()
+                },
+            ),
+            (
+                "chain id",
+                ForkCacheProvenance {
+                    chain_id: None,
+                    ..complete.clone()
+                },
+            ),
+            (
+                "block number",
+                ForkCacheProvenance {
+                    block_number: None,
+                    ..complete.clone()
+                },
+            ),
+            (
+                "block hash",
+                ForkCacheProvenance {
+                    block_hash: None,
+                    ..complete
+                },
+            ),
+        ];
 
-        let finding = provider_side_historical_finding(&manifest, 123, &execution);
+        for (missing, provenance) in cases {
+            let mut snapshot = ForkDb::empty().cache_snapshot();
+            snapshot.provenance = provenance;
+            let error =
+                validate_cached_fork_snapshot(&snapshot, "https://unreachable.invalid", 123)
+                    .expect_err("missing cached fork provenance must fail closed");
+            assert!(
+                error.to_string().contains(&format!("missing {missing}")),
+                "unexpected error for missing {missing}: {error}"
+            );
+        }
+    }
 
-        assert_eq!(finding.vuln, VulnType::PrivilegeEscalation);
-        assert!(finding.evidence.contains("provider-side eth_call replay"));
-        assert!(finding.evidence.contains("local storage diffs unavailable"));
-        assert!(finding.evidence.contains("not a synthetic cached runtime"));
+    #[test]
+    fn stateless_provider_replay_cannot_produce_findings_or_proof() {
+        let path = std::env::temp_dir().join(format!(
+            "rustyfuzz-provider-only-{}.json",
+            std::process::id()
+        ));
+        fs::write(&path, serde_json::to_vec(&serde_json::json!({
+            "provider_replay_only": true, "chain_id": 1, "block_number": 123,
+            "target": "0x1111111111111111111111111111111111111111",
+            "transactions": [{"from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "to": "0x1111111111111111111111111111111111111111", "value": "0", "input": "0x40c10f19", "success": true}]
+        })).unwrap()).unwrap();
+        let manifest = live_manifest(
+            path.to_str().unwrap(),
+            VulnerabilityClass::Erc20MintInflation,
+        );
+        let result = ValidationRunner.run_manifest_with_context(
+            &manifest,
+            &ValidationContext {
+                rpc_url: Some("http://127.0.0.1:1".into()),
+                fork_block: Some(123),
+                block_env: Some(BlockEnv::default()),
+                report_dir: None,
+            },
+        );
+        fs::remove_file(path).unwrap();
+        assert_eq!(result.status, ValidationStatus::FailedExecution);
+        assert!(
+            result
+                .reason
+                .contains("provider_replay_only is unsupported"),
+            "{}",
+            result.reason
+        );
+        assert!(!result.found && !result.executed);
+        assert!(
+            result.proof.is_none()
+                && result.proof_status.is_none()
+                && result.artifact_path.is_none()
+        );
     }
 
     #[test]
@@ -3718,12 +3756,14 @@ success_criteria = ["expected_finding", "invariant_violation"]
 
         assert!(!result.executed);
         assert_eq!(result.status, ValidationStatus::FailedExecution);
-        assert!(result.reason.contains("RPC-backed live-fork replay failed"));
+        assert!(result
+            .reason
+            .contains("failed to establish live fork provenance"));
         let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn live_fork_manifest_can_execute_from_explicit_cached_fork_fixture() {
+    fn live_fork_manifest_labels_explicit_synthetic_profile_fixture() {
         let runner = ValidationRunner;
         let base =
             std::env::temp_dir().join(format!("rusty_fuzz_cached_live_{}", std::process::id()));
@@ -3731,19 +3771,12 @@ success_criteria = ["expected_finding", "invariant_violation"]
         fs::create_dir_all(&base).expect("tmp dir");
 
         let target = Address::repeat_byte(0x11);
-        let db = ForkDb::empty();
-        db.cache_account(
-            target,
-            AccountInfo::default().with_code(Bytecode::new_raw(
-                crate::evm::fork::offline_fallback_runtime_bytecode().into(),
-            )),
-        );
-        let fixture_path = base.join("cached-live.json");
+        let fixture_path = base.join("synthetic-profile.json");
         let fixture = serde_json::json!({
             "chain_id": 1,
             "block_number": 123,
             "target": target.to_string(),
-            "fork_cache": db.cache_snapshot(),
+            "fork_cache_profile": "vulnerable_benchmark_runtime",
             "transactions": [{
                 "hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -3783,7 +3816,11 @@ success_criteria = ["expected_finding", "invariant_violation"]
         assert!(result
             .false_positive_notes
             .iter()
-            .any(|note| note.contains("replay backend: cached-fork-fixture")));
+            .any(|note| note.contains("replay backend: synthetic-fork-cache-profile")));
+        assert!(result
+            .false_positive_notes
+            .iter()
+            .any(|note| note.contains("not live or cached production evidence")));
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -3868,6 +3905,14 @@ success_criteria = ["expected_finding", "invariant_violation"]
             .false_positive_notes
             .iter()
             .any(|note| note.contains("blind rediscovery")));
+        assert!(result
+            .false_positive_notes
+            .iter()
+            .any(|note| note.contains("replay backend: synthetic-fork-cache-profile")));
+        assert!(result
+            .false_positive_notes
+            .iter()
+            .any(|note| note.contains("not live or cached production evidence")));
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -3960,6 +4005,43 @@ success_criteria = ["expected_finding", "invariant_violation"]
         );
         assert!(result.observed_finding.is_some());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn synthetic_regressions_are_retained_but_excluded_from_production_aggregates() {
+        let runner = ValidationRunner;
+        let mut benchmark_manifest = manifest();
+        benchmark_manifest.poc_generation = PocGenerationExpectation::NotRequired;
+        let findings = vec![finding(
+            VulnType::VaultInflation,
+            "share inflation during deposit/redeem path",
+        )];
+        let proof = ProofCarryingFinding::from_candidate(
+            &fixture_exploit_candidate(),
+            &fixture_execution(),
+            &findings,
+        )
+        .with_replay_result(crate::engine::proof::ReplayVerificationStatus::Verified);
+        let observation = ValidationObservation {
+            findings,
+            exploit_candidate: Some(fixture_exploit_candidate()),
+            proof: Some(proof),
+            proof_status: Some(CounterexampleProofStatus::HeuristicOnly),
+            ..ValidationObservation::default()
+        };
+        let synthetic = runner.evaluate_observation(&benchmark_manifest, &observation);
+        assert!(synthetic.found);
+        assert_eq!(
+            synthetic.evidence_class,
+            BenchmarkEvidenceClass::SyntheticRegression
+        );
+        let mut production = synthetic.clone();
+        production.evidence_class = BenchmarkEvidenceClass::ProductionLive;
+        let report = ValidationRunner::report_from_results(vec![synthetic, production]);
+        assert_eq!(report.benchmarks.len(), 2);
+        assert_eq!(report.summary.found, 1);
+        assert_eq!(report.calibration.benchmark_count, 1);
+        assert_eq!(report.calibration.synthetic_regression_count, 1);
     }
 
     #[test]
@@ -4242,7 +4324,8 @@ success_criteria = ["expected_finding", "invariant_violation"]
             .entries
             .iter()
             .any(|entry| !entry.benchmark_ids.is_empty()));
-        assert_eq!(report.calibration.benchmark_count, 1);
+        assert_eq!(report.calibration.benchmark_count, 0);
+        assert_eq!(report.calibration.synthetic_regression_count, 1);
     }
 
     #[test]

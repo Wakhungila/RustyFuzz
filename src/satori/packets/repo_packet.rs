@@ -1,5 +1,5 @@
 use crate::satori::error::SatoriResult;
-use crate::satori::fsutil::write_json;
+use crate::satori::fsutil::write_json_in_run;
 use crate::satori::graph::query::top_critical_functions;
 use crate::satori::ingest::docs::summarize_docs;
 use crate::satori::packets::function_packet::bug_class_library;
@@ -26,6 +26,6 @@ pub fn build_repo_packet(
         detected_protocol_hints: project.detected_protocols.clone(),
         top_bug_class_hints: bug_class_library(),
     };
-    write_json(run_dir.join("packets/repo_packet.json"), &packet)?;
+    write_json_in_run(run_dir, Path::new("packets/repo_packet.json"), &packet)?;
     Ok(packet)
 }

@@ -25,6 +25,8 @@ pub fn job_from_hypothesis(hypothesis: &VulnerabilityHypothesis) -> RustyFuzzJob
             .map(|step| step.success_condition.clone())
             .unwrap_or_else(|| "local replay produces invariant or economic signal".to_string()),
         max_depth: hypothesis.attack_sequence.len().max(1),
+        max_execs: 256,
+        duration_secs: 60,
         fork_rpc_url: None,
         fork_block: None,
         abi_hints: hypothesis.affected_functions.clone(),

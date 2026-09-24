@@ -10,6 +10,7 @@ edition = "2021"
 [[bin]]
 name = "benchmark"
 path = "src/bin/benchmark.rs"
+required-features = ["evm"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FEATURES
@@ -140,9 +141,9 @@ version = "1.1.2"
 [dependencies.anyhow]
 version = "1.0.102"
 
-[dependencies.bincode]
-version = "2.0.0"
-
+[dependencies.uuid]
+version = "1.26.0"
+features = ["v4"]
 
 [dependencies.rand]
 version = "0.10.1"

@@ -45,29 +45,33 @@ impl From<serde_json::Error> for FsUtilError {
 pub fn write_atomic(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> Result<(), FsUtilError> {
     let path = path.as_ref();
     let bytes = bytes.as_ref();
+    reject_symlink_components(path)?;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
+    reject_symlink_components(parent)?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| FsUtilError::Io(std::io::Error::other("non-utf8 artifact file name")))?;
+    let canonical_parent = fs::canonicalize(parent)?;
+    let destination = canonical_parent.join(file_name);
 
     // Exclusive creation prevents collisions and following pre-existing symlinks.
     // Each writer owns its temporary file; Drop cleans it up on every error path.
     let mut tmp = tempfile::Builder::new()
         .prefix(&format!(".{file_name}."))
         .suffix(".tmp")
-        .tempfile_in(parent)?;
+        .tempfile_in(&canonical_parent)?;
     for chunk in bytes.chunks(64 * 1024) {
         tmp.write_all(chunk)?;
     }
     tmp.as_file().sync_all()?;
-    tmp.persist(path)
+    tmp.persist(&destination)
         .map_err(|err| FsUtilError::Io(err.error))?;
-    sync_parent_best_effort(parent);
+    sync_parent_best_effort(&canonical_parent);
     Ok(())
 }
 
@@ -75,6 +79,21 @@ pub fn write_atomic(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> Result<(
 pub fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), FsUtilError> {
     let bytes = serde_json::to_vec_pretty(value)?;
     write_atomic(path, &bytes)
+}
+
+fn reject_symlink_components(path: &Path) -> Result<(), FsUtilError> {
+    let mut current = Some(path.to_path_buf());
+    while let Some(candidate) = current {
+        if let Ok(metadata) = fs::symlink_metadata(&candidate) {
+            if metadata.file_type().is_symlink() {
+                return Err(FsUtilError::Io(std::io::Error::other(
+                    "artifact path contains a symlink",
+                )));
+            }
+        }
+        current = candidate.parent().map(Path::to_path_buf);
+    }
+    Ok(())
 }
 
 fn sync_parent_best_effort(parent: &Path) {
@@ -121,6 +140,18 @@ mod tests {
         });
         assert!(payloads.contains(&fs::read(&path).unwrap()));
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_symlink_is_rejected_without_touching_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        let destination = dir.path().join("artifact.json");
+        fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, &destination).unwrap();
+        assert!(write_atomic(&destination, b"replacement").is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
     }
 
     #[test]

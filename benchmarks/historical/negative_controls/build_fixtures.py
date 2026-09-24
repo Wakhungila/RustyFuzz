@@ -60,7 +60,9 @@ def write(name, target, accounts, transactions, behavior):
 
 p = '0x6200000000000000000000000000000000000101'
 write('erc20-owner-mint', p, [account(p, 'OwnerMintToken')], [
+    tx(p, 'canMint(address)', O, output=out(1)),
     tx(p, 'mint(address,uint256)', V, 100*E, caller=O, slots={2: 100*E}),
+    tx(p, 'canMint(address)', A, output=out(0)),
     tx(p, 'mint(address,uint256)', A, E, status='Revert', slots={2: 100*E}),
     tx(p, 'balanceOf(address)', V, output=out(100*E)),
     tx(p, 'balanceOf(address)', A, output=out(0)),

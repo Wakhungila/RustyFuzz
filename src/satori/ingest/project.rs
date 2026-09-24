@@ -1,5 +1,5 @@
 use crate::satori::error::SatoriResult;
-use crate::satori::fsutil::{collect_files, read_lossy_limited, sha256_hex, write_json};
+use crate::satori::fsutil::{collect_files, read_lossy_limited, write_json_in_run};
 use crate::satori::ingest::foundry::is_foundry_project;
 use crate::satori::ingest::hardhat::is_hardhat_project;
 use crate::satori::types::{ProjectModel, ProjectType, ProtocolType, SourceFile};
@@ -62,7 +62,7 @@ pub fn ingest_project(root: &Path, run_dir: &Path) -> SatoriResult<ProjectModel>
         remappings,
         detected_protocols: Vec::from([ProtocolType::Unknown]),
     };
-    write_json(run_dir.join("project.json"), &model)?;
+    write_json_in_run(run_dir, Path::new("project.json"), &model)?;
     Ok(model)
 }
 
@@ -85,7 +85,19 @@ fn classify_project(root: &Path, source_files: &[SourceFile]) -> ProjectType {
 }
 
 fn source_file(root: &Path, file: &Path, extension: &str) -> SatoriResult<SourceFile> {
-    let bytes = std::fs::read(file)?;
+    let metadata = std::fs::symlink_metadata(file)?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink() && metadata.is_file(),
+        "Satori project file is not a regular canonical file: {}",
+        file.display()
+    );
+    let canonical_file = file.canonicalize()?;
+    anyhow::ensure!(
+        canonical_file.starts_with(root),
+        "Satori project file is outside canonical project root: {}",
+        file.display()
+    );
+    let (content_hash, bytes) = hash_file(&canonical_file)?;
     let language = match extension {
         "sol" => "solidity",
         "vy" => "vyper",
@@ -93,13 +105,35 @@ fn source_file(root: &Path, file: &Path, extension: &str) -> SatoriResult<Source
     }
     .to_string();
     Ok(SourceFile {
-        path: file.to_path_buf(),
-        relative_path: file.strip_prefix(root).unwrap_or(file).to_path_buf(),
+        relative_path: canonical_file
+            .strip_prefix(root)
+            .map_err(|_| anyhow::anyhow!("Satori project file is outside canonical project root"))?
+            .to_path_buf(),
+        path: canonical_file.clone(),
         language,
-        content_hash: sha256_hex(&bytes),
-        bytes: bytes.len(),
-        text: Some(read_lossy_limited(file, 128_000)?),
+        content_hash,
+        bytes,
+        text: Some(read_lossy_limited(&canonical_file, 128_000)?),
     })
+}
+
+fn hash_file(path: &Path) -> SatoriResult<(String, usize)> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 16 * 1024];
+    let mut bytes = 0usize;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        bytes = bytes.saturating_add(read);
+    }
+    Ok((hex::encode(hasher.finalize()), bytes))
 }
 
 fn is_doc_file(path: &Path) -> bool {
@@ -124,11 +158,40 @@ mod tests {
     #[test]
     fn satori_ingests_fixture_sources() {
         let root = PathBuf::from("tests/fixtures/satori");
-        let run_dir = std::env::temp_dir().join("satori-ingest-fixture-test");
+        let run_dir = crate::satori::fsutil::canonical_run_root()
+            .unwrap()
+            .join("satori-ingest-fixture-test");
         let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(&run_dir).unwrap();
         let model = ingest_project(&root, &run_dir).unwrap();
         assert!(model.source_files.len() >= 4);
         assert!(run_dir.join("project.json").exists());
         let _ = std::fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn satori_ingestion_rejects_symlink_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "satori-ingest-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let run_dir = root.join("run");
+        let outside = root.parent().unwrap().join(format!(
+            "satori-outside-{}.sol",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Contract.sol"), b"contract Contract {}").unwrap();
+        std::fs::write(&outside, b"contract Outside {}").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("Linked.sol")).unwrap();
+        let result = ingest_project(&root, &run_dir);
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(outside);
     }
 }

@@ -219,7 +219,6 @@ impl ProtocolInvariantEvaluator {
                 function_selector("upgradeToAndCall(address,bytes)"),
                 function_selector("transferOwnership(address)"),
                 function_selector("grantRole(bytes32,address)"),
-                function_selector("execute(uint256)"),
             ],
         ) {
             if !call.success || call.caller == call.target {
@@ -327,7 +326,6 @@ impl ProtocolInvariantEvaluator {
             function_selector("finalizeMessage(bytes)"),
             function_selector("claim()"),
             function_selector("release(address,uint256)"),
-            function_selector("mint(address,uint256)"),
             function_selector("outboundTransfer(address,address,uint256,bytes)"),
         ];
 
@@ -630,6 +628,24 @@ mod tests {
     }
 
     #[test]
+    fn does_not_classify_permissionless_execute_as_access_control() {
+        let target = Address::repeat_byte(0xcd);
+        let execution = execution_with_call_and_writes(
+            target,
+            function_selector("execute(uint256)"),
+            0,
+            1,
+            U256::from(1),
+        );
+
+        let findings = ProtocolInvariantEvaluator::default().evaluate(&execution);
+
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.family == ProtocolInvariantFamily::AccessControl));
+    }
+
+    #[test]
     fn detects_oracle_freshness_invariant_case() {
         let target = Address::repeat_byte(0xee);
         let mut first =
@@ -722,6 +738,24 @@ mod tests {
             finding.family == ProtocolInvariantFamily::BridgeReplay
                 && finding.evidence.contains("without prior lock/burn")
         }));
+    }
+
+    #[test]
+    fn does_not_classify_erc20_mint_as_bridge_outbound() {
+        let target = Address::repeat_byte(0xf3);
+        let execution = execution_with_call_and_writes(
+            target,
+            function_selector("mint(address,uint256)"),
+            0,
+            1,
+            U256::from(10u128.pow(18)),
+        );
+
+        let findings = ProtocolInvariantEvaluator::default().evaluate(&execution);
+
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.family == ProtocolInvariantFamily::BridgeReplay));
     }
 
     #[test]

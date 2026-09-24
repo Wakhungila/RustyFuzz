@@ -123,3 +123,34 @@ The owner-mint control still exposes unmatched bridge heuristics; the repaid
 borrow exposes an unmatched generic-accounting heuristic, and delayed execution
 exposes an unmatched access-control heuristic. These remain visible and are not
 claims of exploitable vulnerabilities or fixes to those other oracle classes.
+
+## Unmatched-signal review (Gate 2)
+
+The four unmatched signals on the negative pack were reviewed against
+`VulnerabilityClass::matches_finding`. None are class-matcher false negatives
+for the control's own class:
+
+| Control | Unmatched signal | Why it must stay unmatched |
+| --- | --- | --- |
+| `negative-erc20-owner-mint` | Bridge outbound/finalize on `mint` without lock/burn | Owner mint is authorized; matching it to `Erc20MintInflation` would invent a false positive |
+| `negative-erc20-owner-mint` | Bridge finalization without prove/relay | Same mint selector, different oracle class; not an ERC20 supply-inflation claim |
+| `negative-governance-delayed-execute` | Access-control `PrivilegeEscalation` on `execute` after ETA | Timelock held; the call is the authorized post-delay execution, not a bypass |
+| `negative-lending-repaid-borrow` | Generic `AccountingDesync` on large aggregate movement | Repay conserves debt; class is `LiquidationAbuse`, not stale accounting |
+
+The ERC20 pack now flags successful `mint(address,uint256)` only when no mint
+rejection was observed (open supply-inflation path). Owner-mint negatives retain
+a rejected unauthorized attempt, so they stay clear. The ERC4626 pack classifies
+`convertToShares == 0` for nonzero input as `VaultDonationAttack` (share-price
+inflation), not mere rounding.
+
+## Vulnerable counterparts
+
+Deliberately broken counterparts live under
+`benchmarks/historical/gate2_positive_controls/` (never in this pack). They
+reuse the same mechanism contracts with the defense removed and must produce a
+matching signal for their class:
+
+```sh
+python3 benchmarks/historical/gate2_positive_controls/build_fixtures.py
+cargo test --test benchmarks gate2_vulnerable_counterparts_trigger_each_protected_class
+```

@@ -1,5 +1,12 @@
 name: RustyFuzz CI
 
+permissions:
+  contents: read
+
+concurrency:
+  group: rustyfuzz-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: [ main, develop ]
@@ -17,38 +24,42 @@ jobs:
     name: Security Scans
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - name: Gitleaks full-history scan
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.97.1
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version 0.22.2
       - name: Cargo audit
-        # Policy threshold: High/Critical, or CVSS >= 7.0. Lower/unknown
-        # severity advisories remain visible in the artifact but do not block.
         run: |
-          set +e
-          cargo audit --json > cargo-audit.json
-          audit_status=$?
-          set -e
+          audit_status=0
+          cargo audit --json > cargo-audit.json || audit_status=$?
           echo "cargo audit exit status: ${audit_status}"
           test -s cargo-audit.json
           cat cargo-audit.json
-          jq -e '
-            [.vulnerabilities.list[] |
-              select(
-                ((.advisory.severity // "") | ascii_downcase) == "high" or
-                ((.advisory.severity // "") | ascii_downcase) == "critical" or
-                ((.advisory.cvss // 0) >= 7)
-              )] | length == 0
-          ' cargo-audit.json
+          if [ "$audit_status" -eq 0 ]; then
+            jq -e '.vulnerabilities.count == 0' cargo-audit.json
+          else
+            jq -e '
+              .vulnerabilities.count == 1 and
+              (.vulnerabilities.list | length) == 1 and
+              .vulnerabilities.list[0].advisory.id == "RUSTSEC-2025-0055" and
+              .vulnerabilities.list[0].package.name == "tracing-subscriber" and
+              .vulnerabilities.list[0].package.version == "0.2.25"
+            ' cargo-audit.json
+              cargo metadata --locked --all-features --format-version 1 |
+              jq -e '[.packages[] | select(.name == "tracing-subscriber" and .version == "0.2.25")] | length == 1'
+
+          fi
       - name: Upload audit report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-audit-report
           path: cargo-audit.json
@@ -58,9 +69,10 @@ jobs:
     name: Unit Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: 1.97.1
           components: rustfmt, clippy
       - name: Format check
         run: cargo fmt --all -- --check
@@ -72,14 +84,16 @@ jobs:
         run: cargo test --workspace --lib --locked
       - name: Full tests
         run: cargo test --workspace --locked
+      - name: Zen client protocol tests
+        run: cargo test --features llm --lib --locked satori::reasoning::zen_client
       - name: Z3 feature check
-        run: cargo check --features z3
+        run: cargo check --features z3 --locked
       - name: SGX unsupported shim check
-        run: cargo check --features sgx
+        run: cargo check --features sgx --locked
       - name: SVM is explicitly unsupported
         run: |
           set +e
-          cargo check --features svm 2>svm.err
+          cargo check --features svm --locked 2>svm.err
           status=$?
           set -e
           test "$status" -ne 0
@@ -91,10 +105,12 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.97.1
       - name: Integration tests
-        run: cargo test --test benchmarks
+        run: cargo test --test benchmarks --locked
 
   # Memory leak detection with sanitizers.
   # Per-crate scopes match the locally proven gates; full-workspace ASan is a
@@ -111,52 +127,65 @@ jobs:
       RUSTFLAGS: -Zsanitizer=address
       ASAN_OPTIONS: detect_leaks=1
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: nightly-2026-08-01
           components: rust-src
       - name: Root library tests
         if: matrix.scope == 'root-lib'
-        run: cargo +nightly-2026-08-01 test -p rusty-fuzz --lib --target x86_64-unknown-linux-gnu -Zbuild-std
+        run: cargo +nightly-2026-08-01 test -p rusty-fuzz --lib --locked --target x86_64-unknown-linux-gnu -Zbuild-std
       - name: Binary tests
         if: matrix.scope == 'bins'
-        run: cargo +nightly-2026-08-01 test -p rusty-fuzz --bins --target x86_64-unknown-linux-gnu -Zbuild-std
+        run: cargo +nightly-2026-08-01 test -p rusty-fuzz --bins --locked --target x86_64-unknown-linux-gnu -Zbuild-std
       - name: Benchmark integration tests
         if: matrix.scope == 'benchmarks'
-        run: cargo +nightly-2026-08-01 test -p rusty-fuzz --test benchmarks --target x86_64-unknown-linux-gnu -Zbuild-std
+        run: cargo +nightly-2026-08-01 test -p rusty-fuzz --test benchmarks --locked --target x86_64-unknown-linux-gnu -Zbuild-std
       - name: rustyfuzz-core
         if: matrix.scope == 'core'
-        run: cargo +nightly-2026-08-01 test -p rustyfuzz-core --lib --target x86_64-unknown-linux-gnu -Zbuild-std
+        run: cargo +nightly-2026-08-01 test -p rustyfuzz-core --lib --locked --target x86_64-unknown-linux-gnu -Zbuild-std
       - name: rustyfuzz-engine
         if: matrix.scope == 'engine'
-        run: cargo +nightly-2026-08-01 test -p rustyfuzz-engine --lib --target x86_64-unknown-linux-gnu -Zbuild-std
+        run: cargo +nightly-2026-08-01 test -p rustyfuzz-engine --lib --locked --target x86_64-unknown-linux-gnu -Zbuild-std
       - name: rustyfuzz-evm
         if: matrix.scope == 'evm'
-        run: cargo +nightly-2026-08-01 test -p rustyfuzz-evm --lib --target x86_64-unknown-linux-gnu -Zbuild-std
+        run: cargo +nightly-2026-08-01 test -p rustyfuzz-evm --lib --locked --target x86_64-unknown-linux-gnu -Zbuild-std
       - name: rustyfuzz-artifacts
         if: matrix.scope == 'artifacts'
-        run: cargo +nightly-2026-08-01 test -p rustyfuzz-artifacts --lib --target x86_64-unknown-linux-gnu -Zbuild-std
+        run: cargo +nightly-2026-08-01 test -p rustyfuzz-artifacts --lib --locked --target x86_64-unknown-linux-gnu -Zbuild-std
 
-  # Benchmark regression detection
-  benchmark-regression:
-    name: Benchmark Regression Detection
+  # Detection regression on real EVM fixtures, not time-to-discovery evidence.
+  oracle-regression:
+    name: Executable Oracle Regression
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97.1
-      - name: Run benchmarks
-        run: cargo test --test benchmarks --release
-      - name: Store benchmark result
-        run: |
-          cargo test --test benchmarks --release -- --nocapture > benchmark_output.txt
-          echo "Benchmark completed"
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          name: benchmark-results
-          path: benchmark_output.txt
+          toolchain: 1.97.1
+      - name: Build validator
+        run: cargo build --release --locked --bin rusty-fuzz
+      - name: Validate safe and vulnerable counterparts
+        run: |
+          test ! -e config.toml
+          rm -rf benchmarks/results/oracle-controls benchmarks/tmp/oracle-controls
+          trap 'rm -f config.toml' EXIT
+          cat > config.toml <<'EOF'
+          chain = "evm"
+          rpc_url = "http://127.0.0.1:8545"
+          timeout_secs = 60
+          corpus_dir = "benchmarks/tmp/oracle-controls/corpus"
+          report_dir = "benchmarks/results/oracle-controls/reports"
+          llm_enabled = false
+          EOF
+          python3 scripts/validate-oracle-controls.py
+
+      - name: Upload execution evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: oracle-control-evidence
+          path: benchmarks/results/oracle-controls/
 
   # Build verification
   build:
@@ -166,16 +195,19 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.97.1
       - name: Build
-        run: cargo build --verbose --release
+        run: cargo build --verbose --release --locked
+
       - name: Release checksums
         run: ./scripts/build-release.sh dist
       - name: Upload release checksums
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ matrix.os }}
           path: dist/
       - name: Build with supported optional proof feature
-        run: cargo build --verbose --features z3
+        run: cargo build --verbose --features z3 --locked

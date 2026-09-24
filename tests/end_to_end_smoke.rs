@@ -50,9 +50,12 @@ async fn synthetic_abi_smoke_campaign_does_not_promote_findings() {
         duration_secs: Some(1),
         artifact_limit: Some(1),
         campaign_id: Some("smoke".to_string()),
+        paths_are_isolated: false,
         min_finding_confidence: 0,
+
         promotion: PromotionConfig {
             enabled: true,
+            no_promotion: false,
             require_replay_for_report: true,
             require_poc_for_confirmed: true,
             strict_proof: true,
@@ -66,9 +69,10 @@ async fn synthetic_abi_smoke_campaign_does_not_promote_findings() {
         },
     };
 
+    let campaign_report_dir = std::path::PathBuf::from(config.isolated_report_dir());
     run_fuzz_campaign(config).await.expect("smoke campaign");
 
-    let finding_dir = report_dir.join("findings");
+    let finding_dir = campaign_report_dir.join("findings");
     assert!(
         !finding_dir.exists()
             || fs::read_dir(&finding_dir)
@@ -77,17 +81,19 @@ async fn synthetic_abi_smoke_campaign_does_not_promote_findings() {
                 .all(|entry| !entry.path().join("finding.json").exists()),
         "synthetic fallback must not promote vulnerability findings"
     );
-    assert!(
-        report_dir.join("campaign_summary.json").exists(),
-        "campaign summary JSON should exist"
-    );
     let summary: PromotionCampaignSummary = serde_json::from_slice(
-        &fs::read(report_dir.join("campaign_summary.json")).expect("summary json"),
+        &fs::read(campaign_report_dir.join("campaign_summary.json")).expect("summary json"),
     )
     .expect("campaign summary");
     assert_eq!(summary.promoted_findings, 0);
     assert_eq!(summary.confirmed_findings, 0);
     assert_eq!(summary.synthetic_non_production_findings, 0);
+    let status: serde_json::Value = serde_json::from_slice(
+        &fs::read(campaign_report_dir.join("campaign_status.json")).expect("status json"),
+    )
+    .expect("campaign status");
+    assert_eq!(status["state"], "finalized");
+    assert_eq!(status["summary"]["promoted_findings"], 0);
 
     let _ = fs::remove_dir_all(root);
 }

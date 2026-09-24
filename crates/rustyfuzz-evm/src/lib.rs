@@ -10,6 +10,7 @@ pub mod execution;
 pub mod executor;
 pub mod fork_db;
 pub mod inspector;
+pub mod rpc_url;
 pub mod transaction;
 
 pub use dataflow::DataflowRegistry;

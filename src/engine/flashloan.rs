@@ -24,8 +24,7 @@ pub struct FlashLoanValidation {
 
 impl FlashLoanTemplate {
     pub fn wrap_sequence(&self, mut input: EvmInput) -> EvmInput {
-        let payload = bincode::serde::encode_to_vec(&input.txs, bincode::config::standard())
-            .unwrap_or_default();
+        let payload = postcard::to_allocvec(&input.txs).unwrap_or_default();
         let mut calldata = EIP3156_FLASHLOAN_SELECTOR.to_vec();
         calldata.extend_from_slice(&[0u8; 12]);
         calldata.extend_from_slice(self.receiver.as_slice());
@@ -79,6 +78,32 @@ pub fn validate_flashloan_profit(report: &EconomicDeltaReport) -> FlashLoanValid
 mod tests {
     use super::*;
     use crate::engine::economic_delta::{FlashLoanSignal, NormalizedProfit};
+
+    #[test]
+    fn flashloan_calldata_round_trips_postcard_transaction_payload() {
+        let input = EvmInput {
+            txs: vec![crate::common::types::SingletonTx {
+                input: vec![0xde, 0xad],
+                caller: Address::repeat_byte(0x11),
+                to: Address::repeat_byte(0x22),
+                value: U256::from(3),
+                is_victim: false,
+            }],
+            base_snapshot_id: 0,
+        };
+        let template = FlashLoanTemplate {
+            lender: Address::repeat_byte(0x33),
+            receiver: Address::repeat_byte(0x44),
+            token: Address::repeat_byte(0x55),
+            amount: U256::from(7),
+        };
+
+        let wrapped = template.wrap_sequence(input.clone());
+        let payload = &wrapped.txs[0].input[164..];
+        let decoded: Vec<crate::common::types::SingletonTx> =
+            postcard::from_bytes(payload).unwrap();
+        assert_eq!(decoded, input.txs);
+    }
 
     #[test]
     fn flashloan_validation_requires_repayment_and_profit() {

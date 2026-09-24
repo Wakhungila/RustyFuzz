@@ -16,8 +16,8 @@ use crate::engine::exploit_path::ExploitPathBuilder;
 use crate::engine::foundry_ingest::FoundryHarnessManifest;
 use crate::engine::invariant_manifest::TargetInvariantManifest;
 use crate::engine::promotion::{
-    promote_finding_artifact, write_campaign_summary, PromotionCampaignStats, PromotionConfig,
-    PromotionRequest,
+    promote_finding_artifact, write_campaign_status, write_campaign_summary,
+    PromotionCampaignStats, PromotionCampaignSummary, PromotionConfig, PromotionRequest,
 };
 use crate::engine::protocol_model::CounterexampleSearchEngine;
 use crate::engine::scheduler::RustyFuzzScheduler;
@@ -30,10 +30,11 @@ use crate::evm::corpus::{
 use crate::evm::feedback::{EvmCoverageFeedback, EvmStateNoveltyFeedback, StateNoveltyReport};
 use crate::evm::fuzz::{AbiRegistry, EvmMutator, EvmTestcaseMetadataStore, MutationProvenance};
 use crate::evm::registry::GlobalAccountRegistry;
+use crate::evm::seed_ingester::{validate_mainnet_seed_bundle, MainnetSeedBundle};
 use crate::evm::snapshot::new_evm_snapshot;
 use rustyfuzz_evm::dataflow::DataflowRegistry;
 use rustyfuzz_evm::executor::EvmExecutor;
-use rustyfuzz_evm::fork_db::{execution_rpc_budget, ForkDb};
+use rustyfuzz_evm::fork_db::{execution_rpc_budget, ForkCacheProvenance, ForkDb};
 use rustyfuzz_evm::inspector::MAP_SIZE;
 
 use libafl::corpus::{Corpus, Testcase};
@@ -45,17 +46,71 @@ use parking_lot::{Mutex, RwLock};
 use revm::database::CacheDB;
 use revm::primitives::{Address, U256};
 use revm::state::AccountInfo;
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::num::NonZeroUsize;
-use std::sync::atomic::Ordering;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use uuid::Uuid;
 
 const DEFAULT_MUTATIONAL_STAGE_MAX_ITERATIONS: usize = 128;
 const MAX_SNAPSHOT_CORPUS_SIZE: usize = 4096;
+const REQUIRED_SEED_PROVENANCE_PREFIX: &str = "rustyfuzz:required-seed";
+
+fn required_seed_inputs(bundle: &MainnetSeedBundle) -> anyhow::Result<Vec<EvmInput>> {
+    let inputs = bundle
+        .seeds
+        .iter()
+        .filter(|seed| {
+            seed.metadata
+                .provenance
+                .as_deref()
+                .is_some_and(|provenance| provenance.starts_with(REQUIRED_SEED_PROVENANCE_PREFIX))
+        })
+        .map(|seed| seed.input.clone())
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        inputs.len() <= 1,
+        "a seed bundle may contain at most one required pre-fuzz sequence"
+    );
+    Ok(inputs)
+}
+
+fn ensure_campaign_directory(path: &str) -> anyhow::Result<()> {
+    rustyfuzz_artifacts::fsutil::write_atomic(
+        Path::new(path).join(".rustyfuzz-campaign"),
+        b"ready\n",
+    )?;
+    Ok(())
+}
+
+fn write_required_seed_replay_marker(
+    report_dir: &str,
+    input: &EvmInput,
+    execution_admitted: bool,
+) -> anyhow::Result<()> {
+    let marker_path = Path::new(report_dir).join("required_seed_replay.json");
+    if !execution_admitted {
+        if let Err(error) = fs::remove_file(&marker_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
+        }
+        return Ok(());
+    }
+    let marker = serde_json::json!({
+        "completed": true,
+        "sequence_hash": input.semantic_input_hash(),
+    });
+    rustyfuzz_artifacts::fsutil::write_atomic(marker_path, serde_json::to_vec(&marker)?)?;
+    Ok(())
+}
 
 fn campaign_rng_seed(config: &Config, core_id: usize) -> u64 {
     if config.hardened_defi.deterministic {
@@ -70,6 +125,95 @@ fn campaign_rng_seed(config: &Config, core_id: usize) -> u64 {
         .rng_seed
         .map(|seed| seed.wrapping_add(core_id as u64))
         .unwrap_or(core_id as u64)
+}
+
+fn valid_fork_provenance(provenance: &ForkCacheProvenance, expected_block: u64) -> bool {
+    !provenance.provider_sanitized.is_empty()
+        && provenance.chain_id.is_some()
+        && provenance.block_number == Some(expected_block)
+        && provenance.block_hash.is_some()
+        && provenance.cache_id.is_some()
+}
+fn execution_provenance_fields(
+    config: &Config,
+    core_id: usize,
+    synthetic_fork_mode: bool,
+    from_checkpoint: bool,
+    db: &CacheDB<ForkDb>,
+) -> (
+    super::provenance::RpcProvenance,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<u64>,
+) {
+    let source = if from_checkpoint {
+        "cache_replay"
+    } else if synthetic_fork_mode {
+        "synthetic_fallback"
+    } else {
+        "live_rpc"
+    };
+    let fork_prov = db.db.provenance();
+    let provider = if fork_prov.provider_sanitized.is_empty() {
+        None
+    } else {
+        Some(fork_prov.provider_sanitized.clone())
+    };
+    let rpc_provenance = super::provenance::RpcProvenance {
+        provider_sanitized: provider,
+        chain_id: fork_prov.chain_id,
+        fork_block: fork_prov.block_number.or(Some(config.fork_block)),
+        fork_block_hash: fork_prov.block_hash.clone(),
+        fetched_at_unix: fork_prov.fetched_at_unix,
+        fork_cache_id: fork_prov.cache_id.clone(),
+        source: Some(source.to_string()),
+    };
+
+    let bytecode_hash = config.target_contract.and_then(|target| {
+        let info = db.cache.accounts.get(&target)?.info()?;
+        let code = info.code?;
+        let mut hasher = Sha256::new();
+        hasher.update(code.original_byte_slice());
+        Some(format!("0x{}", hex::encode(hasher.finalize())))
+    });
+
+    let config_payload = format!(
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        rustyfuzz_artifacts::sanitize_rpc_endpoint(&config.rpc_url),
+        config.fork_block,
+        config.target_contract,
+        config.require_rpc_fork,
+        config.allow_synthetic_fallback,
+        config.mainnet_seed_bundle,
+        config.target_invariant_manifest,
+        config.abi_path,
+        config.max_execs,
+        config.duration_secs,
+        config.artifact_limit,
+        config.hardened_defi,
+        config.promotion,
+    );
+    let config_hash = Some(format!(
+        "0x{}",
+        hex::encode(Sha256::digest(config_payload.as_bytes()))
+    ));
+
+    let tool_revision = Some(env!("CARGO_PKG_VERSION").to_string());
+    let rng_seed = if config.hardened_defi.deterministic || config.hardened_defi.rng_seed.is_some()
+    {
+        Some(campaign_rng_seed(config, core_id))
+    } else {
+        None
+    };
+
+    (
+        rpc_provenance,
+        bytecode_hash,
+        config_hash,
+        tool_revision,
+        rng_seed,
+    )
 }
 
 fn mutational_stage_iterations(config: &Config) -> NonZeroUsize {
@@ -112,6 +256,8 @@ fn log_bounded_campaign_progress(
     last_report: &mut Instant,
     budget: &CampaignBudget,
     telemetry: &CampaignTelemetry,
+    report_dir: &str,
+    worker_id: Option<usize>,
 ) {
     if last_report.elapsed() < CAMPAIGN_TELEMETRY_INTERVAL {
         return;
@@ -127,6 +273,32 @@ fn log_bounded_campaign_progress(
         telemetry.artifacts(),
         telemetry.coverage_edges()
     );
+    let status = serde_json::json!({
+        "schema_version": 1,
+        "mode": label,
+        "reserved_executions": budget.reserved(),
+        "completed_executions": telemetry.executions(),
+        "mutated_inputs": telemetry.mutated_inputs(),
+        "seed_replays": telemetry.seed_replays(),
+        "max_executions": budget.max_execs,
+        "artifacts": telemetry.artifacts(),
+        "coverage_edges": telemetry.coverage_edges(),
+        "updated_at_unix": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default(),
+    });
+    if let Some(worker_id) = worker_id {
+        let heartbeat_dir = std::path::Path::new(report_dir).join("worker_heartbeat");
+        if let Err(error) = rustyfuzz_artifacts::fsutil::write_json_atomic(
+            &heartbeat_dir.join(format!("{worker_id}.json")),
+            &status,
+        ) {
+            log::error!("worker heartbeat write failed: {error:#}");
+        }
+    } else if let Err(error) = write_campaign_status(std::path::Path::new(report_dir), &status) {
+        log::error!("campaign heartbeat write failed: {error:#}");
+    }
     *last_report = Instant::now();
 }
 
@@ -151,74 +323,108 @@ pub struct Config {
     pub duration_secs: Option<u64>,
     pub artifact_limit: Option<u64>,
     pub campaign_id: Option<String>,
+    pub paths_are_isolated: bool,
     pub min_finding_confidence: u64,
+
     pub promotion: PromotionConfig,
 }
 
 impl Config {
-    /// Ensures proper state isolation by creating campaign-specific directories
-    /// based on the campaign_id. This prevents cross-contamination between campaigns.
-    pub fn ensure_state_isolation(&self) -> anyhow::Result<()> {
-        let campaign_suffix = self
-            .campaign_id
+    fn isolation_suffix(&self) -> String {
+        self.campaign_id
             .as_ref()
             .map(|id| {
-                format!(
-                    "_{}",
-                    id.replace(|c: char| !c.is_alphanumeric() && c != '_', "_")
-                )
+                let sanitized = id
+                    .chars()
+                    .map(|character| {
+                        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                            character
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect::<String>();
+                let mut sanitized = if sanitized.is_empty() {
+                    "campaign".to_string()
+                } else {
+                    sanitized
+                };
+                sanitized.truncate(48);
+                if sanitized == id.as_str() {
+                    return format!("_{sanitized}");
+                }
+                let digest = Sha256::digest(id.as_bytes());
+                let digest = digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                format!("_{}-{}", sanitized, &digest[..16])
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
 
-        // Ensure corpus directory is isolated per campaign
-        let isolated_corpus_dir = format!("{}{}", self.corpus_dir, campaign_suffix);
-        fs::create_dir_all(&isolated_corpus_dir)?;
+    fn isolated_path(path: &str, suffix: &str) -> String {
+        format!("{path}{suffix}")
+    }
 
-        // Ensure report directory is isolated per campaign
-        let isolated_report_dir = format!("{}{}", self.report_dir, campaign_suffix);
-        fs::create_dir_all(&isolated_report_dir)?;
+    pub fn with_isolated_paths(mut self) -> Self {
+        let generated_campaign = self.campaign_id.is_none();
+        if generated_campaign {
+            self.campaign_id = Some(format!("run-{}", Uuid::new_v4()));
+        }
+        if generated_campaign || !self.paths_are_isolated {
+            let suffix = self.isolation_suffix();
+            self.corpus_dir = Self::isolated_path(&self.corpus_dir, &suffix);
+            self.report_dir = Self::isolated_path(&self.report_dir, &suffix);
+            self.paths_are_isolated = true;
+        }
+        self
+    }
 
+    pub fn ensure_state_isolation(&self) -> anyhow::Result<()> {
+        ensure_campaign_directory(&self.corpus_dir)?;
+        ensure_campaign_directory(&self.report_dir)?;
         Ok(())
     }
 
-    /// Returns the isolated corpus directory for this campaign
     pub fn isolated_corpus_dir(&self) -> String {
-        let campaign_suffix = self
-            .campaign_id
-            .as_ref()
-            .map(|id| {
-                format!(
-                    "_{}",
-                    id.replace(|c: char| !c.is_alphanumeric() && c != '_', "_")
-                )
-            })
-            .unwrap_or_default();
-        format!("{}{}", self.corpus_dir, campaign_suffix)
+        if self.paths_are_isolated {
+            self.corpus_dir.clone()
+        } else {
+            Self::isolated_path(&self.corpus_dir, &self.isolation_suffix())
+        }
     }
 
-    /// Returns the isolated report directory for this campaign
     pub fn isolated_report_dir(&self) -> String {
-        let campaign_suffix = self
-            .campaign_id
-            .as_ref()
-            .map(|id| {
-                format!(
-                    "_{}",
-                    id.replace(|c: char| !c.is_alphanumeric() && c != '_', "_")
-                )
-            })
-            .unwrap_or_default();
-        format!("{}{}", self.report_dir, campaign_suffix)
+        if self.paths_are_isolated {
+            self.report_dir.clone()
+        } else {
+            Self::isolated_path(&self.report_dir, &self.isolation_suffix())
+        }
     }
 }
 
+pub fn run_fuzz_campaign_blocking(config: Config) -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_fuzz_campaign(config))
+}
+
 pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
+    run_fuzz_campaign_with_cancellation(config, None).await
+}
+
+pub async fn run_fuzz_campaign_with_cancellation(
+    config: Config,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
+    let config = config.with_isolated_paths();
+    config.ensure_state_isolation()?;
+    let run_nonce = Uuid::new_v4().to_string();
     let checkpoint_session = super::checkpoint::CheckpointSession::open(&config)?;
     let start_time = Instant::now();
-
-    // Ensure state isolation before starting the campaign
-    config.ensure_state_isolation()?;
 
     let monitor = SimpleMonitor::new(|s| {
         log::info!("Stats: {} | Duration: {:?}", s, start_time.elapsed());
@@ -232,7 +438,10 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
         .as_ref()
         .and_then(|session| session.saved.as_ref())
     {
-        (saved.snapshots.initial_db()?, saved.block_env.clone(), true)
+        let restored_db = saved.snapshots.initial_db()?;
+        let restored_provenance = restored_db.db.provenance();
+        let restored_is_synthetic = !valid_fork_provenance(&restored_provenance, config.fork_block);
+        (restored_db, saved.block_env.clone(), restored_is_synthetic)
     } else if let Some(bytecode) = config.in_memory_bytecode.as_ref() {
         let target = config
             .target_contract
@@ -345,6 +554,9 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
             None
         };
 
+    let campaign_from_checkpoint = checkpoint_session
+        .as_ref()
+        .is_some_and(|session| session.saved.is_some());
     let launcher_fallback_config = config.clone();
     let launcher_fallback_db = initial_db.clone();
     let launcher_fallback_env = initial_env.clone();
@@ -404,8 +616,23 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
     let cores = campaign_cores(config.cores.as_ref())?;
     let broker_worker_count = cores.ids.len().max(1);
     let use_launcher = !config.hardened_defi.single_process && cores.ids.len() > 1;
+    if use_launcher && cancellation.is_some() {
+        let report_dir = Path::new(&config.report_dir);
+        write_campaign_status(
+            report_dir,
+            &serde_json::json!({
+                "schema_version": 1,
+                "state": "cancelled",
+                "terminal": true,
+                "campaign_id": config.campaign_id.as_deref().expect("campaign identity is initialized before use"),
+                "run_nonce": run_nonce,
+                "reason": "multi-worker watchdog cancellation is not shared across launcher processes",
+            }),
+        )?;
+        anyhow::bail!("multi-worker watchdog cancellation is unsupported; use single-process mode for cancellable campaigns");
+    }
     if !use_launcher {
-        return run_single_process_campaign(
+        let result = run_single_process_campaign(
             launcher_fallback_config,
             launcher_fallback_db,
             launcher_fallback_env,
@@ -415,9 +642,21 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 selectors: launcher_fallback_bytecode_selectors,
                 analysis: launcher_fallback_bytecode_analysis,
             },
-            checkpoint_session,
+            CampaignResume {
+                session: checkpoint_session,
+                from_checkpoint: campaign_from_checkpoint,
+                cancellation: cancellation.clone(),
+            },
         )
         .await;
+        result?;
+        if cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            anyhow::bail!("fuzz campaign cancelled by watchdog after finalization");
+        }
+        return Ok(());
     }
 
     let execution_timeout = campaign_execution_timeout();
@@ -469,8 +708,11 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                 let state_novelty_feedback =
                     Arc::new(RwLock::new(EvmStateNoveltyFeedback::new()));
                 let telemetry = Arc::new(CampaignTelemetry::new());
-                let promotion_stats = Arc::new(PromotionCampaignStats::default());
-                let pending_campaign_score = Arc::new(RwLock::new(None));
+                 let promotion_stats = Arc::new(PromotionCampaignStats::default());
+                 let promotion_outbox = Arc::new(Mutex::new(VecDeque::new()));
+                 let campaign_cancellation = cancellation.clone();
+                 let pending_campaign_score = Arc::new(RwLock::new(None));
+                 let worker_run_nonce = run_nonce.clone();
                 let testcase_metadata_store = EvmTestcaseMetadataStore::default();
                 let (event_sink, _event_receiver) =
                     EventSink::bounded(rustyfuzz_engine::events::DEFAULT_EVENT_SINK_CAPACITY);
@@ -611,10 +853,12 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
                 let core_id = description.core_id();
 
-                let mut feedback = EvmCoverageFeedback::new();
-                let mut objective = ();
+                 let mut feedback = EvmCoverageFeedback::new();
+                 let mut objective = ();
+                 let mut required_replay_inputs = Vec::new();
 
-                let mut state = state.unwrap_or_else(|| {
+                 let mut state = state.unwrap_or_else(|| {
+
                     StdState::new(
                         StdRand::with_seed(campaign_rng_seed(&config, core_id.0)),
                         InMemoryCorpus::<EvmInput>::new(),
@@ -637,10 +881,22 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                         )
                             .map_err(|err| libafl::Error::unknown(err.to_string()))?;
                         if let SeedBundleStatus::Loaded { .. } = status {
-                            let bundle = persistent_corpus
-                                .load_mainnet_seed_bundle(bundle_id)
-                                .map_err(|err| libafl::Error::unknown(err.to_string()))?;
-                            {
+                             let bundle = persistent_corpus
+                                 .load_mainnet_seed_bundle(bundle_id)
+                                 .map_err(|err| libafl::Error::unknown(err.to_string()))?;
+                             validate_mainnet_seed_bundle(
+                                 &bundle,
+                                 target_contract,
+                                 config.fork_block,
+                                 &initial_db.db.provenance(),
+                             )
+                             .map_err(|err| libafl::Error::unknown(err.to_string()))?;
+                             required_replay_inputs.extend(
+                                 required_seed_inputs(&bundle)
+                                     .map_err(|err| libafl::Error::unknown(err.to_string()))?,
+                             );
+                             {
+
                                 for seed in bundle.seeds {
                                     state.corpus_mut().add(Testcase::new(seed.input))?;
                                     inserted_seed_count += 1;
@@ -782,6 +1038,20 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                     worker_index,
                 ).ok_or_else(|| libafl::Error::unknown("invalid campaign worker topology"))?);
 
+                let (
+                    rpc_provenance,
+                    bytecode_hash,
+                    config_hash,
+                    tool_revision,
+                    rng_seed,
+                ) = execution_provenance_fields(
+                    &config,
+                    core_id.0,
+                    synthetic_fork_mode,
+                    campaign_from_checkpoint,
+                    &initial_db,
+                );
+
                 let mut harness = |input: &EvmInput| {
                     if !budget.reserve_execution() {
                         return ExitKind::Ok;
@@ -829,11 +1099,18 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                             Ok(result) => result,
                             Err(err) => {
                                 if err.to_string().contains("fork RPC budget exhausted") {
-                                    log::warn!(
-                                        "Skipping input after fork RPC budget exhaustion at tx {}; increase RUSTYFUZZ_EXEC_RPC_BUDGET for deeper live-fork exploration",
+                                    if synthetic_fork_mode {
+                                        log::warn!(
+                                            "Skipping input after fork RPC budget exhaustion at tx {}; increase RUSTYFUZZ_EXEC_RPC_BUDGET for deeper live-fork exploration",
+                                            tx_idx
+                                        );
+                                        return ExitKind::Ok;
+                                    }
+                                    log::error!(
+                                        "Fork RPC budget exhausted at tx {} under live RPC (fail-closed); increase RUSTYFUZZ_EXEC_RPC_BUDGET",
                                         tx_idx
                                     );
-                                    return ExitKind::Ok;
+                                    return ExitKind::Crash;
                                 }
                                 log::error!("EVM execution failed for tx {}: {err:#}", tx_idx);
                                 return ExitKind::Crash;
@@ -1008,6 +1285,11 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                             campaign_score: &campaign_score,
                             findings: &findings,
                             mutation_strategies: &mutation_strategies,
+                            rpc_provenance: rpc_provenance.clone(),
+                            bytecode_hash: bytecode_hash.clone(),
+                            config_hash: config_hash.clone(),
+                            tool_revision: tool_revision.clone(),
+                            rng_seed,
                         },
                     ) {
                         log::error!("execution provenance persistence failed: {error:#}");
@@ -1112,15 +1394,15 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                                         outcome.record.score.total,
                                         outcome.record.findings.len()
                                     );
-                                    maybe_promote_artifact(
-                                        &config,
-                                        persistent_corpus.as_ref(),
-                                        &outcome.record,
-                                        &initial_env,
-                                        synthetic_fork_mode,
-                                        &promotion_stats,
-                                        &telemetry,
-                                    );
+                                     enqueue_promotion_artifact(
+                                         &config,
+                                         &promotion_outbox,
+                                         &outcome.record,
+                                         synthetic_fork_mode,
+                                         &promotion_stats,
+                                     );
+
+
                                 } else {
                                     log::debug!(
                                         "Reused campaign artifact: input_id={}, fork_cache_id={}, reason={}, score={}, findings={}",
@@ -1141,10 +1423,26 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 
                     *pending_campaign_score.write() = Some(campaign_score);
 
-                    ExitKind::Ok
-                };
+                     ExitKind::Ok
+                 };
 
-                let mut executor = InProcessExecutor::with_timeout::<()>(
+                 for input in &required_replay_inputs {
+                     let reserved_before = budget.reserved();
+                     if !matches!(harness(input), ExitKind::Ok) {
+                         return Err(libafl::Error::unknown(
+                             "required pre-fuzz sequence execution failed",
+                         ));
+                     }
+                     write_required_seed_replay_marker(
+                         &config.report_dir,
+                         input,
+                         budget.reserved() > reserved_before,
+                     )
+                     .map_err(|error| libafl::Error::unknown(error.to_string()))?;
+                 }
+
+                 let mut executor = InProcessExecutor::with_timeout::<()>(
+
                     &mut harness,
                     tuple_list!(observer),
                     &mut fuzzer,
@@ -1161,61 +1459,136 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
                         budget.max_execs
                     );
                     let mut bounded_progress_report = Instant::now();
-                    while !budget.exhausted() {
-                        let _ =
-                            fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
+                     while !budget.exhausted()
+                         && !campaign_cancellation
+                             .as_ref()
+                             .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                     {
+                         let _ =
+                             fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
                         log_bounded_campaign_progress(
                             "brokered",
                             &mut bounded_progress_report,
-                            &budget,
-                            &telemetry,
+                             &budget,
+                             &telemetry,
+                            &config.report_dir,
+                            Some(core_id.0),
                         );
+
                     }
                     manager.on_restart(&mut state)?;
                     manager.on_shutdown()?;
-                } else {
-                    fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
-                }
+                 } else {
+                     while !campaign_cancellation
+                         .as_ref()
+                         .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                     {
+                         let _ = fuzzer.fuzz_one(
+                             &mut stages,
+                             &mut executor,
+                             &mut state,
+                             &mut manager,
+                         )?;
+                     }
+                 }
 
-                write_final_campaign_summary(&config, &promotion_stats, &telemetry);
-                Ok(())
+                  let worker_state = if campaign_cancellation
+                      .as_ref()
+                      .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                  {
+                      "cancelled"
+                  } else {
+                      "completed"
+                  };
+                   write_worker_terminal_artifact(
+                       &config,
+                       &worker_run_nonce,
+                       core_id.0,
+                       worker_state,
+                       &promotion_stats,
+                       &telemetry,
+                   )
+                  .map_err(|error| libafl::Error::unknown(error.to_string()))?;
+                  Ok(())
             },
         )
         .cores(&cores)
         .build()
         .launch();
 
-    match launcher_result {
-        Ok(_) => Ok(()),
+    let worker_ids: Vec<usize> = cores.ids.iter().map(|worker_id| worker_id.0).collect();
+    let result = match launcher_result {
+        Ok(_) => finalize_brokered_campaign(
+            &config,
+            &run_nonce,
+            &launcher_fallback_env,
+            launcher_fallback_synthetic_fork_mode,
+            &worker_ids,
+            cancellation.as_ref(),
+        ),
         Err(err) => {
+            if cancellation
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                anyhow::bail!("brokered fuzz launcher stopped after watchdog cancellation");
+            }
             if broker_launcher_error_was_shutdown(&err.to_string()) {
                 log::info!("Brokered fuzz launcher shut down cleanly");
-                return Ok(());
+                finalize_brokered_campaign(
+                    &config,
+                    &run_nonce,
+                    &launcher_fallback_env,
+                    launcher_fallback_synthetic_fork_mode,
+                    &worker_ids,
+                    cancellation.as_ref(),
+                )
+            } else if broker_launcher_error_can_fallback(&err.to_string()) {
+                log::warn!(
+                    "brokered fuzz launcher unavailable; falling back to broker-free single-process mode: {}",
+                    err
+                );
+                run_single_process_campaign(
+                    launcher_fallback_config,
+                    launcher_fallback_db,
+                    launcher_fallback_env,
+                    launcher_fallback_actor_set,
+                    launcher_fallback_synthetic_fork_mode,
+                    InitialBytecode {
+                        selectors: launcher_fallback_bytecode_selectors,
+                        analysis: launcher_fallback_bytecode_analysis,
+                    },
+                    CampaignResume {
+                        session: None,
+                        from_checkpoint: campaign_from_checkpoint,
+                        cancellation: cancellation.clone(),
+                    },
+                )
+                .await
+            } else {
+                return Err(err.into());
             }
-            log::warn!(
-                "brokered fuzz launcher unavailable; falling back to broker-free single-process mode: {}",
-                err
-            );
-            run_single_process_campaign(
-                launcher_fallback_config,
-                launcher_fallback_db,
-                launcher_fallback_env,
-                launcher_fallback_actor_set,
-                launcher_fallback_synthetic_fork_mode,
-                InitialBytecode {
-                    selectors: launcher_fallback_bytecode_selectors,
-                    analysis: launcher_fallback_bytecode_analysis,
-                },
-                None,
-            )
-            .await
         }
+    };
+    result?;
+    if cancellation
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    {
+        anyhow::bail!("fuzz campaign cancelled by watchdog after finalization");
     }
+    Ok(())
 }
 
 struct InitialBytecode {
     selectors: Vec<[u8; 4]>,
     analysis: Option<BytecodeAnalysisReport>,
+}
+
+struct CampaignResume {
+    session: Option<super::checkpoint::CheckpointSession>,
+    from_checkpoint: bool,
+    cancellation: Option<Arc<AtomicBool>>,
 }
 
 async fn run_single_process_campaign(
@@ -1225,8 +1598,13 @@ async fn run_single_process_campaign(
     hardened_actor_set: Option<ActorSet>,
     synthetic_fork_mode: bool,
     bytecode: InitialBytecode,
-    mut checkpoint_session: Option<super::checkpoint::CheckpointSession>,
+    resume: CampaignResume,
 ) -> anyhow::Result<()> {
+    let CampaignResume {
+        session: mut checkpoint_session,
+        from_checkpoint: campaign_from_checkpoint,
+        cancellation,
+    } = resume;
     let InitialBytecode {
         selectors: bytecode_selectors,
         analysis: bytecode_analysis,
@@ -1265,6 +1643,7 @@ async fn run_single_process_campaign(
     let state_novelty_feedback = Arc::new(RwLock::new(EvmStateNoveltyFeedback::new()));
     let telemetry = Arc::new(CampaignTelemetry::new());
     let promotion_stats = Arc::new(PromotionCampaignStats::default());
+    let promotion_outbox = Arc::new(Mutex::new(VecDeque::new()));
     let pending_campaign_score = Arc::new(RwLock::new(None));
     let testcase_metadata_store = EvmTestcaseMetadataStore::default();
     let (event_sink, _event_receiver) =
@@ -1416,6 +1795,7 @@ async fn run_single_process_campaign(
     }
     let resumed = restored_checkpoint.is_some();
     let mut direct_seed_inputs = Vec::new();
+    let mut required_replay_inputs = Vec::new();
     if state.corpus().count() == 0 {
         let mut inserted_seed_count = 0usize;
         if let Some(bundle_id) = &config.mainnet_seed_bundle {
@@ -1428,6 +1808,13 @@ async fn run_single_process_campaign(
             )?;
             if let SeedBundleStatus::Loaded { .. } = status {
                 let bundle = persistent_corpus.load_mainnet_seed_bundle(bundle_id)?;
+                validate_mainnet_seed_bundle(
+                    &bundle,
+                    target_contract,
+                    config.fork_block,
+                    &initial_db.db.provenance(),
+                )?;
+                required_replay_inputs.extend(required_seed_inputs(&bundle)?);
                 {
                     for seed in bundle.seeds {
                         let input = seed.input;
@@ -1573,7 +1960,7 @@ async fn run_single_process_campaign(
     let mut restored_map = None;
     let mut restored_strategies = None;
     let budget = if let Some(saved) = restored_checkpoint.take() {
-        *snapshot_corpus.write() = saved.snapshots.restore();
+        *snapshot_corpus.write() = saved.snapshots.restore()?;
         *state_novelty_feedback.write() = saved.novelty;
         *dataflow_registry.write() = saved.dataflow;
         *account_registry.write() = saved.accounts;
@@ -1618,6 +2005,15 @@ async fn run_single_process_campaign(
         OwnedMutSlice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE)
     });
 
+    let (rpc_provenance, bytecode_hash, config_hash, tool_revision, rng_seed) =
+        execution_provenance_fields(
+            &config,
+            core_id,
+            synthetic_fork_mode,
+            campaign_from_checkpoint || resumed,
+            &initial_db,
+        );
+
     let mut harness = |input: &EvmInput| {
         if !budget.reserve_execution() {
             return ExitKind::Ok;
@@ -1658,11 +2054,18 @@ async fn run_single_process_campaign(
                 Ok(result) => result,
                 Err(err) => {
                     if err.to_string().contains("fork RPC budget exhausted") {
-                        log::warn!(
-                            "Skipping input after fork RPC budget exhaustion at tx {}; increase RUSTYFUZZ_EXEC_RPC_BUDGET for deeper live-fork exploration",
+                        if synthetic_fork_mode {
+                            log::warn!(
+                                "Skipping input after fork RPC budget exhaustion at tx {}; increase RUSTYFUZZ_EXEC_RPC_BUDGET for deeper live-fork exploration",
+                                tx_idx
+                            );
+                            return ExitKind::Ok;
+                        }
+                        log::error!(
+                            "Fork RPC budget exhausted at tx {} under live RPC (fail-closed); increase RUSTYFUZZ_EXEC_RPC_BUDGET",
                             tx_idx
                         );
-                        return ExitKind::Ok;
+                        return ExitKind::Crash;
                     }
                     log::error!("EVM execution failed for tx {}: {err:#}", tx_idx);
                     return ExitKind::Crash;
@@ -1821,6 +2224,11 @@ async fn run_single_process_campaign(
                 campaign_score: &campaign_score,
                 findings: &findings,
                 mutation_strategies: &mutation_strategies,
+                rpc_provenance: rpc_provenance.clone(),
+                bytecode_hash: bytecode_hash.clone(),
+                config_hash: config_hash.clone(),
+                tool_revision: tool_revision.clone(),
+                rng_seed,
             },
         ) {
             log::error!("execution provenance persistence failed: {error:#}");
@@ -1886,14 +2294,12 @@ async fn run_single_process_campaign(
                             outcome.record.score.total,
                             outcome.record.findings.len()
                         );
-                        maybe_promote_artifact(
+                        enqueue_promotion_artifact(
                             &config,
-                            persistent_corpus.as_ref(),
+                            &promotion_outbox,
                             &outcome.record,
-                            &initial_env,
                             synthetic_fork_mode,
                             &promotion_stats,
-                            &telemetry,
                         );
                     }
                 }
@@ -1909,7 +2315,20 @@ async fn run_single_process_campaign(
         ExitKind::Ok
     };
 
+    for input in &required_replay_inputs {
+        let reserved_before = budget.reserved();
+        if !matches!(harness(input), ExitKind::Ok) {
+            anyhow::bail!("required pre-fuzz sequence execution failed");
+        }
+        write_required_seed_replay_marker(
+            &config.report_dir,
+            input,
+            budget.reserved() > reserved_before,
+        )?;
+    }
+
     let capture = |state: &EvmCampaignState,
+
                    feedback: &EvmCoverageFeedback,
                    scheduler: &RustyFuzzScheduler|
      -> anyhow::Result<_> {
@@ -1976,7 +2395,11 @@ async fn run_single_process_campaign(
             execution_timeout,
         )?;
         let mut bounded_progress_report = Instant::now();
-        while !budget.exhausted() {
+        while !budget.exhausted()
+            && !cancellation
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
             let _ = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
             if let Some(session) = checkpoint_session.as_mut() {
                 if session.due(budget.reserved()) || budget.exhausted() {
@@ -1993,9 +2416,50 @@ async fn run_single_process_campaign(
                 &mut bounded_progress_report,
                 &budget,
                 &telemetry,
+                &config.report_dir,
+                None,
             );
         }
-        write_final_campaign_summary(&config, &promotion_stats, &telemetry);
+        if let Some(session) = checkpoint_session.as_mut() {
+            let (saved, ids, coverage) = capture(
+                &state,
+                fuzzer.feedback(),
+                HasScheduler::<EvmInput, EvmCampaignState>::scheduler(&fuzzer),
+            )?;
+            session.publish(&saved, ids, coverage, resumed)?;
+        }
+
+        let cancelled = cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed));
+        if !cancelled {
+            promote_outbox(
+                &config,
+                persistent_corpus.as_ref(),
+                &initial_env,
+                synthetic_fork_mode,
+                &promotion_outbox,
+                &promotion_stats,
+            );
+        }
+        let state = if cancelled {
+            "cancelled"
+        } else if promotion_stats.promotion_failure_count() > 0
+            || promotion_stats.promotion_pending_count() > 0
+        {
+            "partial"
+        } else {
+            "finalized"
+        };
+        write_final_campaign_summary(&config, &promotion_stats, &telemetry, state)?;
+        if cancelled {
+            anyhow::bail!("fuzz campaign cancelled by watchdog");
+        }
+        if promotion_stats.promotion_failure_count() > 0
+            || promotion_stats.promotion_pending_count() > 0
+        {
+            anyhow::bail!("campaign completed with promotion failures or pending work");
+        }
         return Ok(());
     }
 
@@ -2010,6 +2474,12 @@ async fn run_single_process_campaign(
 
     if let Some(session) = checkpoint_session.as_mut() {
         loop {
+            if cancellation
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                break;
+            }
             fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
             if session.due(budget.reserved()) {
                 let (saved, ids, coverage) = capture(
@@ -2021,15 +2491,84 @@ async fn run_single_process_campaign(
             }
         }
     } else {
-        fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut manager)?;
+        while !cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
+        }
     }
 
-    write_final_campaign_summary(&config, &promotion_stats, &telemetry);
+    let cancelled = cancellation
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed));
+    if !cancelled {
+        promote_outbox(
+            &config,
+            persistent_corpus.as_ref(),
+            &initial_env,
+            synthetic_fork_mode,
+            &promotion_outbox,
+            &promotion_stats,
+        );
+    }
+    let state = if cancelled {
+        "cancelled"
+    } else if promotion_stats.promotion_failure_count() > 0
+        || promotion_stats.promotion_pending_count() > 0
+    {
+        "partial"
+    } else {
+        "finalized"
+    };
+    write_final_campaign_summary(&config, &promotion_stats, &telemetry, state)?;
+    if cancelled {
+        anyhow::bail!("fuzz campaign cancelled by watchdog");
+    }
+    if promotion_stats.promotion_failure_count() > 0
+        || promotion_stats.promotion_pending_count() > 0
+    {
+        anyhow::bail!("campaign completed with promotion failures or pending work");
+    }
     Ok(())
 }
 
 fn broker_launcher_error_was_shutdown(message: &str) -> bool {
     message.contains("Shutting down")
+}
+
+fn broker_launcher_error_can_fallback(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    let fatal_markers = [
+        "worker",
+        "runtime",
+        "promotion",
+        "panic",
+        "required pre-fuzz",
+        "failed to execute",
+        "execution failed",
+        "checkpoint",
+    ];
+    if fatal_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return false;
+    }
+    let startup_markers = [
+        "failed to bind to port",
+        "address already in use",
+        "no available port",
+        "connection refused",
+        "failed to start broker",
+        "failed to launch broker",
+        "failed to connect to broker",
+        "could not connect to broker",
+        "broker unavailable",
+    ];
+    startup_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
 }
 
 fn campaign_cores(configured: Option<&Cores>) -> anyhow::Result<Cores> {
@@ -2620,15 +3159,21 @@ fn push_unique_string(dst: &mut Vec<String>, value: &str) {
     }
 }
 
-fn maybe_promote_artifact(
+fn promotion_allowed(config: &PromotionConfig, high_confidence: bool) -> bool {
+    !config.no_promotion && (config.enabled || high_confidence)
+}
+
+fn enqueue_promotion_artifact(
     config: &Config,
-    corpus: &PersistentCorpus,
+    outbox: &Mutex<VecDeque<crate::evm::corpus::CampaignArtifactRecord>>,
     artifact: &crate::evm::corpus::CampaignArtifactRecord,
-    block_env: &revm::context::BlockEnv,
     synthetic_fork_mode: bool,
     promotion_stats: &PromotionCampaignStats,
-    telemetry: &CampaignTelemetry,
 ) {
+    if config.promotion.no_promotion {
+        log::debug!("Skipping promotion enqueue because no-promotion mode is active");
+        return;
+    }
     if artifact.findings.is_empty() {
         log::debug!(
             "Skipping promotion for score-only artifact input_id={} reason={} score={}; no oracle/protocol finding evidence",
@@ -2653,13 +3198,14 @@ fn maybe_promote_artifact(
         .max()
         .unwrap_or_default()
         >= 80;
-    if !config.promotion.enabled && !high_confidence {
+    if !promotion_allowed(&config.promotion, high_confidence) {
         return;
     }
+    let queued = outbox.lock().len() as u64;
     if config
         .promotion
         .promotion_limit
-        .is_some_and(|limit| promotion_stats.promoted_count() >= limit)
+        .is_some_and(|limit| promotion_stats.promoted_count().saturating_add(queued) >= limit)
     {
         log::debug!(
             "Promotion limit reached; skipping artifact promotion (limit={:?})",
@@ -2667,7 +3213,10 @@ fn maybe_promote_artifact(
         );
         return;
     }
-    let campaign_id = config.campaign_id.as_deref().unwrap_or("default-campaign");
+    let campaign_id = config
+        .campaign_id
+        .as_deref()
+        .expect("campaign identity is initialized before use");
     let promotion_id = format!("{campaign_id}-{}", artifact.input_id);
     if !promotion_stats.reserve_promotion(&promotion_id) {
         log::debug!(
@@ -2676,45 +3225,129 @@ fn maybe_promote_artifact(
         );
         return;
     }
-    let report_dir = std::path::Path::new(&config.report_dir);
-    match promote_finding_artifact(PromotionRequest {
-        corpus,
-        artifact,
-        block_env,
-        report_dir,
-        campaign_id,
-        fork_block: config.fork_block,
-        rpc_url: &config.rpc_url,
-        synthetic_mode: synthetic_fork_mode,
-        config: &config.promotion,
-    }) {
-        Ok(record) => {
-            promotion_stats.record(&record);
-            let summary = promotion_stats.summary(
-                campaign_id,
-                telemetry.execution_count(),
-                telemetry.mutated_inputs(),
-                telemetry.seed_replays(),
-                telemetry.artifact_count(),
-                telemetry.coverage_edges(),
-            );
-            if let Err(err) = write_campaign_summary(report_dir, &summary) {
-                log::warn!("Failed to write campaign promotion summary: {err:#}");
+    outbox.lock().push_back(artifact.clone());
+}
+
+fn promote_outbox(
+    config: &Config,
+    corpus: &PersistentCorpus,
+    block_env: &revm::context::BlockEnv,
+    synthetic_fork_mode: bool,
+    outbox: &Mutex<VecDeque<crate::evm::corpus::CampaignArtifactRecord>>,
+    promotion_stats: &PromotionCampaignStats,
+) {
+    let queued = std::mem::take(&mut *outbox.lock());
+    if synthetic_fork_mode {
+        return;
+    }
+    if config.promotion.no_promotion {
+        log::debug!("Skipping final persisted-artifact rescan because no-promotion mode is active");
+        return;
+    }
+    let campaign_id = config
+        .campaign_id
+        .as_deref()
+        .expect("campaign identity is initialized before use");
+    let queued_ids = queued
+        .iter()
+        .map(|artifact| format!("{campaign_id}-{}", artifact.input_id))
+        .collect::<HashSet<_>>();
+    let mut artifacts = queued;
+    match corpus.list_campaign_artifacts() {
+        Ok(persisted) => {
+            for artifact in persisted {
+                if !queued_ids.contains(&format!("{campaign_id}-{}", artifact.input_id)) {
+                    artifacts.push_back(artifact);
+                }
             }
         }
-        Err(err) => log::warn!(
-            "Failed to promote campaign artifact input_id={}: {err:#}",
-            artifact.input_id
-        ),
+        Err(error) => {
+            promotion_stats.record_failure(true);
+            log::error!("failed to rescan persisted campaign artifacts: {error:#}");
+            return;
+        }
+    }
+    for artifact in artifacts {
+        if artifact.findings.is_empty() {
+            continue;
+        }
+        let high_confidence = artifact
+            .findings
+            .iter()
+            .map(protocol_finding_confidence)
+            .max()
+            .unwrap_or_default()
+            >= 80;
+        if !promotion_allowed(&config.promotion, high_confidence) {
+            continue;
+        }
+        let finding_id = format!("{campaign_id}-{}", artifact.input_id);
+        if config
+            .promotion
+            .promotion_limit
+            .is_some_and(|limit| promotion_stats.promoted_count() >= limit)
+        {
+            promotion_stats.record_pending();
+            continue;
+        }
+        let already_reserved = queued_ids.contains(&finding_id);
+        if !already_reserved && !promotion_stats.reserve_promotion(&finding_id) {
+            continue;
+        }
+        let report_dir = std::path::Path::new(&config.report_dir);
+        match promote_finding_artifact(PromotionRequest {
+            corpus,
+            artifact: &artifact,
+            block_env,
+            report_dir,
+            campaign_id,
+            fork_block: config.fork_block,
+            rpc_url: &config.rpc_url,
+            synthetic_mode: false,
+            config: &config.promotion,
+        }) {
+            Ok(record) => promotion_stats.record(&record),
+            Err(error) => {
+                promotion_stats.release_promotion(&finding_id);
+                promotion_stats.record_failure(true);
+                log::warn!(
+                    "Failed to promote persisted campaign artifact input_id={}: {error:#}",
+                    artifact.input_id
+                );
+            }
+        }
     }
 }
 
-fn write_final_campaign_summary(
+#[derive(Serialize, Deserialize)]
+struct WorkerTerminalArtifact {
+    schema_version: u32,
+    campaign_id: String,
+    run_nonce: String,
+    worker_id: String,
+    state: String,
+    summary: PromotionCampaignSummary,
+}
+
+fn worker_terminal_path(report_dir: &Path, worker_id: impl ToString) -> PathBuf {
+    report_dir
+        .join("worker_terminal")
+        .join(format!("{}.json", worker_id.to_string()))
+}
+
+fn write_worker_terminal_artifact(
     config: &Config,
+    run_nonce: &str,
+    worker_id: impl ToString,
+    state: &str,
     promotion_stats: &PromotionCampaignStats,
     telemetry: &CampaignTelemetry,
-) {
-    let campaign_id = config.campaign_id.as_deref().unwrap_or("default-campaign");
+) -> anyhow::Result<()> {
+    let report_dir = Path::new(&config.report_dir);
+    let campaign_id = config
+        .campaign_id
+        .as_deref()
+        .expect("campaign identity is initialized before use");
     let summary = promotion_stats.summary(
         campaign_id,
         telemetry.execution_count(),
@@ -2723,9 +3356,240 @@ fn write_final_campaign_summary(
         telemetry.artifact_count(),
         telemetry.coverage_edges(),
     );
-    if let Err(err) = write_campaign_summary(std::path::Path::new(&config.report_dir), &summary) {
-        log::warn!("Failed to write final campaign summary: {err:#}");
+    let worker_id = worker_id.to_string();
+    rustyfuzz_artifacts::fsutil::write_json_atomic(
+        &worker_terminal_path(report_dir, &worker_id),
+        &WorkerTerminalArtifact {
+            schema_version: 2,
+            campaign_id: campaign_id.to_string(),
+            run_nonce: run_nonce.to_string(),
+            worker_id,
+            state: state.to_string(),
+            summary,
+        },
+    )?;
+    Ok(())
+}
+
+fn write_final_campaign_summary(
+    config: &Config,
+    promotion_stats: &PromotionCampaignStats,
+    telemetry: &CampaignTelemetry,
+    state: &str,
+) -> anyhow::Result<()> {
+    let campaign_id = config
+        .campaign_id
+        .as_deref()
+        .expect("campaign identity is initialized before use");
+    let summary = promotion_stats.summary(
+        campaign_id,
+        telemetry.execution_count(),
+        telemetry.mutated_inputs(),
+        telemetry.seed_replays(),
+        telemetry.artifact_count(),
+        telemetry.coverage_edges(),
+    );
+    let report_dir = Path::new(&config.report_dir);
+    write_campaign_summary(report_dir, &summary)?;
+    write_campaign_status(
+        report_dir,
+        &serde_json::json!({
+            "schema_version": 1,
+            "terminal": true,
+            "state": state,
+            "campaign_id": campaign_id,
+            "summary": summary,
+        }),
+    )
+}
+
+fn merge_worker_summaries(
+    campaign_id: &str,
+    workers: &[WorkerTerminalArtifact],
+) -> PromotionCampaignSummary {
+    let mut summary = PromotionCampaignSummary {
+        campaign_id: campaign_id.to_string(),
+        ..Default::default()
+    };
+    for worker in workers {
+        summary.total_executions = summary
+            .total_executions
+            .saturating_add(worker.summary.total_executions);
+        summary.mutated_inputs = summary
+            .mutated_inputs
+            .saturating_add(worker.summary.mutated_inputs);
+        summary.seed_replays = summary
+            .seed_replays
+            .saturating_add(worker.summary.seed_replays);
+        summary.total_artifacts = summary
+            .total_artifacts
+            .saturating_add(worker.summary.total_artifacts);
+        summary.coverage_edges = summary
+            .coverage_edges
+            .saturating_add(worker.summary.coverage_edges);
+        summary.interesting_candidates = summary
+            .interesting_candidates
+            .saturating_add(worker.summary.interesting_candidates);
+        summary.candidate_findings = summary
+            .candidate_findings
+            .saturating_add(worker.summary.candidate_findings);
+        summary.unproven_candidates = summary
+            .unproven_candidates
+            .saturating_add(worker.summary.unproven_candidates);
+        summary.highest_confidence = summary
+            .highest_confidence
+            .max(worker.summary.highest_confidence);
     }
+    summary
+}
+
+fn write_broker_failure_status(config: &Config, reason: &str) -> anyhow::Result<()> {
+    write_campaign_status(
+        Path::new(&config.report_dir),
+        &serde_json::json!({
+            "schema_version": 1,
+            "terminal": true,
+            "state": "failed",
+            "campaign_id": config.campaign_id.as_deref().expect("campaign identity is initialized before use"),
+            "reason": reason,
+        }),
+    )
+}
+
+fn finalize_brokered_campaign(
+    config: &Config,
+    run_nonce: &str,
+    block_env: &revm::context::BlockEnv,
+    synthetic_fork_mode: bool,
+    worker_ids: &[usize],
+    cancellation: Option<&Arc<AtomicBool>>,
+) -> anyhow::Result<()> {
+    let report_dir = Path::new(&config.report_dir);
+    let expected_campaign_id = config
+        .campaign_id
+        .as_deref()
+        .expect("campaign identity is initialized before use");
+    let mut workers = Vec::with_capacity(worker_ids.len());
+    for worker_id in worker_ids {
+        let path = worker_terminal_path(report_dir, *worker_id);
+        let artifact = match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<WorkerTerminalArtifact>(&bytes) {
+                Ok(artifact) => artifact,
+                Err(error) => {
+                    let reason = format!(
+                        "brokered campaign worker {worker_id} has malformed terminal artifact: {error}"
+                    );
+                    write_broker_failure_status(config, &reason)?;
+                    anyhow::bail!(reason);
+                }
+            },
+            Err(error) => {
+                let reason = format!(
+                    "brokered campaign worker {worker_id} has no readable terminal artifact: {error}"
+                );
+                write_broker_failure_status(config, &reason)?;
+                anyhow::bail!(reason);
+            }
+        };
+        let validation_error = if artifact.schema_version != 2 {
+            Some("terminal artifact schema version is not current".to_string())
+        } else if artifact.campaign_id != expected_campaign_id {
+            Some("terminal artifact campaign identity is stale or mismatched".to_string())
+        } else if artifact.run_nonce != run_nonce {
+            Some("terminal artifact run nonce is stale or mismatched".to_string())
+        } else if artifact.worker_id != worker_id.to_string() {
+            Some("terminal artifact worker identity is mismatched".to_string())
+        } else if !matches!(artifact.state.as_str(), "completed" | "cancelled") {
+            Some("terminal artifact has an invalid worker state".to_string())
+        } else if artifact.summary.campaign_id != expected_campaign_id {
+            Some("terminal artifact summary campaign identity is mismatched".to_string())
+        } else {
+            None
+        };
+        if let Some(reason) = validation_error {
+            let reason = format!("brokered campaign worker {worker_id}: {reason}");
+            write_broker_failure_status(config, &reason)?;
+            anyhow::bail!(reason);
+        }
+        workers.push(artifact);
+    }
+
+    let cancelled = cancellation
+        .and_then(|flag| flag.load(Ordering::Relaxed).then_some(()))
+        .is_some()
+        || workers.iter().any(|worker| worker.state == "cancelled");
+    let mut summary = merge_worker_summaries(
+        config
+            .campaign_id
+            .as_deref()
+            .expect("campaign identity is initialized before use"),
+        &workers,
+    );
+    let promotion_stats = PromotionCampaignStats::default();
+    if !cancelled && !synthetic_fork_mode {
+        let corpus = PersistentCorpus::new(&config.corpus_dir)?;
+        promote_outbox(
+            config,
+            &corpus,
+            block_env,
+            false,
+            &Mutex::new(VecDeque::new()),
+            &promotion_stats,
+        );
+        let promotion_summary = promotion_stats.summary(
+            config
+                .campaign_id
+                .as_deref()
+                .expect("campaign identity is initialized before use"),
+            summary.total_executions,
+            summary.mutated_inputs,
+            summary.seed_replays,
+            summary.total_artifacts,
+            summary.coverage_edges,
+        );
+        summary.promoted_findings = promotion_summary.promoted_findings;
+        summary.confirmed_findings = promotion_summary.confirmed_findings;
+        summary.rejected_candidates = promotion_summary.rejected_candidates;
+        summary.synthetic_non_production_findings =
+            promotion_summary.synthetic_non_production_findings;
+        summary.highest_confidence = summary
+            .highest_confidence
+            .max(promotion_summary.highest_confidence);
+        summary.poc_count = promotion_summary.poc_count;
+        summary.missing_poc_for_promoted = promotion_summary.missing_poc_for_promoted;
+        summary.replay_failure_count = promotion_summary.replay_failure_count;
+        summary.minimization_attempts = promotion_summary.minimization_attempts;
+        summary.minimization_reduced = promotion_summary.minimization_reduced;
+        summary.minimization_not_reducible = promotion_summary.minimization_not_reducible;
+        summary.promotion_failures = promotion_summary.promotion_failures;
+        summary.promotion_pending = promotion_summary.promotion_pending;
+    }
+    let state = if cancelled {
+        "cancelled"
+    } else if summary.promotion_failures > 0 || summary.promotion_pending > 0 {
+        "partial"
+    } else {
+        "finalized"
+    };
+    write_campaign_summary(report_dir, &summary)?;
+    write_campaign_status(
+        report_dir,
+        &serde_json::json!({
+            "schema_version": 1,
+            "terminal": true,
+            "state": state,
+            "campaign_id": expected_campaign_id,
+            "run_nonce": run_nonce,
+            "summary": summary,
+        }),
+    )?;
+    if cancelled {
+        anyhow::bail!("fuzz campaign cancelled before final promotion");
+    }
+    if summary.promotion_failures > 0 || summary.promotion_pending > 0 {
+        anyhow::bail!("brokered campaign completed with promotion failures or pending work");
+    }
+    Ok(())
 }
 
 fn sequence_result_from_tx_results(
@@ -2862,6 +3726,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn no_promotion_mode_blocks_high_confidence_promotion() {
+        let config = PromotionConfig {
+            enabled: false,
+            no_promotion: true,
+            ..PromotionConfig::default()
+        };
+        assert!(!promotion_allowed(&config, false));
+        assert!(!promotion_allowed(&config, true));
+    }
+
+    #[test]
+    fn campaign_path_resolution_preserves_campaign_suffix() {
+        assert_eq!(
+            Config::isolated_path("/tmp/reports_a", "_b"),
+            "/tmp/reports_a_b"
+        );
+    }
+
+    #[test]
+    fn missing_campaign_identity_generates_isolated_paths() {
+        let make_config = || Config {
+            rpc_url: "https://rpc.example.com".to_string(),
+            fork_block: 1,
+            target_contract: None,
+            corpus_dir: "corpus".to_string(),
+            report_dir: "reports".to_string(),
+            foundry_harness: None,
+            mainnet_seed_bundle: None,
+            in_memory_bytecode: None,
+            cores: None,
+            require_seed_bundle: false,
+            require_rpc_fork: false,
+            allow_synthetic_fallback: true,
+            hardened_defi: HardenedDefiConfig::default(),
+            target_invariant_manifest: None,
+            abi_path: None,
+            max_execs: Some(1),
+            duration_secs: Some(1),
+            artifact_limit: None,
+            campaign_id: None,
+            paths_are_isolated: true,
+            min_finding_confidence: 0,
+            promotion: PromotionConfig::default(),
+        };
+        let first = make_config().with_isolated_paths();
+        let second = make_config().with_isolated_paths();
+        assert_ne!(first.campaign_id, second.campaign_id);
+        assert_ne!(first.corpus_dir, second.corpus_dir);
+        assert_ne!(first.report_dir, second.report_dir);
+        assert!(first.paths_are_isolated && second.paths_are_isolated);
+    }
+
+    #[test]
     fn state_novelty_projection_rewards_reserved_coverage_slots() {
         let mut coverage = vec![0u8; 64];
 
@@ -2954,6 +3871,101 @@ mod tests {
     }
 
     #[test]
+    fn required_seed_marker_requires_an_admitted_execution() {
+        let report_dir =
+            std::env::temp_dir().join(format!("rustyfuzz-required-marker-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&report_dir);
+        fs::create_dir_all(&report_dir).unwrap();
+        let budget = CampaignBudget::new(Some(0), Some(1), 1);
+        assert!(budget.exhausted());
+        let input = EvmInput::new(
+            vec![SingletonTx {
+                input: vec![0xde, 0xad, 0xbe, 0xef],
+                caller: Address::repeat_byte(0x11),
+                to: Address::repeat_byte(0x22),
+                value: U256::ZERO,
+                is_victim: false,
+            }],
+            0,
+        );
+        write_required_seed_replay_marker(report_dir.to_str().unwrap(), &input, false).unwrap();
+        assert!(!Path::new(&report_dir)
+            .join("required_seed_replay.json")
+            .exists());
+        write_required_seed_replay_marker(report_dir.to_str().unwrap(), &input, true).unwrap();
+        assert!(Path::new(&report_dir)
+            .join("required_seed_replay.json")
+            .is_file());
+        let _ = fs::remove_dir_all(&report_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn campaign_paths_reject_symlinked_parents() {
+        use std::os::unix::fs::symlink;
+
+        let temp = std::env::temp_dir().join(format!(
+            "rustyfuzz-campaign-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&temp).unwrap();
+        let outside = temp.join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, temp.join("linked")).unwrap();
+        let linked = temp.join("linked");
+        let config = Config {
+            rpc_url: "https://rpc.example.com".to_string(),
+            fork_block: 1,
+            target_contract: None,
+            corpus_dir: linked.join("corpus").to_string_lossy().into_owned(),
+            report_dir: linked.join("reports").to_string_lossy().into_owned(),
+            foundry_harness: None,
+            mainnet_seed_bundle: None,
+            in_memory_bytecode: None,
+            cores: None,
+            require_seed_bundle: false,
+            require_rpc_fork: false,
+            allow_synthetic_fallback: true,
+            hardened_defi: HardenedDefiConfig::default(),
+            target_invariant_manifest: None,
+            abi_path: None,
+            max_execs: Some(1),
+            duration_secs: Some(1),
+            artifact_limit: None,
+            campaign_id: Some("test".to_string()),
+            paths_are_isolated: true,
+            min_finding_confidence: 0,
+            promotion: PromotionConfig::default(),
+        };
+        assert!(config.ensure_state_isolation().is_err());
+        assert!(!outside.join("corpus").exists());
+        assert!(!outside.join("reports").exists());
+
+        let input = EvmInput::new(
+            vec![SingletonTx {
+                input: vec![0xde, 0xad],
+                caller: Address::repeat_byte(0x11),
+                to: Address::repeat_byte(0x22),
+                value: U256::ZERO,
+                is_victim: false,
+            }],
+            0,
+        );
+        assert!(write_required_seed_replay_marker(
+            linked.join("campaign").to_str().unwrap(),
+            &input,
+            true,
+        )
+        .is_err());
+        assert!(!outside.join("campaign/required_seed_replay.json").exists());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn campaign_budget_reserves_shutdown_grace_for_duration_runs() {
         std::env::set_var("RUSTYFUZZ_CAMPAIGN_SHUTDOWN_GRACE_SECS", "2");
         let budget = CampaignBudget::new(None, Some(1), 1);
@@ -2962,11 +3974,23 @@ mod tests {
     }
 
     #[test]
-    fn broker_shutdown_error_does_not_trigger_fallback() {
+    fn broker_fallback_is_limited_to_startup_unavailability() {
         assert!(broker_launcher_error_was_shutdown("Shutting down!"));
-        assert!(!broker_launcher_error_was_shutdown(
-            "Failed to bind to port 1337"
+        assert!(!broker_launcher_error_can_fallback("Shutting down!"));
+        assert!(broker_launcher_error_can_fallback(
+            "Failed to bind to port 1337: address already in use"
         ));
+        assert!(broker_launcher_error_can_fallback(
+            "could not connect to broker: connection refused"
+        ));
+        for message in [
+            "worker runtime panicked",
+            "promotion failed while worker was running",
+            "required pre-fuzz sequence execution failed",
+            "unknown launcher failure",
+        ] {
+            assert!(!broker_launcher_error_can_fallback(message), "{message}");
+        }
     }
 
     #[test]

@@ -56,6 +56,10 @@ fn negative_control_pack_has_two_controls_per_oracle_and_no_false_positives() {
     assert_eq!(report.summary.found, 0);
     assert_eq!(report.summary.not_found, 10);
     assert_eq!(report.summary.failed_execution, 0);
+    assert_eq!(
+        report.calibration.useful_seed_sources,
+        vec!["executable EVM fixture transaction sequences"]
+    );
 
     let mut counts = BTreeMap::new();
     for result in &report.benchmarks {
@@ -101,8 +105,14 @@ fn negative_control_pack_has_two_controls_per_oracle_and_no_false_positives() {
         .find(|r| r.benchmark_id == "negative-erc20-owner-mint")
         .unwrap();
     assert!(
-        !owner.runtime.as_ref().unwrap().unmatched_signals.is_empty(),
-        "cross-pack bridge heuristics must remain visible"
+        owner
+            .runtime
+            .as_ref()
+            .unwrap()
+            .unmatched_signals
+            .iter()
+            .all(|finding| finding.pack != ProtocolOraclePackKind::Bridge),
+        "owner mint must not be misclassified as a bridge outbound"
     );
 }
 
@@ -888,7 +898,12 @@ fn foundry_poc_generation_embeds_protocol_oracle_assertions() {
                 pc: 0,
             },
         ],
-        call_trace: vec![call(0, pool, vec![0x02, 0x2c, 0x0d, 0x9f], true)],
+        call_trace: vec![
+            reserve_read(0, pool, 1_000_000, 1_000_000),
+            call(0, pool, vec![0x02, 0x2c, 0x0d, 0x9f], true),
+            token_transfer(0, pool, addr(0x90)),
+            reserve_read(1, pool, 1, 1_000_000),
+        ],
         oracle_observations: Vec::new(),
     };
     let findings = ProtocolOraclePack::default().evaluate(&execution);
@@ -981,7 +996,7 @@ fn foundry_poc_generation_fails_closed_without_pinned_fork_for_proof() {
     std::fs::create_dir_all(&root).expect("create poc dir");
     let input = EvmInput {
         txs: vec![SingletonTx {
-            input: vec![0xb6, 0xb5, 0x5f, 0x25],
+            input: vec![0x6e, 0x55, 0x3f, 0x65],
             caller: addr(0xf1),
             to: addr(0xf2),
             value: U256::ZERO,
@@ -1607,7 +1622,10 @@ fn protocol_oracle_pack_detects_governance_and_amm_findings() {
         ],
         call_trace: vec![
             call(0, governor, vec![0xfe, 0x0d, 0x94, 0xc1], true),
+            reserve_read(0, pool, 1_000_000, 1_000_000),
             call(1, pool, vec![0x02, 0x2c, 0x0d, 0x9f], true),
+            token_transfer(1, pool, addr(0x90)),
+            reserve_read(2, pool, 1, 1_000_000),
         ],
         oracle_observations: Vec::new(),
     };
@@ -1633,27 +1651,18 @@ fn protocol_oracle_pack_detects_erc4626_and_lending_findings() {
         final_coverage_hash: 0,
         storage_reads: Vec::new(),
         storage_writes: Vec::new(),
-        storage_diffs: vec![
-            StorageDiff {
-                tx_index: 0,
-                address: vault,
-                slot: U256::ZERO.to_be_bytes::<32>().into(),
-                old_value: U256::ZERO,
-                new_value: U256::from(10u128.pow(20)),
-                pc: 0,
-            },
-            StorageDiff {
-                tx_index: 1,
-                address: market,
-                slot: U256::ZERO.to_be_bytes::<32>().into(),
-                old_value: U256::from(10u128.pow(20)),
-                new_value: U256::ZERO,
-                pc: 0,
-            },
-        ],
+        storage_diffs: vec![StorageDiff {
+            tx_index: 0,
+            address: vault,
+            slot: U256::ZERO.to_be_bytes::<32>().into(),
+            old_value: U256::ZERO,
+            new_value: U256::from(10u128.pow(20)),
+            pc: 0,
+        }],
         call_trace: vec![
-            call(0, vault, vec![0xb6, 0xb5, 0x5f, 0x25], true),
+            call(0, vault, vec![0x6e, 0x55, 0x3f, 0x65], true),
             call(1, market, vec![0xc5, 0xeb, 0xea, 0xec], true),
+            token_transfer(1, market, addr(0x90)),
         ],
         oracle_observations: Vec::new(),
     };
@@ -1665,7 +1674,7 @@ fn protocol_oracle_pack_detects_erc4626_and_lending_findings() {
     }));
     assert!(findings.iter().any(|finding| {
         finding.pack == ProtocolOraclePackKind::Lending
-            && matches!(finding.vuln, VulnType::AccountingDesync)
+            && matches!(&finding.vuln, VulnType::InvariantViolation(label) if label.contains("debt accounting"))
     }));
 }
 
@@ -1721,6 +1730,39 @@ fn call(tx_index: usize, target: Address, selector: Vec<u8>, success: bool) -> C
         created_address: None,
         result: Some("Stop".to_string()),
     }
+}
+
+fn token_transfer(tx_index: usize, caller: Address, target: Address) -> CallObservation {
+    let mut input = vec![0xa9, 0x05, 0x9c, 0xbb];
+    input.extend_from_slice(&[0; 12]);
+    input.extend_from_slice(addr(0xf1).as_slice());
+    input.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
+    CallObservation {
+        tx_index,
+        depth: 2,
+        caller,
+        target,
+        value: U256::ZERO,
+        input,
+        output: vec![0; 32],
+        gas_limit: 1_000_000,
+        gas_used: 1000,
+        success: true,
+        kind: CallKind::Call,
+        phase: CallPhase::End,
+        created_address: None,
+        result: Some("Stop".to_string()),
+    }
+}
+
+fn reserve_read(tx_index: usize, target: Address, reserve0: u64, reserve1: u64) -> CallObservation {
+    let mut output = Vec::new();
+    output.extend_from_slice(&U256::from(reserve0).to_be_bytes::<32>());
+    output.extend_from_slice(&U256::from(reserve1).to_be_bytes::<32>());
+    output.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+    let mut observation = call(tx_index, target, vec![0x09, 0x02, 0xf1, 0xac], true);
+    observation.output = output;
+    observation
 }
 
 // ============================================================================
@@ -1906,7 +1948,7 @@ fn integration_oracle_detection_across_multiple_vulnerability_types() {
         storage_writes: Vec::new(),
         storage_diffs: vec![
             StorageDiff {
-                tx_index: 0,
+                tx_index: 1,
                 address: addr(0x01),
                 slot: U256::ZERO.to_be_bytes::<32>().into(),
                 old_value: U256::from(1),
@@ -1914,7 +1956,7 @@ fn integration_oracle_detection_across_multiple_vulnerability_types() {
                 pc: 0,
             },
             StorageDiff {
-                tx_index: 0,
+                tx_index: 1,
                 address: addr(0x01),
                 slot: U256::from(1).to_be_bytes::<32>().into(),
                 old_value: U256::from(1_000_000),
@@ -1922,7 +1964,12 @@ fn integration_oracle_detection_across_multiple_vulnerability_types() {
                 pc: 0,
             },
         ],
-        call_trace: vec![call(0, addr(0x01), vec![0x02, 0x2c, 0x0d, 0x9f], true)],
+        call_trace: vec![
+            reserve_read(0, addr(0x01), 1_000_000, 1_000_000),
+            call(1, addr(0x01), vec![0x02, 0x2c, 0x0d, 0x9f], true),
+            token_transfer(1, addr(0x01), addr(0x02)),
+            reserve_read(2, addr(0x01), 1, 1_000_000),
+        ],
         oracle_observations: Vec::new(),
     };
 
@@ -2348,4 +2395,131 @@ fn executable_matching_signal_is_found_without_a_proof() {
         result.proof.is_none() && result.proof_status.is_none() && result.artifact_path.is_none()
     );
     assert!(!result.foundry_poc_generated);
+}
+
+#[test]
+fn gate2_vulnerable_counterparts_trigger_each_protected_class() {
+    use rusty_fuzz::engine::benchmark::ValidationRunner;
+    let manifests =
+        ValidationRunner::load_manifests("benchmarks/historical/gate2_positive_controls").unwrap();
+    assert_eq!(manifests.len(), 5);
+    let report = ValidationRunner.run_manifests(&manifests);
+    let mut missed = Vec::new();
+    for result in &report.benchmarks {
+        println!(
+            "{} executed={} found={} reason={}",
+            result.benchmark_id, result.executed, result.found, result.reason
+        );
+        if let Some(runtime) = &result.runtime {
+            println!(
+                "matching={:?} unmatched={:?}",
+                runtime.matching_signals, runtime.unmatched_signals
+            );
+            assert!(runtime.transactions.iter().all(|tx| tx.coverage_edges > 0));
+        }
+        if !result.executed || !result.found {
+            missed.push(result.benchmark_id.clone());
+        }
+        assert!(result.proof.is_none() && result.proof_status.is_none());
+    }
+    assert!(
+        missed.is_empty(),
+        "real vulnerable counterparts missed: {missed:?}"
+    );
+}
+
+#[test]
+fn gate2_authorized_mint_without_rejected_probe_is_not_inflation() {
+    use rusty_fuzz::engine::executable_fixture::ExecutableFixture;
+    let path = std::path::Path::new(
+        "benchmarks/historical/negative_controls/fixtures/erc20-owner-mint.json",
+    );
+    let mut fixture = ExecutableFixture::load(path).unwrap();
+    // Keep the owner's successful mint and balance checks; omit only the
+    // unrelated unauthorized attempt. Authorization must not depend on it.
+    fixture.transactions.remove(3);
+    let (execution, _) = fixture.execute(path).unwrap();
+    let findings = ProtocolOraclePack::default().evaluate(&execution);
+    let matching: Vec<_> = findings
+        .iter()
+        .filter(|finding| {
+            rusty_fuzz::engine::benchmark::VulnerabilityClass::Erc20MintInflation
+                .matches_finding(finding)
+        })
+        .collect();
+    assert!(
+        matching.is_empty(),
+        "authorized mint misclassified: {matching:?}"
+    );
+}
+
+#[test]
+fn gate2_unrelated_rejected_mint_must_not_hide_open_mint() {
+    use rusty_fuzz::engine::executable_fixture::ExecutableFixture;
+    let path = std::path::Path::new(
+        "benchmarks/historical/gate2_positive_controls/fixtures/erc20-owner-mint.json",
+    );
+    let mut fixture = ExecutableFixture::load(path).unwrap();
+    let rejected = ExecutableFixture::load(std::path::Path::new(
+        "benchmarks/historical/negative_controls/fixtures/erc20-burn-only.json",
+    ))
+    .unwrap();
+    fixture.accounts.push(
+        rejected
+            .accounts
+            .iter()
+            .find(|a| a.address == rejected.target)
+            .unwrap()
+            .clone(),
+    );
+    let mut attempt = rejected.transactions[1].clone();
+    // This token was not burned: assert its original supply is unchanged.
+    attempt.expected_storage.clear();
+    fixture.transactions.push(attempt);
+    let (execution, _) = fixture.execute(path).unwrap();
+    let findings = ProtocolOraclePack::default().evaluate(&execution);
+    assert!(
+        findings.iter().any(|finding| {
+            rusty_fuzz::engine::benchmark::VulnerabilityClass::Erc20MintInflation
+                .matches_finding(finding)
+        }),
+        "open mint hidden by unrelated revert: {findings:?}"
+    );
+}
+
+#[test]
+fn gate2_zero_share_quote_alone_is_not_an_exploit() {
+    use rusty_fuzz::engine::executable_fixture::ExecutableFixture;
+    let path = std::path::Path::new(
+        "benchmarks/historical/gate2_positive_controls/fixtures/erc4626-virtual-offset.json",
+    );
+    let mut fixture = ExecutableFixture::load(path).unwrap();
+    // Execute the donation and the zero-share view, but no victim deposit.
+    fixture.transactions.truncate(5);
+    let (execution, _) = fixture.execute(path).unwrap();
+    assert!(!ProtocolOraclePack::default()
+        .evaluate(&execution)
+        .iter()
+        .any(|f| matches!(
+            f.vuln,
+            VulnType::VaultInflation | VulnType::VaultDonationAttack
+        )));
+}
+
+#[test]
+fn gate2_unknown_mint_policy_is_not_inferred_from_success() {
+    use rusty_fuzz::engine::executable_fixture::ExecutableFixture;
+    let path = std::path::Path::new(
+        "benchmarks/historical/gate2_positive_controls/fixtures/erc20-owner-mint.json",
+    );
+    let mut fixture = ExecutableFixture::load(path).unwrap();
+    fixture.transactions.remove(0);
+    let (execution, _) = fixture.execute(path).unwrap();
+    assert!(!ProtocolOraclePack::default()
+        .evaluate(&execution)
+        .iter()
+        .any(
+            |f| rusty_fuzz::engine::benchmark::VulnerabilityClass::Erc20MintInflation
+                .matches_finding(f)
+        ));
 }

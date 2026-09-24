@@ -346,7 +346,7 @@ mod tests {
     fn executable_fixture_parses_json_and_toml_and_validates() {
         let fixture = ExecutableFixture::load(Path::new(FIXTURE)).unwrap();
         assert_eq!(fixture.schema_version, 1);
-        assert_eq!(fixture.transactions.len(), 4);
+        assert_eq!(fixture.transactions.len(), 6);
         let toml = toml::to_string(&fixture).unwrap();
         let decoded: ExecutableFixture = toml::from_str(&toml).unwrap();
         decoded.validate().unwrap();
