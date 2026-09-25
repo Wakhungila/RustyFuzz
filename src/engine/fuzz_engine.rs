@@ -1025,10 +1025,11 @@ pub async fn run_fuzz_campaign_with_cancellation(
                 let mut shmem_provider = StdShMemProvider::new()?;
                 let mut shmem = shmem_provider.new_shmem(MAP_SIZE)?;
                 let coverage_map_ptr = shmem.as_mut_ptr();
-                let observer = StdMapObserver::from_mut_slice(
-                    "edges",
-                    unsafe { OwnedMutSlice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE) },
-                );
+                 // SAFETY: `shmem` owns a writable allocation of `MAP_SIZE` bytes and its raw pointer remains valid for the observer lifetime.
+                 let observer = StdMapObserver::from_mut_slice(
+                     "edges",
+                     unsafe { OwnedMutSlice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE) },
+                 );
                 let worker_index = cores.ids.iter().position(|id| *id == description.core_id())
                     .ok_or_else(|| libafl::Error::unknown("worker core is absent from campaign topology"))?;
                 let budget = Arc::new(CampaignBudget::for_worker(
@@ -1080,6 +1081,7 @@ pub async fn run_fuzz_campaign_with_cancellation(
 
                         let exec_result = ForkDb::with_thread_rpc_budget(
                             Some(execution_rpc_budget()),
+                            // SAFETY: the shared-memory allocation is writable and exactly `MAP_SIZE` bytes for the harness lifetime.
                             || unsafe {
                                 let map_slice =
                                     std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE);
@@ -1131,6 +1133,7 @@ pub async fn run_fuzz_campaign_with_cancellation(
                     let report = state_novelty_feedback
                         .write()
                         .observe_execution(&execution);
+                    // SAFETY: the shared-memory allocation is readable and exactly `MAP_SIZE` bytes for the harness lifetime.
                     unsafe {
                         let map_slice = std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE);
                         if let Some(snapshot_id) = snapshot_corpus.write().maybe_add_post_execution_snapshot(
@@ -1297,6 +1300,7 @@ pub async fn run_fuzz_campaign_with_cancellation(
                     }
 
                     if report.interesting {
+                        // SAFETY: the shared-memory allocation is writable and exactly `MAP_SIZE` bytes for the harness lifetime.
                         unsafe {
                             let map_slice =
                                 std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE);
@@ -1315,6 +1319,7 @@ pub async fn run_fuzz_campaign_with_cancellation(
                     }
 
                     if campaign_score.is_interesting() {
+                        // SAFETY: the shared-memory allocation is writable and exactly `MAP_SIZE` bytes for the harness lifetime.
                         unsafe {
                             let map_slice =
                                 std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE);
@@ -1360,6 +1365,7 @@ pub async fn run_fuzz_campaign_with_cancellation(
                         &findings,
                         exploit_candidate.as_ref(),
                     ) {
+                        // SAFETY: the shared-memory allocation is readable and exactly `MAP_SIZE` bytes for the harness lifetime.
                         let persisted = unsafe {
                             let map_slice =
                                 std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE);
@@ -1997,10 +2003,12 @@ async fn run_single_process_campaign(
     let mut shmem = shmem_provider.new_shmem(MAP_SIZE)?;
     let coverage_map_ptr = shmem.as_mut_ptr();
     if let Some(map) = restored_map {
+        // SAFETY: the shared-memory allocation is writable and exactly `MAP_SIZE` bytes, and `map` has the same bounded length.
         unsafe {
             std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE).copy_from_slice(&map);
         }
     }
+    // SAFETY: `shmem` owns a writable allocation of `MAP_SIZE` bytes and its raw pointer remains valid for the observer lifetime.
     let observer = StdMapObserver::from_mut_slice("edges", unsafe {
         OwnedMutSlice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE)
     });
@@ -2036,8 +2044,10 @@ async fn run_single_process_campaign(
         for (tx_idx, tx) in input.txs.iter().enumerate() {
             let mut waypoints = Vec::new();
             let mut df = dataflow_registry.write();
-            let exec_result =
-                ForkDb::with_thread_rpc_budget(Some(execution_rpc_budget()), || unsafe {
+            let exec_result = ForkDb::with_thread_rpc_budget(
+                Some(execution_rpc_budget()),
+                // SAFETY: the shared-memory allocation is writable and exactly `MAP_SIZE` bytes for the harness lifetime.
+                || unsafe {
                     let map_slice = std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE);
                     evm_executor.execute_with_result(
                         &mut current_state,
@@ -2048,7 +2058,8 @@ async fn run_single_process_campaign(
                         &mut waypoints,
                         tx_idx,
                     )
-                });
+                },
+            );
 
             let result = match exec_result {
                 Ok(result) => result,
@@ -2082,6 +2093,7 @@ async fn run_single_process_campaign(
 
         let execution = sequence_result_from_tx_results(tx_results);
         let report = state_novelty_feedback.write().observe_execution(&execution);
+        // SAFETY: the shared-memory allocation is readable and exactly `MAP_SIZE` bytes for the harness lifetime.
         unsafe {
             let map_slice = std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE);
             if let Some(snapshot_id) = snapshot_corpus.write().maybe_add_post_execution_snapshot(
@@ -2236,6 +2248,7 @@ async fn run_single_process_campaign(
         }
 
         if report.interesting {
+            // SAFETY: the shared-memory allocation is writable and exactly `MAP_SIZE` bytes for the harness lifetime.
             unsafe {
                 let map_slice = std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE);
                 reward_state_novelty(map_slice, &report);
@@ -2243,6 +2256,7 @@ async fn run_single_process_campaign(
         }
 
         if campaign_score.is_interesting() {
+            // SAFETY: the shared-memory allocation is writable and exactly `MAP_SIZE` bytes for the harness lifetime.
             unsafe {
                 let map_slice = std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE);
                 reward_campaign_score(map_slice, &campaign_score);
@@ -2262,6 +2276,7 @@ async fn run_single_process_campaign(
             &findings,
             exploit_candidate.as_ref(),
         ) {
+            // SAFETY: the shared-memory allocation is readable and exactly `MAP_SIZE` bytes for the harness lifetime.
             let persisted = unsafe {
                 let map_slice = std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE);
                 persistent_corpus.persist_campaign_artifact(CampaignArtifactRequest {
@@ -2335,6 +2350,7 @@ async fn run_single_process_campaign(
         let saved = super::checkpoint::Checkpoint {
             state: postcard::to_stdvec(state)?,
             feedback: feedback.clone(),
+            // SAFETY: the shared-memory allocation is readable and exactly `MAP_SIZE` bytes for the harness lifetime.
             raw_coverage: unsafe {
                 std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE).to_vec()
             },
@@ -3202,22 +3218,23 @@ fn enqueue_promotion_artifact(
         return;
     }
     let queued = outbox.lock().len() as u64;
+    let campaign_id = config
+        .campaign_id
+        .as_deref()
+        .expect("campaign identity is initialized before use");
+    let promotion_id = format!("{campaign_id}-{}", artifact.input_id);
     if config
         .promotion
         .promotion_limit
         .is_some_and(|limit| promotion_stats.promoted_count().saturating_add(queued) >= limit)
     {
+        promotion_stats.record_capped(&promotion_id);
         log::debug!(
             "Promotion limit reached; skipping artifact promotion (limit={:?})",
             config.promotion.promotion_limit
         );
         return;
     }
-    let campaign_id = config
-        .campaign_id
-        .as_deref()
-        .expect("campaign identity is initialized before use");
-    let promotion_id = format!("{campaign_id}-{}", artifact.input_id);
     if !promotion_stats.reserve_promotion(&promotion_id) {
         log::debug!(
             "Skipping duplicate promotion for artifact input_id={}",
@@ -3287,7 +3304,7 @@ fn promote_outbox(
             .promotion_limit
             .is_some_and(|limit| promotion_stats.promoted_count() >= limit)
         {
-            promotion_stats.record_pending();
+            promotion_stats.record_capped(&finding_id);
             continue;
         }
         let already_reserved = queued_ids.contains(&finding_id);
@@ -3439,6 +3456,9 @@ fn merge_worker_summaries(
         summary.highest_confidence = summary
             .highest_confidence
             .max(worker.summary.highest_confidence);
+        summary.promotion_capped = summary
+            .promotion_capped
+            .saturating_add(worker.summary.promotion_capped);
     }
     summary
 }
@@ -3563,6 +3583,7 @@ fn finalize_brokered_campaign(
         summary.minimization_not_reducible = promotion_summary.minimization_not_reducible;
         summary.promotion_failures = promotion_summary.promotion_failures;
         summary.promotion_pending = promotion_summary.promotion_pending;
+        summary.promotion_capped = promotion_summary.promotion_capped;
     }
     let state = if cancelled {
         "cancelled"
@@ -3734,6 +3755,88 @@ mod tests {
         };
         assert!(!promotion_allowed(&config, false));
         assert!(!promotion_allowed(&config, true));
+    }
+
+    #[test]
+    fn promotion_limit_counts_capped_candidates_without_pending_or_failure() {
+        use crate::common::oracle::{ProtocolOraclePackKind, ProtocolSeverity, VulnType};
+        use crate::evm::corpus::CorpusEntryMetadata;
+
+        let config = Config {
+            rpc_url: "https://rpc.example.com".to_string(),
+            fork_block: 1,
+            target_contract: None,
+            corpus_dir: "corpus".to_string(),
+            report_dir: "reports".to_string(),
+            foundry_harness: None,
+            mainnet_seed_bundle: None,
+            in_memory_bytecode: None,
+            cores: None,
+            require_seed_bundle: false,
+            require_rpc_fork: false,
+            allow_synthetic_fallback: true,
+            hardened_defi: HardenedDefiConfig::default(),
+            target_invariant_manifest: None,
+            abi_path: None,
+            max_execs: Some(1),
+            duration_secs: Some(1),
+            artifact_limit: None,
+            campaign_id: Some("bounded-promotion".to_string()),
+            paths_are_isolated: true,
+            min_finding_confidence: 0,
+            promotion: PromotionConfig {
+                enabled: true,
+                promotion_limit: Some(2),
+                ..PromotionConfig::default()
+            },
+        };
+        let outbox = Mutex::new(VecDeque::new());
+        let stats = PromotionCampaignStats::default();
+
+        for index in 0..5 {
+            let input_id = format!("candidate-{index}");
+            let artifact = crate::evm::corpus::CampaignArtifactRecord {
+                input_id: input_id.clone(),
+                fork_cache_id: "fork".to_string(),
+                artifact_key: String::new(),
+                block_number: 1,
+                target: None,
+                reason: "promotable".to_string(),
+                score: CampaignScore {
+                    total: 100,
+                    ..CampaignScore::default()
+                },
+                findings: vec![crate::common::oracle::ProtocolFinding {
+                    pack: ProtocolOraclePackKind::RuntimePanic,
+                    vuln: VulnType::Reentrancy,
+                    severity: ProtocolSeverity::Critical,
+                    tx_index: Some(0),
+                    target: None,
+                    evidence: "test evidence".to_string(),
+                }],
+                proof: None,
+                metadata: CorpusEntryMetadata {
+                    id: input_id.clone(),
+                    input_hash: input_id,
+                    path_hash: index as u64,
+                    state_hash: 0,
+                    state_novelty_score: 0,
+                    coverage_edges: 0,
+                    gas_used: 0,
+                    crash_fingerprint: None,
+                    frontier: Default::default(),
+                },
+                triage: Default::default(),
+            };
+            enqueue_promotion_artifact(&config, &outbox, &artifact, false, &stats);
+        }
+
+        let summary = stats.summary("bounded-promotion", 0, 0, 0, 5, 0);
+        assert_eq!(outbox.lock().len(), 2);
+        assert_eq!(summary.promoted_findings, 0);
+        assert_eq!(summary.promotion_capped, 3);
+        assert_eq!(summary.promotion_pending, 0);
+        assert_eq!(summary.promotion_failures, 0);
     }
 
     #[test]

@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
+use std::io::Read;
 use std::num::{NonZero, NonZeroU128};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -186,6 +187,7 @@ pub struct CampaignArtifactRequest<'a> {
 
 pub struct PersistentCorpus {
     root: PathBuf,
+    global_root: Option<PathBuf>,
 }
 
 fn safe_corpus_path(
@@ -217,6 +219,59 @@ fn ensure_corpus_directory(root: &Path, path: &Path) -> anyhow::Result<()> {
         "corpus directory escapes its canonical root"
     );
     Ok(())
+}
+
+fn reject_symlink_components(path: &Path) -> anyhow::Result<()> {
+    let mut current = Some(path.to_path_buf());
+    while let Some(candidate) = current {
+        if let Ok(metadata) = fs::symlink_metadata(&candidate) {
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "corpus path contains a symlink: {}",
+                candidate.display()
+            );
+        }
+        current = candidate.parent().map(Path::to_path_buf);
+    }
+    Ok(())
+}
+
+fn canonical_corpus_root(path: &Path, label: &str) -> anyhow::Result<PathBuf> {
+    reject_symlink_components(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    anyhow::ensure!(metadata.is_dir(), "{label} is not a directory");
+    let canonical = fs::canonicalize(path)?;
+    anyhow::ensure!(
+        fs::symlink_metadata(&canonical)?.is_dir(),
+        "{label} is not a directory after canonicalization"
+    );
+    Ok(canonical)
+}
+
+const MAX_PERSISTED_CORPUS_JSON_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_regular_file_under(root: &Path, path: &Path, description: &str) -> anyhow::Result<Vec<u8>> {
+    let safe_path = contained_path(root, path).map_err(anyhow::Error::msg)?;
+    let metadata = fs::symlink_metadata(&safe_path)?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "{description} is not a regular non-symlink file"
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_PERSISTED_CORPUS_JSON_BYTES,
+        "{description} exceeds the {MAX_PERSISTED_CORPUS_JSON_BYTES} byte limit"
+    );
+    let file = fs::File::open(&safe_path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let read = file
+        .take(MAX_PERSISTED_CORPUS_JSON_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_PERSISTED_CORPUS_JSON_BYTES
+            && read as u64 <= MAX_PERSISTED_CORPUS_JSON_BYTES + 1,
+        "{description} exceeds the {MAX_PERSISTED_CORPUS_JSON_BYTES} byte limit"
+    );
+    Ok(bytes)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -253,8 +308,18 @@ pub enum SeedBundleStatus {
 
 impl PersistentCorpus {
     pub fn new(root: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::new_with_global_root(root, None::<&Path>)
+    }
+
+    pub fn new_with_global_root(
+        root: impl AsRef<Path>,
+        global_root: Option<impl AsRef<Path>>,
+    ) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
+        reject_symlink_components(&root)?;
         fs::create_dir_all(&root)?;
+        reject_symlink_components(&root)?;
+        let root = canonical_corpus_root(&root, "corpus root")?;
         ensure_corpus_directory(&root, &root.join("inputs"))?;
         ensure_corpus_directory(&root, &root.join("crashes"))?;
         ensure_corpus_directory(&root, &root.join("fork_cache"))?;
@@ -263,18 +328,29 @@ impl PersistentCorpus {
         ensure_corpus_directory(&root, &root.join("campaign_artifacts").join("index"))?;
         ensure_corpus_directory(&root, &root.join("campaign_artifacts").join("summaries"))?;
         Self::validate_published_artifacts(&root)?;
-        Ok(Self { root })
+        let global_root = global_root
+            .map(|root| canonical_corpus_root(root.as_ref(), "global corpus root"))
+            .transpose()?;
+        Ok(Self { root, global_root })
     }
 
     fn validate_published_artifacts(root: &Path) -> anyhow::Result<()> {
         let index_dir = root.join("campaign_artifacts").join("index");
+        reject_symlink_components(&index_dir)?;
+        anyhow::ensure!(
+            fs::symlink_metadata(&index_dir)?.is_dir(),
+            "campaign artifact index directory is not a regular directory"
+        );
         for entry in fs::read_dir(&index_dir)? {
             let path = entry?.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            let bytes = fs::read(&path)
-                .with_context(|| format!("read campaign artifact index {}", path.display()))?;
+            let bytes = read_regular_file_under(
+                root,
+                &path,
+                &format!("campaign artifact index {}", path.display()),
+            )?;
             let record: CampaignArtifactRecord = serde_json::from_slice(&bytes)
                 .with_context(|| format!("validate campaign artifact index {}", path.display()))?;
             let input_id = &record.input_id;
@@ -301,12 +377,14 @@ impl PersistentCorpus {
                 ),
             ];
             for (member, label) in members {
-                let member_bytes = fs::read(&member).with_context(|| {
-                    format!(
-                        "recover campaign artifact {input_id}: read {label} {}",
+                let member_bytes = read_regular_file_under(
+                    root,
+                    &member,
+                    &format!(
+                        "recover campaign artifact {input_id}: {label} {}",
                         member.display()
-                    )
-                })?;
+                    ),
+                )?;
                 if label != "artifact summary" {
                     match label {
                         "input" => {
@@ -419,11 +497,15 @@ impl PersistentCorpus {
         let prefix_meta_path = safe_corpus_path(&self.root, "inputs", prefix, ".meta.json")?;
 
         let id = if prefix_input_path.exists() {
-            let existing_full = fs::read_to_string(&prefix_meta_path)
-                .ok()
-                .and_then(|bytes| serde_json::from_str::<CorpusEntryMetadata>(&bytes).ok())
-                .map(|existing| existing.input_hash)
-                .unwrap_or_default();
+            let existing_full = read_regular_file_under(
+                &self.root,
+                &prefix_meta_path,
+                "existing persisted input metadata",
+            )
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<CorpusEntryMetadata>(&bytes).ok())
+            .map(|existing| existing.input_hash)
+            .unwrap_or_default();
             if existing_full.trim_start_matches("0x") == full_hash {
                 prefix.to_string()
             } else {
@@ -452,7 +534,7 @@ impl PersistentCorpus {
         id: &str,
     ) -> anyhow::Result<(EvmInput, EvmTestcaseMetadata)> {
         let path = safe_corpus_path(&self.root, "inputs", id, ".json")?;
-        let bytes = fs::read(path)?;
+        let bytes = read_regular_file_under(&self.root, &path, &format!("persisted input {id}"))?;
         EvmInput::split_legacy_json(&bytes)
             .map_err(|err| anyhow::Error::new(err).context("deserialize persisted EvmInput"))
     }
@@ -479,7 +561,9 @@ impl PersistentCorpus {
                 continue;
             }
             let metadata_path = path.with_extension("meta.json");
-            let Ok(bytes) = fs::read(&metadata_path) else {
+            let Ok(bytes) =
+                read_regular_file_under(&self.root, &metadata_path, "persisted input metadata")
+            else {
                 continue;
             };
             let metadata: CorpusEntryMetadata = serde_json::from_slice(&bytes)?;
@@ -574,7 +658,9 @@ impl PersistentCorpus {
                 .join(format!("{artifact_key}.lock")),
         )
         .map_err(anyhow::Error::msg)?;
-        if let Ok(bytes) = fs::read(&index_path) {
+        if let Ok(bytes) =
+            read_regular_file_under(&self.root, &index_path, "campaign artifact index")
+        {
             if let Ok(existing) = serde_json::from_slice::<CampaignArtifactRecord>(&bytes) {
                 if existing.score.total >= request.score.total {
                     return Ok(CampaignArtifactOutcome {
@@ -594,7 +680,9 @@ impl PersistentCorpus {
             Err(_) => {
                 let mut waited = 0u64;
                 loop {
-                    if let Ok(bytes) = fs::read(&index_path) {
+                    if let Ok(bytes) =
+                        read_regular_file_under(&self.root, &index_path, "campaign artifact index")
+                    {
                         if let Ok(existing) =
                             serde_json::from_slice::<CampaignArtifactRecord>(&bytes)
                         {
@@ -612,7 +700,9 @@ impl PersistentCorpus {
                     thread::sleep(Duration::from_millis(10));
                 }
 
-                if let Ok(bytes) = fs::read(&index_path) {
+                if let Ok(bytes) =
+                    read_regular_file_under(&self.root, &index_path, "campaign artifact index")
+                {
                     if let Ok(existing) = serde_json::from_slice::<CampaignArtifactRecord>(&bytes) {
                         return Ok(CampaignArtifactOutcome {
                             record: existing,
@@ -633,7 +723,9 @@ impl PersistentCorpus {
             path: lock_path,
         };
 
-        if let Ok(bytes) = fs::read(&index_path) {
+        if let Ok(bytes) =
+            read_regular_file_under(&self.root, &index_path, "campaign artifact index")
+        {
             if let Ok(existing) = serde_json::from_slice::<CampaignArtifactRecord>(&bytes) {
                 if existing.score.total >= request.score.total {
                     return Ok(CampaignArtifactOutcome {
@@ -653,7 +745,9 @@ impl PersistentCorpus {
         validate_filesystem_identifier(&metadata.id).map_err(anyhow::Error::msg)?;
         let record_path =
             safe_corpus_path(&self.root, "campaign_artifacts", &metadata.id, ".json")?;
-        if let Ok(bytes) = fs::read(&record_path) {
+        if let Ok(bytes) =
+            read_regular_file_under(&self.root, &record_path, "campaign artifact record")
+        {
             if let Ok(existing) = serde_json::from_slice::<CampaignArtifactRecord>(&bytes) {
                 if existing.score.total >= request.score.total {
                     return Ok(CampaignArtifactOutcome {
@@ -717,17 +811,25 @@ impl PersistentCorpus {
 
     pub fn list_campaign_artifacts(&self) -> anyhow::Result<Vec<CampaignArtifactRecord>> {
         let index_dir = self.root.join("campaign_artifacts").join("index");
+        reject_symlink_components(&index_dir)?;
+        anyhow::ensure!(
+            fs::symlink_metadata(&index_dir)?.is_dir(),
+            "campaign artifact index directory is not a regular directory"
+        );
         let mut records = fs::read_dir(index_dir)?
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
             .map(|path| {
-                fs::read(&path)
-                    .with_context(|| format!("read campaign artifact index {}", path.display()))
-                    .and_then(|bytes| {
-                        serde_json::from_slice::<CampaignArtifactRecord>(&bytes)
-                            .with_context(|| format!("decode campaign artifact {}", path.display()))
-                    })
+                read_regular_file_under(
+                    &self.root,
+                    &path,
+                    &format!("campaign artifact index {}", path.display()),
+                )
+                .and_then(|bytes| {
+                    serde_json::from_slice::<CampaignArtifactRecord>(&bytes)
+                        .with_context(|| format!("decode campaign artifact {}", path.display()))
+                })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         records.sort_by(|left, right| left.input_id.cmp(&right.input_id));
@@ -737,7 +839,7 @@ impl PersistentCorpus {
 
     pub fn load_fork_cache(&self, id: &str) -> anyhow::Result<ForkDbCacheSnapshot> {
         let path = safe_corpus_path(&self.root, "fork_cache", id, ".json")?;
-        let bytes = fs::read(path)?;
+        let bytes = read_regular_file_under(&self.root, &path, &format!("fork cache {id}"))?;
         let snapshot: ForkDbCacheSnapshot = serde_json::from_slice(&bytes)?;
         snapshot
             .verify_content_digest()
@@ -863,7 +965,11 @@ impl PersistentCorpus {
         let path = self
             .resolve_mainnet_seed_bundle_manifest_path(id)
             .unwrap_or(self.safe_mainnet_seed_bundle_manifest_path(id)?);
-        let bytes = fs::read(path)?;
+        let bytes = read_regular_file_under(
+            path.parent().unwrap_or(&self.root),
+            &path,
+            &format!("mainnet seed bundle {id} manifest"),
+        )?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 
@@ -882,10 +988,12 @@ impl PersistentCorpus {
         if local.exists() {
             return Some(local);
         }
-        let global = self
-            .root
-            .parent()
-            .map(|parent| parent.join("mainnet_seeds").join(id).join("manifest.json"))?;
+        let global_root = self.global_root.as_deref()?;
+        let global = global_root
+            .join("mainnet_seeds")
+            .join(id)
+            .join("manifest.json");
+        let global = contained_path(global_root, &global).ok()?;
         (global != local && global.exists()).then_some(global)
     }
 
@@ -2954,6 +3062,24 @@ mod artifact_tests {
         let _ = fs::remove_dir_all(outside);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn corpus_rejects_preexisting_symlinked_index_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_corpus_root("preexisting-index-symlink");
+        let outside = root.with_extension("outside");
+        fs::create_dir_all(&root).expect("root directory");
+        fs::create_dir_all(&outside).expect("outside directory");
+        let index = root.join("campaign_artifacts").join("index");
+        fs::create_dir_all(&index).expect("index directory");
+        fs::remove_dir(&index).expect("remove index directory");
+        symlink(&outside, &index).expect("index symlink");
+        assert!(PersistentCorpus::new(&root).is_err());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
     #[test]
     fn nested_campaign_corpus_loads_global_seed_bundle() {
         let root = temp_corpus_root("seed-bundle-global-lookup");
@@ -2962,7 +3088,8 @@ mod artifact_tests {
         global
             .persist_mainnet_seed_bundle("shared", &seed_bundle(target, vec![seed(target)]))
             .expect("persist bundle");
-        let nested = PersistentCorpus::new(root.join("campaign-a")).expect("nested corpus");
+        let nested = PersistentCorpus::new_with_global_root(root.join("campaign-a"), Some(&root))
+            .expect("nested corpus");
         assert_eq!(
             nested
                 .load_mainnet_seed_bundle("shared")
@@ -3013,6 +3140,38 @@ mod artifact_tests {
     }
 
     #[test]
+    fn seed_bundle_does_not_infer_a_global_root_from_the_local_parent() {
+        let root = temp_corpus_root("seed-bundle-no-implicit-global");
+        let target = Address::repeat_byte(0xaa);
+        let global = PersistentCorpus::new(&root).expect("global corpus");
+        global
+            .persist_mainnet_seed_bundle("bundle", &seed_bundle(target, vec![seed(target)]))
+            .expect("persist global bundle");
+        let nested = PersistentCorpus::new(root.join("campaign-a")).expect("nested corpus");
+        assert!(nested.load_mainnet_seed_bundle("bundle").is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_global_root_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_corpus_root("seed-bundle-global-symlink");
+        let outside = root.with_extension("outside");
+        fs::create_dir_all(&outside).expect("outside directory");
+        let linked = root.with_extension("linked");
+        symlink(&outside, &linked).expect("global symlink");
+        assert!(
+            PersistentCorpus::new_with_global_root(root.join("campaign-a"), Some(&linked),)
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(linked);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
     fn campaign_corpus_falls_back_to_global_seed_bundle() {
         let root = temp_corpus_root("seed-bundle-global-fallback");
         let global = PersistentCorpus::new(&root).expect("global corpus");
@@ -3021,7 +3180,8 @@ mod artifact_tests {
             .persist_mainnet_seed_bundle("bundle", &seed_bundle(target, vec![seed(target)]))
             .expect("persist global bundle");
 
-        let campaign = PersistentCorpus::new(root.join("campaign-a")).expect("campaign corpus");
+        let campaign = PersistentCorpus::new_with_global_root(root.join("campaign-a"), Some(&root))
+            .expect("campaign corpus");
         let status = campaign.inspect_mainnet_seed_bundle(Some("bundle"), target);
         assert!(matches!(
             status,

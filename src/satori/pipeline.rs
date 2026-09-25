@@ -3,6 +3,7 @@ use crate::satori::analysis::analyze_project;
 use crate::satori::budget::BudgetTracker;
 use crate::satori::cache::ResponseCache;
 use crate::satori::error::SatoriResult;
+use crate::satori::fsutil::redact_source_text;
 use crate::satori::fsutil::{
     canonical_run_dir, canonical_run_dir_path, canonical_run_root, ensure_dir, new_run_id_checked,
     read_dir_under, read_json_in_run, safe_identifier_path, validate_identifier,
@@ -24,6 +25,7 @@ use crate::satori::types::{
 };
 use crate::satori::validation::validate_jobs_async;
 use chrono::Utc;
+use serde::de::DeserializeOwned;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -75,7 +77,12 @@ pub fn ingest_graph_packets(
     write_json_in_run(&run.run_dir, Path::new("run.json"), &run)?;
     let project = ingest_project(path, &run.run_dir)?;
     ensure_project_bound_to_run(&run, &project)?;
-    let analysis = analyze_project(&project, &run.run_dir)?;
+    let analysis = analyze_project(
+        &project,
+        &run.run_dir,
+        config.external_foundry_opt_in(),
+        config.external_slither_opt_in(),
+    )?;
     let graph = build_graph(&project, &analysis, &run.run_dir)?;
     let memory = MemoryStore::new(&config.memory_path);
     build_repo_packet(&project, &analysis, &graph, &run.run_dir)?;
@@ -143,20 +150,25 @@ pub async fn run_model_audit(path: &Path, config: SatoriConfig) -> SatoriResult<
     let mut budget = BudgetTracker::default();
     let mut hypotheses = Vec::new();
     let mut rejected = Vec::new();
+    let mut model_hypotheses = 0usize;
     for packet in &function_packets {
         let prompt = function_audit_prompt(packet, config.max_hypotheses_per_function);
         let (response, cached) = client.complete_json(&prompt).await?;
         budget.record_call(&prompt, &response, cached);
         let audit: FunctionAuditResult = parse_strict_json(&response)?;
+        ensure_hypothesis_count(
+            audit.hypotheses.len(),
+            config.max_hypotheses_per_function,
+            "per-function",
+        )?;
         for hypothesis in audit.hypotheses {
-            if reject_hypothesis(&hypothesis, &config).is_none() {
-                hypotheses.push(hypothesis);
-            } else {
-                rejected.push(format!(
-                    "{}: {}",
-                    hypothesis.id,
-                    reject_hypothesis(&hypothesis, &config).unwrap()
-                ));
+            model_hypotheses = model_hypotheses
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("Satori hypothesis count overflow"))?;
+            ensure_hypothesis_count(model_hypotheses, config.max_hypotheses_total, "global")?;
+            match reject_hypothesis(&hypothesis, &config) {
+                None => hypotheses.push(hypothesis),
+                Some(reason) => rejected.push(format!("{}: {reason}", hypothesis.id)),
             }
         }
     }
@@ -175,6 +187,7 @@ pub async fn run_model_audit(path: &Path, config: SatoriConfig) -> SatoriResult<
         Vec::new()
     };
     ensure_unique_job_ids(&jobs)?;
+    ensure_job_count(jobs.len(), config.max_jobs)?;
     let jobs_dir = artifacts.run.run_dir.join("jobs");
     ensure_dir(&jobs_dir)?;
     for job in &jobs {
@@ -194,9 +207,20 @@ pub async fn run_model_audit(path: &Path, config: SatoriConfig) -> SatoriResult<
             &artifacts.run.run_dir,
             &hypotheses,
             &jobs,
+            config.external_foundry_opt_in(),
         )
         .await?
     } else {
+        write_json_in_run(
+            &artifacts.run.run_dir,
+            Path::new("validation_verdicts.json"),
+            &Vec::<crate::satori::types::ValidationVerdict>::new(),
+        )?;
+        write_json_in_run(
+            &artifacts.run.run_dir,
+            Path::new("foundry_pocs.json"),
+            &Vec::<crate::satori::types::FoundryPocSpec>::new(),
+        )?;
         (Vec::new(), Vec::new())
     };
     let protocol_model = ProtocolModel {
@@ -232,16 +256,32 @@ pub async fn run_model_audit(path: &Path, config: SatoriConfig) -> SatoriResult<
 }
 
 pub async fn revalidate_existing_run(run_id: &str) -> SatoriResult<SatoriReport> {
+    let revalidation_rpc_url = std::env::var("RUSTYFUZZ_SATORI_REVALIDATION_RPC_URL").ok();
+    revalidate_existing_run_with_rpc(run_id, revalidation_rpc_url.as_deref()).await
+}
+
+pub async fn revalidate_existing_run_with_rpc(
+    run_id: &str,
+    revalidation_rpc_url: Option<&str>,
+) -> SatoriResult<SatoriReport> {
     let (run, project, analysis) = load_run_project_analysis(run_id)?;
     ensure_loaded_run_dir(&run, run_id)?;
     ensure_project_bound_to_run(&run, &project)?;
     let hypotheses: Vec<VulnerabilityHypothesis> =
         read_json_in_run(&run.run_dir, Path::new("hypotheses.json"))?;
-    let jobs: Vec<RustyFuzzJobSpec> = read_json_in_run(&run.run_dir, Path::new("jobs.json"))?;
+    let mut jobs: Vec<RustyFuzzJobSpec> = read_json_in_run(&run.run_dir, Path::new("jobs.json"))?;
+    ensure_revalidation_caps(&run.config, hypotheses.len(), jobs.len())?;
+    apply_revalidation_rpc_context(&mut jobs, revalidation_rpc_url);
     ensure_unique_hypotheses(&hypotheses)?;
     ensure_unique_job_ids(&jobs)?;
-    let (validation_verdicts, foundry_pocs) =
-        validate_jobs_async(&project, &run.run_dir, &hypotheses, &jobs).await?;
+    let (validation_verdicts, foundry_pocs) = validate_jobs_async(
+        &project,
+        &run.run_dir,
+        &hypotheses,
+        &jobs,
+        run.config.external_foundry_opt_in(),
+    )
+    .await?;
     let report = SatoriReport {
         run_id: run.run_id.clone(),
         project_summary: format!(
@@ -274,6 +314,14 @@ pub async fn revalidate_existing_run(run_id: &str) -> SatoriResult<SatoriReport>
     Ok(report)
 }
 
+fn apply_revalidation_rpc_context(jobs: &mut [RustyFuzzJobSpec], rpc_url: Option<&str>) {
+    for job in jobs.iter_mut() {
+        job.fork_rpc_url = rpc_url
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+    }
+}
+
 pub fn build_report_for_existing_run(run_id: &str) -> SatoriResult<SatoriReport> {
     let (run, project, analysis) = load_run_project_analysis(run_id)?;
     ensure_loaded_run_dir(&run, run_id)?;
@@ -289,16 +337,8 @@ pub fn build_report_for_existing_run(run_id: &str) -> SatoriResult<SatoriReport>
 
     ensure_unique_hypotheses(&hypotheses)?;
     ensure_unique_job_ids(&jobs)?;
-    let verdicts: Vec<crate::satori::types::ValidationVerdict> =
-        read_json_in_run(&run.run_dir, Path::new("validation_verdicts.json")).map_err(|error| {
-            anyhow::anyhow!(
-                "Satori validation verdicts artifact is missing or malformed: {error:#}"
-            )
-        })?;
-    let pocs: Vec<crate::satori::types::FoundryPocSpec> =
-        read_json_in_run(&run.run_dir, Path::new("foundry_pocs.json")).map_err(|error| {
-            anyhow::anyhow!("Satori Foundry PoC artifact is missing or malformed: {error:#}")
-        })?;
+    let (verdicts, pocs) = load_validation_artifacts(&run)?;
+
     let report = SatoriReport {
         run_id: run.run_id.clone(),
         project_summary: format!(
@@ -329,6 +369,51 @@ pub fn build_report_for_existing_run(run_id: &str) -> SatoriResult<SatoriReport>
     Ok(report)
 }
 
+fn load_validation_artifacts(
+    run: &crate::satori::types::SatoriRun,
+) -> SatoriResult<(
+    Vec<crate::satori::types::ValidationVerdict>,
+    Vec<crate::satori::types::FoundryPocSpec>,
+)> {
+    if run.config.validate {
+        let verdicts: Vec<crate::satori::types::ValidationVerdict> =
+            read_json_in_run(&run.run_dir, Path::new("validation_verdicts.json")).map_err(
+                |error| {
+                    anyhow::anyhow!(
+                        "Satori validation verdicts artifact is missing or malformed: {error:#}"
+                    )
+                },
+            )?;
+        let pocs: Vec<crate::satori::types::FoundryPocSpec> =
+            read_json_in_run(&run.run_dir, Path::new("foundry_pocs.json")).map_err(|error| {
+                anyhow::anyhow!("Satori Foundry PoC artifact is missing or malformed: {error:#}")
+            })?;
+        return Ok((verdicts, pocs));
+    }
+    let verdicts = read_optional_json_in_run(&run.run_dir, Path::new("validation_verdicts.json"))
+        .map_err(|error| {
+            anyhow::anyhow!("Satori validation verdicts artifact is malformed: {error:#}")
+        })?
+        .unwrap_or_default();
+    let pocs = read_optional_json_in_run(&run.run_dir, Path::new("foundry_pocs.json"))
+        .map_err(|error| anyhow::anyhow!("Satori Foundry PoC artifact is malformed: {error:#}"))?
+        .unwrap_or_default();
+    Ok((verdicts, pocs))
+}
+
+fn read_optional_json_in_run<T: DeserializeOwned>(
+    run_dir: &Path,
+    relative_path: &Path,
+) -> SatoriResult<Option<T>> {
+    let run_dir = canonical_run_dir_path(run_dir)?;
+    let path = run_dir.join(relative_path);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => read_json_in_run(&run_dir, relative_path).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn load_function_packets(run_dir: &Path) -> SatoriResult<Vec<FunctionPacket>> {
     let run_dir = canonical_run_dir_path(run_dir)?;
     let runs_root = canonical_run_root()?;
@@ -354,13 +439,40 @@ fn load_function_packets(run_dir: &Path) -> SatoriResult<Vec<FunctionPacket>> {
 }
 
 fn function_audit_prompt(packet: &FunctionPacket, max_hypotheses: usize) -> String {
+    let packet_json = serde_json::to_string_pretty(packet).unwrap_or_default();
     format!(
         "{}\n\n{}\n\nReturn at most {} hypotheses as FunctionAuditResult JSON.\n\nPACKET:\n{}",
         load_prompt("system"),
         load_prompt("function_audit"),
         max_hypotheses,
-        serde_json::to_string_pretty(packet).unwrap_or_default()
+        redact_source_text(&packet_json)
     )
+}
+
+fn ensure_hypothesis_count(count: usize, cap: usize, scope: &str) -> SatoriResult<()> {
+    anyhow::ensure!(
+        count <= cap,
+        "Satori model returned {count} hypotheses, exceeding the {scope} cap of {cap}"
+    );
+    Ok(())
+}
+
+fn ensure_revalidation_caps(
+    config: &SatoriConfig,
+    hypothesis_count: usize,
+    job_count: usize,
+) -> SatoriResult<()> {
+    ensure_hypothesis_count(hypothesis_count, config.max_hypotheses_total, "global")?;
+    ensure_job_count(job_count, config.max_jobs)?;
+    Ok(())
+}
+
+fn ensure_job_count(count: usize, cap: usize) -> SatoriResult<()> {
+    anyhow::ensure!(
+        count <= cap,
+        "Satori generated {count} jobs, exceeding the job cap of {cap}"
+    );
+    Ok(())
 }
 
 fn ensure_unique_hypotheses(hypotheses: &[VulnerabilityHypothesis]) -> SatoriResult<()> {
@@ -413,6 +525,95 @@ fn reject_hypothesis(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::satori::types::FunctionSummary;
+
+    #[test]
+    fn function_audit_prompt_redacts_source_secrets() {
+        let packet = FunctionPacket {
+            target_function: FunctionSummary {
+                id: "Vault::deposit()".to_string(),
+                contract: "Vault".to_string(),
+                name: "deposit".to_string(),
+                signature: "deposit()".to_string(),
+                selector: None,
+                file: std::path::PathBuf::from("Vault.sol"),
+                visibility: "external".to_string(),
+                mutability: "nonpayable".to_string(),
+                modifiers: Vec::new(),
+                source_snippet: "string private_key = \"prompt-secret\";".to_string(),
+                reads: Vec::new(),
+                writes: Vec::new(),
+                internal_calls: Vec::new(),
+                external_calls: Vec::new(),
+                detector_signals: Vec::new(),
+                criticality_score: 0.8,
+            },
+            related_functions: Vec::new(),
+            protocol_context: ProtocolModel::default(),
+            relevant_memories: Vec::new(),
+            known_bug_classes: Vec::new(),
+            detector_evidence: Vec::new(),
+            output_constraints: Vec::new(),
+        };
+        let prompt = function_audit_prompt(&packet, 2);
+        assert!(!prompt.contains("prompt-secret"));
+        assert!(prompt.contains("<redacted>"));
+    }
+
+    #[test]
+    fn revalidation_rpc_context_is_explicit_and_never_reuses_artifact_secrets() {
+        let mut jobs = vec![RustyFuzzJobSpec {
+            job_id: "job-h1".to_string(),
+            hypothesis_id: "h1".to_string(),
+            job_type: "sequence_fuzz".to_string(),
+            target_contract: Some("0x0000000000000000000000000000000000000001".to_string()),
+            bug_class: "access_control".to_string(),
+            actors: Vec::new(),
+            preconditions: Vec::new(),
+            sequence_template: Vec::new(),
+            mutation_focus: Vec::new(),
+            invariants: Vec::new(),
+            objective: "objective".to_string(),
+            success_condition: "success".to_string(),
+            max_depth: 1,
+            max_execs: 1,
+            duration_secs: 1,
+            fork_rpc_url: Some("https://artifact.example/v1/old-secret".to_string()),
+            fork_block: Some(1),
+            abi_hints: Vec::new(),
+        }];
+        apply_revalidation_rpc_context(&mut jobs, None);
+        assert_eq!(jobs[0].fork_rpc_url, None);
+        apply_revalidation_rpc_context(&mut jobs, Some("https://rpc.example/v1"));
+        assert_eq!(
+            jobs[0].fork_rpc_url.as_deref(),
+            Some("https://rpc.example/v1")
+        );
+        let serialized = serde_json::to_string(&jobs).expect("serialize job");
+        assert!(!serialized.contains("fork_rpc_url"));
+    }
+
+    #[test]
+    fn hypothesis_and_job_caps_are_enforced_before_artifacts_are_written() {
+        assert!(ensure_hypothesis_count(2, 1, "per-function").is_err());
+        assert!(ensure_hypothesis_count(3, 2, "global").is_err());
+        assert!(ensure_hypothesis_count(2, 2, "global").is_ok());
+        assert!(ensure_job_count(3, 2).is_err());
+        assert!(ensure_job_count(2, 2).is_ok());
+    }
+
+    #[test]
+    fn revalidation_enforces_hypothesis_and_job_caps() {
+        let config = SatoriConfig {
+            max_hypotheses_total: 1,
+            max_jobs: 1,
+            ..SatoriConfig::default()
+        };
+
+        assert!(ensure_revalidation_caps(&config, 2, 1).is_err());
+        assert!(ensure_revalidation_caps(&config, 1, 2).is_err());
+        assert!(ensure_revalidation_caps(&config, 1, 1).is_ok());
+    }
 
     #[test]
     fn duplicate_model_hypothesis_ids_are_rejected() {
@@ -466,9 +667,42 @@ mod tests {
         let job: RustyFuzzJobSpec = serde_json::from_value(raw.clone()).unwrap();
         let duplicate: RustyFuzzJobSpec = serde_json::from_value(raw).unwrap();
         let error = ensure_unique_job_ids(&[job.clone(), duplicate])
-            .expect_err("duplicate job ids must fail");
+            .expect_err("duplicate Satori job ids must fail");
         assert!(error
             .to_string()
             .contains("duplicate Satori job id `job-h1`"));
+    }
+
+    #[test]
+    fn missing_validation_artifacts_are_incomplete_unless_validation_is_disabled(
+    ) -> SatoriResult<()> {
+        let run_dir = canonical_run_root()?.join(format!(
+            "validation-artifact-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&run_dir)?;
+        let config = SatoriConfig {
+            validate: true,
+            ..SatoriConfig::default()
+        };
+        let run = crate::satori::types::SatoriRun {
+            run_id: "run-test".to_string(),
+            root: std::env::current_dir()?,
+            run_dir: run_dir.clone(),
+            started_at: Utc::now(),
+            config: config.clone(),
+        };
+        assert!(load_validation_artifacts(&run).is_err());
+        let disabled_config = SatoriConfig {
+            validate: false,
+            ..config
+        };
+        let disabled = crate::satori::types::SatoriRun {
+            config: disabled_config,
+            ..run
+        };
+        assert!(load_validation_artifacts(&disabled).is_ok());
+        let _ = std::fs::remove_dir_all(run_dir);
+        Ok(())
     }
 }

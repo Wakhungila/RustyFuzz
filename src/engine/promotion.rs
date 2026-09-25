@@ -11,6 +11,10 @@ use crate::engine::exploit_synthesizer::synthesize_foundry_poc_with_findings;
 use crate::engine::minimizer::Minimizer;
 use crate::evm::corpus::{CampaignArtifactRecord, PersistentCorpus};
 use crate::evm::fuzz::EvmInput;
+use crate::satori::fsutil::{
+    redact_external_output, run_bounded_command, BoundedCommandOutput,
+    MAX_EXTERNAL_COMMAND_TIMEOUT, MAX_EXTERNAL_OUTPUT_BYTES,
+};
 use revm::context::BlockEnv;
 use revm::database::CacheDB;
 use revm::primitives::Address;
@@ -22,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,6 +75,8 @@ pub struct PromotionConfig {
     #[serde(default)]
     pub no_promotion: bool,
     #[serde(default)]
+    pub external_foundry_opt_in: bool,
+    #[serde(default)]
     pub require_foundry_poc: bool,
     #[serde(default)]
     pub require_minimized: bool,
@@ -91,6 +98,7 @@ impl Default for PromotionConfig {
             strict_proof: false,
             no_synthetic_proof: false,
             no_promotion: false,
+            external_foundry_opt_in: false,
             require_foundry_poc: false,
             require_minimized: false,
             reject_heuristics: false,
@@ -163,6 +171,8 @@ pub struct MinimizationPromotionReport {
     pub reason: String,
 }
 
+const MAX_PROMOTION_POC_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PocValidationReport {
     pub success: bool,
@@ -209,11 +219,14 @@ pub struct PromotionCampaignSummary {
     pub promotion_failures: u64,
     #[serde(default)]
     pub promotion_pending: u64,
+    #[serde(default)]
+    pub promotion_capped: u64,
 }
 
 #[derive(Debug, Default)]
 pub struct PromotionCampaignStats {
     promoted_ids: Mutex<BTreeSet<String>>,
+    capped_ids: Mutex<BTreeSet<String>>,
     promoted_findings: AtomicU64,
     confirmed_findings: AtomicU64,
     rejected_candidates: AtomicU64,
@@ -226,6 +239,7 @@ pub struct PromotionCampaignStats {
     minimization_not_reducible: AtomicU64,
     promotion_failures: AtomicU64,
     promotion_pending: AtomicU64,
+    promotion_capped: AtomicU64,
 }
 
 impl PromotionCampaignStats {
@@ -239,6 +253,10 @@ impl PromotionCampaignStats {
 
     pub fn promotion_pending_count(&self) -> u64 {
         self.promotion_pending.load(Ordering::Relaxed)
+    }
+
+    pub fn promotion_capped_count(&self) -> u64 {
+        self.promotion_capped.load(Ordering::Relaxed)
     }
 
     pub fn reserve_promotion(&self, finding_id: &str) -> bool {
@@ -257,6 +275,19 @@ impl PromotionCampaignStats {
 
     pub fn record_pending(&self) {
         self.promotion_pending.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_capped(&self, finding_id: &str) {
+        let mut capped_ids = match self.capped_ids.lock() {
+            Ok(capped_ids) => capped_ids,
+            Err(poisoned) => {
+                log::warn!("capped promotion id lock was poisoned; recovering bookkeeping state");
+                poisoned.into_inner()
+            }
+        };
+        if capped_ids.insert(finding_id.to_string()) {
+            self.promotion_capped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn record_failure(&self, pending: bool) {
@@ -344,6 +375,7 @@ impl PromotionCampaignStats {
             minimization_not_reducible: self.minimization_not_reducible.load(Ordering::Relaxed),
             promotion_failures: self.promotion_failures.load(Ordering::Relaxed),
             promotion_pending: self.promotion_pending.load(Ordering::Relaxed),
+            promotion_capped: self.promotion_capped.load(Ordering::Relaxed),
         }
     }
 }
@@ -589,11 +621,26 @@ pub fn promote_finding_artifact(
                     ) {
                         Ok(path) => {
                             generated_poc_hash = Some(hash_file(Path::new(&path))?);
-                            let validation = validate_foundry_poc(
-                                Path::new(&path),
-                                &request.artifact.findings,
-                                request.report_dir,
-                            );
+                            let validation = if request.config.external_foundry_opt_in {
+                                validate_foundry_poc(
+                                    Path::new(&path),
+                                    &request.artifact.findings,
+                                    request.report_dir,
+                                )
+                            } else {
+                                PocValidationReport {
+                                    success: false,
+                                    static_assertions_present: true,
+                                    transaction_replay_assertions_present: true,
+                                    invariant_hook_present: true,
+                                    forge_status: "skipped".to_string(),
+                                    forge_command: None,
+                                    stdout_snippet: String::new(),
+                                    stderr_snippet: String::new(),
+                                    reason: "Foundry runtime validation was skipped because external Foundry opt-in is disabled"
+                                        .to_string(),
+                                }
+                            };
                             let validation_path = finding_dir.join("poc_validation.json");
                             write_json(&validation_path, &validation)?;
                             artifact_paths.insert(
@@ -819,14 +866,21 @@ pub fn promote_finding_artifact(
     Ok(record)
 }
 
+fn forge_version_is_unavailable(version: &std::io::Result<BoundedCommandOutput>) -> bool {
+    match version {
+        Ok(output) => output.timed_out,
+        Err(_) => true,
+    }
+}
+
 fn validate_foundry_poc(
     poc_path: &Path,
     findings: &[ProtocolFinding],
     project_root: &Path,
 ) -> PocValidationReport {
-    let contents = match fs::read_to_string(poc_path) {
+    let contents = match read_bounded_poc(poc_path) {
         Ok(contents) => contents,
-        Err(err) => {
+        Err(error) => {
             return PocValidationReport {
                 success: false,
                 static_assertions_present: false,
@@ -835,8 +889,12 @@ fn validate_foundry_poc(
                 forge_status: "not_run".to_string(),
                 forge_command: None,
                 stdout_snippet: String::new(),
-                stderr_snippet: String::new(),
-                reason: format!("could not read generated PoC: {err:#}"),
+                stderr_snippet: redact_external_output(
+                    error.to_string().as_bytes(),
+                    MAX_EXTERNAL_OUTPUT_BYTES,
+                ),
+                reason: "generated PoC could not be read within the promotion file limit"
+                    .to_string(),
             };
         }
     };
@@ -868,7 +926,25 @@ fn validate_foundry_poc(
         };
     }
 
-    if Command::new("forge").arg("--version").output().is_err() {
+    let mut version_command = Command::new("forge");
+    version_command.arg("--version");
+    let version = run_bounded_command(&mut version_command, MAX_EXTERNAL_COMMAND_TIMEOUT);
+    if forge_version_is_unavailable(&version) {
+        let stderr_snippet = match &version {
+            Ok(output) => {
+                let mut snippet = redact_external_output(&output.stderr, MAX_EXTERNAL_OUTPUT_BYTES);
+                if output.timed_out {
+                    if !snippet.is_empty() {
+                        snippet.push('\n');
+                    }
+                    snippet.push_str("[Forge version timed out]");
+                }
+                snippet
+            }
+            Err(error) => {
+                redact_external_output(error.to_string().as_bytes(), MAX_EXTERNAL_OUTPUT_BYTES)
+            }
+        };
         return PocValidationReport {
             success: false,
             static_assertions_present,
@@ -877,64 +953,82 @@ fn validate_foundry_poc(
             forge_status: "unavailable".to_string(),
             forge_command: None,
             stdout_snippet: String::new(),
-            stderr_snippet: "forge is not installed or not on PATH".to_string(),
+            stderr_snippet,
             reason: "static PoC validation passed; forge runtime validation was unavailable"
                 .to_string(),
         };
     }
 
-    let command = format!("forge test --match-path {}", poc_path.display());
-    match Command::new("forge")
+    let command_display = format!("forge test --match-path {}", poc_path.display());
+    let mut command = Command::new("forge");
+    command
         .arg("test")
         .arg("--match-path")
         .arg(poc_path)
-        .current_dir(project_root)
-        .output()
-    {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            PocValidationReport {
-                success: output.status.success(),
-                static_assertions_present,
-                transaction_replay_assertions_present,
-                invariant_hook_present,
-                forge_status: if output.status.success() {
-                    "passed".to_string()
-                } else {
-                    "failed".to_string()
-                },
-                forge_command: Some(command),
-                stdout_snippet: snippet(&stdout),
-                stderr_snippet: snippet(&stderr),
-                reason: if output.status.success() {
-                    "static and forge runtime validation passed".to_string()
-                } else {
-                    "static validation passed, but forge runtime validation failed".to_string()
-                },
-            }
-        }
-        Err(err) => PocValidationReport {
+        .current_dir(project_root);
+    match run_bounded_command(&mut command, MAX_EXTERNAL_COMMAND_TIMEOUT) {
+        Ok(output) => PocValidationReport {
+            success: output.status.success() && !output.timed_out,
+            static_assertions_present,
+            transaction_replay_assertions_present,
+            invariant_hook_present,
+            forge_status: if output.status.success() && !output.timed_out {
+                "passed".to_string()
+            } else if output.timed_out {
+                "timed_out".to_string()
+            } else {
+                "failed".to_string()
+            },
+            forge_command: Some(command_display),
+            stdout_snippet: redact_external_output(&output.stdout, MAX_EXTERNAL_OUTPUT_BYTES),
+            stderr_snippet: {
+                let mut snippet = redact_external_output(&output.stderr, MAX_EXTERNAL_OUTPUT_BYTES);
+                if output.timed_out {
+                    if !snippet.is_empty() {
+                        snippet.push('\n');
+                    }
+                    snippet.push_str("[Forge timed out]");
+                }
+                snippet
+            },
+            reason: if output.status.success() {
+                "static and forge runtime validation passed".to_string()
+            } else {
+                "static validation passed, but forge runtime validation failed".to_string()
+            },
+        },
+        Err(error) => PocValidationReport {
             success: false,
             static_assertions_present,
             transaction_replay_assertions_present,
             invariant_hook_present,
             forge_status: "failed_to_start".to_string(),
-            forge_command: Some(command),
+            forge_command: Some(command_display),
             stdout_snippet: String::new(),
-            stderr_snippet: err.to_string(),
+            stderr_snippet: redact_external_output(
+                error.to_string().as_bytes(),
+                MAX_EXTERNAL_OUTPUT_BYTES,
+            ),
             reason: "could not start forge runtime validation".to_string(),
         },
     }
 }
 
-fn snippet(value: &str) -> String {
-    const LIMIT: usize = 800;
-    if value.len() <= LIMIT {
-        value.to_string()
-    } else {
-        value.chars().take(LIMIT).collect()
-    }
+fn read_bounded_poc(path: &Path) -> anyhow::Result<String> {
+    let metadata = fs::metadata(path)?;
+    anyhow::ensure!(
+        metadata.len() <= MAX_PROMOTION_POC_BYTES as u64,
+        "generated PoC exceeds the {MAX_PROMOTION_POC_BYTES} byte limit"
+    );
+    let file = fs::File::open(path)?;
+    let mut limited = file.take(MAX_PROMOTION_POC_BYTES as u64 + 1);
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::read_to_end(&mut limited, &mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_PROMOTION_POC_BYTES,
+        "generated PoC exceeds the {MAX_PROMOTION_POC_BYTES} byte limit"
+    );
+    Ok(String::from_utf8(bytes)?)
 }
 
 pub fn write_campaign_summary(
@@ -1400,7 +1494,7 @@ fn limitations_markdown(record: &FindingPromotionRecord) -> String {
 
 fn campaign_summary_markdown(summary: &PromotionCampaignSummary) -> String {
     format!(
-        "# RustyFuzz Campaign Summary\n\n- campaign_id: `{}`\n- total_executions: `{}`\n- mutated_inputs: `{}`\n- seed_replays: `{}`\n- total_artifacts: `{}`\n- coverage_edges: `{}`\n- confirmed_vulnerabilities: `{}`\n- interesting_candidates: `{}`\n- candidate_findings: `{}`\n- promoted_findings: `{}`\n- confirmed_findings: `{}`\n- rejected_candidates: `{}`\n- unproven_candidates: `{}`\n- poc_count: `{}`\n- missing_poc_for_promoted: `{}`\n- replay_failure_count: `{}`\n- synthetic_non_production_findings: `{}`\n- highest_confidence: `{}`\n- minimization_attempts: `{}`\n- minimization_reduced: `{}`\n- minimization_not_reducible: `{}`\n\nSuccess definition: no replay-confirmed finding means no confirmed vulnerability; no passing PoC means the issue is not bounty-grade confirmed.\n",
+        "# RustyFuzz Campaign Summary\n\n- campaign_id: `{}`\n- total_executions: `{}`\n- mutated_inputs: `{}`\n- seed_replays: `{}`\n- total_artifacts: `{}`\n- coverage_edges: `{}`\n- confirmed_vulnerabilities: `{}`\n- interesting_candidates: `{}`\n- candidate_findings: `{}`\n- promoted_findings: `{}`\n- confirmed_findings: `{}`\n- rejected_candidates: `{}`\n- unproven_candidates: `{}`\n- poc_count: `{}`\n- missing_poc_for_promoted: `{}`\n- replay_failure_count: `{}`\n- synthetic_non_production_findings: `{}`\n- highest_confidence: `{}`\n- minimization_attempts: `{}`\n- minimization_reduced: `{}`\n- minimization_not_reducible: `{}`\n- promotion_capped: `{}`\n\nSuccess definition: no replay-confirmed finding means no confirmed vulnerability; no passing PoC means the issue is not bounty-grade confirmed.\n",
         summary.campaign_id,
         summary.total_executions,
         summary.mutated_inputs,
@@ -1421,7 +1515,8 @@ fn campaign_summary_markdown(summary: &PromotionCampaignSummary) -> String {
         summary.highest_confidence,
         summary.minimization_attempts,
         summary.minimization_reduced,
-        summary.minimization_not_reducible
+        summary.minimization_not_reducible,
+        summary.promotion_capped
     )
 }
 
@@ -1436,6 +1531,50 @@ impl crate::common::oracle::VulnerabilityOracle for NullOracle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forge_version_timeout_is_unavailable() {
+        let status = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .status()
+            .expect("create a local process status");
+        let timed_out = crate::satori::fsutil::BoundedCommandOutput {
+            status,
+            timed_out: true,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        assert!(forge_version_is_unavailable(&Ok(timed_out)));
+        assert!(forge_version_is_unavailable(&Err(std::io::Error::other(
+            "forge is unavailable"
+        ))));
+    }
+
+    #[test]
+    fn promotion_forge_output_is_bounded_and_redacted() {
+        let output = redact_external_output(
+            b"Authorization: Bearer super-secret\nhttps://rpc.example/v1?apikey=url-secret",
+            MAX_EXTERNAL_OUTPUT_BYTES,
+        );
+        assert!(!output.contains("super-secret"));
+        assert!(!output.contains("url-secret"));
+        assert!(output.contains("<redacted>"));
+    }
+
+    #[test]
+    fn promotion_poc_reader_rejects_oversized_files() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "rustyfuzz-promotion-poc-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&path, vec![b'x'; MAX_PROMOTION_POC_BYTES + 1])?;
+        assert!(read_bounded_poc(&path).is_err());
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
 
     #[test]
     fn replay_report_gate_rejects_failed_replay_when_enabled() {
@@ -1567,6 +1706,22 @@ mod tests {
         assert_eq!(summary.candidate_findings, 1);
         assert_eq!(summary.unproven_candidates, 4);
         assert_eq!(summary.poc_count, 1);
+    }
+
+    #[test]
+    fn capped_id_count_survives_poisoned_mutex() {
+        let stats = PromotionCampaignStats::default();
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = stats.capped_ids.lock().expect("poison capped id mutex");
+            panic!("poison capped id mutex");
+        }));
+        assert!(poison_result.is_err());
+
+        stats.record_capped("finding-1");
+        stats.record_capped("finding-1");
+        stats.record_capped("finding-2");
+
+        assert_eq!(stats.promotion_capped_count(), 2);
     }
 
     #[test]

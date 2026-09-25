@@ -18,6 +18,30 @@ pub const MAX_TOTAL_WAYPOINTS: usize = 10000;
 /// Maximum memory usage in bytes before triggering backpressure (default: 2GB)
 pub const MAX_MEMORY_USAGE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
+/// Maximum number of memory bytes inspected for taint propagation in one execution.
+pub const MAX_MEMORY_TAINT_TRACKING_BYTES: usize = 64 * 1024;
+
+/// Maximum number of call/create observations retained in one execution.
+pub const MAX_CALL_TRACE_OBSERVATIONS: usize = 512;
+
+/// Maximum calldata or init-code prefix retained in telemetry.
+pub const MAX_CALLDATA_TELEMETRY_BYTES: usize = 4 * 1024;
+
+/// Maximum returndata or deployed-code prefix retained in telemetry.
+pub const MAX_RETURN_DATA_TELEMETRY_BYTES: usize = 4 * 1024;
+
+pub(crate) fn bounded_calldata(bytes: &[u8]) -> Vec<u8> {
+    bounded_telemetry_bytes(bytes, MAX_CALLDATA_TELEMETRY_BYTES)
+}
+
+pub(crate) fn bounded_returndata(bytes: &[u8]) -> Vec<u8> {
+    bounded_telemetry_bytes(bytes, MAX_RETURN_DATA_TELEMETRY_BYTES)
+}
+
+fn bounded_telemetry_bytes(bytes: &[u8], limit: usize) -> Vec<u8> {
+    bytes.iter().copied().take(limit).collect()
+}
+
 /// Memory usage monitoring utilities
 pub struct MemoryMonitor;
 
@@ -332,4 +356,30 @@ pub enum Waypoint {
         slippage_harvested: U256,
         is_sandwich: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_payload_helpers_keep_deterministic_prefixes() {
+        let calldata = vec![0xAA; MAX_CALLDATA_TELEMETRY_BYTES + 32];
+        let returndata = vec![0x55; MAX_RETURN_DATA_TELEMETRY_BYTES + 32];
+
+        assert_eq!(
+            bounded_calldata(&calldata),
+            vec![0xAA; MAX_CALLDATA_TELEMETRY_BYTES]
+        );
+        assert_eq!(
+            bounded_returndata(&returndata),
+            vec![0x55; MAX_RETURN_DATA_TELEMETRY_BYTES]
+        );
+    }
+
+    #[test]
+    fn telemetry_payload_helpers_accept_empty_input() {
+        assert!(bounded_calldata(&[]).is_empty());
+        assert!(bounded_returndata(&[]).is_empty());
+    }
 }

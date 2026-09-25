@@ -3,10 +3,38 @@ use crate::evm::etherscan_abi_fetcher::EtherscanAbiFetcher;
 use crate::evm::fuzz::AbiRegistry;
 use crate::evm::trace::ExecutionTrace;
 use alloy_dyn_abi::DynSolType;
+use alloy_json_abi::JsonAbi;
 use libafl_bolts::rands::Rand;
 use revm::primitives::{Address, U256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZero;
+
+fn populate_remote_abi(abi: &JsonAbi, abi_registry: &mut AbiRegistry) -> anyhow::Result<()> {
+    let mut staged_functions = HashMap::new();
+
+    for function in abi.functions() {
+        let inputs = function
+            .inputs
+            .iter()
+            .map(|parameter| DynSolType::parse(&parameter.ty))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "remote ABI function `{}` contains an invalid type `{}`: {error}",
+                    function.name,
+                    function
+                        .inputs
+                        .iter()
+                        .find(|parameter| DynSolType::parse(&parameter.ty).is_err())
+                        .map_or_else(|| "<unknown>".to_string(), |parameter| parameter.ty.clone())
+                )
+            })?;
+        staged_functions.insert(function.selector().0, inputs);
+    }
+
+    abi_registry.functions.extend(staged_functions);
+    Ok(())
+}
 
 #[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GlobalAccountRegistry {
@@ -230,15 +258,7 @@ impl GlobalAccountRegistry {
     ) -> anyhow::Result<()> {
         if let Some(fetcher) = &self.etherscan_abi_fetcher {
             let abi = fetcher.fetch_abi(address).await?;
-            for func in abi.functions() {
-                abi_registry.functions.insert(
-                    func.selector().0,
-                    func.inputs
-                        .iter()
-                        .map(|p| DynSolType::parse(&p.ty).unwrap())
-                        .collect(),
-                );
-            }
+            populate_remote_abi(&abi, abi_registry)?;
             log::info!("Fetched ABI for {} from Etherscan.", address);
         }
         Ok(())
@@ -258,5 +278,72 @@ impl GlobalAccountRegistry {
         }
         let idx = rand.below(NonZero::new(self.contracts.len()).unwrap());
         self.contracts.iter().nth(idx).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_abi_malformed_type_is_propagated_without_partial_registry_entry() {
+        let function = alloy_json_abi::Function {
+            name: "broken".to_string(),
+            inputs: vec![alloy_json_abi::Param {
+                ty: "not-a-solidity-type".to_string(),
+                name: "value".to_string(),
+                components: Vec::new(),
+                internal_type: None,
+            }],
+            outputs: Vec::new(),
+            state_mutability: alloy_json_abi::StateMutability::NonPayable,
+        };
+        let mut abi = JsonAbi::default();
+        abi.functions.insert("broken".to_string(), vec![function]);
+        let mut registry = AbiRegistry::default();
+        let error = populate_remote_abi(&abi, &mut registry).expect_err("malformed ABI type");
+        assert!(error.to_string().contains("not-a-solidity-type"));
+        assert!(registry.functions.is_empty());
+    }
+
+    #[test]
+    fn remote_abi_partial_failure_does_not_commit_staged_functions() {
+        let valid_function = alloy_json_abi::Function {
+            name: "a_valid".to_string(),
+            inputs: vec![alloy_json_abi::Param {
+                ty: "uint256".to_string(),
+                name: "value".to_string(),
+                components: Vec::new(),
+                internal_type: None,
+            }],
+            outputs: Vec::new(),
+            state_mutability: alloy_json_abi::StateMutability::NonPayable,
+        };
+        let invalid_function = alloy_json_abi::Function {
+            name: "z_broken".to_string(),
+            inputs: vec![alloy_json_abi::Param {
+                ty: "not-a-solidity-type".to_string(),
+                name: "value".to_string(),
+                components: Vec::new(),
+                internal_type: None,
+            }],
+            outputs: Vec::new(),
+            state_mutability: alloy_json_abi::StateMutability::NonPayable,
+        };
+        let mut abi = JsonAbi::default();
+        abi.functions
+            .insert("a_valid".to_string(), vec![valid_function]);
+        abi.functions
+            .insert("z_broken".to_string(), vec![invalid_function]);
+
+        let mut registry = AbiRegistry::default();
+        let existing_selector = [0, 0, 0, 0];
+        registry.functions.insert(existing_selector, Vec::new());
+
+        let error = populate_remote_abi(&abi, &mut registry).expect_err("malformed ABI type");
+
+        assert!(error.to_string().contains("not-a-solidity-type"));
+        assert_eq!(registry.functions.len(), 1);
+        assert!(registry.functions.contains_key(&existing_selector));
     }
 }

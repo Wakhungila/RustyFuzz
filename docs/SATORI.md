@@ -1,11 +1,11 @@
 # Satori
 
-Satori is RustyFuzz's AI-guided semantic audit harness. It ingests a smart-contract repository, builds deterministic protocol context, selects critical functions, asks OpenAI `o3` for bounded hypotheses, converts useful hypotheses into RustyFuzz job JSON and Foundry PoC scaffolds, and emits reports that clearly separate hypotheses from validated findings.
+Satori is RustyFuzz's AI-guided semantic audit harness. It ingests a smart-contract repository, builds deterministic protocol context, selects critical functions, asks the configured OpenCode Zen free model for bounded hypotheses, converts useful hypotheses into RustyFuzz job JSON and Foundry PoC scaffolds, and emits reports that clearly separate hypotheses from validated findings.
 
 ## What Satori Is
 
 - A repo modeling, packetization, and audit-control layer for RustyFuzz.
-- A compact-context `o3` client behind the `llm` feature.
+- A compact-context OpenCode Zen client behind the `llm` feature.
 - A deterministic artifact generator for jobs, PoC scaffolds, memory, and reports.
 - A safety gate: model output is treated as hypothesis until local evidence exists.
 
@@ -18,7 +18,7 @@ Satori is RustyFuzz's AI-guided semantic audit harness. It ingests a smart-contr
 
 ## Safety Model
 
-`o3` proposes hypotheses. RustyFuzz, Foundry, local fixtures, and fork-safe replay decide truth. If a path requires live execution or missing target data, Satori marks it `NeedsMoreContext` or `PlausibleUnvalidated`, not confirmed.
+The configured Zen model proposes hypotheses. RustyFuzz, Foundry, local fixtures, and fork-safe replay decide truth. If a path requires live execution or missing target data, Satori marks it `NeedsMoreContext` or `PlausibleUnvalidated`, not confirmed.
 
 ## Commands
 
@@ -30,19 +30,29 @@ cargo run -- satori graph ./protocol
 cargo run -- satori packets ./protocol --max-critical-functions 8
 ```
 
-With `o3`:
+With OpenCode Zen:
 
 ```bash
-export OPENAI_API_KEY="..."
+export OPENCODE_API_KEY="..."
 
 cargo run --features llm -- satori audit ./protocol \
-  --model o3 \
+  --model big-pickle \
   --max-critical-functions 8 \
   --max-hypotheses-per-function 2 \
   --min-confidence 0.40 \
   --validate true \
   --generate-jobs true
 ```
+
+## RPC API Key Origin Allowlist
+
+When an RPC API key is configured, its request origin must be explicitly allowlisted. Set the comma-separated origins without paths, queries, fragments, or credentials:
+
+```bash
+export RUSTYFUZZ_RPC_API_KEY_ALLOWED_ORIGINS="https://rpc.example.com,https://rpc.example.org"
+```
+
+Origins must use `http` or `https` and match the normalized RPC URL origin exactly. If the variable is unset or does not contain the RPC origin, authenticated RPC requests fail closed.
 
 Report:
 
@@ -89,7 +99,7 @@ satori/reports/latest.md
 
 ## Current Validation Path
 
-Satori v1 generates RustyFuzz job specs and Foundry scaffolds. It inspects whether concrete replay context exists and reports missing context explicitly. It does not call a full RustyFuzz campaign adapter yet; that is the next integration step.
+Satori v1 generates RustyFuzz job specs and Foundry scaffolds. It inspects whether concrete replay context exists and reports missing context explicitly. Direct jobs with complete target, RPC, block, and executable sequence context can run bounded RustyFuzz validation.
 
 ## How To Wire Jobs Into RustyFuzz
 
@@ -98,9 +108,9 @@ Use the generated `satori/runs/<run_id>/jobs/*.rustyfuzz.json` as a machine-read
 ## Limitations
 
 - Static extraction is layered but still heuristic when Slither/Foundry artifacts are unavailable.
-- The o3 API path requires `--features llm` and `OPENAI_API_KEY`.
+- The OpenCode Zen path requires `--features llm` and `OPENCODE_API_KEY`.
 - Foundry scaffolds may need manual contract bindings before they compile.
-- Direct RustyFuzz campaign execution from job JSON is planned but not fully wired in v1.
+- Direct RustyFuzz campaign execution is limited to jobs with complete executable context; semantic-only jobs remain unvalidated.
 
 ## Next Steps
 

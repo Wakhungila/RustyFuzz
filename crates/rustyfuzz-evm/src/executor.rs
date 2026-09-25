@@ -1,8 +1,9 @@
 use crate::coverage::stable_path_hash;
 use crate::dataflow::DataflowRegistry;
 use crate::execution::{
-    CallKind, CallObservation, CallPhase, ChainState, ExecutionStatus, StorageAccess, StorageDiff,
-    TxExecutionResult, Waypoint,
+    bounded_calldata, bounded_returndata, CallKind, CallObservation, CallPhase, ChainState,
+    ExecutionStatus, StorageAccess, StorageDiff, TxExecutionResult, Waypoint,
+    MAX_CALL_TRACE_OBSERVATIONS,
 };
 use crate::fork_db::ForkDb;
 use crate::inspector::CoverageInspector;
@@ -163,7 +164,7 @@ impl EvmExecutor {
 
         let output = result
             .output()
-            .map(|bytes| bytes.to_vec())
+            .map(|bytes| canonical_execution_output(bytes))
             .unwrap_or_default();
 
         let coverage_hash = stable_path_hash(coverage);
@@ -171,7 +172,8 @@ impl EvmExecutor {
         let waypoints = waypoints.clone();
         let storage_reads = storage_reads_from_waypoints(&waypoints);
         let storage_writes = storage_writes_from_waypoints(&waypoints);
-        let mut call_trace = call_trace_from_waypoints(&waypoints, tx_idx);
+        let mut call_trace =
+            call_trace_from_waypoints(&waypoints, MAX_CALL_TRACE_OBSERVATIONS.saturating_sub(1));
 
         call_trace.insert(
             0,
@@ -181,8 +183,8 @@ impl EvmExecutor {
                 caller: tx.caller,
                 target: tx.to,
                 value: executed_value,
-                input: tx.input.clone(),
-                output: output.clone(),
+                input: bounded_calldata(&tx.input),
+                output: bounded_returndata(&output),
                 gas_limit: TX_GAS_LIMIT,
                 gas_used,
                 success: matches!(status, ExecutionStatus::Success),
@@ -215,6 +217,10 @@ impl Default for EvmExecutor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn canonical_execution_output(bytes: &[u8]) -> Vec<u8> {
+    bytes.to_vec()
 }
 
 fn fund_fuzz_caller(db: &mut CacheDB<ForkDb>, caller: Address) {
@@ -332,7 +338,7 @@ fn cached_storage_value(db: &CacheDB<ForkDb>, address: Address, slot: B256) -> U
         .unwrap_or_default()
 }
 
-fn call_trace_from_waypoints(waypoints: &[Waypoint], _tx_index: usize) -> Vec<CallObservation> {
+fn call_trace_from_waypoints(waypoints: &[Waypoint], max_entries: usize) -> Vec<CallObservation> {
     waypoints
         .iter()
         .filter_map(|waypoint| match waypoint {
@@ -356,8 +362,8 @@ fn call_trace_from_waypoints(waypoints: &[Waypoint], _tx_index: usize) -> Vec<Ca
                 caller: *caller,
                 target: *target,
                 value: *value,
-                input: input.clone(),
-                output: output.clone(),
+                input: bounded_calldata(input),
+                output: bounded_returndata(output),
                 gas_limit: *gas_limit,
                 gas_used: *gas_used,
                 success: *success,
@@ -386,8 +392,8 @@ fn call_trace_from_waypoints(waypoints: &[Waypoint], _tx_index: usize) -> Vec<Ca
                 caller: *creator,
                 target: created_address.unwrap_or_default(),
                 value: *value,
-                input: init_code.clone(),
-                output: deployed_code.clone(),
+                input: bounded_calldata(init_code),
+                output: bounded_returndata(deployed_code),
                 gas_limit: *gas_limit,
                 gas_used: *gas_used,
                 success: *success,
@@ -398,6 +404,7 @@ fn call_trace_from_waypoints(waypoints: &[Waypoint], _tx_index: usize) -> Vec<Ca
             }),
             _ => None,
         })
+        .take(max_entries)
         .collect()
 }
 
@@ -406,5 +413,73 @@ fn b256_from_slot_bytes(slot: &[u8]) -> B256 {
         B256::from_slice(slot)
     } else {
         B256::from(U256::from_be_slice(slot))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::{
+        bounded_calldata, bounded_returndata, MAX_CALLDATA_TELEMETRY_BYTES,
+        MAX_RETURN_DATA_TELEMETRY_BYTES,
+    };
+
+    fn call_waypoint(input: Vec<u8>, output: Vec<u8>) -> Waypoint {
+        Waypoint::CallTrace {
+            tx_idx: 0,
+            depth: 1,
+            caller: Address::ZERO,
+            target: Address::ZERO,
+            value: U256::ZERO,
+            input,
+            output,
+            gas_limit: 1,
+            gas_used: 0,
+            success: true,
+            kind: CallKind::Call,
+            phase: CallPhase::End,
+            result: None,
+        }
+    }
+
+    #[test]
+    fn call_trace_conversion_is_bounded_and_preserves_input_order() {
+        let waypoints = vec![
+            call_waypoint(vec![1], vec![2]),
+            call_waypoint(vec![3], vec![4]),
+            call_waypoint(vec![5], vec![6]),
+        ];
+
+        let observations = call_trace_from_waypoints(&waypoints, 2);
+
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].input, vec![1]);
+        assert_eq!(observations[0].output, vec![2]);
+        assert_eq!(observations[1].input, vec![3]);
+    }
+
+    #[test]
+    fn call_trace_conversion_bounds_calldata_and_returndata() {
+        let input = vec![0xAA; MAX_CALLDATA_TELEMETRY_BYTES + 1];
+        let output = vec![0xBB; MAX_RETURN_DATA_TELEMETRY_BYTES + 1];
+        let waypoints = vec![call_waypoint(input.clone(), output.clone())];
+
+        let observations = call_trace_from_waypoints(&waypoints, 1);
+
+        assert_eq!(observations[0].input, bounded_calldata(&input));
+        assert_eq!(observations[0].output, bounded_returndata(&output));
+    }
+
+    #[test]
+    fn canonical_output_distinguishes_results_differing_after_4096_bytes() {
+        let first = vec![0x11; MAX_RETURN_DATA_TELEMETRY_BYTES + 1];
+        let mut second = first.clone();
+        second[MAX_RETURN_DATA_TELEMETRY_BYTES] = 0x22;
+
+        let first_output = canonical_execution_output(&first);
+        let second_output = canonical_execution_output(&second);
+
+        assert_eq!(first_output, first);
+        assert_ne!(first_output, second_output);
     }
 }

@@ -1,6 +1,7 @@
 //! OpenCode Zen's documented free chat-completion models. No paid fallback.
 use crate::satori::cache::{CachedResponse, ResponseCache};
 use crate::satori::error::SatoriResult;
+use crate::satori::fsutil::redact_source_text;
 
 pub const DEFAULT_MODEL: &str = "big-pickle";
 #[cfg(feature = "llm")]
@@ -43,8 +44,9 @@ impl ZenClient {
     }
 
     pub async fn complete_json(&self, prompt: &str) -> SatoriResult<(String, bool)> {
+        let prompt = redact_prompt_for_external_transmission(prompt);
         let identity = format!("opencode-zen/chat-v1/{}", self.model);
-        let key = ResponseCache::key(&identity, prompt);
+        let key = ResponseCache::key(&identity, &prompt);
         let cache = self.cache.clone();
         let cache_key = key.clone();
         let cached = tokio::task::spawn_blocking(move || cache.get(&cache_key))
@@ -58,7 +60,7 @@ impl ZenClient {
             validate_json(&cached.response_text)?;
             return Ok((cached.response_text, true));
         }
-        let response = complete_json_impl(&self.model, prompt).await?;
+        let response = complete_json_impl(&self.model, &prompt).await?;
         validate_json(&response)?;
         let cache = self.cache.clone();
         let cached = CachedResponse {
@@ -71,6 +73,10 @@ impl ZenClient {
             .map_err(|error| anyhow::anyhow!("Zen cache writer failed: {error}"))??;
         Ok((response, false))
     }
+}
+
+fn redact_prompt_for_external_transmission(prompt: &str) -> String {
+    redact_source_text(prompt)
 }
 
 fn validate_json(text: &str) -> SatoriResult<()> {
@@ -122,6 +128,7 @@ async fn request_json(
         .timeout(Duration::from_secs(60))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
+    let prompt = redact_prompt_for_external_transmission(prompt);
     let body = serde_json::json!({
         "model": model,
         "messages": [
@@ -246,6 +253,16 @@ mod tests {
     use super::*;
     #[cfg(feature = "llm")]
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[test]
+    fn external_prompt_redacts_credentials_before_transmission() {
+        let prompt = "api_key = prompt-secret\nhttps://user:pass@rpc.example/v1?token=url-secret";
+        let redacted = redact_prompt_for_external_transmission(prompt);
+        assert!(!redacted.contains("prompt-secret"));
+        assert!(!redacted.contains("user:pass"));
+        assert!(!redacted.contains("url-secret"));
+        assert!(redacted.contains("<redacted>"));
+    }
+
     #[test]
     fn paid_and_unknown_models_fail_closed() {
         assert!(ZenClient::new("o3", ResponseCache::new("unused")).is_err());
@@ -447,6 +464,8 @@ mod tests {
                 assert!(request.contains("Bearer test-key"));
                 assert!(request.contains("\"model\":\"big-pickle\""));
                 assert!(request.contains("\"messages\""));
+                assert!(!request.contains("request-secret"));
+                assert!(request.contains("<redacted>"));
                 let body = r#"{"choices":[{"finish_reason":"stop","message":{"content":"{\"ok\":true}"}}]}"#;
                 let response = if attempt == 0 {
                     "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
@@ -461,9 +480,14 @@ mod tests {
             }
         });
         assert_eq!(
-            request_json(&endpoint, "test-key", "big-pickle", "return JSON")
-                .await
-                .unwrap(),
+            request_json(
+                &endpoint,
+                "test-key",
+                "big-pickle",
+                "api_key = request-secret",
+            )
+            .await
+            .unwrap(),
             r#"{"ok":true}"#
         );
         worker.join().unwrap();

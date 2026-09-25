@@ -5,7 +5,7 @@ use crate::common::types::{
     CallKind, CallObservation, CallPhase, ChainState, ExecutionStatus, SequenceExecutionResult,
     SingletonTx, StorageDiff, TxExecutionResult,
 };
-use crate::common::verifier::ReplayVerifier;
+use crate::common::verifier::{ReplayEconomicResult, ReplayVerifier};
 use crate::engine::actors::{ActorModel, ActorModelConfig};
 use crate::engine::bounded_search::{
     BoundedSearchBounds, BoundedSearchEngine, BoundedSearchRequest,
@@ -26,6 +26,7 @@ use crate::engine::target_profile::TargetProfiler;
 use crate::evm::corpus::SnapshotScoreWeights;
 use crate::evm::feedback::StateNoveltyReport;
 use crate::evm::fuzz::{AbiRegistry, EvmInput};
+use crate::satori::fsutil::{redact_external_output, sha256_hex, MAX_EXTERNAL_OUTPUT_BYTES};
 use anyhow::{Context, Result};
 use revm::context::BlockEnv;
 use revm::database::CacheDB;
@@ -35,11 +36,14 @@ use rustyfuzz_artifacts::fsutil::write_atomic;
 use rustyfuzz_evm::fork_db::{ForkCacheProvenance, ForkDb, ForkDbCacheSnapshot};
 use rustyfuzz_evm::inspector::MAP_SIZE;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, File, Metadata};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
+use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -80,19 +84,115 @@ pub enum PocGenerationExpectation {
     Required,
 }
 
-fn load_synthetic_fixture(path: &str) -> Result<SyntheticBenchmarkFixture> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("read synthetic benchmark fixture {}", path))?;
-    match Path::new(path).extension().and_then(|ext| ext.to_str()) {
-        Some("json") => serde_json::from_str(&raw)
-            .with_context(|| format!("parse JSON benchmark fixture {}", path)),
-        Some("toml") => {
-            toml::from_str(&raw).with_context(|| format!("parse TOML benchmark fixture {}", path))
+const MAX_BENCHMARK_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_BENCHMARK_MANIFESTS: usize = 10_000;
+const MAX_BENCHMARK_FIXTURE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CARGO_WORKSPACE_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchmarkReadKind {
+    Manifest,
+    Fixture,
+    WorkspaceManifest,
+}
+
+impl BenchmarkReadKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Manifest => "benchmark manifest",
+            Self::Fixture => "benchmark fixture",
+            Self::WorkspaceManifest => "Cargo workspace manifest",
         }
+    }
+}
+
+fn bounded_file_metadata(path: &Path, kind: BenchmarkReadKind, max_bytes: u64) -> Result<Metadata> {
+    anyhow::ensure!(
+        max_bytes > 0,
+        "{} byte limit must be positive",
+        kind.label()
+    );
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("read metadata for {} {}", kind.label(), path.display()))?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "{} must not be a symlink: {}",
+        kind.label(),
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{} is not a regular file: {}",
+        kind.label(),
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= max_bytes,
+        "{} {} is {} bytes and exceeds limit of {} bytes",
+        kind.label(),
+        path.display(),
+        metadata.len(),
+        max_bytes
+    );
+    Ok(metadata)
+}
+
+fn read_benchmark_text(path: &Path, kind: BenchmarkReadKind, max_bytes: u64) -> Result<String> {
+    let metadata = bounded_file_metadata(path, kind, max_bytes)?;
+    let mut file =
+        File::open(path).with_context(|| format!("open {} {}", kind.label(), path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len().min(max_bytes) as usize);
+    file.by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {} {}", kind.label(), path.display()))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= max_bytes,
+        "{} {} exceeds limit of {} bytes",
+        kind.label(),
+        path.display(),
+        max_bytes
+    );
+    String::from_utf8(bytes)
+        .with_context(|| format!("{} {} is not valid UTF-8", kind.label(), path.display()))
+}
+
+fn load_synthetic_fixture(path: &Path) -> Result<SyntheticBenchmarkFixture> {
+    let raw = read_benchmark_text(
+        path,
+        BenchmarkReadKind::Fixture,
+        MAX_BENCHMARK_FIXTURE_BYTES,
+    )
+    .with_context(|| format!("read synthetic benchmark fixture {}", path.display()))?;
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("json") => serde_json::from_str(&raw)
+            .with_context(|| format!("parse JSON benchmark fixture {}", path.display())),
+        Some("toml") => toml::from_str(&raw)
+            .with_context(|| format!("parse TOML benchmark fixture {}", path.display())),
         other => anyhow::bail!(
             "unsupported benchmark fixture extension {:?} for {}",
             other,
-            path
+            path.display()
+        ),
+    }
+}
+
+fn load_executable_fixture(path: &Path) -> Result<super::executable_fixture::ExecutableFixture> {
+    let raw = read_benchmark_text(
+        path,
+        BenchmarkReadKind::Fixture,
+        MAX_BENCHMARK_FIXTURE_BYTES,
+    )
+    .with_context(|| format!("read executable benchmark fixture {}", path.display()))?;
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("json") => serde_json::from_str(&raw)
+            .with_context(|| format!("parse JSON executable benchmark fixture {}", path.display())),
+        Some("toml") => toml::from_str(&raw)
+            .with_context(|| format!("parse TOML executable benchmark fixture {}", path.display())),
+        other => anyhow::bail!(
+            "unsupported executable benchmark fixture extension {:?} for {}",
+            other,
+            path.display()
         ),
     }
 }
@@ -566,6 +666,10 @@ pub struct BenchmarkManifest {
     pub mode: BenchmarkMode,
     pub target: Option<String>,
     pub fixture: Option<String>,
+    #[serde(skip)]
+    pub manifest_root: Option<PathBuf>,
+    #[serde(skip)]
+    pub resolved_fixture: Option<PathBuf>,
     pub chain: Option<String>,
     pub fork_block: Option<u64>,
     #[serde(default)]
@@ -662,6 +766,58 @@ impl BenchmarkManifest {
             .as_deref()
             .and_then(|value| Address::from_str(value).ok())
     }
+
+    fn resolve_fixture_path(&self) -> Result<Option<PathBuf>> {
+        let Some(raw_fixture) = self.fixture.as_deref() else {
+            return Ok(None);
+        };
+        let relative = Path::new(raw_fixture);
+        anyhow::ensure!(
+            !relative.is_absolute(),
+            "benchmark fixture path must be relative to the manifest root"
+        );
+        anyhow::ensure!(
+            relative
+                .components()
+                .all(|component| { matches!(component, std::path::Component::Normal(_)) }),
+            "benchmark fixture path must not contain traversal or root components"
+        );
+        let root = self
+            .manifest_root
+            .as_deref()
+            .context("benchmark manifest has no authoritative root")?
+            .canonicalize()
+            .with_context(|| format!("canonicalize benchmark manifest root {}", self.id))?;
+        let candidate = root.join(relative);
+        let mut component = Some(candidate.as_path());
+        while let Some(path) = component {
+            let metadata = fs::symlink_metadata(path)?;
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "benchmark fixture path must not contain symlink components"
+            );
+            component = path.parent();
+        }
+        let canonical = candidate
+            .canonicalize()
+            .with_context(|| format!("canonicalize benchmark fixture {raw_fixture}"))?;
+        anyhow::ensure!(
+            canonical.starts_with(&root),
+            "benchmark fixture escapes the manifest root"
+        );
+        let metadata = fs::symlink_metadata(&canonical)?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "benchmark fixture is not a regular file"
+        );
+        bounded_file_metadata(
+            &canonical,
+            BenchmarkReadKind::Fixture,
+            MAX_BENCHMARK_FIXTURE_BYTES,
+        )
+        .with_context(|| format!("bound benchmark fixture {}", canonical.display()))?;
+        Ok(Some(canonical))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -709,6 +865,76 @@ enum LiveForkCacheProfile {
     OracleChangingReturn,
     #[serde(alias = "noop_runtime")]
     Noop,
+}
+
+#[derive(Debug, Clone)]
+enum ReplayCacheSelection {
+    ProfileSynthetic(ForkDbCacheSnapshot),
+    Explicit(ForkDbCacheSnapshot),
+}
+
+#[derive(Debug, Clone)]
+struct PreparedReplayCache {
+    snapshot: ForkDbCacheSnapshot,
+    synthetic_profile: bool,
+}
+
+impl PreparedReplayCache {
+    fn production_eligible(&self) -> bool {
+        !self.synthetic_profile
+    }
+}
+
+fn select_replay_cache(
+    fixture: &LiveBenchmarkFixture,
+    manifest: &BenchmarkManifest,
+) -> Result<Option<ReplayCacheSelection>> {
+    match (&fixture.fork_cache, &fixture.fork_cache_profile) {
+        (Some(snapshot), None) => {
+            Ok(Some(ReplayCacheSelection::Explicit(snapshot.clone())))
+        }
+        (None, Some(profile)) => Ok(Some(ReplayCacheSelection::ProfileSynthetic(
+            explicit_profile_fork_cache(manifest, profile.clone()).cache_snapshot(),
+        ))),
+        (Some(_), Some(_)) => anyhow::bail!(
+            "live benchmark fixture must not combine an explicit fork cache with a synthetic profile"
+        ),
+        (None, None) => Ok(None),
+    }
+}
+
+fn prepare_replay_cache<F>(
+    selection: ReplayCacheSelection,
+    fork_block: u64,
+    validate_explicit: F,
+) -> Result<PreparedReplayCache>
+where
+    F: FnOnce(&ForkDbCacheSnapshot) -> Result<()>,
+{
+    let (snapshot, synthetic_profile) = match selection {
+        ReplayCacheSelection::ProfileSynthetic(snapshot) => (snapshot, true),
+        ReplayCacheSelection::Explicit(snapshot) => (snapshot, false),
+    };
+    snapshot
+        .verify_content_digest()
+        .map_err(|error| anyhow::anyhow!("cached fork snapshot integrity: {error}"))?;
+    if !synthetic_profile {
+        ensure_fork_provenance_complete(
+            &snapshot.provenance,
+            fork_block,
+            "explicit cached fork fixture",
+        )?;
+        snapshot
+            .ensure_consistent(Some(fork_block), None, None, None, true)
+            .map_err(|error| {
+                anyhow::anyhow!("explicit cached fork fixture provenance is invalid: {error}")
+            })?;
+        validate_explicit(&snapshot)?;
+    }
+    Ok(PreparedReplayCache {
+        snapshot,
+        synthetic_profile,
+    })
 }
 
 impl Default for SyntheticBenchmarkFixture {
@@ -779,6 +1005,14 @@ pub enum BenchmarkFailureKind {
     Passed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BenchmarkReportDigests {
+    pub input_digest: String,
+    pub config_digest: String,
+    pub manifest_digest: String,
+    pub fixture_digest: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BenchmarkValidationResult {
     #[serde(default)]
@@ -786,6 +1020,8 @@ pub struct BenchmarkValidationResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<super::executable_fixture::ExecutableEvidence>,
     pub benchmark_id: String,
+    #[serde(default)]
+    pub digests: BenchmarkReportDigests,
     #[serde(rename = "class")]
     pub vulnerability_class: VulnerabilityClass,
     #[serde(default)]
@@ -895,19 +1131,62 @@ impl ValidationContext {
 
 impl ValidationRunner {
     pub fn load_manifests(path: impl AsRef<Path>) -> Result<Vec<BenchmarkManifest>> {
-        let path = path.as_ref();
+        let path = path.as_ref().canonicalize().with_context(|| {
+            format!(
+                "canonicalize benchmark manifest path {}",
+                path.as_ref().display()
+            )
+        })?;
+        let root = authoritative_manifest_root(&path)?;
+        Self::load_manifests_with_root(path, root)
+    }
+
+    pub fn load_manifests_with_root(
+        path: impl AsRef<Path>,
+        workspace_root: impl AsRef<Path>,
+    ) -> Result<Vec<BenchmarkManifest>> {
+        let path = path.as_ref().canonicalize().with_context(|| {
+            format!(
+                "canonicalize benchmark manifest path {}",
+                path.as_ref().display()
+            )
+        })?;
+        let root = workspace_root.as_ref().canonicalize().with_context(|| {
+            format!(
+                "canonicalize benchmark workspace root {}",
+                workspace_root.as_ref().display()
+            )
+        })?;
+        anyhow::ensure!(
+            root.is_dir(),
+            "benchmark workspace root is not a directory: {}",
+            root.display()
+        );
+        anyhow::ensure!(
+            path.starts_with(&root),
+            "benchmark manifest path {} escapes explicit workspace root {}",
+            path.display(),
+            root.display()
+        );
         let mut manifests = Vec::new();
         if path.is_file() {
-            manifests.push(load_manifest_file(path)?);
+            manifests.push(load_manifest_file(&path, &root)?);
         } else {
-            let mut files = fs::read_dir(path)
-                .with_context(|| format!("read benchmark directory {}", path.display()))?
+            let manifest_dir = path.clone();
+            let mut files = fs::read_dir(&manifest_dir)
+                .with_context(|| format!("read benchmark directory {}", manifest_dir.display()))?
                 .filter_map(|entry| entry.ok().map(|entry| entry.path()))
                 .filter(|path| is_manifest_path(path))
                 .collect::<Vec<_>>();
             files.sort();
+            anyhow::ensure!(
+                files.len() <= MAX_BENCHMARK_MANIFESTS,
+                "benchmark manifest count {} exceeds limit of {}",
+                files.len(),
+                MAX_BENCHMARK_MANIFESTS
+            );
             for file in files {
-                manifests.push(load_manifest_file(&file)?);
+                manifests.push(load_manifest_file(&file, &root)?);
             }
         }
         anyhow::ensure!(
@@ -947,6 +1226,16 @@ impl ValidationRunner {
         manifest: &BenchmarkManifest,
         context: &ValidationContext,
     ) -> BenchmarkValidationResult {
+        let mut result = self.run_manifest_with_context_inner(manifest, context);
+        result.digests = benchmark_report_digests(manifest, context);
+        result
+    }
+
+    fn run_manifest_with_context_inner(
+        &self,
+        manifest: &BenchmarkManifest,
+        context: &ValidationContext,
+    ) -> BenchmarkValidationResult {
         if manifest.target_address().is_none() {
             return self.skipped_result(
                 manifest,
@@ -964,10 +1253,12 @@ impl ValidationRunner {
         match manifest.mode {
             BenchmarkMode::ExecutableEvm => {
                 let execute = || -> Result<BenchmarkValidationResult> {
-                    let path = Path::new(manifest.fixture.as_deref().context("missing executable fixture path")?);
-                    let fixture = super::executable_fixture::ExecutableFixture::load(path)?;
+                    let path = manifest
+                        .resolve_fixture_path()?
+                        .context("missing executable fixture path")?;
+                    let fixture = load_executable_fixture(&path)?;
                     anyhow::ensure!(Some(fixture.target) == manifest.target_address(), "fixture target differs from manifest target");
-                    let (execution, mut evidence) = fixture.execute(path)?;
+                    let (execution, mut evidence) = fixture.execute(&path)?;
                     let findings = ProtocolOraclePack::default().evaluate(&execution);
                     let (matching, unmatched): (Vec<_>, Vec<_>) = findings.iter().cloned()
                         .partition(|finding| manifest.vulnerability_class.matches_finding(finding));
@@ -988,28 +1279,31 @@ impl ValidationRunner {
                 execute().unwrap_or_else(|err| self.failed_result(manifest, format!("executable fixture failed: {err:#}")))
             }
             BenchmarkMode::LocalFixture => {
-                let Some(fixture_path) = manifest.fixture.as_deref() else {
-                    return self.skipped_result(
-                        manifest,
-                        ValidationStatus::NotRunMissingFixture,
-                        "benchmark manifest does not reference a fixture file".to_string(),
-                    );
+                let fixture_path = match manifest.resolve_fixture_path() {
+                    Ok(Some(path)) => path,
+                    Ok(None) => {
+                        return self.skipped_result(
+                            manifest,
+                            ValidationStatus::NotRunMissingFixture,
+                            "benchmark manifest does not reference a fixture file".to_string(),
+                        );
+                    }
+                    Err(error) => {
+                        return self.failed_result(
+                            manifest,
+                            format!("invalid benchmark fixture path: {error:#}"),
+                        );
+                    }
                 };
-                if !Path::new(fixture_path).exists() {
-                    return self.skipped_result(
-                        manifest,
-                        ValidationStatus::NotRunMissingFixture,
-                        format!("fixture file `{fixture_path}` is missing"),
-                    );
-                }
 
-                let fixture = match load_synthetic_fixture(fixture_path) {
+                let fixture = match load_synthetic_fixture(&fixture_path) {
                     Ok(fixture) => fixture,
                     Err(error) => {
                         return self.failed_result(
                             manifest,
                             format!(
-                                "failed to load benchmark fixture `{fixture_path}`: {error}"
+                                "failed to load benchmark fixture `{}`: {error}",
+                                fixture_path.display()
                             ),
                         );
                     }
@@ -1019,7 +1313,10 @@ impl ValidationRunner {
                     Ok(observation) => self.evaluate_observation(manifest, &observation),
                     Err(error) => self.failed_result(
                         manifest,
-                        format!("failed to execute benchmark fixture `{fixture_path}`: {error}"),
+                        format!(
+                            "failed to execute benchmark fixture `{}`: {error}",
+                            fixture_path.display()
+                        ),
                     ),
                 }
             }
@@ -1032,23 +1329,25 @@ impl ValidationRunner {
                             .to_string(),
                     );
                 }
-                let Some(fixture_path) = manifest.fixture.as_deref() else {
-                    return self.skipped_result(
-                        manifest,
-                        ValidationStatus::NotRunMissingFixture,
-                        "mainnet-fork benchmark does not reference a historical seed fixture"
-                            .to_string(),
-                    );
+                let fixture_path = match manifest.resolve_fixture_path() {
+                    Ok(Some(path)) => path,
+                    Ok(None) => {
+                        return self.skipped_result(
+                            manifest,
+                            ValidationStatus::NotRunMissingFixture,
+                            "mainnet-fork benchmark does not reference a historical seed fixture"
+                                .to_string(),
+                        );
+                    }
+                    Err(error) => {
+                        return self.failed_result(
+                            manifest,
+                            format!("invalid historical seed fixture path: {error:#}"),
+                        );
+                    }
                 };
-                if !Path::new(fixture_path).exists() {
-                    return self.skipped_result(
-                        manifest,
-                        ValidationStatus::NotRunMissingFixture,
-                        format!("historical seed fixture `{fixture_path}` is missing"),
-                    );
-                }
 
-                match self.execute_live_fork_benchmark(manifest, context) {
+                match self.execute_live_fork_benchmark(manifest, &fixture_path, context) {
                     Ok(observation) => self.evaluate_observation(manifest, &observation),
                     Err(error) => self.failed_result(
                         manifest,
@@ -1057,23 +1356,25 @@ impl ValidationRunner {
                 }
             }
             BenchmarkMode::BlindRediscovery => {
-                let Some(fixture_path) = manifest.fixture.as_deref() else {
-                    return self.skipped_result(
-                        manifest,
-                        ValidationStatus::NotRunMissingFixture,
-                        "blind rediscovery benchmark does not reference a historical seed fixture"
-                            .to_string(),
-                    );
+                let fixture_path = match manifest.resolve_fixture_path() {
+                    Ok(Some(path)) => path,
+                    Ok(None) => {
+                        return self.skipped_result(
+                            manifest,
+                            ValidationStatus::NotRunMissingFixture,
+                            "blind rediscovery benchmark does not reference a historical seed fixture"
+                                .to_string(),
+                        );
+                    }
+                    Err(error) => {
+                        return self.failed_result(
+                            manifest,
+                            format!("invalid blind rediscovery fixture path: {error:#}"),
+                        );
+                    }
                 };
-                if !Path::new(fixture_path).exists() {
-                    return self.skipped_result(
-                        manifest,
-                        ValidationStatus::NotRunMissingFixture,
-                        format!("blind rediscovery fixture `{fixture_path}` is missing"),
-                    );
-                }
 
-                match execute_blind_rediscovery_benchmark(self, manifest, context) {
+                match execute_blind_rediscovery_benchmark(self, manifest, &fixture_path, context) {
                     Ok(observation) => self.evaluate_observation(manifest, &observation),
                     Err(error) => self.failed_result(
                         manifest,
@@ -1161,6 +1462,7 @@ impl ValidationRunner {
             evidence_class: evidence_class(manifest.mode.clone(), observation.synthetic_profile),
             runtime: None,
             benchmark_id: manifest.id.clone(),
+            digests: BenchmarkReportDigests::default(),
             vulnerability_class: manifest.vulnerability_class.clone(),
             target_profile: validation_target_profile(manifest, candidate, proof),
             expected_exploit_shape: manifest.expected_exploit_shape.clone(),
@@ -1229,7 +1531,7 @@ impl ValidationRunner {
                     .with_context(|| format!("create report directory {}", parent.display()))?;
             }
         }
-        let json = serde_json::to_string_pretty(report)?;
+        let json = serde_json::to_string_pretty(&report_for_serialization(report))?;
         write_atomic(output, json.as_bytes())
             .with_context(|| format!("write report {}", output.display()))
     }
@@ -1245,6 +1547,7 @@ impl ValidationRunner {
             evidence_class: evidence_class_for_manifest(manifest),
             runtime: None,
             benchmark_id: manifest.id.clone(),
+            digests: BenchmarkReportDigests::default(),
             vulnerability_class: manifest.vulnerability_class.clone(),
             target_profile: if manifest.target_profile_expectation.is_empty() {
                 target_profile_from_class(&manifest.vulnerability_class)
@@ -1304,6 +1607,7 @@ impl ValidationRunner {
             evidence_class: evidence_class_for_manifest(manifest),
             runtime: None,
             benchmark_id: manifest.id.clone(),
+            digests: BenchmarkReportDigests::default(),
             vulnerability_class: manifest.vulnerability_class.clone(),
             target_profile: if manifest.target_profile_expectation.is_empty() {
                 target_profile_from_class(&manifest.vulnerability_class)
@@ -1515,6 +1819,7 @@ impl ValidationRunner {
     fn execute_live_fork_benchmark(
         &self,
         manifest: &BenchmarkManifest,
+        fixture_path: &Path,
         context: &ValidationContext,
     ) -> Result<ValidationObservation> {
         let rpc_url = context
@@ -1534,25 +1839,14 @@ impl ValidationRunner {
             .clone()
             .unwrap_or_else(|| PathBuf::from("reports"));
 
-        let Some(fixture_path) = manifest.fixture.as_deref() else {
-            return Err(anyhow::anyhow!(
-                "mainnet-fork benchmark is missing a historical seed or trace fixture"
-            ));
-        };
-        if !Path::new(fixture_path).exists() {
-            return Err(anyhow::anyhow!(
-                "historical seed fixture `{fixture_path}` is missing"
-            ));
-        }
-
-        let raw = fs::read_to_string(fixture_path)
-            .with_context(|| format!("read live benchmark fixture {}", fixture_path))?;
-        let live_fixture =
-            serde_json::from_str::<LiveBenchmarkFixture>(&raw).unwrap_or(LiveBenchmarkFixture {
-                fork_cache: None,
-                fork_cache_profile: None,
-                provider_replay_only: false,
-            });
+        let raw = read_benchmark_text(
+            fixture_path,
+            BenchmarkReadKind::Fixture,
+            MAX_BENCHMARK_FIXTURE_BYTES,
+        )
+        .with_context(|| format!("read live benchmark fixture {}", fixture_path.display()))?;
+        let live_fixture = serde_json::from_str::<LiveBenchmarkFixture>(&raw)
+            .with_context(|| format!("parse live benchmark fixture {}", fixture_path.display()))?;
         let intelligence = SeedIntelligence::default();
         let mut candidates = intelligence
             .parse_historical_seed_json(&raw)
@@ -1562,53 +1856,61 @@ impl ValidationRunner {
         }
         anyhow::ensure!(
             !candidates.is_empty(),
-            "live benchmark fixture `{fixture_path}` did not yield any seed candidates"
+            "live benchmark fixture `{}` did not yield any seed candidates",
+            fixture_path.display()
         );
         let inputs = intelligence.historical_candidates_to_inputs(candidates, 0, 4);
         anyhow::ensure!(
             !inputs.is_empty(),
-            "live benchmark fixture `{fixture_path}` did not produce any executable inputs"
+            "live benchmark fixture `{}` did not produce any executable inputs",
+            fixture_path.display()
         );
         let input = select_best_live_input(inputs.into_iter().map(|(input, _)| input).collect());
 
         let started = std::time::Instant::now();
         let replay_verifier = ReplayVerifier::new(MAP_SIZE);
-        let explicit_fork_cache = live_fixture
-            .fork_cache
-            .map(|snapshot| (snapshot, false))
-            .or_else(|| {
-                live_fixture.fork_cache_profile.map(|profile| {
-                    (
-                        explicit_profile_fork_cache(manifest, profile).cache_snapshot(),
-                        true,
-                    )
+        let prepared_replay_cache = select_replay_cache(&live_fixture, manifest)?
+            .map(|selection| {
+                prepare_replay_cache(selection, fork_block, |snapshot| {
+                    validate_cached_fork_snapshot(snapshot, rpc_url, fork_block).map_err(|error| {
+                        anyhow::anyhow!(
+                            "explicit cached fork fixture failed live validation: {}",
+                            sanitize_report_error(&error.to_string())
+                        )
+                    })
                 })
-            });
-        let minimization_snapshot = explicit_fork_cache
+            })
+            .transpose()?;
+        let minimization_snapshot = prepared_replay_cache
             .as_ref()
-            .map(|(snapshot, _)| snapshot.clone());
+            .map(|cache| cache.snapshot.clone());
         let replay_economic_delta;
         anyhow::ensure!(
             !live_fixture.provider_replay_only,
             "provider_replay_only is unsupported: independent eth_call requests do not preserve sequence state or prove an invariant; use local EVM replay with a pinned fork/cache"
         );
-        let (execution, replay_backend, synthetic_profile) = if let Some((
-            snapshot,
-            synthetic_profile,
-        )) = explicit_fork_cache
+        let (execution, replay_backend, synthetic_profile) = if let Some(cache) =
+            prepared_replay_cache
         {
-            snapshot
-                .verify_content_digest()
-                .map_err(|error| anyhow::anyhow!("cached fork snapshot integrity: {error}"))?;
-            if !synthetic_profile {
-                validate_cached_fork_snapshot(&snapshot, rpc_url, fork_block)?;
-            }
-            let replay = replay_verifier.replay_with_economic_views(
-                &ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(snapshot))),
-                &block_env,
-                &input,
-                manifest.target_address(),
-            )?;
+            let synthetic_profile = !cache.production_eligible();
+            let replay = if synthetic_profile {
+                replay_verifier.replay_with_economic_views(
+                    &ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(cache.snapshot))),
+                    &block_env,
+                    &input,
+                    manifest.target_address(),
+                )?
+            } else {
+                replay_provenance_equivalent_explicit_cache(
+                    &replay_verifier,
+                    &cache.snapshot,
+                    rpc_url,
+                    fork_block,
+                    &block_env,
+                    &input,
+                    manifest.target_address(),
+                )?
+            };
             replay_economic_delta = Some(replay.delta);
             let backend = if synthetic_profile {
                 "synthetic-fork-cache-profile"
@@ -1699,7 +2001,10 @@ impl ValidationRunner {
             artifact_path: None,
             foundry_poc_path: None,
             synthetic_profile,
-            false_positive_notes: vec![format!("live-fork benchmark from `{fixture_path}`")],
+            false_positive_notes: vec![format!(
+                "live-fork benchmark from `{}`",
+                fixture_path.display()
+            )],
         };
 
         if let Some(notes) = &manifest.notes {
@@ -1718,7 +2023,8 @@ impl ValidationRunner {
             .push(format!("replay backend: {replay_backend}"));
         if synthetic_profile {
             observation.false_positive_notes.push(
-                "explicit synthetic profile: not live or cached production evidence".to_string(),
+                "explicit non-production profile: synthetic state or unauthenticated cached fork snapshot; excluded from production-live aggregates"
+                    .to_string(),
             );
         }
 
@@ -1810,6 +2116,7 @@ impl ValidationRunner {
 fn execute_blind_rediscovery_benchmark(
     _runner: &ValidationRunner,
     manifest: &BenchmarkManifest,
+    fixture_path: &Path,
     context: &ValidationContext,
 ) -> Result<ValidationObservation> {
     let rpc_url = context.rpc_url.as_deref();
@@ -1818,20 +2125,14 @@ fn execute_blind_rediscovery_benchmark(
         .report_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from("reports"));
-    let Some(fixture_path) = manifest.fixture.as_deref() else {
-        return Err(anyhow::anyhow!(
-            "blind rediscovery benchmark is missing a historical seed fixture"
-        ));
-    };
-
-    let raw = fs::read_to_string(fixture_path)
-        .with_context(|| format!("read blind benchmark fixture {}", fixture_path))?;
-    let live_fixture =
-        serde_json::from_str::<LiveBenchmarkFixture>(&raw).unwrap_or(LiveBenchmarkFixture {
-            fork_cache: None,
-            fork_cache_profile: None,
-            provider_replay_only: false,
-        });
+    let raw = read_benchmark_text(
+        fixture_path,
+        BenchmarkReadKind::Fixture,
+        MAX_BENCHMARK_FIXTURE_BYTES,
+    )
+    .with_context(|| format!("read blind benchmark fixture {}", fixture_path.display()))?;
+    let live_fixture = serde_json::from_str::<LiveBenchmarkFixture>(&raw)
+        .with_context(|| format!("parse blind benchmark fixture {}", fixture_path.display()))?;
 
     let intelligence = SeedIntelligence::default();
     let mut historical_candidates = intelligence.parse_historical_seed_json(&raw)?;
@@ -1840,7 +2141,8 @@ fn execute_blind_rediscovery_benchmark(
     }
     anyhow::ensure!(
         !historical_candidates.is_empty(),
-        "blind rediscovery fixture `{fixture_path}` did not yield any benign historical seed candidates"
+        "blind rediscovery fixture `{}` did not yield any benign historical seed candidates",
+        fixture_path.display()
     );
 
     let observed_callers = historical_candidates
@@ -1888,40 +2190,53 @@ fn execute_blind_rediscovery_benchmark(
     let candidate_input = EvmInput::new(candidate.sequence.clone(), 0);
 
     let started = std::time::Instant::now();
-    let explicit_fork_cache = live_fixture
-        .fork_cache
-        .map(|snapshot| (snapshot, false))
-        .or_else(|| {
-            live_fixture.fork_cache_profile.map(|profile| {
-                (
-                    explicit_profile_fork_cache(manifest, profile).cache_snapshot(),
-                    true,
-                )
+    let replay_cache = select_replay_cache(&live_fixture, manifest)?;
+    let expected_cache_block = match &replay_cache {
+        Some(ReplayCacheSelection::Explicit(_)) => {
+            fork_block.context("missing fork block for explicit cached replay")?
+        }
+        Some(ReplayCacheSelection::ProfileSynthetic(_)) => fork_block.unwrap_or_default(),
+        None => fork_block.unwrap_or_default(),
+    };
+    let prepared_replay_cache = replay_cache
+        .map(|selection| {
+            prepare_replay_cache(selection, expected_cache_block, |snapshot| {
+                let expected_rpc_url =
+                    rpc_url.context("missing RPC URL for explicit cached replay")?;
+                validate_cached_fork_snapshot(snapshot, expected_rpc_url, expected_cache_block)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "explicit cached fork fixture failed live validation: {}",
+                            sanitize_report_error(&error.to_string())
+                        )
+                    })
             })
-        });
+        })
+        .transpose()?;
     let replay_verifier = ReplayVerifier::new(MAP_SIZE);
     let block_env = context.block_env.clone().unwrap_or_default();
-    let (execution, replay_backend, replay_economic_delta, synthetic_profile) = if let Some((
-        snapshot,
-        synthetic_profile,
-    )) =
-        explicit_fork_cache
+    let (execution, replay_backend, replay_economic_delta, synthetic_profile) = if let Some(cache) =
+        prepared_replay_cache
     {
-        snapshot
-            .verify_content_digest()
-            .map_err(|error| anyhow::anyhow!("cached fork snapshot integrity: {error}"))?;
-        if !synthetic_profile {
-            let expected_fork_block = fork_block.context("missing fork block for cached replay")?;
-            let expected_rpc_url = rpc_url.context("missing RPC URL for cached replay")?;
-            validate_cached_fork_snapshot(&snapshot, expected_rpc_url, expected_fork_block)?;
-        }
-
-        let replay = replay_verifier.replay_with_economic_views(
-            &ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(snapshot))),
-            &block_env,
-            &candidate_input,
-            manifest.target_address(),
-        )?;
+        let synthetic_profile = !cache.production_eligible();
+        let replay = if synthetic_profile {
+            replay_verifier.replay_with_economic_views(
+                &ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(cache.snapshot))),
+                &block_env,
+                &candidate_input,
+                manifest.target_address(),
+            )?
+        } else {
+            replay_provenance_equivalent_explicit_cache(
+                &replay_verifier,
+                &cache.snapshot,
+                rpc_url.context("missing RPC URL for explicit cached replay")?,
+                expected_cache_block,
+                &block_env,
+                &candidate_input,
+                manifest.target_address(),
+            )?
+        };
         let backend = if synthetic_profile {
             "synthetic-fork-cache-profile"
         } else {
@@ -2000,7 +2315,10 @@ fn execute_blind_rediscovery_benchmark(
         foundry_poc_path: None,
         synthetic_profile,
         false_positive_notes: vec![
-            format!("blind rediscovery benchmark from `{fixture_path}`"),
+            format!(
+                "blind rediscovery benchmark from `{}`",
+                fixture_path.display()
+            ),
             format!(
                 "search driver: {}",
                 blind_search_driver_name(
@@ -2012,9 +2330,9 @@ fn execute_blind_rediscovery_benchmark(
         ],
     };
     if synthetic_profile {
-        observation
-            .false_positive_notes
-            .push("explicit synthetic profile: not live or cached production evidence".to_string());
+        observation.false_positive_notes.push(
+            "explicit synthetic profile: excluded from production-live aggregates".to_string(),
+        );
     }
 
     if !observation.findings.is_empty() {
@@ -2493,12 +2811,18 @@ fn ensure_fork_provenance_complete(
         provenance.block_number == Some(fork_block),
         "{evidence_kind} provenance block number does not match expected block {fork_block}"
     );
+    let block_hash = provenance.block_hash.as_deref().unwrap_or_default().trim();
     anyhow::ensure!(
-        provenance
-            .block_hash
-            .as_deref()
-            .is_some_and(|block_hash| !block_hash.trim().is_empty()),
+        !block_hash.is_empty(),
         "{evidence_kind} provenance is missing block hash"
+    );
+    let encoded_hash = block_hash.strip_prefix("0x").unwrap_or(block_hash);
+    anyhow::ensure!(
+        encoded_hash.len() == 64
+            && hex::decode(encoded_hash)
+                .map(|bytes| bytes.len() == 32)
+                .unwrap_or(false),
+        "{evidence_kind} provenance has an invalid block hash"
     );
     Ok(())
 }
@@ -2534,6 +2858,122 @@ fn validate_cached_fork_snapshot(
         )
         .map_err(|error| anyhow::anyhow!("cached fork snapshot is inconsistent: {error}"))?;
     Ok(())
+}
+
+fn ensure_execution_cache_coverage(
+    snapshot: &ForkDbCacheSnapshot,
+    execution: &SequenceExecutionResult,
+) -> anyhow::Result<()> {
+    let mut required_accounts = BTreeSet::new();
+    for tx in &execution.tx_results {
+        for observation in tx.call_trace.iter().chain(execution.call_trace.iter()) {
+            required_accounts.insert(observation.caller);
+            required_accounts.insert(observation.target);
+            if let Some(created) = observation.created_address {
+                required_accounts.insert(created);
+            }
+        }
+    }
+    let mut required_slots = BTreeSet::new();
+    for access in execution
+        .storage_reads
+        .iter()
+        .chain(execution.storage_writes.iter())
+    {
+        required_accounts.insert(access.address);
+        required_slots.insert((access.address, U256::from_be_bytes(access.slot.0)));
+    }
+    for diff in &execution.storage_diffs {
+        required_accounts.insert(diff.address);
+        required_slots.insert((diff.address, U256::from_be_bytes(diff.slot.0)));
+    }
+
+    let cached_accounts = snapshot
+        .accounts
+        .iter()
+        .map(|entry| entry.address)
+        .collect::<BTreeSet<_>>();
+    let missing_accounts = required_accounts
+        .difference(&cached_accounts)
+        .copied()
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        missing_accounts.is_empty(),
+        "explicit fork cache is partial: missing execution accounts {:?}",
+        missing_accounts
+    );
+
+    let cached_slots = snapshot
+        .storage
+        .iter()
+        .map(|entry| (entry.address, entry.slot))
+        .collect::<BTreeSet<_>>();
+    let missing_slots = required_slots
+        .difference(&cached_slots)
+        .copied()
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        missing_slots.is_empty(),
+        "explicit fork cache is partial: missing execution storage slots {:?}",
+        missing_slots
+    );
+    Ok(())
+}
+
+fn replay_provenance_equivalent_explicit_cache(
+    verifier: &ReplayVerifier,
+    snapshot: &ForkDbCacheSnapshot,
+    rpc_url: &str,
+    fork_block: u64,
+    block_env: &BlockEnv,
+    input: &EvmInput,
+    target: Option<Address>,
+) -> anyhow::Result<ReplayEconomicResult> {
+    validate_cached_fork_snapshot(snapshot, rpc_url, fork_block).map_err(|error| {
+        anyhow::anyhow!(
+            "explicit cached fork fixture failed live provenance validation: {}",
+            sanitize_report_error(&error.to_string())
+        )
+    })?;
+    let cached = verifier.replay_with_economic_views(
+        &ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(snapshot.clone()))),
+        block_env,
+        input,
+        target,
+    )?;
+    ensure_execution_cache_coverage(snapshot, &cached.execution)?;
+
+    let live_db = ForkDb::new(rpc_url, fork_block);
+    let observed = live_db.refresh_remote_provenance().map_err(|error| {
+        anyhow::anyhow!(
+            "explicit cached fork fixture live replay could not validate provenance: {}",
+            sanitize_report_error(&error.to_string())
+        )
+    })?;
+    ensure_fork_provenance_complete(
+        &observed,
+        fork_block,
+        "live replay used to verify explicit cached fork fixture",
+    )?;
+    let live = verifier.replay_with_economic_views(
+        &ChainState::Evm(CacheDB::new(live_db)),
+        block_env,
+        input,
+        target,
+    )?;
+    let cached_digest = sha256_digest(
+        &serde_json::to_vec(&cached)
+            .map_err(|error| anyhow::anyhow!("encode cached replay: {error}"))?,
+    );
+    let live_digest = sha256_digest(
+        &serde_json::to_vec(&live)
+            .map_err(|error| anyhow::anyhow!("encode live replay: {error}"))?,
+    );
+    anyhow::ensure!(
+        cached == live,
+        "explicit fork cache is partial or not execution-equivalent: cached_digest={cached_digest}, live_digest={live_digest}"
+    );
+    Ok(cached)
 }
 
 fn live_minimized_status(
@@ -2663,20 +3103,160 @@ pub fn snapshot_weights_for_manifest(manifest: &BenchmarkManifest) -> SnapshotSc
     SnapshotScoreWeights::for_known_bug_class(&hints.join(" "))
 }
 
-fn load_manifest_file(path: &Path) -> Result<BenchmarkManifest> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("read benchmark manifest {}", path.display()))?;
-    match path.extension().and_then(|ext| ext.to_str()) {
+fn authoritative_manifest_root(path: &Path) -> Result<PathBuf> {
+    let start = if path.is_dir() {
+        path
+    } else {
+        path.parent().ok_or_else(|| {
+            anyhow::anyhow!("benchmark manifest has no authoritative parent directory")
+        })?
+    };
+    for ancestor in start.ancestors() {
+        let cargo_manifest = ancestor.join("Cargo.toml");
+        if !cargo_manifest.is_file() {
+            continue;
+        }
+        let raw = read_benchmark_text(
+            &cargo_manifest,
+            BenchmarkReadKind::WorkspaceManifest,
+            MAX_CARGO_WORKSPACE_MANIFEST_BYTES,
+        )?;
+        let value = toml::from_str::<toml::Table>(&raw).with_context(|| {
+            format!(
+                "parse Cargo workspace manifest {}",
+                cargo_manifest.display()
+            )
+        })?;
+        if value.contains_key("workspace") {
+            return ancestor.canonicalize().with_context(|| {
+                format!(
+                    "canonicalize benchmark workspace root {}",
+                    ancestor.display()
+                )
+            });
+        }
+    }
+
+    let fallback = if path.is_dir() {
+        path
+    } else {
+        path.parent().ok_or_else(|| {
+            anyhow::anyhow!("benchmark manifest has no authoritative parent directory")
+        })?
+    };
+    fallback.canonicalize().with_context(|| {
+        format!(
+            "canonicalize benchmark manifest root {}",
+            fallback.display()
+        )
+    })
+}
+
+fn load_manifest_file(path: &Path, manifest_root: &Path) -> Result<BenchmarkManifest> {
+    let raw = read_benchmark_text(
+        path,
+        BenchmarkReadKind::Manifest,
+        MAX_BENCHMARK_MANIFEST_BYTES,
+    )
+    .with_context(|| format!("read benchmark manifest {}", path.display()))?;
+    let mut manifest: BenchmarkManifest = match path.extension().and_then(|ext| ext.to_str()) {
         Some("json") => serde_json::from_str(&raw)
-            .with_context(|| format!("parse JSON benchmark manifest {}", path.display())),
+            .with_context(|| format!("parse JSON benchmark manifest {}", path.display()))?,
         Some("toml") => toml::from_str(&raw)
-            .with_context(|| format!("parse TOML benchmark manifest {}", path.display())),
+            .with_context(|| format!("parse TOML benchmark manifest {}", path.display()))?,
         other => anyhow::bail!(
             "unsupported benchmark manifest extension {:?} for {}",
             other,
             path.display()
         ),
+    };
+    manifest.manifest_root = Some(manifest_root.to_path_buf());
+    manifest.resolved_fixture = manifest.resolve_fixture_path()?;
+    Ok(manifest)
+}
+
+fn sha256_digest(bytes: &[u8]) -> String {
+    format!("sha256:{}", sha256_hex(bytes))
+}
+
+fn sanitized_rpc_origin(raw: Option<&str>) -> Option<String> {
+    let mut url = Url::parse(raw?).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
     }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_path("/");
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.origin().ascii_serialization())
+}
+
+fn benchmark_config_payload(manifest: &BenchmarkManifest, context: &ValidationContext) -> Value {
+    serde_json::json!({
+        "rpc_origin": sanitized_rpc_origin(context.rpc_url.as_deref()),
+        "rpc_provenance": {
+            "chain": manifest.chain.as_deref(),
+            "fork_block": manifest.fork_block.or(context.fork_block),
+            "block_env_number": context.block_env.as_ref().map(|block| block.number.to_string()),
+        },
+        "fork_block": context.fork_block,
+        "block_env": context.block_env.as_ref().map(|block| format!("{block:?}")),
+        "report_dir": context.report_dir.as_deref().map(|path| path.display().to_string()),
+    })
+}
+
+fn benchmark_report_digests(
+    manifest: &BenchmarkManifest,
+    context: &ValidationContext,
+) -> BenchmarkReportDigests {
+    let manifest_digest = sha256_digest(&serde_json::to_vec(manifest).unwrap_or_default());
+    let resolved_fixture = manifest
+        .resolved_fixture
+        .clone()
+        .or_else(|| manifest.resolve_fixture_path().ok().flatten());
+    let fixture_digest = resolved_fixture.as_deref().and_then(|path| {
+        read_benchmark_text(
+            path,
+            BenchmarkReadKind::Fixture,
+            MAX_BENCHMARK_FIXTURE_BYTES,
+        )
+        .ok()
+        .map(|raw| sha256_digest(raw.as_bytes()))
+    });
+    let mut input_payload = Vec::new();
+    input_payload.extend_from_slice(b"manifest:");
+    input_payload.extend_from_slice(manifest_digest.as_bytes());
+    input_payload.push(b'\0');
+    input_payload.extend_from_slice(b"fixture:");
+    input_payload.extend_from_slice(fixture_digest.as_deref().unwrap_or("").as_bytes());
+    let config_payload = benchmark_config_payload(manifest, context);
+    BenchmarkReportDigests {
+        input_digest: sha256_digest(&input_payload),
+        config_digest: sha256_digest(&serde_json::to_vec(&config_payload).unwrap_or_default()),
+        manifest_digest,
+        fixture_digest,
+    }
+}
+
+fn redact_report_note(note: &str) -> String {
+    redact_external_output(note.as_bytes(), MAX_EXTERNAL_OUTPUT_BYTES)
+}
+
+fn report_for_serialization(report: &ValidationReport) -> ValidationReport {
+    let mut redacted = report.clone();
+    redacted
+        .calibration
+        .false_positive_budget_notes
+        .iter_mut()
+        .for_each(|note| *note = redact_report_note(note));
+    redacted.benchmarks.iter_mut().for_each(|benchmark| {
+        benchmark
+            .false_positive_notes
+            .iter_mut()
+            .for_each(|note| *note = redact_report_note(note));
+    });
+    redacted
 }
 
 fn is_manifest_path(path: &Path) -> bool {
@@ -2695,13 +3275,16 @@ fn evidence_class(mode: BenchmarkMode, synthetic_profile: bool) -> BenchmarkEvid
 }
 
 fn evidence_class_for_manifest(manifest: &BenchmarkManifest) -> BenchmarkEvidenceClass {
-    let synthetic_profile = manifest
-        .fixture
-        .as_deref()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|raw| serde_json::from_str::<LiveBenchmarkFixture>(&raw).ok())
-        .is_some_and(|fixture| fixture.fork_cache_profile.is_some());
-    evidence_class(manifest.mode.clone(), synthetic_profile)
+    if matches!(
+        manifest.mode,
+        BenchmarkMode::MainnetFork | BenchmarkMode::BlindRediscovery
+    ) {
+        // A skipped or failed live benchmark has not authenticated RPC/cache
+        // provenance, so it must not enter production-live aggregates.
+        BenchmarkEvidenceClass::SyntheticRegression
+    } else {
+        evidence_class(manifest.mode.clone(), false)
+    }
 }
 
 fn report_from_results(results: Vec<BenchmarkValidationResult>) -> ValidationReport {
@@ -2753,7 +3336,7 @@ fn report_from_results(results: Vec<BenchmarkValidationResult>) -> ValidationRep
         .cloned()
         .collect::<Vec<_>>();
     let calibration = calibration_from_results(&calibration_results, &results);
-    ValidationReport {
+    report_for_serialization(&ValidationReport {
         generated_at_unix_secs: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -2762,7 +3345,7 @@ fn report_from_results(results: Vec<BenchmarkValidationResult>) -> ValidationRep
         coverage,
         calibration,
         benchmarks: results,
-    }
+    })
 }
 
 fn calibration_from_results(
@@ -3298,7 +3881,9 @@ mod tests {
             vulnerability_class: VulnerabilityClass::Erc4626ShareInflation,
             mode: BenchmarkMode::LocalFixture,
             target: Some("0x1111111111111111111111111111111111111111".to_string()),
-            fixture: Some("fixtures/ERC4626ShareInflation.sol".to_string()),
+            fixture: None,
+            manifest_root: None,
+            resolved_fixture: None,
             chain: None,
             fork_block: None,
             setup_requirements: vec!["fund attacker with asset token".to_string()],
@@ -3429,17 +4014,37 @@ mod tests {
         }
     }
 
+    fn rooted_fixture(path: &str) -> (String, PathBuf) {
+        let path = Path::new(path);
+        if path.is_absolute() {
+            (
+                path.file_name()
+                    .expect("absolute fixture file name")
+                    .to_string_lossy()
+                    .into_owned(),
+                path.parent()
+                    .expect("absolute fixture parent")
+                    .to_path_buf(),
+            )
+        } else {
+            (path.to_string_lossy().into_owned(), PathBuf::from("."))
+        }
+    }
+
     fn fixture_manifest(
         path: &str,
         class: VulnerabilityClass,
         criteria: Vec<SuccessCriterion>,
     ) -> BenchmarkManifest {
+        let (fixture, manifest_root) = rooted_fixture(path);
         BenchmarkManifest {
             id: format!("test-{}", class_name(&class)),
             vulnerability_class: class,
             mode: BenchmarkMode::LocalFixture,
             target: Some("0x1111111111111111111111111111111111111111".to_string()),
-            fixture: Some(path.to_string()),
+            fixture: Some(fixture),
+            manifest_root: Some(manifest_root),
+            resolved_fixture: None,
             chain: None,
             fork_block: None,
             setup_requirements: vec!["synthetic setup".to_string()],
@@ -3472,12 +4077,15 @@ mod tests {
     }
 
     fn live_manifest(path: &str, class: VulnerabilityClass) -> BenchmarkManifest {
+        let (fixture, manifest_root) = rooted_fixture(path);
         BenchmarkManifest {
             id: format!("live-{}", class_name(&class)),
             vulnerability_class: class,
             mode: BenchmarkMode::MainnetFork,
             target: Some("0x1111111111111111111111111111111111111111".to_string()),
-            fixture: Some(path.to_string()),
+            fixture: Some(fixture),
+            manifest_root: Some(manifest_root),
+            resolved_fixture: None,
             chain: Some("evm".to_string()),
             fork_block: Some(123),
             setup_requirements: vec!["forked mainnet replay".to_string()],
@@ -3512,6 +4120,23 @@ mod tests {
             seed_hints: vec!["deposit".to_string()],
             notes: Some("live-fork example manifest".to_string()),
         }
+    }
+
+    fn validated_cache_snapshot(block_number: u64) -> ForkDbCacheSnapshot {
+        let mut snapshot = ForkDb::empty().cache_snapshot();
+        snapshot.block_tag = block_number.to_string();
+        snapshot.provenance = ForkCacheProvenance {
+            provider_sanitized: "https://rpc.example".to_string(),
+            chain_id: Some(1),
+            block_number: Some(block_number),
+            block_hash: Some(format!("0x{:064x}", block_number)),
+            fetched_at_unix: Some(1),
+            cache_id: Some(format!("cache-{block_number}")),
+        };
+        snapshot.content_digest = snapshot
+            .calculate_content_digest()
+            .expect("calculate valid cache snapshot digest");
+        snapshot
     }
 
     fn class_name(class: &VulnerabilityClass) -> &'static str {
@@ -3625,6 +4250,402 @@ success_criteria = ["expected_finding", "invariant_violation"]
         assert!(parsed.provider_replay_only);
         assert!(parsed.fork_cache.is_none());
         assert!(parsed.fork_cache_profile.is_none());
+    }
+
+    #[test]
+    fn loaded_manifest_records_verified_manifest_and_fixture_digests() {
+        let base = std::env::temp_dir().join(format!(
+            "rusty_fuzz_manifest_digests_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&base).expect("create digest fixture directory");
+        let fixture = base.join("fixture.json");
+        let manifest_path = base.join("manifest.json");
+        let manifest = fixture_manifest(
+            fixture.to_str().expect("utf8 fixture path"),
+            VulnerabilityClass::Erc4626ShareInflation,
+            vec![SuccessCriterion::ExpectedFinding],
+        );
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("encode manifest"),
+        )
+        .expect("write manifest");
+        fs::write(&fixture, br#"{"outcome":"not_found"}"#).expect("write fixture");
+
+        let loaded = ValidationRunner::load_manifests(&manifest_path)
+            .expect("load digest manifest")
+            .remove(0);
+        let context = ValidationContext {
+            rpc_url: Some("https://user:password@rpc.example/key".to_string()),
+            fork_block: Some(321),
+            block_env: None,
+            report_dir: None,
+        };
+        let digests = benchmark_report_digests(&loaded, &context);
+
+        assert_eq!(digests.manifest_digest.len(), "sha256:".len() + 64);
+        assert_eq!(
+            digests.fixture_digest.as_deref().map(str::len),
+            Some("sha256:".len() + 64)
+        );
+        assert_eq!(digests.input_digest.len(), "sha256:".len() + 64);
+        assert_eq!(digests.config_digest.len(), "sha256:".len() + 64);
+        assert_ne!(digests.input_digest, digests.manifest_digest);
+        assert_ne!(digests.input_digest, digests.fixture_digest.unwrap());
+
+        let result = ValidationRunner.run_manifest_with_context(&loaded, &context);
+        let serialized = serde_json::to_string(&result).expect("digest result serializes");
+        assert!(serialized.contains(&result.digests.input_digest));
+        assert!(serialized.contains(&result.digests.config_digest));
+        assert!(serialized.contains(&result.digests.manifest_digest));
+        assert!(serialized.contains(result.digests.fixture_digest.as_deref().unwrap()));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn benchmark_config_digest_uses_only_sanitized_rpc_origin_and_provenance() {
+        let base_context = ValidationContext {
+            rpc_url: Some(
+                "https://user:password@RPC.Example:8443/private/key?api_key=secret#fragment"
+                    .to_string(),
+            ),
+            fork_block: Some(321),
+            block_env: Some(BlockEnv {
+                number: U256::from(321u64),
+                ..Default::default()
+            }),
+            report_dir: None,
+        };
+        let mut alternate_context = base_context.clone();
+        alternate_context.rpc_url =
+            Some("https://other:credentials@rpc.example:8443/another/path?token=other".to_string());
+
+        let payload = benchmark_config_payload(&manifest(), &base_context);
+        let serialized = serde_json::to_string(&payload).expect("config payload serializes");
+        assert_eq!(payload["rpc_origin"], "https://rpc.example:8443");
+        assert_eq!(payload["rpc_provenance"]["fork_block"], 321);
+        assert_eq!(payload["rpc_provenance"]["block_env_number"], "321");
+        assert!(!serialized.contains("password"));
+        assert!(!serialized.contains("secret"));
+        assert_eq!(
+            benchmark_report_digests(&manifest(), &base_context).config_digest,
+            benchmark_report_digests(&manifest(), &alternate_context).config_digest,
+            "credentials and request paths must not affect the RPC origin digest"
+        );
+    }
+
+    #[test]
+    fn explicit_fork_cache_rejects_execution_state_missing_from_the_snapshot() {
+        let snapshot = validated_cache_snapshot(123);
+        let error = ensure_execution_cache_coverage(&snapshot, &fixture_execution())
+            .expect_err("a production cache must contain every account and slot used by execution");
+        assert!(
+            error.to_string().contains("partial"),
+            "unexpected partial-cache error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn write_report_redacts_notes_before_serialization() {
+        let base = std::env::temp_dir().join(format!(
+            "rusty_fuzz_note_redaction_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&base).expect("create report directory");
+        let report_path = base.join("report.json");
+        let mut report = ValidationRunner::report_from_results(Vec::new());
+        report
+            .calibration
+            .false_positive_budget_notes
+            .push("https://user:password@rpc.example/secret?api_key=do-not-serialize".to_string());
+        let mut result = ValidationRunner.skipped_result(
+            &manifest(),
+            ValidationStatus::NotRunMissingFixture,
+            "safe reason".to_string(),
+        );
+        result.false_positive_notes = vec![
+            "authorization: Bearer benchmark-secret".to_string(),
+            "ordinary note remains".to_string(),
+        ];
+        report.benchmarks.push(result);
+        let report = report_for_serialization(&report);
+
+        ValidationRunner
+            .write_report(&report, &report_path)
+            .expect("write redacted report");
+        let serialized = fs::read_to_string(&report_path).expect("read redacted report");
+
+        assert!(!serialized.contains("benchmark-secret"));
+        assert!(!serialized.contains("user:password@rpc.example"));
+        assert!(serialized.contains("ordinary note remains"));
+        assert!(serialized.contains("<redacted>") || serialized.contains("<rpc-url>"));
+        assert!(!report.benchmarks[0].false_positive_notes[0].contains("benchmark-secret"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn bounded_benchmark_reads_accept_exact_limit_and_reject_oversize() {
+        let base = std::env::temp_dir().join(format!(
+            "rusty_fuzz_bounded_reads_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&base).expect("create bounded read root");
+        let path = base.join("fixture.json");
+        let limit = 32_u64;
+        let limit_bytes = usize::try_from(limit).expect("test limit fits usize");
+        fs::write(&path, vec![b'a'; limit_bytes]).expect("write boundary fixture");
+
+        assert_eq!(
+            read_benchmark_text(&path, BenchmarkReadKind::Fixture, limit)
+                .expect("read exact-size fixture")
+                .len(),
+            limit_bytes
+        );
+
+        fs::write(
+            &path,
+            vec![b'a'; usize::try_from(limit + 1).expect("test limit fits usize")],
+        )
+        .expect("write oversize fixture");
+        let error = read_benchmark_text(&path, BenchmarkReadKind::Fixture, limit)
+            .expect_err("reject oversize fixture");
+        assert!(
+            error.to_string().contains("exceeds limit"),
+            "unexpected bounded read error: {error:#}"
+        );
+
+        let manifest_path = base.join("manifest.toml");
+        let manifest_limit = 8_u64;
+        let manifest_limit_bytes =
+            usize::try_from(manifest_limit).expect("manifest test limit fits usize");
+        fs::write(&manifest_path, vec![b'b'; manifest_limit_bytes])
+            .expect("write boundary benchmark manifest");
+        assert_eq!(
+            read_benchmark_text(&manifest_path, BenchmarkReadKind::Manifest, manifest_limit)
+                .expect("read exact-size benchmark manifest")
+                .len(),
+            manifest_limit_bytes
+        );
+        fs::write(
+            &manifest_path,
+            vec![
+                b'b';
+                usize::try_from(manifest_limit + 1).expect("manifest test limit fits usize")
+            ],
+        )
+        .expect("write oversize benchmark manifest");
+        let error =
+            read_benchmark_text(&manifest_path, BenchmarkReadKind::Manifest, manifest_limit)
+                .expect_err("reject oversize benchmark manifest");
+        assert!(
+            error.to_string().contains("exceeds limit"),
+            "unexpected manifest bounded read error: {error:#}"
+        );
+
+        fs::write(&path, vec![0xff; limit_bytes]).expect("write invalid UTF-8 fixture");
+        let error = read_benchmark_text(&path, BenchmarkReadKind::Fixture, limit)
+            .expect_err("reject invalid UTF-8 fixture");
+        assert!(
+            error.to_string().contains("valid UTF-8"),
+            "unexpected UTF-8 error: {error:#}"
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn explicit_fork_cache_is_production_only_after_provenance_validation() {
+        let fixture = LiveBenchmarkFixture {
+            fork_cache: Some(validated_cache_snapshot(123)),
+            fork_cache_profile: None,
+            provider_replay_only: false,
+        };
+        let cache = select_replay_cache(
+            &fixture,
+            &live_manifest(
+                "benchmarks/live/fixtures/access-control-live.json",
+                VulnerabilityClass::AccessControlBypass,
+            ),
+        )
+        .expect("explicit cache selection succeeds")
+        .expect("explicit cache is selected");
+        assert!(matches!(cache, ReplayCacheSelection::Explicit(_)));
+
+        let mut validation_calls = 0;
+        let prepared = prepare_replay_cache(cache, 123, |_snapshot| {
+            validation_calls += 1;
+            Ok(())
+        })
+        .expect("validated explicit cache");
+        assert_eq!(validation_calls, 1);
+        assert!(!prepared.synthetic_profile);
+        assert!(prepared.production_eligible());
+
+        let rejected = prepare_replay_cache(
+            ReplayCacheSelection::Explicit(validated_cache_snapshot(123)),
+            123,
+            |_| Err(anyhow::anyhow!("provider validation rejected cache")),
+        )
+        .expect_err("failed live validation cannot yield production evidence");
+        assert!(rejected
+            .to_string()
+            .contains("provider validation rejected"));
+    }
+
+    #[test]
+    fn profile_fork_cache_stays_synthetic_and_skips_explicit_validation() {
+        let fixture = LiveBenchmarkFixture {
+            fork_cache: None,
+            fork_cache_profile: Some(LiveForkCacheProfile::Noop),
+            provider_replay_only: false,
+        };
+        let cache = select_replay_cache(
+            &fixture,
+            &live_manifest(
+                "benchmarks/live/fixtures/access-control-live.json",
+                VulnerabilityClass::AccessControlBypass,
+            ),
+        )
+        .expect("profile cache selection succeeds")
+        .expect("profile cache is selected");
+        assert!(matches!(cache, ReplayCacheSelection::ProfileSynthetic(_)));
+
+        let mut validation_calls = 0;
+        let prepared = prepare_replay_cache(cache, 123, |_snapshot| {
+            validation_calls += 1;
+            Ok(())
+        })
+        .expect("profile cache is synthetic by construction");
+        assert_eq!(validation_calls, 0);
+        assert!(prepared.synthetic_profile);
+        assert!(!prepared.production_eligible());
+    }
+
+    #[test]
+    fn explicit_fork_cache_rejects_incomplete_or_wrong_block_provenance() {
+        let valid = validated_cache_snapshot(123);
+        let mut wrong_block = valid.clone();
+        wrong_block.provenance.block_number = Some(122);
+        wrong_block.content_digest = wrong_block
+            .calculate_content_digest()
+            .expect("recalculate digest");
+        let error =
+            prepare_replay_cache(ReplayCacheSelection::Explicit(wrong_block), 123, |_| Ok(()))
+                .expect_err("wrong explicit block must fail before classification");
+        assert!(error
+            .to_string()
+            .contains("does not match expected block 123"));
+
+        let mut bad_hash = valid.clone();
+        bad_hash.provenance.block_hash = Some("0xnot-a-block-hash".to_string());
+        bad_hash.content_digest = bad_hash
+            .calculate_content_digest()
+            .expect("recalculate digest");
+        let error = prepare_replay_cache(ReplayCacheSelection::Explicit(bad_hash), 123, |_| Ok(()))
+            .expect_err("malformed explicit block hash must fail");
+        assert!(error.to_string().contains("block hash"));
+
+        let mut missing_provider = valid;
+        missing_provider.provenance.provider_sanitized.clear();
+        missing_provider.content_digest = missing_provider
+            .calculate_content_digest()
+            .expect("recalculate digest");
+        let error = prepare_replay_cache(
+            ReplayCacheSelection::Explicit(missing_provider),
+            123,
+            |_| Ok(()),
+        )
+        .expect_err("missing explicit provider must fail");
+        assert!(error.to_string().contains("missing provider"));
+    }
+
+    #[test]
+    fn repository_manifest_loads_from_workspace_path_when_cwd_is_elsewhere() {
+        const CHILD_MARKER: &str = "RUSTYFUZZ_BENCHMARK_CWD_CHILD";
+        const CHILD_MANIFEST: &str = "RUSTYFUZZ_BENCHMARK_CWD_MANIFEST";
+        const CHILD_CWD: &str = "RUSTYFUZZ_BENCHMARK_CWD_PATH";
+        let test_name = "engine::benchmark::tests::repository_manifest_loads_from_workspace_path_when_cwd_is_elsewhere";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let manifest = PathBuf::from(
+                std::env::var_os(CHILD_MANIFEST).expect("child manifest path env var"),
+            );
+            let other_cwd = PathBuf::from(
+                std::env::var_os(CHILD_CWD).expect("child working directory env var"),
+            );
+            std::env::set_current_dir(other_cwd).expect("change child process cwd");
+            let loaded = ValidationRunner::load_manifests(&manifest)
+                .expect("load repository manifest from another cwd");
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(
+                loaded[0].manifest_root.as_deref(),
+                Some(
+                    manifest
+                        .ancestors()
+                        .nth(3)
+                        .expect("workspace root")
+                        .canonicalize()
+                        .expect("canonical workspace root")
+                        .as_path()
+                )
+            );
+            return;
+        }
+
+        let base = std::env::temp_dir().join(format!(
+            "rusty_fuzz_repository_manifest_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let workspace = base.join("workspace");
+        let manifest_dir = workspace.join("benchmarks/live");
+        let fixture_dir = workspace.join("benchmarks/live/fixtures");
+        let other_cwd = base.join("other-cwd");
+        fs::create_dir_all(&manifest_dir).expect("create benchmark directory");
+        fs::create_dir_all(&fixture_dir).expect("create fixture directory");
+        fs::create_dir_all(&other_cwd).expect("create alternate cwd");
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\".\"]\nresolver = \"2\"\n",
+        )
+        .expect("write workspace manifest");
+        fs::write(
+            fixture_dir.join("tiny.json"),
+            r#"{"chain_id":1,"block_number":123,"transactions":[]}"#,
+        )
+        .expect("write repository fixture");
+        let manifest_path = manifest_dir.join("tiny.toml");
+        fs::write(
+            &manifest_path,
+            r#"id = "tiny-live"
+class = "oracle_manipulation"
+mode = "mainnet_fork"
+target = "0x1111111111111111111111111111111111111111"
+fixture = "benchmarks/live/fixtures/tiny.json"
+fork_block = 123
+success_criteria = ["expected_finding"]
+"#,
+        )
+        .expect("write repository benchmark manifest");
+
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env(CHILD_MANIFEST, &manifest_path)
+            .env(CHILD_CWD, &other_cwd)
+            .current_dir(&other_cwd)
+            .status()
+            .expect("run benchmark manifest cwd child test");
+        assert!(
+            status.success(),
+            "repository manifest child test failed: {status}"
+        );
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -3820,7 +4841,7 @@ success_criteria = ["expected_finding", "invariant_violation"]
         assert!(result
             .false_positive_notes
             .iter()
-            .any(|note| note.contains("not live or cached production evidence")));
+            .any(|note| note.contains("excluded from production-live aggregates")));
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -3860,7 +4881,9 @@ success_criteria = ["expected_finding", "invariant_violation"]
             vulnerability_class: VulnerabilityClass::Erc4626ShareInflation,
             mode: BenchmarkMode::BlindRediscovery,
             target: Some("0x1111111111111111111111111111111111111111".to_string()),
-            fixture: Some(fixture_path.to_string_lossy().to_string()),
+            fixture: Some("blind.json".to_string()),
+            manifest_root: Some(base.clone()),
+            resolved_fixture: None,
             chain: Some("evm".to_string()),
             fork_block: Some(123),
             setup_requirements: vec!["blind rediscovery".to_string()],
@@ -3912,7 +4935,7 @@ success_criteria = ["expected_finding", "invariant_violation"]
         assert!(result
             .false_positive_notes
             .iter()
-            .any(|note| note.contains("not live or cached production evidence")));
+            .any(|note| note.contains("excluded from production-live aggregates")));
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -3950,7 +4973,9 @@ success_criteria = ["expected_finding", "invariant_violation"]
             vulnerability_class: VulnerabilityClass::AccessControlBypass,
             mode: BenchmarkMode::BlindRediscovery,
             target: Some("0x1111111111111111111111111111111111111111".to_string()),
-            fixture: Some(fixture_path.to_string_lossy().to_string()),
+            fixture: Some("blind-confirmed.json".to_string()),
+            manifest_root: Some(base.clone()),
+            resolved_fixture: None,
             chain: Some("evm".to_string()),
             fork_block: Some(123),
             setup_requirements: vec!["blind rediscovery".to_string()],
@@ -4174,6 +5199,138 @@ success_criteria = ["expected_finding", "invariant_violation"]
             permission_weights.storage_slot_sensitivity > default_weights.storage_slot_sensitivity
         );
         assert!(permission_weights.selector_novelty > default_weights.selector_novelty);
+    }
+
+    #[test]
+    fn benchmark_manifest_fixture_cannot_fall_back_to_cwd_outside_authoritative_root() {
+        let base = std::env::temp_dir().join(format!(
+            "rusty_fuzz_manifest_root_escape_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&base).expect("create manifest root");
+        let manifest_path = base.join("manifest.json");
+        let manifest = fixture_manifest(
+            "benchmarks/historical/negative_controls/fixtures/erc20-owner-mint.json",
+            VulnerabilityClass::Erc4626ShareInflation,
+            vec![SuccessCriterion::ExpectedFinding],
+        );
+        let mut unrooted = manifest.clone();
+        unrooted.manifest_root = None;
+        assert!(unrooted.resolve_fixture_path().is_err());
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("encode manifest"),
+        )
+        .expect("write manifest");
+
+        assert!(ValidationRunner::load_manifests(&manifest_path).is_err());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn benchmark_manifest_fixtures_are_relative_canonical_and_non_symlinked() {
+        let base = std::env::temp_dir().join(format!(
+            "rusty_fuzz_manifest_paths_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(base.join("nested")).expect("create benchmark root");
+        fs::write(base.join("fixture.json"), r#"{"outcome":"not_found"}"#).expect("write fixture");
+        fs::write(
+            base.join("nested/fixture.json"),
+            r#"{"outcome":"not_found"}"#,
+        )
+        .expect("write nested fixture");
+        let mut manifest = fixture_manifest(
+            base.join("nested/fixture.json")
+                .to_str()
+                .expect("utf8 fixture path"),
+            VulnerabilityClass::Erc4626ShareInflation,
+            vec![SuccessCriterion::ExpectedFinding],
+        );
+        manifest.fixture = Some("nested/../fixture.json".to_string());
+        let manifest_path = base.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("encode manifest"),
+        )
+        .expect("write manifest");
+        assert!(ValidationRunner::load_manifests(&manifest_path).is_err());
+
+        manifest.fixture = Some("nested/fixture.json".to_string());
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("encode manifest"),
+        )
+        .expect("write manifest");
+        let loaded = ValidationRunner::load_manifests(&manifest_path)
+            .expect("load contained manifest")
+            .remove(0);
+        assert_eq!(
+            loaded
+                .resolve_fixture_path()
+                .expect("resolve contained fixture"),
+            Some(
+                base.join("nested/fixture.json")
+                    .canonicalize()
+                    .expect("canonical fixture"),
+            )
+        );
+
+        manifest.fixture = Some(base.join("fixture.json").to_string_lossy().into_owned());
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("encode manifest"),
+        )
+        .expect("write manifest");
+        assert!(ValidationRunner::load_manifests(&manifest_path).is_err());
+        manifest.fixture = Some("../fixture.json".to_string());
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("encode manifest"),
+        )
+        .expect("write manifest");
+        assert!(ValidationRunner::load_manifests(&manifest_path).is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(base.join("fixture.json"), base.join("nested/link.json"))
+                .expect("create fixture symlink");
+            manifest.fixture = Some("nested/link.json".to_string());
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec(&manifest).expect("encode manifest"),
+            )
+            .expect("write manifest");
+            assert!(ValidationRunner::load_manifests(&manifest_path).is_err());
+        }
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn unauthenticated_cached_fork_fixture_is_non_production() {
+        let base = std::env::temp_dir().join(format!(
+            "rusty_fuzz_cached_evidence_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&base).expect("create cached evidence root");
+        let fixture_path = base.join("fixture.json");
+        let snapshot = ForkDb::empty().cache_snapshot();
+        fs::write(
+            &fixture_path,
+            serde_json::to_vec(&serde_json::json!({ "fork_cache": snapshot }))
+                .expect("encode cached fixture"),
+        )
+        .expect("write cached fixture");
+        let mut manifest = live_manifest(
+            fixture_path.to_str().expect("utf8 fixture path"),
+            VulnerabilityClass::OracleManipulation,
+        );
+        manifest.resolved_fixture = Some(fixture_path.canonicalize().expect("canonical fixture"));
+        assert_eq!(
+            evidence_class_for_manifest(&manifest),
+            BenchmarkEvidenceClass::SyntheticRegression
+        );
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

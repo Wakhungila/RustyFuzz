@@ -2,63 +2,72 @@ use crate::satori::types::{SatoriReport, ValidationStatus};
 
 pub fn render_markdown(report: &SatoriReport) -> String {
     let mut out = String::new();
-    out.push_str(&format!("# Satori Report `{}`\n\n", report.run_id));
+    out.push_str(&format!("# Satori Report {}\n\n", md_code(&report.run_id)));
     out.push_str("## Repository Summary\n\n");
-    out.push_str(&report.project_summary);
+    out.push_str(&md_block(&report.project_summary));
     out.push_str("\n\n## Tool Status\n\n");
     for tool in &report.tool_status {
         out.push_str(&format!(
-            "- `{}`: available={}, success={} {}\n",
-            tool.command, tool.available, tool.success, tool.stderr_snippet
+            "- command={} available={}, success={} stderr={}\n",
+            md_code(&tool.command),
+            tool.available,
+            tool.success,
+            md_code(&tool.stderr_snippet)
         ));
     }
     out.push_str("\n## Protocol Model\n\n");
     out.push_str(&format!(
-        "- Types: {:?}\n- Confidence: {:.2}\n- Explanation: {}\n",
-        report.protocol_model.protocol_types,
-        report.protocol_model.confidence,
-        report.protocol_model.explanation
+        "- Types: {:?}\n- Confidence: {:.2}\n",
+        report.protocol_model.protocol_types, report.protocol_model.confidence
     ));
+    out.push_str(&md_block(&report.protocol_model.explanation));
     out.push_str("\n## Critical Functions Analyzed\n\n");
     for function in &report.critical_functions {
         out.push_str(&format!(
-            "- `{}` score={:.2} file={}\n",
-            function.id,
+            "- id={} score={:.2} file={}\n",
+            md_code(&function.id),
             function.criticality_score,
-            function.file.display()
+            md_code(&function.file.display().to_string())
         ));
     }
     out.push_str("\n## Hypotheses Generated\n\n");
     for hypothesis in &report.hypotheses {
         out.push_str(&format!(
-            "- `{}` [{}] confidence_before_validation={:.2}: {}\n",
-            hypothesis.id,
-            hypothesis.bug_class,
-            hypothesis.confidence_before_validation,
-            hypothesis.title
+            "- id={} bug_class={} confidence_before_validation={:.2}\n",
+            md_code(&hypothesis.id),
+            md_code(&hypothesis.bug_class),
+            hypothesis.confidence_before_validation
         ));
+        out.push_str(&format!("{}\n", md_block(&hypothesis.title)));
     }
     out.push_str("\n## Rejected Hypotheses\n\n");
     for rejected in &report.rejected_hypotheses {
-        out.push_str(&format!("- {rejected}\n"));
+        out.push_str(&format!("{}\n", md_block(rejected)));
     }
     out.push_str("\n## RustyFuzz Jobs Generated\n\n");
     for job in &report.jobs {
-        out.push_str(&format!("- `{}` objective={}\n", job.job_id, job.objective));
+        out.push_str(&format!(
+            "- id={} objective={}\n",
+            md_code(&job.job_id),
+            md_code(&job.objective)
+        ));
     }
     out.push_str("\n## Foundry PoCs Generated\n\n");
     for poc in &report.foundry_pocs {
         out.push_str(&format!(
-            "- `{}` generated={}\n",
-            poc.path.display(),
+            "- path={} generated={}\n",
+            md_code(&poc.path.display().to_string()),
             poc.generated
         ));
     }
     out.push_str("\n## Validation Verdicts\n\n");
     for verdict in &report.validation_verdicts {
         out.push_str(&format!(
-            "- `{}` status={:?} proof={:?}: {}\n",
-            verdict.hypothesis_id, verdict.status, verdict.proof_status, verdict.reason
+            "- id={} status={:?} proof={:?} reason={}\n",
+            md_code(&verdict.hypothesis_id),
+            verdict.status,
+            verdict.proof_status,
+            md_code(&verdict.reason)
         ));
     }
     out.push_str("\n## Validated Findings Only\n\n");
@@ -86,8 +95,9 @@ pub fn render_markdown(report: &SatoriReport) -> String {
                 | ValidationStatus::ValidatedEconomicImpact
         ) {
             out.push_str(&format!(
-                "- `{}`: {:?}\n",
-                verdict.hypothesis_id, verdict.status
+                "- id={} status={:?}\n",
+                md_code(&verdict.hypothesis_id),
+                verdict.status
             ));
         }
     }
@@ -101,9 +111,34 @@ pub fn render_markdown(report: &SatoriReport) -> String {
     ));
     out.push_str("\n## Next Recommended Manual Steps\n\n");
     for step in &report.next_steps {
-        out.push_str(&format!("- {step}\n"));
+        out.push_str(&format!("{}\n", md_block(step)));
     }
     out
+}
+
+fn md_code(value: &str) -> String {
+    let delimiter = markdown_delimiter(value);
+    let value = value.replace('\r', "&#13;").replace('\n', "&#10;");
+    format!("{delimiter} {value} {delimiter}")
+}
+
+fn md_block(value: &str) -> String {
+    let delimiter = markdown_delimiter(value);
+    format!("{delimiter}\n{value}\n{delimiter}")
+}
+
+fn markdown_delimiter(value: &str) -> String {
+    let mut longest = 0usize;
+    let mut current = 0usize;
+    for character in value.chars() {
+        if character == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    "`".repeat(longest.max(2) + 1)
 }
 
 #[cfg(test)]
@@ -130,5 +165,16 @@ mod tests {
         let md = render_markdown(&report);
         assert!(md.contains("Validated Findings Only"));
         assert!(md.contains("Budget / Call Summary"));
+    }
+
+    #[test]
+    fn untrusted_markdown_values_are_fenced_or_encoded() {
+        let value = "value\n## injected\n```";
+        let inline = md_code(value);
+        assert!(!inline.contains('\n'));
+        assert!(inline.contains("&#10;"));
+        let block = md_block(value);
+        assert!(block.starts_with("````\n"));
+        assert!(block.ends_with("\n````"));
     }
 }

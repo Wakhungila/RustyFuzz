@@ -5,6 +5,17 @@ pub fn validate_production_rpc_url(raw: &str) -> Result<Url, String> {
     validate_rpc_url(raw, false)
 }
 
+pub fn validate_rpc_url_for_argv(raw: &str) -> Result<Url, String> {
+    let (url, _) = resolve_rpc_url(raw, false)?;
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err(
+            "RPC URLs with paths or query data must be supplied through the child environment"
+                .to_string(),
+        );
+    }
+    Ok(url)
+}
+
 pub fn validate_rpc_url(raw: &str, allow_loopback: bool) -> Result<Url, String> {
     let url = Url::parse(raw).map_err(|_| "URL is invalid".to_string())?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -44,10 +55,18 @@ pub fn resolve_rpc_url(raw: &str, allow_loopback: bool) -> Result<(Url, Vec<Sock
         .collect::<Vec<_>>();
     addresses.sort_by_key(|address| address.ip());
     addresses.dedup();
+    ensure_resolved_addresses_allowed(&addresses, allow_loopback)?;
+    Ok((url, addresses))
+}
+
+fn ensure_resolved_addresses_allowed(
+    addresses: &[SocketAddr],
+    allow_loopback: bool,
+) -> Result<(), String> {
     if addresses.is_empty() {
         return Err("URL host resolved to no addresses".to_string());
     }
-    for address in &addresses {
+    for address in addresses {
         if allow_loopback {
             if !is_loopback_address(address.ip()) {
                 return Err("test endpoint must resolve only to loopback".to_string());
@@ -58,11 +77,88 @@ pub fn resolve_rpc_url(raw: &str, allow_loopback: bool) -> Result<(Url, Vec<Sock
             );
         }
     }
-    Ok((url, addresses))
+    Ok(())
 }
 
 pub fn resolve_rpc_url_for_current_process(raw: &str) -> Result<(Url, Vec<SocketAddr>), String> {
     resolve_rpc_url(raw, test_loopback_allowed())
+}
+
+pub fn rpc_api_key_allowed_origins() -> Result<Vec<String>, String> {
+    let raw = std::env::var("RUSTYFUZZ_RPC_API_KEY_ALLOWED_ORIGINS").unwrap_or_default();
+    parse_allowed_origins(&raw)
+}
+
+pub fn rpc_api_key_header(
+    raw_url: &str,
+    api_key: Option<&str>,
+    allowed_origins: &[String],
+) -> Result<Option<String>, String> {
+    let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let origin = request_origin(raw_url)?;
+    if !allowed_origins.iter().any(|allowed| allowed == &origin) {
+        return Err("RPC API key origin is not explicitly allowlisted".to_string());
+    }
+    Ok(Some(format!("Bearer {api_key}")))
+}
+
+fn parse_allowed_origins(raw: &str) -> Result<Vec<String>, String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let url = Url::parse(value)
+                .map_err(|_| "invalid RPC API key allowlist origin".to_string())?;
+            if !(matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none())
+            {
+                return Err(
+                    "RPC API key allowlist entries must be origins without paths or credentials"
+                        .to_string(),
+                );
+            }
+            Ok(origin_from_url(&url))
+        })
+        .collect()
+}
+
+fn request_origin(raw_url: &str) -> Result<String, String> {
+    let url = Url::parse(raw_url).map_err(|_| "RPC URL is invalid".to_string())?;
+    Ok(origin_from_url(&url))
+}
+
+fn origin_from_url(url: &Url) -> String {
+    let scheme = url.scheme().to_ascii_lowercase();
+    let raw_host = url
+        .host_str()
+        .unwrap_or_default()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let host = if raw_host.contains(':') {
+        format!("[{raw_host}]")
+    } else {
+        raw_host
+    };
+    let default_port = matches!(
+        (scheme.as_str(), url.port()),
+        ("http", Some(80)) | ("https", Some(443))
+    );
+    let mut origin = format!("{scheme}://{host}");
+    if let Some(port) = url.port() {
+        if !default_port {
+            origin.push(':');
+            origin.push_str(&port.to_string());
+        }
+    }
+    origin
 }
 
 pub fn test_loopback_allowed() -> bool {
@@ -90,14 +186,7 @@ pub fn redact_rpc_error(message: &str) -> String {
     let mut output = String::new();
     let mut remaining = message;
     loop {
-        let http = remaining.find("http://").map(|index| (index, 7));
-        let https = remaining.find("https://").map(|index| (index, 8));
-        let next = match (http, https) {
-            (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
-            (Some(value), None) | (None, Some(value)) => Some(value),
-            (None, None) => None,
-        };
-        let Some((start, scheme_len)) = next else {
+        let Some((start, scheme_len)) = find_http_url(remaining) else {
             output.push_str(remaining);
             break;
         };
@@ -112,6 +201,27 @@ pub fn redact_rpc_error(message: &str) -> String {
         remaining = &tail[end..];
     }
     output
+}
+
+fn find_http_url(value: &str) -> Option<(usize, usize)> {
+    value.char_indices().find_map(|(index, _)| {
+        let tail = &value[index..];
+        if tail
+            .as_bytes()
+            .get(..7)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"http://"))
+        {
+            Some((index, 7))
+        } else if tail
+            .as_bytes()
+            .get(..8)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"https://"))
+        {
+            Some((index, 8))
+        } else {
+            None
+        }
+    })
 }
 
 fn normalized_host(url: &Url) -> Result<String, String> {
@@ -209,6 +319,29 @@ mod tests {
     }
 
     #[test]
+    fn argv_rpc_policy_allows_only_origin_urls() {
+        assert!(validate_rpc_url_for_argv("https://8.8.8.8").is_ok());
+        for raw in [
+            "https://user:pass@rpc.example.com/v1",
+            "https://rpc.example.com/v1?apikey=secret",
+            "https://rpc.example.com/v1/super-secret-api-key",
+            "https://rpc.example.com/v1/0123456789abcdef0123456789abcdef",
+            "http://rpc.example.com/v1",
+        ] {
+            assert!(validate_rpc_url_for_argv(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn argv_rpc_policy_rejects_private_and_mixed_dns_answers() {
+        let private = SocketAddr::from(([10, 0, 0, 1], 443));
+        let public = SocketAddr::from(([8, 8, 8, 8], 443));
+        assert!(ensure_resolved_addresses_allowed(&[private], false).is_err());
+        assert!(ensure_resolved_addresses_allowed(&[public, private], false).is_err());
+        assert!(ensure_resolved_addresses_allowed(&[public], false).is_ok());
+    }
+
+    #[test]
     fn explicit_test_allowance_accepts_only_resolved_loopback() {
         let (_, addresses) = resolve_rpc_url("http://localhost:8545", true).expect("loopback DNS");
         assert!(!addresses.is_empty());
@@ -219,15 +352,54 @@ mod tests {
     }
 
     #[test]
+    fn rpc_api_key_requires_an_explicit_origin_allowlist() {
+        let allowed = vec!["https://rpc.example.com".to_string()];
+        assert_eq!(
+            rpc_api_key_header("https://rpc.example.com/v1", Some("secret"), &allowed,),
+            Ok(Some("Bearer secret".to_string()))
+        );
+        assert_eq!(
+            rpc_api_key_header("https://user.example.com/v1", Some("secret"), &allowed),
+            Err("RPC API key origin is not explicitly allowlisted".to_string())
+        );
+        assert_eq!(
+            rpc_api_key_header("https://rpc.example.com/v1", None, &[]),
+            Ok(None)
+        );
+        assert!(
+            parse_allowed_origins("https://rpc.example.com, https://other.example.com:443").is_ok()
+        );
+        assert_eq!(
+            parse_allowed_origins("https://[2001:db8::1]:8545").unwrap(),
+            vec!["https://[2001:db8::1]:8545".to_string()]
+        );
+        assert_eq!(
+            rpc_api_key_header(
+                "https://[2001:db8::1]:8545/v1",
+                Some("secret"),
+                &["https://[2001:db8::1]:8545".to_string()],
+            ),
+            Ok(Some("Bearer secret".to_string()))
+        );
+        assert!(parse_allowed_origins("https://rpc.example.com/v1").is_err());
+    }
+    #[test]
     fn redaction_removes_userinfo_query_and_fragment() {
         let redacted = redact_url_query_credentials(
             "https://user:pass@example.com/path?apikey=secret#fragment",
         );
         assert_eq!(redacted, "https://example.com/path");
         let error = redact_rpc_error(
-            "request failed for https://user:pass@example.com/rpc?apikey=secret while retrying",
+            "request failed for HTTPS://user:pass@example.com/rpc?access_key=secret while retrying",
         );
         assert_eq!(error, "request failed for <rpc-url> while retrying");
         assert!(!error.contains("secret"));
+        for raw in [
+            "HTTP://example.com/rpc?key=secret",
+            "HtTpS://example.com/rpc?access_key=secret",
+            "https://example.com/rpc?pass=secret",
+        ] {
+            assert!(!redact_rpc_error(raw).contains("secret"), "{raw}");
+        }
     }
 }

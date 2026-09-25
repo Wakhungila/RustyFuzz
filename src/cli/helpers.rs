@@ -68,6 +68,22 @@ pub fn ensure_evm_chain(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn external_foundry_opt_in() -> bool {
+    [
+        "RUSTYFUZZ_RUN_FORGE_TESTS",
+        "RUSTYFUZZ_ALLOW_EXTERNAL_ANALYZERS",
+    ]
+    .into_iter()
+    .any(|name| {
+        std::env::var(name).ok().is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+    })
+}
+
 pub fn sanitize_campaign_id(id: &str) -> String {
     let mut sanitized = id
         .chars()
@@ -490,6 +506,8 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
         promotion: PromotionConfig {
             enabled: true,
             no_promotion: false,
+            external_foundry_opt_in: external_foundry_opt_in(),
+
             require_replay_for_report: true,
             require_poc_for_confirmed: true,
             strict_proof: options.strict_proof,

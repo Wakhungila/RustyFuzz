@@ -4592,6 +4592,7 @@ dependencies = [
  "hex",
  "libafl",
  "libafl_bolts",
+ "libc",
  "log",
  "parking_lot",
  "postcard",

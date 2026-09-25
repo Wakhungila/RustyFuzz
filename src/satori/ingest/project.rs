@@ -1,5 +1,7 @@
 use crate::satori::error::SatoriResult;
-use crate::satori::fsutil::{collect_files, read_lossy_limited, write_json_in_run};
+use crate::satori::fsutil::{
+    collect_files, read_lossy_limited, redact_source_text, write_json_in_run,
+};
 use crate::satori::ingest::foundry::is_foundry_project;
 use crate::satori::ingest::hardhat::is_hardhat_project;
 use crate::satori::types::{ProjectModel, ProjectType, ProtocolType, SourceFile};
@@ -97,6 +99,12 @@ fn source_file(root: &Path, file: &Path, extension: &str) -> SatoriResult<Source
         "Satori project file is outside canonical project root: {}",
         file.display()
     );
+    let metadata = std::fs::metadata(&canonical_file)?;
+    anyhow::ensure!(
+        metadata.len() <= crate::satori::fsutil::MAX_INGEST_FILE_BYTES,
+        "Satori project file exceeds the ingestion file-byte budget: {}",
+        file.display()
+    );
     let (content_hash, bytes) = hash_file(&canonical_file)?;
     let language = match extension {
         "sol" => "solidity",
@@ -113,7 +121,10 @@ fn source_file(root: &Path, file: &Path, extension: &str) -> SatoriResult<Source
         language,
         content_hash,
         bytes,
-        text: Some(read_lossy_limited(&canonical_file, 128_000)?),
+        text: Some(redact_source_text(&read_lossy_limited(
+            &canonical_file,
+            128_000,
+        )?)),
     })
 }
 
@@ -130,8 +141,14 @@ fn hash_file(path: &Path) -> SatoriResult<(String, usize)> {
         if read == 0 {
             break;
         }
+        bytes = bytes
+            .checked_add(read)
+            .ok_or_else(|| anyhow::anyhow!("Satori project byte budget overflow"))?;
+        anyhow::ensure!(
+            bytes as u64 <= crate::satori::fsutil::MAX_INGEST_FILE_BYTES,
+            "Satori project file exceeds the ingestion file-byte budget"
+        );
         hasher.update(&buffer[..read]);
-        bytes = bytes.saturating_add(read);
     }
     Ok((hex::encode(hasher.finalize()), bytes))
 }
@@ -167,6 +184,39 @@ mod tests {
         assert!(model.source_files.len() >= 4);
         assert!(run_dir.join("project.json").exists());
         let _ = std::fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn project_artifact_omits_raw_source_text() -> SatoriResult<()> {
+        let root = std::env::temp_dir().join(format!(
+            "satori-ingest-redaction-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let run_dir = crate::satori::fsutil::canonical_run_root()?.join(format!(
+            "satori-ingest-redaction-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(&run_dir)?;
+        std::fs::write(
+            root.join("Vault.sol"),
+            b"contract Vault { function deposit() external { string private_key = \"raw-source-secret\"; } }",
+        )?;
+
+        let model = ingest_project(&root, &run_dir)?;
+        let persisted = std::fs::read_to_string(run_dir.join("project.json"))?;
+        assert!(!model.source_files[0]
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("raw-source-secret")));
+        assert!(!persisted.contains("raw-source-secret"));
+
+        let _ = std::fs::remove_dir_all(run_dir);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]

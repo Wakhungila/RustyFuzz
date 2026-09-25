@@ -74,7 +74,14 @@ mod tests {
         let job = job_from_hypothesis(&hypothesis);
         let json = serde_json::to_string(&job).unwrap();
         assert!(json.contains("sequence_fuzz"));
+        assert!(!json.contains("fork_rpc_url"));
         let decoded: RustyFuzzJobSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.hypothesis_id, "h1");
+        assert_eq!(decoded.fork_rpc_url, None);
+        let mut executable = job;
+        executable.fork_rpc_url = Some("https://rpc.example/v1?key=secret".to_string());
+        let serialized = serde_json::to_string(&executable).unwrap();
+        assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("fork_rpc_url"));
     }
 }

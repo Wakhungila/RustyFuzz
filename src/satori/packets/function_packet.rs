@@ -1,4 +1,5 @@
 use crate::satori::error::SatoriResult;
+use crate::satori::fsutil::redact_source_text;
 use crate::satori::fsutil::{sha256_hex, write_json_in_run};
 use crate::satori::graph::query::{related_functions, top_critical_functions};
 use crate::satori::memory::store::MemoryStore;
@@ -15,7 +16,10 @@ pub fn build_function_packets(
     limit: usize,
     memory: &MemoryStore,
 ) -> SatoriResult<Vec<FunctionPacket>> {
-    let functions = top_critical_functions(analysis, limit);
+    let functions = top_critical_functions(analysis, limit)
+        .into_iter()
+        .map(redact_function_summary)
+        .collect::<Vec<_>>();
     let mut packets = Vec::new();
     for function in functions {
         let memories = memory.retrieve(&[
@@ -31,7 +35,10 @@ pub fn build_function_packets(
         let packet = FunctionPacket {
             detector_evidence: function.detector_signals.clone(),
             protocol_context: protocol_model_for_function(project, &function),
-            related_functions: related_functions(analysis, &function),
+            related_functions: related_functions(analysis, &function)
+                .into_iter()
+                .map(redact_function_summary)
+                .collect(),
             relevant_memories: memories,
             known_bug_classes: bug_class_library(),
             output_constraints: vec![
@@ -98,6 +105,14 @@ fn protocol_model_for_function(
     }
 }
 
+pub(crate) fn redact_function_summary(mut function: FunctionSummary) -> FunctionSummary {
+    function.source_snippet = redact_source_text(&function.source_snippet);
+    for signal in &mut function.detector_signals {
+        signal.evidence = redact_source_text(&signal.evidence);
+    }
+    function
+}
+
 pub fn bug_class_library() -> Vec<String> {
     [
         "erc4626_share_inflation_via_donation",
@@ -128,6 +143,38 @@ mod tests {
     use super::*;
     use crate::satori::types::{DetectorSignal, ProjectType, SourceFile};
     use std::path::PathBuf;
+
+    #[test]
+    fn packet_source_context_is_redacted_at_the_persistence_boundary() {
+        let function = FunctionSummary {
+            id: "Vault::deposit()".to_string(),
+            contract: "Vault".to_string(),
+            name: "deposit".to_string(),
+            signature: "deposit()".to_string(),
+            selector: None,
+            file: PathBuf::from("Vault.sol"),
+            visibility: "external".to_string(),
+            mutability: "nonpayable".to_string(),
+            modifiers: Vec::new(),
+            source_snippet: "string private_key = \"packet-secret\";".to_string(),
+            reads: Vec::new(),
+            writes: Vec::new(),
+            internal_calls: Vec::new(),
+            external_calls: Vec::new(),
+            detector_signals: vec![DetectorSignal {
+                detector: "private_key".to_string(),
+                tag: "private-key".to_string(),
+                confidence: 0.8,
+                evidence: "private_key = packet-secret".to_string(),
+            }],
+            criticality_score: 0.8,
+        };
+        let redacted = redact_function_summary(function);
+        assert!(!redacted.source_snippet.contains("packet-secret"));
+        assert!(!redacted.detector_signals[0]
+            .evidence
+            .contains("packet-secret"));
+    }
 
     #[test]
     fn packet_builder_includes_detector_evidence() {

@@ -2,9 +2,7 @@ use alloy_json_abi::JsonAbi;
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
 use revm::primitives::Address;
-use rustyfuzz_evm::rpc_url::{
-    resolve_rpc_url_for_current_process, test_loopback_allowed, validate_rpc_url,
-};
+use rustyfuzz_evm::rpc_url::{resolve_rpc_url, test_loopback_allowed, validate_rpc_url};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -97,8 +95,9 @@ impl EtherscanAbiFetcher {
         let rate_limiter = RateLimiter::new(requests_per_second)?;
         let parsed_url = validate_rpc_url(&base_url, test_loopback_allowed())
             .map_err(|error| anyhow!("invalid explorer URL: {error}"))?;
-        let (_, addresses) =
-            resolve_rpc_url_for_current_process(&base_url).map_err(anyhow::Error::msg)?;
+        let (_, addresses) = resolve_rpc_url(&base_url, false)
+            .or_else(|_| resolve_rpc_url(&base_url, test_loopback_allowed()))
+            .map_err(|error| anyhow!("invalid explorer URL resolution: {error}"))?;
         let host = parsed_url
             .host_str()
             .ok_or_else(|| anyhow!("explorer URL must contain a host"))?;

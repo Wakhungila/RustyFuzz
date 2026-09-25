@@ -161,6 +161,12 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 .as_ref()
                 .map(|id| format!("{}/{}", config.report_dir, id))
                 .unwrap_or_else(|| config.report_dir.clone());
+            if let Some(bundle_id) = config.mainnet_seed_bundle.as_deref() {
+                let global_corpus = PersistentCorpus::new(&config.corpus_dir)?;
+                let campaign_corpus = PersistentCorpus::new(&campaign_corpus_dir)?;
+                let bundle = global_corpus.load_mainnet_seed_bundle(bundle_id)?;
+                campaign_corpus.persist_mainnet_seed_bundle(bundle_id, &bundle)?;
+            }
             // Stage 4A: capture provenance before config values are moved into
             // the engine Config. Additive only; campaign behavior unchanged.
             let manifest_run_id = sanitized_campaign_id
@@ -204,6 +210,8 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 promotion: PromotionConfig {
                     enabled: promotion_enabled,
                     no_promotion: no_promote_findings,
+                    external_foundry_opt_in: external_foundry_opt_in(),
+
                     require_replay_for_report,
                     require_poc_for_confirmed,
                     strict_proof,
@@ -728,7 +736,10 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 let job_path_id = job.job_id.clone();
                 let job_report_dir = format!("{}/jobs/{}", config.report_dir, job_path_id);
                 let job_corpus_dir = format!("{}/jobs/{}", config.corpus_dir, job_path_id);
-                let job_corpus = PersistentCorpus::new(&job_corpus_dir)?;
+                let job_corpus = PersistentCorpus::new_with_global_root(
+                    &job_corpus_dir,
+                    Some(&config.corpus_dir),
+                )?;
                 if let Some(bundle_id) =
                     seed_bundle.as_ref().or(config.mainnet_seed_bundle.as_ref())
                 {
@@ -777,6 +788,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     promotion: PromotionConfig {
                         enabled: true,
                         no_promotion: false,
+                        external_foundry_opt_in: external_foundry_opt_in(),
                         require_replay_for_report: true,
                         require_poc_for_confirmed: true,
                         strict_proof: true,
@@ -943,6 +955,8 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             let promotion_config = PromotionConfig {
                 enabled: true,
                 no_promotion: false,
+                external_foundry_opt_in: external_foundry_opt_in(),
+
                 require_replay_for_report: true,
                 require_poc_for_confirmed: true,
                 strict_proof,

@@ -258,6 +258,7 @@ fn required_seed_replay_verified(run_dir: &Path, marker_path: &Path, sequence_ha
 pub async fn execute_bounded_job(
     job: &RustyFuzzJobSpec,
     run_dir: &Path,
+    external_foundry_opt_in: bool,
 ) -> SatoriResult<ValidationVerdict> {
     let run_dir = canonical_run_dir_path(run_dir)?;
     validate_job_limits(job)?;
@@ -364,6 +365,7 @@ pub async fn execute_bounded_job(
         promotion: PromotionConfig {
             enabled: true,
             no_promotion: false,
+            external_foundry_opt_in,
             require_replay_for_report: true,
             require_poc_for_confirmed: true,
             strict_proof: true,

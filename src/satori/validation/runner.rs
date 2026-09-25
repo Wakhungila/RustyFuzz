@@ -16,12 +16,19 @@ pub fn validate_jobs(
     run_dir: &Path,
     hypotheses: &[VulnerabilityHypothesis],
     jobs: &[RustyFuzzJobSpec],
+    external_foundry_opt_in: bool,
 ) -> SatoriResult<(Vec<ValidationVerdict>, Vec<FoundryPocSpec>)> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| anyhow::anyhow!("validation runtime failed: {error}"))?
-        .block_on(validate_jobs_async(project, run_dir, hypotheses, jobs))
+        .block_on(validate_jobs_async(
+            project,
+            run_dir,
+            hypotheses,
+            jobs,
+            external_foundry_opt_in,
+        ))
 }
 
 pub async fn validate_jobs_async(
@@ -29,6 +36,7 @@ pub async fn validate_jobs_async(
     run_dir: &Path,
     hypotheses: &[VulnerabilityHypothesis],
     jobs: &[RustyFuzzJobSpec],
+    external_foundry_opt_in: bool,
 ) -> SatoriResult<(Vec<ValidationVerdict>, Vec<FoundryPocSpec>)> {
     crate::satori::fsutil::reject_symlink_components(&project.root)?;
     let project_root = project.root.canonicalize()?;
@@ -48,7 +56,7 @@ pub async fn validate_jobs_async(
         let job_for_poc = job.cloned();
         let poc_dir = run_dir.to_path_buf();
         let project_root = project.root.clone();
-        let poc = tokio::task::spawn_blocking(move || {
+        let mut poc = tokio::task::spawn_blocking(move || {
             generate_foundry_poc(
                 &project_root,
                 &poc_dir,
@@ -61,7 +69,7 @@ pub async fn validate_jobs_async(
         let direct_context = job.is_some_and(has_direct_rustyfuzz_context);
         let mut verdict = if let Some(job) = job {
             if direct_context {
-                execute_bounded_job(job, run_dir).await?
+                execute_bounded_job(job, run_dir, external_foundry_opt_in).await?
             } else {
                 ValidationVerdict {
                     hypothesis_id: hypothesis.id.clone(),
@@ -91,13 +99,19 @@ pub async fn validate_jobs_async(
         if matches!(
             project.project_type,
             crate::satori::types::ProjectType::Foundry | crate::satori::types::ProjectType::Mixed
-        ) {
+        ) && external_foundry_opt_in
+        {
             let project_root = project.root.clone();
+            let run_dir = run_dir.to_path_buf();
             let poc_path = poc.path.clone();
-            let tool_run =
-                tokio::task::spawn_blocking(move || maybe_run_forge_test(&project_root, &poc_path))
-                    .await
-                    .map_err(|error| anyhow::anyhow!("forge worker failed: {error}"))??;
+            let rpc_url = job.and_then(|job| job.fork_rpc_url.clone());
+            let tool_run = tokio::task::spawn_blocking(move || {
+                maybe_run_forge_test(&project_root, &run_dir, &poc_path, rpc_url.as_deref())
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("forge worker failed: {error}"))??;
+            poc.compile_attempted = tool_run.available;
+            poc.compile_success = tool_run.available && tool_run.success;
             if tool_run.available && tool_run.success {
                 if direct_context {
                     verdict.reason.push_str(
@@ -140,6 +154,13 @@ pub async fn validate_jobs_async(
                     " Foundry PoC scaffold was generated, but forge is unavailable; scaffold is not proof.",
                 );
             }
+        } else if matches!(
+            project.project_type,
+            crate::satori::types::ProjectType::Foundry | crate::satori::types::ProjectType::Mixed
+        ) {
+            verdict.reason.push_str(
+                " Foundry validation skipped: external Foundry analysis requires explicit operator opt-in.",
+            );
         } else if !direct_context {
             verdict.status = ValidationStatus::FoundryPocGenerated;
             verdict

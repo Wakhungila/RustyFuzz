@@ -56,6 +56,7 @@ async fn synthetic_abi_smoke_campaign_does_not_promote_findings() {
         promotion: PromotionConfig {
             enabled: true,
             no_promotion: false,
+            external_foundry_opt_in: true,
             require_replay_for_report: true,
             require_poc_for_confirmed: true,
             strict_proof: true,

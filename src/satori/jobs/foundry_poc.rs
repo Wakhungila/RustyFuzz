@@ -26,7 +26,7 @@ pub fn generate_foundry_poc(
     job: Option<&RustyFuzzJobSpec>,
 ) -> SatoriResult<FoundryPocSpec> {
     reject_symlink_components(project_root)?;
-    let project_root = project_root.canonicalize()?;
+    let _project_root = project_root.canonicalize()?;
     let run_dir = canonical_run_dir_path(run_dir)?;
     let hypothesis_ref = format!("hypothesis-{}", &sha256_hex(hypothesis.id.as_bytes())[..16]);
     let file_name = format!(
@@ -49,8 +49,8 @@ pub fn generate_foundry_poc(
     )?;
     let canonical_path = path.canonicalize()?;
     let report_path = canonical_path
-        .strip_prefix(&project_root)
-        .unwrap_or(&canonical_path)
+        .strip_prefix(&run_dir)
+        .map_err(|_| anyhow::anyhow!("generated Foundry PoC escaped the Satori run directory"))?
         .to_path_buf();
     Ok(FoundryPocSpec {
         hypothesis_id: hypothesis_ref,
@@ -296,6 +296,8 @@ mod tests {
         let second = generate_foundry_poc(&root, &run_dir, &malicious_hypothesis(), None)?;
         assert_ne!(first.path, second.path);
         assert!(first.path.extension().is_some());
+        assert!(first.path.starts_with("foundry_poc"));
+        assert!(run_dir.join(&first.path).is_file());
         assert!(first
             .path
             .file_name()

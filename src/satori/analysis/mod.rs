@@ -17,12 +17,16 @@ use std::path::Path;
 pub fn analyze_project(
     project: &ProjectModel,
     run_dir: &Path,
+    allow_foundry: bool,
+    allow_slither: bool,
 ) -> SatoriResult<StaticAnalysisBundle> {
     let mut bundle = StaticAnalysisBundle::default();
     bundle
         .tool_runs
-        .extend(run_foundry_tools(project, run_dir)?);
-    bundle.tool_runs.push(run_slither_tool(project, run_dir)?);
+        .extend(run_foundry_tools(project, run_dir, allow_foundry)?);
+    bundle
+        .tool_runs
+        .push(run_slither_tool(project, run_dir, allow_slither)?);
     let (contracts, functions) = extract_contracts_and_functions(project);
     bundle.contracts = contracts;
     bundle.functions = functions;

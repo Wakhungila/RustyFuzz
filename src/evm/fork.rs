@@ -31,15 +31,25 @@ pub fn configured_provider(url: reqwest::Url) -> anyhow::Result<impl Provider> {
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .resolve_to_addrs(host, &addresses);
-    if let Ok(api_key) = std::env::var("RUSTYFUZZ_RPC_API_KEY") {
-        if !api_key.trim().is_empty() {
-            if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {api_key}"))
-            {
-                let mut headers = reqwest::header::HeaderMap::new();
-                headers.insert(reqwest::header::AUTHORIZATION, value);
-                builder = builder.default_headers(headers);
-            }
-        }
+    let api_key = std::env::var("RUSTYFUZZ_RPC_API_KEY").ok();
+    if api_key
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        let allowed_origins =
+            rustyfuzz_evm::rpc_url::rpc_api_key_allowed_origins().map_err(anyhow::Error::msg)?;
+        let authorization = rustyfuzz_evm::rpc_url::rpc_api_key_header(
+            url.as_str(),
+            api_key.as_deref(),
+            &allowed_origins,
+        )
+        .map_err(anyhow::Error::msg)?
+        .ok_or_else(|| anyhow::anyhow!("RPC API key is empty"))?;
+        let value = reqwest::header::HeaderValue::from_str(&authorization)
+            .map_err(|_| anyhow::anyhow!("RPC API key contains invalid header characters"))?;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+        builder = builder.default_headers(headers);
     }
     let client = builder
         .build()

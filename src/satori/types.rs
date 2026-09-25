@@ -17,6 +17,10 @@ pub struct SatoriConfig {
     pub model: String,
     pub max_critical_functions: usize,
     pub max_hypotheses_per_function: usize,
+    #[serde(default = "default_max_hypotheses_total")]
+    pub max_hypotheses_total: usize,
+    #[serde(default = "default_max_jobs")]
+    pub max_jobs: usize,
     pub min_confidence: f64,
     pub validate: bool,
     pub generate_jobs: bool,
@@ -32,11 +36,13 @@ impl Default for SatoriConfig {
             model: crate::satori::reasoning::zen_client::DEFAULT_MODEL.to_string(),
             max_critical_functions: 8,
             max_hypotheses_per_function: 2,
+            max_hypotheses_total: 32,
+            max_jobs: 32,
             min_confidence: 0.4,
             validate: false,
             generate_jobs: true,
             run_forge_tests: false,
-            run_slither: true,
+            run_slither: false,
             cache_dir: PathBuf::from("satori/cache"),
             memory_path: PathBuf::from("satori/memory/events.jsonl"),
         }
@@ -74,6 +80,7 @@ pub struct SourceFile {
     pub language: String,
     pub content_hash: String,
     pub bytes: usize,
+    #[serde(skip_serializing, default)]
     pub text: Option<String>,
 }
 
@@ -318,9 +325,18 @@ pub struct RustyFuzzJobSpec {
     pub max_execs: u64,
     #[serde(default = "default_job_duration_secs")]
     pub duration_secs: u64,
+    #[serde(skip_serializing, default)]
     pub fork_rpc_url: Option<String>,
     pub fork_block: Option<u64>,
     pub abi_hints: Vec<String>,
+}
+
+fn default_max_hypotheses_total() -> usize {
+    32
+}
+
+fn default_max_jobs() -> usize {
+    32
 }
 
 fn default_job_max_execs() -> u64 {

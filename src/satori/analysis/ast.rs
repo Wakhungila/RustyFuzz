@@ -1,5 +1,6 @@
 use crate::satori::analysis::criticality::score_function;
 use crate::satori::analysis::detectors::detect_in_source;
+use crate::satori::fsutil::redact_source_text;
 use crate::satori::types::{
     ContractSummary, ExternalCallSummary, FunctionSummary, ProjectModel, ProtocolType, SourceFile,
     StateAccess,
@@ -72,10 +73,11 @@ fn extract_functions(file: &SourceFile, text: &str, contracts: &[String]) -> Vec
         if !trimmed.starts_with("function ") && !trimmed.starts_with("constructor(") {
             continue;
         }
-        let snippet = lines[idx..lines.len().min(idx + 18)].join("\n");
+        let raw_snippet = lines[idx..lines.len().min(idx + 18)].join("\n");
+        let snippet = redact_source_text(&raw_snippet);
         let signature = signature_from_line(trimmed);
         let name = function_name_from_signature(&signature);
-        let detectors = detect_in_snippet(&snippet, file);
+        let detectors = detect_in_snippet(&raw_snippet, file);
         let mut summary = FunctionSummary {
             id: format!("{}::{}", contract, signature),
             contract: contract.clone(),
@@ -245,4 +247,40 @@ fn protocol_hints(text: &str) -> Vec<ProtocolType> {
 #[allow(dead_code)]
 fn _path(path: PathBuf) -> PathBuf {
     path
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn function_snippets_redact_source_secrets_before_analysis_output() {
+        let file = SourceFile {
+            path: PathBuf::from("Vault.sol"),
+            relative_path: PathBuf::from("Vault.sol"),
+            language: "solidity".to_string(),
+            content_hash: "x".to_string(),
+            bytes: 1,
+            text: Some(
+                "contract Vault {\n    function deposit() external {\n        string private_key = \"source-secret\";\n    }\n}"
+                    .to_string(),
+            ),
+        };
+        let (contracts, functions) = extract_contracts_and_functions(&ProjectModel {
+            root: PathBuf::from("."),
+            project_type: crate::satori::types::ProjectType::Solidity,
+            source_files: vec![file],
+            test_files: Vec::new(),
+            docs: Vec::new(),
+            foundry_toml: None,
+            hardhat_config: None,
+            package_json: None,
+            remappings: None,
+            detected_protocols: Vec::new(),
+        });
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(functions.len(), 1);
+        assert!(!functions[0].source_snippet.contains("source-secret"));
+        assert!(functions[0].source_snippet.contains("<redacted>"));
+    }
 }

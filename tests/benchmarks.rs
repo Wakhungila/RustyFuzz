@@ -2384,7 +2384,9 @@ fn executable_matching_signal_is_found_without_a_proof() {
             .as_nanos()
     ));
     std::fs::write(&path, serde_json::to_vec(&fixture).unwrap()).unwrap();
-    manifest.fixture = Some(path.display().to_string());
+    manifest.fixture = Some(path.file_name().unwrap().to_string_lossy().into_owned());
+    manifest.manifest_root = Some(path.parent().unwrap().to_path_buf());
+    manifest.resolved_fixture = None;
     let report = ValidationRunner.run_manifests(&[manifest]);
     std::fs::remove_file(path).unwrap();
     let result = &report.benchmarks[0];

@@ -539,11 +539,11 @@ impl ForkDb {
                 self.inner.block_tag
             ),
         })?;
+        let (_, _) = parse_provenance_block(&block, parse_block_tag_number(&self.inner.block_tag))?;
         let block_hash = block
             .get("hash")
             .and_then(Value::as_str)
             .ok_or_else(|| ForkDbError::Decode("block response is missing a hash".to_string()))?;
-        validate_block_hash(block_hash)?;
         let block_hash = Some(block_hash.to_string());
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -686,7 +686,9 @@ impl ForkDb {
     }
 
     pub fn cache_block_hash(&self, number: u64, hash: B256) {
-        self.inner.block_hashes.lock().insert(number, hash);
+        if hash != B256::ZERO {
+            self.inner.block_hashes.lock().insert(number, hash);
+        }
     }
 
     pub fn with_thread_rpc_budget<T>(budget: Option<usize>, f: impl FnOnce() -> T) -> T {
@@ -737,6 +739,17 @@ impl ForkDb {
         )
         .map_err(|_| ForkDbError::Decode("invalid JSON-RPC response".to_string()))
     }
+
+    fn known_historical_limit(&self) -> Option<u64> {
+        parse_block_tag_number(&self.inner.block_tag)
+            .or_else(|| self.inner.provenance.lock().block_number)
+    }
+
+    fn offline_cache_miss(&self, number: u64, limit: u64) -> ForkDbError {
+        ForkDbError::Rpc(format!(
+            "offline fork cache is missing block {number} within known historical range through {limit}"
+        ))
+    }
 }
 
 fn rpc_on_blocking_thread(
@@ -759,16 +772,23 @@ fn rpc_on_blocking_thread(
             .redirect(reqwest::redirect::Policy::none())
             .resolve_to_addrs(&host, &addresses)
             .user_agent("rusty-fuzz-fork-db/0.1");
-        if let Ok(api_key) = std::env::var("RUSTYFUZZ_RPC_API_KEY") {
-            if !api_key.trim().is_empty() {
-                if let Ok(value) =
-                    reqwest::header::HeaderValue::from_str(&format!("Bearer {api_key}"))
-                {
-                    let mut headers = reqwest::header::HeaderMap::new();
-                    headers.insert(reqwest::header::AUTHORIZATION, value);
-                    client_builder = client_builder.default_headers(headers);
-                }
-            }
+        let api_key = std::env::var("RUSTYFUZZ_RPC_API_KEY").ok();
+        if api_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            let allowed_origins = crate::rpc_url::rpc_api_key_allowed_origins()
+                .map_err(|error| ForkDbError::Rpc(error.to_string()))?;
+            let authorization =
+                crate::rpc_url::rpc_api_key_header(&rpc_url, api_key.as_deref(), &allowed_origins)
+                    .map_err(|error| ForkDbError::Rpc(error.to_string()))?
+                    .ok_or_else(|| ForkDbError::Rpc("RPC API key is empty".to_string()))?;
+            let value = reqwest::header::HeaderValue::from_str(&authorization).map_err(|_| {
+                ForkDbError::Rpc("RPC API key contains invalid header characters".to_string())
+            })?;
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            client_builder = client_builder.default_headers(headers);
         }
         let client = client_builder
             .build()
@@ -1108,24 +1128,87 @@ impl DatabaseRef for ForkDb {
 
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
         if let Some(hash) = self.inner.block_hashes.lock().get(&number).copied() {
+            if hash == B256::ZERO {
+                if let Some(limit) = self.known_historical_limit() {
+                    if number <= limit {
+                        return Err(self.offline_cache_miss(number, limit));
+                    }
+                }
+            }
             return Ok(hash);
         }
 
         let Some(_) = &self.inner.rpc_url else {
-            self.inner.block_hashes.lock().insert(number, B256::ZERO);
+            if let Some(limit) = self.known_historical_limit() {
+                if number <= limit {
+                    return Err(self.offline_cache_miss(number, limit));
+                }
+            }
             return Ok(B256::ZERO);
         };
 
         let block: Option<Value> =
             self.rpc("eth_getBlockByNumber", json!([to_quantity(number), false]))?;
-        let hash = block
-            .and_then(|block| block.get("hash").and_then(Value::as_str).map(str::to_owned))
-            .map(|hash| validate_block_hash(&hash))
-            .transpose()?
-            .unwrap_or(B256::ZERO);
-        self.inner.block_hashes.lock().insert(number, hash);
+        if block.is_none() {
+            return match self.known_historical_limit() {
+                Some(limit) if number <= limit => Err(ForkDbError::Classified {
+                    kind: RpcFailureKind::ArchiveGap,
+                    message: format!(
+                        "block {number} not found within known historical range through {limit}"
+                    ),
+                }),
+                _ => Ok(B256::ZERO),
+            };
+        }
+        let hash = parse_block_hash_response(block, number)?;
+        if hash != B256::ZERO {
+            self.inner.block_hashes.lock().insert(number, hash);
+        }
         Ok(hash)
     }
+}
+
+fn parse_provenance_block(
+    block: &Value,
+    requested_block: Option<u64>,
+) -> Result<(B256, Option<u64>), ForkDbError> {
+    let hash = block
+        .get("hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ForkDbError::Decode("block response is missing a hash".to_string()))?;
+    let hash = validate_block_hash(hash)?;
+    if hash == B256::ZERO {
+        return Err(ForkDbError::Decode(
+            "block response returned the forbidden zero hash".to_string(),
+        ));
+    }
+    let number = block
+        .get("number")
+        .and_then(Value::as_str)
+        .map(hex_to_u64)
+        .transpose()?;
+    if let (Some(requested), Some(returned)) = (requested_block, number) {
+        if requested != returned {
+            return Err(ForkDbError::Decode(format!(
+                "block response returned number {returned}, requested {requested}"
+            )));
+        }
+    } else if requested_block.is_some() {
+        return Err(ForkDbError::Decode(
+            "block response is missing a number".to_string(),
+        ));
+    }
+    Ok((hash, number))
+}
+
+fn parse_block_hash_response(
+    block: Option<Value>,
+    requested_number: u64,
+) -> Result<B256, ForkDbError> {
+    let Some(block) = block else {
+        return Ok(B256::ZERO);
+    };
+    Ok(parse_provenance_block(&block, Some(requested_number))?.0)
 }
 
 fn to_quantity(value: u64) -> String {
@@ -1168,7 +1251,7 @@ fn hex_to_u64(value: &str) -> Result<u64, ForkDbError> {
         .map_err(|_| ForkDbError::Decode("JSON-RPC U256 value exceeds u64".to_string()))
 }
 
-pub fn validate_block_hash(value: &str) -> Result<B256, ForkDbError> {
+fn decode_block_hash(value: &str) -> Result<B256, ForkDbError> {
     let encoded = value
         .strip_prefix("0x")
         .or_else(|| value.strip_prefix("0X"))
@@ -1183,9 +1266,159 @@ pub fn validate_block_hash(value: &str) -> Result<B256, ForkDbError> {
     Ok(B256::from_slice(&bytes))
 }
 
+pub fn validate_block_hash(value: &str) -> Result<B256, ForkDbError> {
+    let hash = decode_block_hash(value)?;
+    if hash == B256::ZERO {
+        return Err(ForkDbError::Decode(
+            "block hash must not be the forbidden zero sentinel".to_string(),
+        ));
+    }
+    Ok(hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+
+    #[test]
+    fn live_rpc_null_is_an_archive_gap_within_the_known_historical_range() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.strip_prefix("Content-Length: ") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut request = vec![0; content_length];
+                reader.read_exact(&mut request).unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 38\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}",
+                    )
+                    .unwrap();
+            }
+        });
+
+        let db = ForkDb::new_for_test(format!("http://{address}"), 16, Duration::from_secs(1), 1);
+        let within_known_range = db.block_hash_ref(16);
+        let future = db.block_hash_ref(17);
+        server.join().unwrap();
+
+        let error = within_known_range.expect_err("null must fail closed inside the known range");
+        assert_eq!(error.failure_kind(), RpcFailureKind::ArchiveGap);
+        assert_eq!(future.unwrap(), B256::ZERO);
+    }
+
+    #[test]
+    fn block_hash_response_uses_zero_only_for_rpc_null() {
+        assert_eq!(parse_block_hash_response(None, 16).unwrap(), B256::ZERO);
+
+        for block in [
+            Some(json!({})),
+            Some(json!({"hash": null})),
+            Some(json!({"hash": "not-a-hash"})),
+        ] {
+            assert!(parse_block_hash_response(block, 16).is_err());
+        }
+    }
+
+    #[test]
+    fn block_hash_response_rejects_mismatched_or_zero_block_objects() {
+        let mismatch = json!({
+            "number": "0x11",
+            "hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+        assert!(parse_block_hash_response(Some(mismatch), 16).is_err());
+
+        let zero = json!({
+            "number": "0x10",
+            "hash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+        });
+        assert!(parse_block_hash_response(Some(zero), 16).is_err());
+
+        let missing_number = json!({
+            "hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+        assert!(parse_block_hash_response(Some(missing_number), 16).is_err());
+    }
+
+    #[test]
+    fn offline_missing_cached_hash_within_known_range_errors_without_caching() {
+        let offline = ForkDb::new_offline("0x10");
+        let error = offline
+            .block_hash_ref(10)
+            .expect_err("a pinned offline range must not be represented as a cache miss");
+        assert_eq!(error.failure_kind(), RpcFailureKind::Offline);
+        assert!(offline.cache_snapshot().block_hashes.is_empty());
+    }
+
+    #[test]
+    fn offline_out_of_range_block_is_authoritatively_unavailable() {
+        let offline = ForkDb::new_offline("0x10");
+        assert_eq!(offline.block_hash_ref(17).unwrap(), B256::ZERO);
+        assert_eq!(offline.block_hash_ref(17).unwrap(), B256::ZERO);
+    }
+
+    #[test]
+    fn offline_provenance_establishes_the_historical_range() {
+        let snapshot = ForkDbCacheSnapshot {
+            block_tag: "latest".to_string(),
+            accounts: vec![],
+            code_by_hash: vec![],
+            storage: vec![],
+            block_hashes: vec![],
+            provenance: ForkCacheProvenance {
+                block_number: Some(16),
+                ..ForkCacheProvenance::default()
+            },
+            content_digest: String::new(),
+        };
+        let offline = ForkDb::from_cache_snapshot(snapshot);
+
+        assert_eq!(offline.block_hash_ref(17).unwrap(), B256::ZERO);
+        assert!(offline.block_hash_ref(16).is_err());
+    }
+
+    #[test]
+    fn fork_provenance_rejects_zero_hashes_and_block_number_mismatches() {
+        let zero = json!({
+            "number": "0x10",
+            "hash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+        });
+        assert!(parse_provenance_block(&zero, Some(16)).is_err());
+
+        let mismatch = json!({
+            "number": "0x11",
+            "hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+        assert!(parse_provenance_block(&mismatch, Some(16)).is_err());
+
+        let matching = json!({
+            "number": "0x10",
+            "hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+        let (hash, number) = parse_provenance_block(&matching, Some(16)).expect("matching block");
+        assert_ne!(hash, B256::ZERO);
+        assert_eq!(number, Some(16));
+    }
+
+    #[test]
+    fn zero_block_hashes_are_never_cached() {
+        let live = ForkDb::new("https://rpc.example.com", 10);
+        live.cache_block_hash(10, B256::ZERO);
+        assert!(live.cache_snapshot().block_hashes.is_empty());
+    }
 
     #[test]
     fn refresh_remote_provenance_rejects_offline_databases() {
@@ -1412,6 +1645,25 @@ mod tests {
                 Err(CacheStaleReason::MissingProvenance)
             );
         }
+        let zero_hash = ForkDbCacheSnapshot {
+            block_tag: "0x10".to_string(),
+            accounts: vec![],
+            code_by_hash: vec![],
+            storage: vec![],
+            block_hashes: vec![],
+            provenance: ForkCacheProvenance {
+                block_hash: Some(
+                    "0x0000000000000000000000000000000000000000000000000000000000000000"
+                        .to_string(),
+                ),
+                ..complete
+            },
+            content_digest: String::new(),
+        };
+        assert_eq!(
+            zero_hash.ensure_consistent(Some(16), None, None, None, true),
+            Err(CacheStaleReason::MissingProvenance)
+        );
     }
 
     #[test]
