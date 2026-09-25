@@ -1182,4 +1182,3 @@ For issues, feature requests, or discussion, please open a GitHub issue or pull 
 
 ---
 
-**Last Updated**: May 2025  
