@@ -6,6 +6,7 @@ use crate::evm::fuzz::AbiRegistry;
 use alloy_dyn_abi::DynSolType;
 use alloy_json_abi::JsonAbi;
 use revm::primitives::Address;
+use rustyfuzz_artifacts::fsutil::write_json_atomic;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -145,8 +146,8 @@ pub fn write_abi_cache(
     std::fs::create_dir_all(&cache_dir)?;
     let abi_path = cache_dir.join("abi.json");
     let report_path = cache_dir.join("report.json");
-    std::fs::write(&abi_path, serde_json::to_vec_pretty(abi)?)?;
-    std::fs::write(&report_path, serde_json::to_vec_pretty(report)?)?;
+    write_json_atomic(&abi_path, abi).map_err(anyhow::Error::from)?;
+    write_json_atomic(&report_path, report).map_err(anyhow::Error::from)?;
     Ok((abi_path, report_path))
 }
 
@@ -241,6 +242,62 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn write_abi_cache_rejects_preexisting_abi_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("rustyfuzz-abi-cache-abi-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let cache_dir = root.join("bundle");
+        std::fs::create_dir(&cache_dir).unwrap();
+        let target = root.join("abi-target.json");
+        std::fs::write(&target, b"untouched").unwrap();
+        symlink(&target, cache_dir.join("abi.json")).unwrap();
+        let abi: JsonAbi = serde_json::from_str("[]").unwrap();
+        let (_registry, report) = ingest_abi(&abi, None, None);
+
+        let result = write_abi_cache(&root, "bundle", &abi, &report);
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        assert!(std::fs::symlink_metadata(cache_dir.join("abi.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_abi_cache_rejects_preexisting_report_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "rustyfuzz-abi-cache-report-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let cache_dir = root.join("bundle");
+        std::fs::create_dir(&cache_dir).unwrap();
+        let target = root.join("report-target.json");
+        std::fs::write(&target, b"untouched").unwrap();
+        symlink(&target, cache_dir.join("report.json")).unwrap();
+        let abi: JsonAbi = serde_json::from_str("[]").unwrap();
+        let (_registry, report) = ingest_abi(&abi, None, None);
+
+        let result = write_abi_cache(&root, "bundle", &abi, &report);
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        assert!(std::fs::symlink_metadata(cache_dir.join("report.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn abi_ingest_extracts_selectors_and_profile() {

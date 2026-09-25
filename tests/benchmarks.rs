@@ -1240,14 +1240,51 @@ fn benchmark_privilege_escalation() {
     );
 }
 
-/// Stretch Goal: Mainnet Regression Template
-/// To run: `cargo test -- --ignored`
-#[tokio::test]
-#[ignore]
-async fn mainnet_regression_euler_finance() {
-    // This test would use create_fork_db to pull state from block 16817992
-    // and verify that a sequence mimicking the 'donate' exploit triggers
-    // the SolvencyOracle or a CustomInvariant.
+#[cfg(feature = "live-tests")]
+#[test]
+fn mainnet_regression_robinhood() {
+    dotenvy::dotenv().ok();
+    assert_eq!(
+        std::env::var("RUSTYFUZZ_RUN_LIVE_TESTS").as_deref(),
+        Ok("1"),
+        "set RUSTYFUZZ_RUN_LIVE_TESTS=1 to run the live regression"
+    );
+    let rpc_url = std::env::var("RUSTYFUZZ_LIVE_RPC_URL")
+        .expect("RUSTYFUZZ_LIVE_RPC_URL is required for live tests");
+    let expected_chain_id = std::env::var("RUSTYFUZZ_LIVE_CHAIN_ID")
+        .expect("RUSTYFUZZ_LIVE_CHAIN_ID is required for live tests")
+        .parse::<u64>()
+        .expect("RUSTYFUZZ_LIVE_CHAIN_ID must be an integer");
+    let fork_block = std::env::var("RUSTYFUZZ_LIVE_FORK_BLOCK")
+        .expect("RUSTYFUZZ_LIVE_FORK_BLOCK is required for live tests")
+        .parse::<u64>()
+        .expect("RUSTYFUZZ_LIVE_FORK_BLOCK must be an integer");
+    let target_text = std::env::var("RUSTYFUZZ_LIVE_TARGET")
+        .expect("RUSTYFUZZ_LIVE_TARGET is required for live tests");
+    let target = target_text
+        .parse::<Address>()
+        .expect("RUSTYFUZZ_LIVE_TARGET must be an EVM address");
+
+    let fork = ForkDb::new(rpc_url, fork_block);
+    let provenance = fork
+        .refresh_remote_provenance()
+        .expect("live RPC provenance must be available");
+    assert_eq!(provenance.chain_id, Some(expected_chain_id));
+    assert_eq!(provenance.block_number, Some(fork_block));
+    assert!(provenance
+        .block_hash
+        .as_deref()
+        .is_some_and(|hash| hash.len() == 66));
+
+    let account = fork
+        .basic_ref(target)
+        .expect("live target account lookup")
+        .expect("live target must exist");
+    assert!(
+        account.code.as_ref().is_some_and(|code| !code.is_empty()),
+        "live target must have code"
+    );
+    assert!(account.code_hash != revm::primitives::B256::ZERO);
 }
 
 #[test]

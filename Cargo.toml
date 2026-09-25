@@ -32,6 +32,7 @@ evm      = [
 svm      = []
 z3       = ["dep:z3"]
 llm      = ["dep:reqwest"]
+live-tests = []
 notifier = ["dep:reqwest"]
 sgx      = []
 
