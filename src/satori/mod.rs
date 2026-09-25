@@ -3,6 +3,7 @@ pub mod budget;
 pub mod cache;
 pub mod cli;
 pub mod config;
+pub mod containment;
 pub mod error;
 pub mod fsutil;
 pub mod graph;

@@ -12,7 +12,10 @@ use anyhow::{ensure, Context};
 use parking_lot::RwLock;
 use revm::database::{Cache, CacheDB};
 use revm::primitives::{keccak256, Address, B256};
-use rustyfuzz_artifacts::fsutil::write_json_atomic;
+use rustyfuzz_artifacts::{
+    fsutil::{read_regular_bounded, reject_symlink_components, write_atomic},
+    SourceIdentity,
+};
 use rustyfuzz_core::InputId;
 use rustyfuzz_engine::campaign::{budget::BudgetCheckpoint, telemetry::TelemetryCheckpoint};
 use rustyfuzz_evm::{
@@ -39,9 +42,11 @@ fn default_interval() -> u64 {
     1000
 }
 
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 pub const CHECKPOINT_CONFIG_IDENTITY_SCHEMA_VERSION: u32 = 2;
 const LEGACY_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+const MAX_CHECKPOINT_IDENTITY_INPUT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CHECKPOINT_ENVELOPE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Serialize)]
 struct CheckpointIdentity {
@@ -142,7 +147,11 @@ fn checkpoint_identity_digest(config: &Config) -> anyhow::Result<String> {
     .into_iter()
     .flatten()
     {
-        let bytes = fs::read(path).with_context(|| format!("checkpoint identity input {path}"))?;
+        let bytes = read_regular_bounded(
+            std::path::Path::new(path),
+            MAX_CHECKPOINT_IDENTITY_INPUT_BYTES,
+        )
+        .with_context(|| format!("checkpoint identity input {path}"))?;
         identity.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
         identity.extend_from_slice(&bytes);
     }
@@ -313,6 +322,8 @@ pub struct CheckpointEnvelope {
     #[serde(default)]
     pub config_schema_version: u32,
     pub producer_version: String,
+    #[serde(default)]
+    pub source_identity: Option<SourceIdentity>,
     pub config_digest: String,
     pub budget_consumed: u64,
     pub completed_execs: u64,
@@ -325,12 +336,20 @@ pub struct CheckpointEnvelope {
 pub(crate) struct CheckpointSession {
     config: CheckpointConfig,
     digest: String,
+    source_identity: SourceIdentity,
     _lock: File,
     pub saved: Option<Checkpoint>,
     pub last_published: u64,
 }
 impl CheckpointSession {
     pub fn open(config: &Config) -> anyhow::Result<Option<Self>> {
+        Self::open_with_source_identity(config, SourceIdentity::from_environment())
+    }
+
+    fn open_with_source_identity(
+        config: &Config,
+        source_identity: SourceIdentity,
+    ) -> anyhow::Result<Option<Self>> {
         let Some(options) = &config.hardened_defi.checkpoint else {
             return Ok(None);
         };
@@ -343,20 +362,45 @@ impl CheckpointSession {
         // Hash, never persist, endpoint credentials. Resume requires the same
         // execution configuration; checkpoint controls themselves may change.
         let digest = checkpoint_identity_digest(config)?;
+        ensure!(
+            source_identity.is_resume_bindable(),
+            "checkpoint source identity is incomplete"
+        );
+        reject_symlink_components(&options.directory)?;
         fs::create_dir_all(&options.directory)?;
-        let lock = OpenOptions::new()
+        reject_symlink_components(&options.directory)?;
+        let directory_metadata = fs::symlink_metadata(&options.directory)?;
+        if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+            anyhow::bail!("checkpoint directory is not a safe directory");
+        }
+        let mut lock_options = OpenOptions::new();
+        lock_options
             .create(true)
             .truncate(false)
             .read(true)
-            .write(true)
-            .open(options.directory.join("checkpoint.lock"))?;
+            .write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let lock = lock_options.open(options.directory.join("checkpoint.lock"))?;
+        if !lock.metadata()?.is_file() {
+            anyhow::bail!("checkpoint lock is not a regular file");
+        }
         lock.try_lock()
             .context("checkpoint directory is owned by another campaign")?;
         let path = options.directory.join("checkpoint.json");
+        let path_metadata = fs::symlink_metadata(&path);
+        if let Ok(metadata) = &path_metadata {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                anyhow::bail!("checkpoint is not a safe regular file");
+            }
+        }
         let saved = if options.resume {
-            let envelope: CheckpointEnvelope = serde_json::from_slice(
-                &fs::read(&path).with_context(|| format!("read checkpoint {}", path.display()))?,
-            )?;
+            let bytes = read_regular_bounded(&path, MAX_CHECKPOINT_ENVELOPE_BYTES)
+                .with_context(|| format!("read checkpoint {}", path.display()))?;
+            let envelope: CheckpointEnvelope = serde_json::from_slice(&bytes)?;
             if envelope.schema_version == LEGACY_CHECKPOINT_SCHEMA_VERSION {
                 anyhow::bail!(
                     "legacy checkpoint schema {} is not resumable; start a new campaign with a new checkpoint directory",
@@ -380,6 +424,18 @@ impl CheckpointSession {
                 "checkpoint producer version mismatch: expected {}, got {}",
                 env!("CARGO_PKG_VERSION"),
                 envelope.producer_version
+            );
+            let checkpoint_source = envelope
+                .source_identity
+                .as_ref()
+                .context("checkpoint predates source identity binding and is not resumable")?;
+            ensure!(
+                checkpoint_source.is_resume_bindable(),
+                "checkpoint source identity is invalid"
+            );
+            ensure!(
+                checkpoint_source == &source_identity,
+                "checkpoint source or binary identity mismatch"
             );
             ensure!(
                 envelope.config_digest == digest,
@@ -407,16 +463,20 @@ impl CheckpointSession {
             );
             Some(saved)
         } else {
-            ensure!(
-                !path.exists(),
-                "checkpoint exists: enable resume or choose a new directory"
-            );
+            match path_metadata {
+                Ok(_) => {
+                    anyhow::bail!("checkpoint exists: enable resume or choose a new directory")
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
             None
         };
         let last_published = saved.as_ref().map_or(0, |s| s.budget.consumed);
         Ok(Some(Self {
             config: options.clone(),
             digest,
+            source_identity,
             _lock: lock,
             saved,
             last_published,
@@ -437,6 +497,7 @@ impl CheckpointSession {
             schema_version: CHECKPOINT_SCHEMA_VERSION,
             config_schema_version: CHECKPOINT_CONFIG_IDENTITY_SCHEMA_VERSION,
             producer_version: env!("CARGO_PKG_VERSION").into(),
+            source_identity: Some(self.source_identity.clone()),
             config_digest: self.digest.clone(),
             budget_consumed: saved.budget.consumed,
             completed_execs: saved.telemetry.executions,
@@ -445,7 +506,16 @@ impl CheckpointSession {
             payload_digest: format!("{:x}", keccak256(&bytes)),
             payload_hex: hex::encode(bytes),
         };
-        write_json_atomic(&self.config.directory.join("checkpoint.json"), &envelope)?;
+        let envelope_bytes =
+            serde_json::to_vec(&envelope).context("serialize checkpoint envelope")?;
+        ensure!(
+            envelope_bytes.len() as u64 <= MAX_CHECKPOINT_ENVELOPE_BYTES,
+            "checkpoint envelope exceeds {MAX_CHECKPOINT_ENVELOPE_BYTES} bytes"
+        );
+        write_atomic(
+            self.config.directory.join("checkpoint.json"),
+            envelope_bytes.as_slice(),
+        )?;
         File::open(&self.config.directory)?.sync_all()?;
         self.last_published = saved.budget.consumed;
         Ok(())
@@ -454,7 +524,147 @@ impl CheckpointSession {
 
 #[cfg(test)]
 mod tests {
-    use super::checkpoint_rpc_identity;
+    use super::{
+        checkpoint_rpc_identity, CheckpointConfig, CheckpointEnvelope, CheckpointSession,
+        CHECKPOINT_CONFIG_IDENTITY_SCHEMA_VERSION, CHECKPOINT_SCHEMA_VERSION,
+        MAX_CHECKPOINT_ENVELOPE_BYTES,
+    };
+    use crate::config::HardenedDefiConfig;
+    use crate::engine::fuzz_engine::Config;
+    use crate::engine::promotion::PromotionConfig;
+    use rustyfuzz_artifacts::SourceIdentity;
+    use std::path::{Path, PathBuf};
+
+    fn temp_directory(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "rustyfuzz-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn source_identity(binary_byte: &str) -> SourceIdentity {
+        SourceIdentity {
+            git_revision: "checkpoint-test".to_string(),
+            source_dirty: "clean".to_string(),
+            source_diff_sha256: "unknown".to_string(),
+            binary_sha256: format!("sha256:{}", binary_byte.repeat(32)),
+        }
+    }
+
+    fn config(directory: &Path) -> Config {
+        Config {
+            rpc_url: "offline-test".to_string(),
+            fork_block: 1,
+            target_contract: None,
+            corpus_dir: directory.join("corpus").display().to_string(),
+            report_dir: directory.join("reports").display().to_string(),
+            foundry_harness: None,
+            mainnet_seed_bundle: None,
+            in_memory_bytecode: Some(vec![0x60, 0x00]),
+            cores: None,
+            require_seed_bundle: false,
+            require_rpc_fork: false,
+            allow_synthetic_fallback: true,
+            hardened_defi: HardenedDefiConfig {
+                single_process: true,
+                checkpoint: Some(CheckpointConfig {
+                    directory: directory.to_path_buf(),
+                    resume: true,
+                    every_execs: 1,
+                }),
+                ..Default::default()
+            },
+            target_invariant_manifest: None,
+            abi_path: None,
+            max_execs: Some(1),
+            duration_secs: Some(1),
+            artifact_limit: Some(1),
+            campaign_id: Some("checkpoint-test".to_string()),
+            paths_are_isolated: true,
+            min_finding_confidence: 0,
+            promotion: PromotionConfig::default(),
+        }
+    }
+
+    fn envelope(source_identity: SourceIdentity) -> CheckpointEnvelope {
+        CheckpointEnvelope {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            config_schema_version: CHECKPOINT_CONFIG_IDENTITY_SCHEMA_VERSION,
+            producer_version: env!("CARGO_PKG_VERSION").to_string(),
+            source_identity: Some(source_identity),
+            config_digest: String::new(),
+            budget_consumed: 0,
+            completed_execs: 0,
+            corpus_ids: Vec::new(),
+            coverage: Vec::new(),
+            payload_digest: String::new(),
+            payload_hex: String::new(),
+        }
+    }
+
+    #[test]
+    fn checkpoint_resume_rejects_source_identity_mismatch() {
+        let directory = temp_directory("checkpoint-source-mismatch");
+        let checkpoint = directory.join("checkpoint.json");
+        std::fs::write(
+            &checkpoint,
+            serde_json::to_vec(&envelope(source_identity("bb"))).unwrap(),
+        )
+        .unwrap();
+        let error = CheckpointSession::open_with_source_identity(
+            &config(&directory),
+            source_identity("aa"),
+        )
+        .err()
+        .unwrap();
+        assert!(error
+            .to_string()
+            .contains("source or binary identity mismatch"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn checkpoint_resume_rejects_oversized_and_symlinked_files() {
+        let directory = temp_directory("checkpoint-unsafe-files");
+        let checkpoint = directory.join("checkpoint.json");
+        std::fs::write(&checkpoint, b"{}").unwrap();
+        std::fs::File::create(&checkpoint)
+            .unwrap()
+            .set_len(MAX_CHECKPOINT_ENVELOPE_BYTES + 1)
+            .unwrap();
+        assert!(CheckpointSession::open_with_source_identity(
+            &config(&directory),
+            source_identity("aa")
+        )
+        .is_err());
+
+        #[cfg(unix)]
+        {
+            let outside = directory.join("outside.json");
+            std::fs::write(&outside, b"{}").unwrap();
+            std::fs::remove_file(&checkpoint).unwrap();
+            std::os::unix::fs::symlink(&outside, &checkpoint).unwrap();
+            assert!(CheckpointSession::open_with_source_identity(
+                &config(&directory),
+                source_identity("aa")
+            )
+            .is_err());
+            std::fs::remove_file(directory.join("checkpoint.lock")).unwrap();
+            std::os::unix::fs::symlink(&outside, directory.join("checkpoint.lock")).unwrap();
+            assert!(CheckpointSession::open_with_source_identity(
+                &config(&directory),
+                source_identity("aa")
+            )
+            .is_err());
+        }
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn checkpoint_rpc_identity_distinguishes_paths_and_query_credentials() {

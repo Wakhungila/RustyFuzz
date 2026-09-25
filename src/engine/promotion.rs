@@ -12,7 +12,7 @@ use crate::engine::minimizer::Minimizer;
 use crate::evm::corpus::{CampaignArtifactRecord, PersistentCorpus};
 use crate::evm::fuzz::EvmInput;
 use crate::satori::fsutil::{
-    redact_external_output, run_bounded_command, BoundedCommandOutput,
+    redact_external_output, run_bounded_external_command, BoundedCommandOutput,
     MAX_EXTERNAL_COMMAND_TIMEOUT, MAX_EXTERNAL_OUTPUT_BYTES,
 };
 use revm::context::BlockEnv;
@@ -928,7 +928,7 @@ fn validate_foundry_poc(
 
     let mut version_command = Command::new("forge");
     version_command.arg("--version");
-    let version = run_bounded_command(&mut version_command, MAX_EXTERNAL_COMMAND_TIMEOUT);
+    let version = run_bounded_external_command(&mut version_command, MAX_EXTERNAL_COMMAND_TIMEOUT);
     if forge_version_is_unavailable(&version) {
         let stderr_snippet = match &version {
             Ok(output) => {
@@ -965,8 +965,13 @@ fn validate_foundry_poc(
         .arg("test")
         .arg("--match-path")
         .arg(poc_path)
-        .current_dir(project_root);
-    match run_bounded_command(&mut command, MAX_EXTERNAL_COMMAND_TIMEOUT) {
+        .arg("--out")
+        .arg(project_root.join("out"))
+        .arg("--cache-path")
+        .arg(project_root.join("cache"))
+        .current_dir(project_root)
+        .env("RUSTYFUZZ_SATORI_WRITABLE_ROOT", project_root);
+    match run_bounded_external_command(&mut command, MAX_EXTERNAL_COMMAND_TIMEOUT) {
         Ok(output) => PocValidationReport {
             success: output.status.success() && !output.timed_out,
             static_assertions_present,

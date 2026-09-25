@@ -1,6 +1,6 @@
 use crate::satori::error::SatoriResult;
 use crate::satori::fsutil::{
-    ensure_dir, redact_external_output, run_bounded_command, write_atomic_under,
+    ensure_dir, redact_external_output, run_bounded_external_command, write_atomic_under,
     MAX_EXTERNAL_ARTIFACT_BYTES, MAX_EXTERNAL_COMMAND_TIMEOUT, MAX_EXTERNAL_OUTPUT_BYTES,
 };
 use crate::satori::types::{ProjectModel, ToolRun};
@@ -29,7 +29,7 @@ pub fn run_slither_tool(
     }
     let mut version_command = Command::new("slither");
     version_command.arg("--version");
-    if !run_bounded_command(&mut version_command, MAX_EXTERNAL_COMMAND_TIMEOUT)
+    if !run_bounded_external_command(&mut version_command, MAX_EXTERNAL_COMMAND_TIMEOUT)
         .map(|output| output.status.success() && !output.timed_out)
         .unwrap_or(false)
     {
@@ -57,14 +57,20 @@ pub fn run_slither_tool(
         .arg(".")
         .arg("--json")
         .arg(&temporary)
-        .current_dir(&project.root);
+        .current_dir(&project.root)
+        .env("RUSTYFUZZ_SATORI_WRITABLE_ROOT", &analysis_dir);
     let output = with_temporary_cleanup(
-        run_bounded_command(&mut command, MAX_EXTERNAL_COMMAND_TIMEOUT).map_err(anyhow::Error::msg),
+        run_bounded_external_command(&mut command, MAX_EXTERNAL_COMMAND_TIMEOUT)
+            .map_err(anyhow::Error::msg),
         || cleanup_slither_temporary(&temporary),
     )?;
     let persisted = with_temporary_cleanup(
         (|| -> SatoriResult<bool> {
             if !output.status.success() {
+                return Ok(false);
+            }
+            let metadata = std::fs::symlink_metadata(&temporary)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Ok(false);
             }
             let mut bytes = Vec::new();

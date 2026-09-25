@@ -1,0 +1,22 @@
+[package]
+name = "rustyfuzz-operations"
+version = "0.1.0"
+edition = "2021"
+description = "Local-only operations, integrity, backup, restore, and recovery services for RustyFuzz."
+
+[dependencies]
+rustyfuzz-artifacts = { path = "../rustyfuzz-artifacts" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.11.0"
+hex = "0.4.3"
+base64 = "0.22.1"
+argon2 = { version = "0.5.3", features = ["std"] }
+chacha20poly1305 = { version = "0.10.1", features = ["std"] }
+zeroize = "1.9.0"
+fs2 = "0.4.3"
+libc = "0.2"
+getrandom = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

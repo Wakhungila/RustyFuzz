@@ -7,8 +7,8 @@ use crate::evm::economic_views::{snapshot_economic_views, EconomicViewProbePlan}
 use crate::evm::feedback::EvmCoverageFeedback;
 use crate::evm::fuzz::EvmInput;
 use crate::satori::fsutil::{
-    redact_external_output, run_bounded_command_with_output_limit, MAX_EXTERNAL_COMMAND_TIMEOUT,
-    MAX_EXTERNAL_OUTPUT_BYTES,
+    redact_external_output, run_bounded_external_command_with_output_limit,
+    MAX_EXTERNAL_COMMAND_TIMEOUT, MAX_EXTERNAL_OUTPUT_BYTES,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -682,7 +682,7 @@ fn run_halmos_in_project_dir(
         .arg("--target")
         .arg(target)
         .current_dir(project_root);
-    let output = run_bounded_command_with_output_limit(
+    let output = run_bounded_external_command_with_output_limit(
         &mut command,
         MAX_EXTERNAL_COMMAND_TIMEOUT,
         MAX_HALMOS_OUTPUT_BYTES,

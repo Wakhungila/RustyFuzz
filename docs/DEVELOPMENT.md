@@ -51,4 +51,4 @@ toolchain.
 Future runtime output belongs under `.rustyfuzz/`. Current production code still
 writes to legacy paths such as `corpus/`, `reports/`, Satori runtime
 directories, and benchmark temp locations. Do not commit generated campaign
-output. See `docs/reengineering/RUNTIME_DATA_POLICY.md`.
+output. See `docs/ARTIFACT_FORMAT.md`.

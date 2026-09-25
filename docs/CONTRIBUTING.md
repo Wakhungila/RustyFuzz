@@ -4,7 +4,7 @@ Status: CURRENT policy for the re-engineering branch.
 
 Before changing production Rust code:
 
-- read `docs/reengineering/CODEBASE_INVENTORY.md`;
+- read `docs/ARCHITECTURE.md`;
 - preserve the Stage 0.5 green gate;
 - keep changes small and reviewable;
 - do not combine module moves, behavior changes, and new features in one patch;

@@ -9,6 +9,7 @@ use alloy::providers::Provider;
 use libafl_bolts::core_affinity::Cores;
 
 use revm::database::CacheDB;
+use revm::database_interface::DatabaseRef;
 use revm::primitives::Address;
 use rusty_fuzz::common::fs_security::{validate_filesystem_identifier, validate_job_bounds};
 use rusty_fuzz::common::oracle::{ProtocolOraclePack, ReentrancyOracle, VulnType};
@@ -32,12 +33,15 @@ use rustyfuzz_evm::executor::EvmExecutor;
 use rustyfuzz_evm::fork_db::ForkDb;
 use rustyfuzz_evm::inspector::MAP_SIZE;
 use rustyfuzz_evm::rpc_url::validate_production_rpc_url;
+use sha2::{Digest, Sha256};
 use std::io::Write;
+use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
 
 /// Executes a non-Satori command against the loaded config.
 pub async fn run(command: Command) -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
     let config = rusty_fuzz::config::Config::load("config.toml")?;
     let _config_ref = &config;
     match command {
@@ -76,6 +80,11 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             poc_out,
             promotion_limit,
         } => {
+            let effective_chain = chain
+                .as_deref()
+                .unwrap_or(config.chain.as_str())
+                .trim()
+                .to_ascii_lowercase();
             let raw_target = match contract.as_deref() {
                 Some(target) if target.trim().is_empty() => {
                     anyhow::bail!(
@@ -178,12 +187,11 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             let manifest_deterministic = hardened_defi_config.deterministic;
             let manifest_synthetic_fallback = !no_synthetic_fallback
                 && (config.allow_synthetic_fallback || allow_synthetic_fallback);
-            let manifest_cfg_hash = format!("{:x}", config_fingerprint(&config));
-            let fuzz_config = rusty_fuzz::engine::fuzz_engine::Config {
+            let mut fuzz_config = rusty_fuzz::engine::fuzz_engine::Config {
                 rpc_url: config.rpc_url.clone(),
                 fork_block: config.fork_block.unwrap_or(0),
                 target_contract,
-                corpus_dir: campaign_corpus_dir,
+                corpus_dir: campaign_corpus_dir.clone(),
                 report_dir: campaign_report_dir,
                 foundry_harness: config
                     .foundry_project
@@ -228,80 +236,189 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 std::path::Path::new(".rustyfuzz"),
                 &manifest_run_id,
             );
-            run_layout.materialize().map_err(|err| {
+            let campaign_owner = run_layout
+                .acquire_campaign_lock()
+                .map_err(|err| anyhow::anyhow!("cannot acquire campaign ownership: {err}"))?;
+            run_layout.materialize_new().map_err(|err| {
                 anyhow::anyhow!(
                     "cannot create run artifacts at {}: {err}",
                     run_layout.root().display()
                 )
             })?;
-            let mut run_manifest = rustyfuzz_artifacts::RunManifest::v1(
-                &manifest_run_id,
-                env!("CARGO_PKG_VERSION"),
-                &manifest_cfg_hash,
-                if unbounded { "unbounded" } else { "bounded" },
-            );
-            run_manifest.git_revision = option_env!("RUSTYFUZZ_GIT_REV").map(str::to_string);
-            run_manifest.fork_block = manifest_fork_block;
-            run_manifest.rpc_endpoint_sanitized = Some(manifest_rpc);
-            run_manifest.rng_seed = manifest_rng_seed;
-            // Gate 4: pin live chain provenance on the run manifest when a
-            // fork block is configured. Fail closed when RPC fork is required
-            // and synthetic fallback cannot absorb a probe failure.
-            if let Some(fork_block) = manifest_fork_block {
-                let rpc_url = config.rpc_url.clone();
-                let probe_result = tokio::task::spawn_blocking(move || {
-                    ForkDb::new(rpc_url, fork_block).refresh_remote_provenance()
-                })
-                .await
-                .map_err(|error| anyhow::anyhow!("fork provenance worker failed: {error}"))?;
-                match probe_result {
-                    Ok(prov) => {
-                        run_manifest.chain_id = prov.chain_id;
-                        run_manifest.fork_block_hash = prov.block_hash;
-                        run_manifest.rpc_fetched_at_unix = prov.fetched_at_unix;
-                        run_manifest.fork_cache_id = prov.cache_id;
-                    }
-                    Err(err) => {
-                        let require_rpc = config.require_rpc_fork || require_rpc_fork;
-                        let synthetic_ok = manifest_synthetic_fallback;
-                        if require_rpc && !synthetic_ok {
-                            return Err(anyhow::anyhow!(
-                                "live RPC provenance probe failed (fail-closed): {err}"
-                            ));
+            let setup_guard = RunSetupTerminalGuard::new(run_layout.clone(), &manifest_run_id);
+            run_layout
+                .mark_incomplete(&manifest_run_id)
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "cannot mark run incomplete at {}: {err}",
+                        run_layout.terminal_status_path().display()
+                    )
+                })?;
+            if let Some(bundle_id) = config.mainnet_seed_bundle.as_deref() {
+                let source = PersistentCorpus::new(&campaign_corpus_dir)?;
+                let bundle = source.load_mainnet_seed_bundle(bundle_id)?;
+                let destination =
+                    PersistentCorpus::new(run_layout.inputs_dir().display().to_string())?;
+                destination.persist_mainnet_seed_bundle(bundle_id, &bundle)?;
+            }
+            fuzz_config.corpus_dir = run_layout.inputs_dir().display().to_string();
+            fuzz_config.report_dir = run_layout.reports_dir().display().to_string();
+            if let Some(checkpoint) = &mut fuzz_config.hardened_defi.checkpoint {
+                checkpoint.directory = run_layout.root().join("checkpoints");
+            }
+            let startup_result: anyhow::Result<()> = async {
+                let mut live_target_bytecode_hash = None;
+                let mut live_provenance = None;
+                // Gate 4: pin live chain provenance and target bytecode on the run
+                // manifest when a fork block is configured. Fail closed when RPC
+                // fork is required and synthetic fallback cannot absorb a failure.
+                if let Some(fork_block) = manifest_fork_block {
+                    let rpc_url = config.rpc_url.clone();
+                    let target_contract = fuzz_config.target_contract;
+                    let probe_result = tokio::task::spawn_blocking(move || {
+                        let fork_db = ForkDb::new(rpc_url, fork_block);
+                        let provenance = fork_db.refresh_remote_provenance()?;
+                        let bytecode_hash = target_contract
+                            .map(|target| fork_db.basic_ref(target))
+                            .transpose()?
+                            .and_then(|account| account.and_then(|account| account.code))
+                            .map(|code| {
+                                format!(
+                                    "sha256:{}",
+                                    hex::encode(Sha256::digest(code.original_byte_slice()))
+                                )
+                            });
+                        Ok::<_, anyhow::Error>((provenance, bytecode_hash))
+                    })
+                    .await
+                    .map_err(|error| anyhow::anyhow!("fork provenance worker failed: {error}"))?;
+                    match probe_result {
+                        Ok((provenance, bytecode_hash)) => {
+                            live_target_bytecode_hash = bytecode_hash;
+                            live_provenance = Some(provenance);
                         }
-                        log::warn!("run manifest provenance probe skipped: {err}");
+                        Err(err) => {
+                            let require_rpc = config.require_rpc_fork || require_rpc_fork;
+                            let synthetic_ok = manifest_synthetic_fallback;
+                            if require_rpc && !synthetic_ok {
+                                return Err(anyhow::anyhow!(
+                                    "live RPC provenance probe failed (fail-closed): {err}"
+                                ));
+                            }
+                            log::warn!("run manifest provenance probe skipped: {err}");
+                        }
                     }
                 }
+                let effective_fingerprint =
+                    rusty_fuzz::engine::fuzz_engine::effective_config_fingerprint(
+                        &effective_chain,
+                        &fuzz_config,
+                        rusty_fuzz::engine::fuzz_engine::resolve_startup_mode(&fuzz_config),
+                        live_target_bytecode_hash.as_deref(),
+                    )?;
+                let mut run_manifest = rustyfuzz_artifacts::RunManifest::v1(
+                    &manifest_run_id,
+                    env!("CARGO_PKG_VERSION"),
+                    &effective_fingerprint.config_hash,
+                    if unbounded { "unbounded" } else { "bounded" },
+                );
+                run_manifest.source_identity =
+                    rustyfuzz_artifacts::SourceIdentity::from_environment();
+                run_manifest.git_revision = (run_manifest.source_identity.git_revision
+                    != "unknown")
+                    .then(|| run_manifest.source_identity.git_revision.clone());
+                run_manifest.canonical_effective_config =
+                    Some(effective_fingerprint.canonical_effective_config);
+                run_manifest.startup_mode = effective_fingerprint.startup_mode;
+                run_manifest.seed_sources = effective_fingerprint.seed_sources;
+                run_manifest.abi_hash = effective_fingerprint.abi_hash;
+                run_manifest.bytecode_hash = effective_fingerprint.bytecode_hash;
+                run_manifest.environment = effective_fingerprint.environment;
+                run_manifest.fork_block = manifest_fork_block;
+                run_manifest.rpc_endpoint_sanitized = Some(manifest_rpc);
+                run_manifest.rng_seed = manifest_rng_seed;
+                if let Some(provenance) = live_provenance {
+                    run_manifest.chain_id = provenance.chain_id;
+                    run_manifest.fork_block_hash = provenance.block_hash;
+                    run_manifest.rpc_fetched_at_unix = provenance.fetched_at_unix;
+                    run_manifest.fork_cache_id = provenance.cache_id;
+                }
+                if manifest_deterministic {
+                    run_manifest
+                        .assumptions
+                        .push("deterministic=true".to_string());
+                }
+                if manifest_synthetic_fallback {
+                    run_manifest
+                        .assumptions
+                        .push("synthetic_fallback=true".to_string());
+                }
+                let manifest_path = run_layout.config_file();
+                run_manifest.persist(&manifest_path).map_err(|err| {
+                    anyhow::anyhow!(
+                        "cannot persist run manifest at {}: {err}",
+                        manifest_path.display()
+                    )
+                })?;
+                log::info!("run manifest persisted at {}", manifest_path.display());
+                Ok(())
             }
-            if manifest_deterministic {
-                run_manifest
-                    .assumptions
-                    .push("deterministic=true".to_string());
+            .await;
+            if let Err(error) = startup_result {
+                if let Err(status_error) = run_layout.write_terminal_status(
+                    &manifest_run_id,
+                    rustyfuzz_artifacts::RunTerminalState::Failed,
+                    None,
+                    None,
+                ) {
+                    log::error!("failed to persist startup failure status: {status_error:#}");
+                }
+                return Err(error);
             }
-            if manifest_synthetic_fallback {
-                run_manifest
-                    .assumptions
-                    .push("synthetic_fallback=true".to_string());
-            }
-            let manifest_path = run_layout.config_file();
-            run_manifest.persist(&manifest_path).map_err(|err| {
-                anyhow::anyhow!(
-                    "cannot persist run manifest at {}: {err}",
-                    manifest_path.display()
-                )
-            })?;
-            log::info!("run manifest persisted at {}", manifest_path.display());
 
             let watchdog =
                 install_campaign_watchdog(wall_timeout_secs, max_execs, duration_secs, unbounded);
             let cancellation = watchdog.as_ref().map(|watchdog| watchdog.cancellation());
-            let result = rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign_with_cancellation(
-                fuzz_config,
-                cancellation,
-            )
-            .await;
+            let terminal_report_dir = fuzz_config.report_dir.clone();
+            setup_guard.complete();
+            let result =
+                rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign_with_cancellation_locked(
+                    fuzz_config,
+                    cancellation,
+                    campaign_owner,
+                )
+                .await;
             if let Some(watchdog) = watchdog {
                 watchdog.complete();
+            }
+            if let Err(error) = &result {
+                let terminal = run_layout.terminal_state().is_some_and(|state| {
+                    matches!(
+                        state,
+                        rustyfuzz_artifacts::RunTerminalState::Completed
+                            | rustyfuzz_artifacts::RunTerminalState::Partial
+                            | rustyfuzz_artifacts::RunTerminalState::Cancelled
+                            | rustyfuzz_artifacts::RunTerminalState::Failed
+                    )
+                });
+                if !terminal {
+                    let summary_path =
+                        Path::new(&terminal_report_dir).join("campaign_summary.json");
+                    let digest = std::fs::read(&summary_path)
+                        .ok()
+                        .map(|bytes| format!("sha256:{}", hex::encode(Sha256::digest(bytes))));
+                    if let Err(status_error) = run_layout.write_terminal_status(
+                        &manifest_run_id,
+                        rustyfuzz_artifacts::RunTerminalState::Failed,
+                        summary_path.exists().then_some(summary_path.as_path()),
+                        digest.as_deref(),
+                    ) {
+                        log::error!(
+                            "failed to persist failed run terminal status: {status_error:#}"
+                        );
+                    }
+                }
+                log::error!("fuzz campaign failed before terminal finalization: {error:#}");
             }
             result?;
         }
@@ -1111,6 +1228,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             );
         }
         Command::Satori { .. } => unreachable!("Satori command is dispatched before config load"),
+        Command::Ops { .. } => unreachable!("Ops command is dispatched before config load"),
     }
 
     Ok(())

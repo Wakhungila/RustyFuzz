@@ -81,8 +81,16 @@ fn start(root: &Path, resume: bool) -> Process {
     let log = fs::File::create(root.join(if resume { "resume.log" } else { "start.log" })).unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
+        .current_dir(root)
         .args(["--exact", "checkpoint_campaign_worker", "--nocapture"])
         .env("RUSTYFUZZ_RESTART_TEST_ROOT", root)
+        .env("RUSTYFUZZ_GIT_REV", "restart-test")
+        .env("RUSTYFUZZ_SOURCE_DIRTY", "clean")
+        .env("RUSTYFUZZ_SOURCE_DIFF_SHA256", "unknown")
+        .env(
+            "RUSTYFUZZ_BINARY_SHA256",
+            format!("sha256:{}", "ab".repeat(32)),
+        )
         .stdout(Stdio::from(log.try_clone().unwrap()))
         .stderr(Stdio::from(log));
     if resume {
@@ -132,15 +140,16 @@ fn sigkill_resumes_real_campaign_from_checkpoint() {
             .as_nanos()
     ));
     fs::create_dir_all(&root).unwrap();
-    let path = root.join("checkpoint/checkpoint.json");
+    let path = root.join(".rustyfuzz/runs/restart/checkpoints/checkpoint.json");
     let mut first = start(&root, false);
     wait_for(&mut first, &root, &path, 8);
     kill(&mut first);
     // Read AFTER death: this is the last committed checkpoint, not an earlier poll.
     let before = read(&path);
     assert!(before.completed_execs >= 8);
-    assert_eq!(before.schema_version, 2);
+    assert_eq!(before.schema_version, 3);
     assert_eq!(before.config_schema_version, 2);
+    assert!(before.source_identity.is_some());
 
     assert!(before.coverage.iter().any(|byte| *byte != 0));
     assert!(!before.corpus_ids.is_empty());
@@ -152,11 +161,11 @@ fn sigkill_resumes_real_campaign_from_checkpoint() {
         before.coverage.iter().filter(|b| **b != 0).count()
     );
     let provenance_path = root
-        .join("corpus/execution_provenance")
+        .join(".rustyfuzz/runs/restart/inputs/execution_provenance")
         .join(format!("{:020}.json", before.completed_execs));
     let provenance: rusty_fuzz::engine::provenance::ExecutionProvenanceRecord =
         serde_json::from_slice(&fs::read(&provenance_path).unwrap()).unwrap();
-    assert_eq!(provenance.schema_version, 2);
+    assert_eq!(provenance.schema_version, 3);
     assert_eq!(provenance.execution_index, before.completed_execs);
     assert_eq!(provenance.budget_consumed, before.budget_consumed);
     assert_eq!(provenance.input_id, provenance.input.semantic_input_hash());
@@ -185,7 +194,9 @@ fn sigkill_resumes_real_campaign_from_checkpoint() {
     );
     let mut second = start(&root, true);
     wait_for(&mut second, &root, &path, before.budget_consumed + 1);
-    assert!(!root.join("checkpoint/resume.json").exists());
+    assert!(!root
+        .join(".rustyfuzz/runs/restart/checkpoints/resume.json")
+        .exists());
     wait_for(&mut second, &root, &path, before.budget_consumed + 4);
     kill(&mut second);
     let after = read(&path);

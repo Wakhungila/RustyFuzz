@@ -293,6 +293,92 @@ pub enum Command {
         #[command(subcommand)]
         command: SatoriCommand,
     },
+    #[command(name = "ops")]
+    Ops {
+        #[command(subcommand)]
+        command: OpsCommand,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum OpsCommand {
+    Status {
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Campaigns {
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Metrics,
+    Events {
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        severity: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    Alerts {
+        #[arg(long, default_value_t = false)]
+        active: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Verify {
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        backup: Option<std::path::PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Backup {
+        #[command(subcommand)]
+        command: OpsBackupCommand,
+    },
+    Drill {
+        #[command(subcommand)]
+        command: OpsDrillCommand,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum OpsBackupCommand {
+    Create {
+        #[arg(long)]
+        output: std::path::PathBuf,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        strict: bool,
+    },
+    List,
+    Verify {
+        path: std::path::PathBuf,
+    },
+    Restore {
+        path: std::path::PathBuf,
+        #[arg(long)]
+        target: std::path::PathBuf,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum OpsDrillCommand {
+    Restore {
+        path: std::path::PathBuf,
+        #[arg(long)]
+        target: std::path::PathBuf,
+        #[arg(long, default_value_t = false)]
+        keep_payload: bool,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]

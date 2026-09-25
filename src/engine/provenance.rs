@@ -1,3 +1,4 @@
+use crate::common::fs_security::validate_filesystem_identifier;
 use crate::common::oracle::ProtocolFinding;
 use crate::common::types::{EvmInput, SequenceExecutionResult};
 use crate::engine::scoring::CampaignScore;
@@ -7,7 +8,8 @@ use std::path::Path;
 
 /// v1: baseline execution provenance.
 /// v2: adds live-RPC / fork-cache provenance (Gate 4 + Gate 10).
-pub const EXECUTION_PROVENANCE_SCHEMA_VERSION: u32 = 2;
+/// v3: adds source identity and collision-safe multi-worker execution identity.
+pub const EXECUTION_PROVENANCE_SCHEMA_VERSION: u32 = 3;
 
 /// Live-RPC and fork-cache provenance attached to every execution record.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,6 +55,16 @@ pub struct ExecutionProvenanceRecord {
     /// Configuration fingerprint of the campaign (Gate 10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_hash: Option<String>,
+    /// Run nonce and worker identity form a globally unique execution identity
+    /// in multi-worker campaigns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_nonce: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    /// Source revision, dirty state, diff digest, and binary digest. Missing
+    /// inputs are represented explicitly as `unknown`.
+    #[serde(default)]
+    pub source_identity: rustyfuzz_artifacts::SourceIdentity,
     /// Tool revision / version string (Gate 10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_revision: Option<String>,
@@ -74,6 +86,9 @@ pub struct PersistRequest<'a> {
     pub rpc_provenance: RpcProvenance,
     pub bytecode_hash: Option<String>,
     pub config_hash: Option<String>,
+    pub run_nonce: Option<String>,
+    pub worker_id: Option<String>,
+    pub source_identity: rustyfuzz_artifacts::SourceIdentity,
     pub tool_revision: Option<String>,
     pub rng_seed: Option<u64>,
 }
@@ -81,6 +96,12 @@ pub struct PersistRequest<'a> {
 pub fn persist(root: &Path, request: PersistRequest<'_>) -> anyhow::Result<()> {
     let directory = root.join("execution_provenance");
     std::fs::create_dir_all(&directory)?;
+    let path = execution_provenance_path(
+        &directory,
+        request.execution_index,
+        request.run_nonce.as_deref(),
+        request.worker_id.as_deref(),
+    )?;
     let record = ExecutionProvenanceRecord {
         schema_version: EXECUTION_PROVENANCE_SCHEMA_VERSION,
         execution_index: request.execution_index,
@@ -96,12 +117,76 @@ pub fn persist(root: &Path, request: PersistRequest<'_>) -> anyhow::Result<()> {
         rpc_provenance: request.rpc_provenance,
         bytecode_hash: request.bytecode_hash,
         config_hash: request.config_hash,
+        run_nonce: request.run_nonce,
+        worker_id: request.worker_id,
+        source_identity: request.source_identity,
         tool_revision: request.tool_revision,
         rng_seed: request.rng_seed,
     };
-    write_json_atomic(
-        &directory.join(format!("{:020}.json", request.execution_index)),
-        &record,
-    )?;
+    write_json_atomic(&path, &record)?;
     Ok(())
+}
+
+fn execution_provenance_path(
+    directory: &Path,
+    execution_index: u64,
+    run_nonce: Option<&str>,
+    worker_id: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(run_nonce) = run_nonce {
+        validate_filesystem_identifier(run_nonce).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(worker_id) = worker_id {
+        validate_filesystem_identifier(worker_id).map_err(anyhow::Error::msg)?;
+    }
+    Ok(match (run_nonce, worker_id) {
+        (Some(run_nonce), Some(worker_id)) => directory.join(format!(
+            "{run_nonce}-worker-{worker_id}-{:020}.json",
+            execution_index
+        )),
+        _ => directory.join(format!("{execution_index:020}.json")),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{execution_provenance_path, EXECUTION_PROVENANCE_SCHEMA_VERSION};
+    use std::path::Path;
+
+    #[test]
+    fn two_worker_provenance_filenames_cannot_collide() {
+        let directory = Path::new("execution_provenance");
+        let first = execution_provenance_path(directory, 7, Some("run-123"), Some("0")).unwrap();
+        let second = execution_provenance_path(directory, 7, Some("run-123"), Some("1")).unwrap();
+
+        assert_ne!(first, second);
+        assert!(first
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("run-123-worker-0-"));
+        assert!(second
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("run-123-worker-1-"));
+    }
+
+    #[test]
+    fn single_worker_provenance_filename_preserves_ordered_index() {
+        let path =
+            execution_provenance_path(Path::new("execution_provenance"), 7, None, None).unwrap();
+        assert_eq!(
+            path,
+            Path::new("execution_provenance/00000000000000000007.json")
+        );
+        assert!(execution_provenance_path(
+            Path::new("execution_provenance"),
+            7,
+            Some("../escape"),
+            Some("worker"),
+        )
+        .is_err());
+        assert_eq!(EXECUTION_PROVENANCE_SCHEMA_VERSION, 3);
+    }
 }

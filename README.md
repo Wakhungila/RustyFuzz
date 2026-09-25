@@ -11,7 +11,7 @@ versioned artifacts — see `docs/adr/` for the architectural decisions).
 Status boundaries:
 
 Reliability changes and their remaining limits are tracked in
-[production hardening notes](docs/reengineering/PRODUCTION_HARDENING.md).
+[docs/SECURITY.md](docs/SECURITY.md).
 
 - **Working today**: EVM fuzzing campaigns (bounded/unbounded), semantic
   input identity with corpus deduplication, snapshot state exploration,
@@ -64,7 +64,7 @@ and the configured corpus dir; every JSON schema carries `schema_version`.
 - Benchmark fixture: add a manifest under `benchmarks/` fixtures dirs used by
   `tests/benchmarks.rs` blind-rediscovery.
 
-Canonical project docs start at [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), and [docs/reengineering/BASELINE.md](docs/reengineering/BASELINE.md).
+Canonical project docs start at [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), and [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 
 ## What Is RustyFuzz?
 

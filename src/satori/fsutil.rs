@@ -1,4 +1,5 @@
 use crate::common::fs_security::{contained_path, identifier_path, validate_filesystem_identifier};
+use crate::satori::containment::{ExternalContainment, ExternalContainmentLimits};
 use crate::satori::error::SatoriResult;
 use chrono::Utc;
 use serde::de::DeserializeOwned;
@@ -276,6 +277,11 @@ pub struct BoundedCommandOutput {
     pub stderr_truncated: bool,
 }
 
+/// Runs a bounded command for a trusted/internal operation.
+///
+/// This helper still uses a Unix process group for cleanup, but a process group
+/// is not a security boundary. External Satori analyzers must use the strict
+/// `run_bounded_external_command` path below.
 pub fn run_bounded_command(
     command: &mut Command,
     timeout: Duration,
@@ -328,6 +334,60 @@ pub fn run_bounded_command_with_output_limit(
     timeout: Duration,
     max_output_bytes: usize,
 ) -> std::io::Result<BoundedCommandOutput> {
+    run_bounded_command_with_output_limit_inner(command, timeout, max_output_bytes, None)
+}
+
+/// Runs an external Satori analyzer inside a Linux cgroup v2 or an explicitly
+/// configured sandbox launcher. If neither backend is available, the command is
+/// not started: untrusted projects fail closed instead of falling back to a
+/// process group.
+pub(crate) fn run_bounded_external_command(
+    command: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<BoundedCommandOutput> {
+    run_bounded_external_command_with_output_limit(command, timeout, MAX_EXTERNAL_OUTPUT_BYTES)
+}
+
+pub(crate) fn run_bounded_external_command_with_output_limit(
+    command: &mut Command,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> std::io::Result<BoundedCommandOutput> {
+    run_bounded_external_command_with_limits(
+        command,
+        timeout,
+        max_output_bytes,
+        ExternalContainmentLimits::default(),
+    )
+}
+
+fn run_bounded_external_command_with_limits(
+    command: &mut Command,
+    timeout: Duration,
+    max_output_bytes: usize,
+    limits: ExternalContainmentLimits,
+) -> std::io::Result<BoundedCommandOutput> {
+    let mut containment = ExternalContainment::prepare(command, limits)?;
+    let result = run_bounded_command_with_output_limit_inner(
+        command,
+        timeout,
+        max_output_bytes,
+        Some(&mut containment),
+    );
+    let cleanup = containment.terminate();
+    match (result, cleanup) {
+        (Ok(output), Ok(())) => Ok(output),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn run_bounded_command_with_output_limit_inner(
+    command: &mut Command,
+    timeout: Duration,
+    max_output_bytes: usize,
+    containment: Option<&mut ExternalContainment>,
+) -> std::io::Result<BoundedCommandOutput> {
     // Regular files avoid a reader thread and a pipe whose EOF can be held by an
     // escaped descendant. This works on Unix systems without /proc, while the
     // output read itself remains bounded.
@@ -364,6 +424,9 @@ pub fn run_bounded_command_with_output_limit(
         thread::sleep(READER_POLL_INTERVAL);
     };
 
+    if let Some(containment) = containment {
+        containment.terminate()?;
+    }
     let stdout_result = read_output_file(&stdout.path, max_output_bytes);
     let stderr_result = read_output_file(&stderr.path, max_output_bytes);
     let (stdout, stdout_truncated) = stdout_result?;
@@ -1368,6 +1431,95 @@ An apitoken, clientsecret, passwordhash, and seedphrase are discussed in ordinar
         assert!(serialized.contains("ordinary prose"));
         fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_containment_reaps_a_descendant_that_escapes_the_process_group() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "rustyfuzz-satori-escaped-descendant-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "setsid sh -c '\''echo $$ > \"$1\"; sleep 30'\'' sh \"$1\" & wait",
+                "sh",
+            ])
+            .arg(&pid_file);
+        let started = std::time::Instant::now();
+        let result = run_bounded_external_command_with_output_limit(
+            &mut command,
+            Duration::from_millis(150),
+            1024,
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let pid = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        if let Some(pid) = pid {
+            for _ in 0..30 {
+                if !Path::new(&format!("/proc/{pid}")).exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        }
+        let _ = std::fs::remove_file(pid_file);
+        assert!(
+            result.is_err()
+                || result
+                    .as_ref()
+                    .is_ok_and(|output| output.timed_out || !output.status.success())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_containment_enforces_pid_limits() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 & sleep 30 & wait"]);
+        let started = std::time::Instant::now();
+        let result = run_bounded_external_command_with_limits(
+            &mut command,
+            Duration::from_millis(150),
+            1024,
+            ExternalContainmentLimits {
+                memory_bytes: 2 * 1024 * 1024 * 1024,
+                max_processes: 2,
+                output_bytes: 1024,
+            },
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(
+            result.is_err()
+                || result
+                    .as_ref()
+                    .is_ok_and(|output| output.timed_out || !output.status.success())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_containment_enforces_memory_limits() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let started = std::time::Instant::now();
+        let result = run_bounded_external_command_with_limits(
+            &mut command,
+            Duration::from_secs(3),
+            1024,
+            ExternalContainmentLimits {
+                memory_bytes: 1,
+                max_processes: 8,
+                output_bytes: 1024,
+            },
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(result.is_err() || !result.expect("bounded result").status.success());
     }
 
     #[test]

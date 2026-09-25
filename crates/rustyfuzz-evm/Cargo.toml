@@ -20,6 +20,6 @@ version  = "0.13.3"
 features = ["json", "blocking"]
 
 [dependencies.revm]
-version          = "38.0.0"
+version          = "43.0.3"
 default-features = false
 features         = ["std", "serde", "memory_limit", "secp256k1", "portable"]

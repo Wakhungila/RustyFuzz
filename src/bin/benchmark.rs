@@ -256,7 +256,28 @@ async fn run_benchmark_contract(
 
         promotion: PromotionConfig::default(),
     })
-    .await
+    .await?;
+    let canonical = rustyfuzz_artifacts::RunLayout::new(
+        std::path::Path::new(".rustyfuzz"),
+        &benchmark_campaign_id(run_id, idx),
+    );
+    copy_directory_contents(&canonical.inputs_dir(), &corpus_dir)?;
+    copy_directory_contents(&canonical.reports_dir(), &report_dir)?;
+    Ok(())
+}
+
+fn copy_directory_contents(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink() && metadata.is_file(),
+            "benchmark canonical output contains an unsupported entry"
+        );
+        fs::copy(entry.path(), destination.join(entry.file_name()))?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +295,7 @@ fn child_completion_outcome(success: bool, timed_out: bool) -> anyhow::Result<Ch
 
 fn run_contract_child(args: &Args, run_id: &str, idx: usize) -> anyhow::Result<bool> {
     let mut child = Command::new(std::env::current_exe()?)
+        .current_dir(verified_benchmark_root()?)
         .arg(&args.artifacts_dir)
         .arg("--max-execs")
         .arg(args.max_execs.to_string())

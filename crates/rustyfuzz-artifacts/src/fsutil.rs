@@ -7,7 +7,7 @@
 //! see the previous complete file or the new complete file.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 /// Errors surfaced by safe persistence helpers.
@@ -15,6 +15,7 @@ use std::path::Path;
 pub enum FsUtilError {
     Io(std::io::Error),
     Serialize(serde_json::Error),
+    InvalidData(String),
 }
 
 impl std::fmt::Display for FsUtilError {
@@ -22,6 +23,7 @@ impl std::fmt::Display for FsUtilError {
         match self {
             FsUtilError::Io(err) => write!(f, "filesystem error: {err}"),
             FsUtilError::Serialize(err) => write!(f, "serialization error: {err}"),
+            FsUtilError::InvalidData(detail) => write!(f, "invalid artifact data: {detail}"),
         }
     }
 }
@@ -75,13 +77,88 @@ pub fn write_atomic(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> Result<(
     Ok(())
 }
 
+pub fn write_atomic_noclobber(
+    path: impl AsRef<Path>,
+    bytes: impl AsRef<[u8]>,
+) -> Result<(), FsUtilError> {
+    let path = path.as_ref();
+    let bytes = bytes.as_ref();
+    reject_symlink_components(path)?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    reject_symlink_components(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| FsUtilError::Io(std::io::Error::other("non-utf8 artifact file name")))?;
+    let canonical_parent = fs::canonicalize(parent)?;
+    let destination = canonical_parent.join(file_name);
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&format!(".{file_name}."))
+        .suffix(".tmp")
+        .tempfile_in(&canonical_parent)?;
+    for chunk in bytes.chunks(64 * 1024) {
+        tmp.write_all(chunk)?;
+    }
+    tmp.as_file().sync_all()?;
+    tmp.persist_noclobber(&destination)
+        .map_err(|err| FsUtilError::Io(err.error))?;
+    sync_parent_best_effort(&canonical_parent);
+    Ok(())
+}
+
+pub fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, FsUtilError> {
+    reject_symlink_components(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(FsUtilError::InvalidData(
+            "artifact is not a regular file".to_string(),
+        ));
+    }
+    if metadata.len() > max_bytes {
+        return Err(FsUtilError::InvalidData(
+            "artifact exceeds the size limit".to_string(),
+        ));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.len() > max_bytes {
+        return Err(FsUtilError::InvalidData(
+            "artifact changed while being read".to_string(),
+        ));
+    }
+    let limit = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| FsUtilError::InvalidData("artifact size limit is too large".to_string()))?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(limit)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(FsUtilError::InvalidData(
+            "artifact exceeds the size limit".to_string(),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Serializes `value` as pretty JSON and writes it atomically.
 pub fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), FsUtilError> {
     let bytes = serde_json::to_vec_pretty(value)?;
     write_atomic(path, &bytes)
 }
 
-fn reject_symlink_components(path: &Path) -> Result<(), FsUtilError> {
+pub fn reject_symlink_components(path: &Path) -> Result<(), FsUtilError> {
     let mut current = Some(path.to_path_buf());
     while let Some(candidate) = current {
         if let Ok(metadata) = fs::symlink_metadata(&candidate) {
@@ -105,6 +182,31 @@ fn sync_parent_best_effort(parent: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_regular_reader_rejects_oversized_and_symlinked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.bin");
+        fs::write(&path, b"12345").unwrap();
+        assert_eq!(read_regular_bounded(&path, 5).unwrap(), b"12345");
+        assert!(read_regular_bounded(&path, 4).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = dir.path().join("input-link.bin");
+            symlink(&path, &link).unwrap();
+            assert!(read_regular_bounded(&link, 5).is_err());
+        }
+    }
+
+    #[test]
+    fn no_clobber_publication_preserves_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.bin");
+        write_atomic_noclobber(&path, b"first").unwrap();
+        assert!(write_atomic_noclobber(&path, b"second").is_err());
+        assert_eq!(fs::read(path).unwrap(), b"first");
+    }
 
     #[test]
     fn concurrent_writers_publish_only_complete_payloads() {

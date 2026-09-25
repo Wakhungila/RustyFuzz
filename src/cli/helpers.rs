@@ -228,6 +228,72 @@ pub struct ProveLiveOptions {
     pub rng_seed: Option<u64>,
 }
 
+fn persist_failure_terminal_if_pending(
+    run_layout: &rustyfuzz_artifacts::RunLayout,
+    campaign_id: &str,
+) {
+    let terminal = run_layout.terminal_state().is_some_and(|state| {
+        matches!(
+            state,
+            rustyfuzz_artifacts::RunTerminalState::Completed
+                | rustyfuzz_artifacts::RunTerminalState::Partial
+                | rustyfuzz_artifacts::RunTerminalState::Cancelled
+                | rustyfuzz_artifacts::RunTerminalState::Failed
+        )
+    });
+    if terminal {
+        return;
+    }
+    let summary_path = run_layout.reports_dir().join("campaign_summary.json");
+    let digest = std::fs::read(&summary_path)
+        .ok()
+        .map(|bytes| format!("sha256:{}", hex::encode(Sha256::digest(bytes))));
+    if let Err(status_error) = run_layout.write_terminal_status(
+        campaign_id,
+        rustyfuzz_artifacts::RunTerminalState::Failed,
+        summary_path.exists().then_some(summary_path.as_path()),
+        digest.as_deref(),
+    ) {
+        log::error!("failed to persist failure terminal status: {status_error:#}");
+    }
+}
+
+pub(crate) struct RunSetupTerminalGuard {
+    layout: rustyfuzz_artifacts::RunLayout,
+    campaign_id: String,
+    armed: bool,
+}
+
+impl RunSetupTerminalGuard {
+    pub(crate) fn new(layout: rustyfuzz_artifacts::RunLayout, campaign_id: &str) -> Self {
+        Self {
+            layout,
+            campaign_id: campaign_id.to_string(),
+            armed: true,
+        }
+    }
+
+    pub(crate) fn complete(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RunSetupTerminalGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = self.layout.write_terminal_status(
+            &self.campaign_id,
+            rustyfuzz_artifacts::RunTerminalState::Failed,
+            None,
+            None,
+        ) {
+            log::error!("failed to persist campaign setup failure: {error:#}");
+        }
+    }
+}
+
 pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyhow::Result<()> {
     ensure_evm_chain(config)?;
     anyhow::ensure!(
@@ -251,9 +317,16 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
         .campaign_id
         .unwrap_or_else(|| format!("prove-live-{}-{fork_block}-{}", target, Uuid::new_v4()));
     let campaign_id = sanitize_campaign_id(&campaign_id);
-    let campaign_corpus_dir = format!("{}/prove-live/{}", config.corpus_dir, campaign_id);
-    let campaign_report_dir = format!("{}/prove-live/{}", config.report_dir, campaign_id);
-    std::fs::create_dir_all(&campaign_report_dir)?;
+    let run_layout =
+        rustyfuzz_artifacts::RunLayout::new(std::path::Path::new(".rustyfuzz"), &campaign_id);
+    let campaign_owner = run_layout
+        .acquire_campaign_lock()
+        .map_err(|error| anyhow::anyhow!("cannot acquire campaign ownership: {error}"))?;
+    run_layout.materialize_new()?;
+    let setup_guard = RunSetupTerminalGuard::new(run_layout.clone(), &campaign_id);
+    run_layout.mark_incomplete(&campaign_id)?;
+    let campaign_corpus_dir = run_layout.inputs_dir().display().to_string();
+    let campaign_report_dir = run_layout.reports_dir().display().to_string();
 
     print_prove_live_banner(&campaign_id, target, fork_block, options.duration_secs);
 
@@ -294,7 +367,7 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
     if let Some(abi_path) = resolved_abi_path.as_deref() {
         let (_abi, _registry, report) = ingest_abi_file(abi_path, Some(target))?;
         let output = std::path::Path::new(&campaign_report_dir).join("abi_report.json");
-        std::fs::write(&output, serde_json::to_vec_pretty(&report)?)?;
+        rustyfuzz_artifacts::fsutil::write_json_atomic(&output, &report)?;
         println!(
             "\x1b[36m[abi]\x1b[0m loaded {} functions, {} events -> {}",
             report.function_count,
@@ -328,7 +401,7 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
                         let (_abi, _registry, report) = ingest_abi_file(&path, Some(target))?;
                         let output = std::path::Path::new(&campaign_report_dir)
                             .join("implementation_abi_report.json");
-                        std::fs::write(&output, serde_json::to_vec_pretty(&report)?)?;
+                        rustyfuzz_artifacts::fsutil::write_json_atomic(&output, &report)?;
                         println!(
                             "\x1b[36m[abi]\x1b[0m loaded implementation ABI {} functions, {} events -> {}",
                             report.function_count,
@@ -395,7 +468,7 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
             .ingest_bundle_from_target(&seed_config, &fork_db)
             .await?;
         let manifest_output = std::path::Path::new(&campaign_report_dir).join("seed_bundle.json");
-        std::fs::write(&manifest_output, serde_json::to_vec_pretty(&bundle)?)?;
+        rustyfuzz_artifacts::fsutil::write_json_atomic(&manifest_output, &bundle)?;
         let corpus = PersistentCorpus::new(&campaign_corpus_dir)?;
         corpus.persist_mainnet_seed_bundle(&bundle_id, &bundle)?;
         println!(
@@ -421,7 +494,7 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
             )
         };
         let setup_output = std::path::Path::new(&campaign_report_dir).join("setup_report.json");
-        std::fs::write(&setup_output, serde_json::to_vec_pretty(&setup_report)?)?;
+        rustyfuzz_artifacts::fsutil::write_json_atomic(&setup_output, &setup_report)?;
         println!(
             "\x1b[36m[setup]\x1b[0m tokens={}, whales={}, pools={}, oracles={} -> {}",
             setup_report.tokens.len(),
@@ -438,9 +511,9 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
             None,
         );
         let invariant_output = std::path::Path::new(&campaign_report_dir).join("invariants.toml");
-        std::fs::write(
+        rustyfuzz_artifacts::fsutil::write_atomic(
             &invariant_output,
-            toml::to_string_pretty(&invariant_manifest)?,
+            toml::to_string_pretty(&invariant_manifest)?.as_bytes(),
         )?;
         println!(
             "\x1b[36m[invariants]\x1b[0m rules={} -> {}",
@@ -457,7 +530,10 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
         } else {
             let invariant_manifest =
                 TargetInvariantManifest::generate(Some(target), abi_report.as_ref(), None, None);
-            std::fs::write(&path, toml::to_string_pretty(&invariant_manifest)?)?;
+            rustyfuzz_artifacts::fsutil::write_atomic(
+                &path,
+                toml::to_string_pretty(&invariant_manifest)?.as_bytes(),
+            )?;
             Some(path.to_string_lossy().to_string())
         }
     };
@@ -527,13 +603,19 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
         false,
     );
     let cancellation = watchdog.as_ref().map(|watchdog| watchdog.cancellation());
-    let result = rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign_with_cancellation(
+    setup_guard.complete();
+    let result = rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign_with_cancellation_locked(
         fuzz_config,
         cancellation,
+        campaign_owner,
     )
     .await;
     if let Some(watchdog) = watchdog {
         watchdog.complete();
+    }
+    if let Err(error) = &result {
+        persist_failure_terminal_if_pending(&run_layout, &campaign_id);
+        log::error!("prove-live campaign failed before terminal finalization: {error:#}");
     }
     result?;
     println!(
@@ -606,7 +688,7 @@ async fn fetch_explorer_abi_to_report(
                 _ => "fetched_abi.json",
             };
             let output = std::path::Path::new(campaign_report_dir).join(filename);
-            std::fs::write(&output, serde_json::to_vec_pretty(&abi)?)?;
+            rustyfuzz_artifacts::fsutil::write_json_atomic(&output, &abi)?;
             println!(
                 "\x1b[36m[abi]\x1b[0m fetched {} ABI for {} -> {}",
                 label,
@@ -723,36 +805,269 @@ pub fn execution_coverage_material(
     material
 }
 
-/// Deterministic fingerprint of the effective configuration for run manifests.
-///
-/// Hashes the serialized shape of non-secret config fields; secrets (the RPC
-/// URL credentials) are excluded by hashing the sanitized endpoint instead.
-pub fn config_fingerprint(config: &rusty_fuzz::config::Config) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    rustyfuzz_artifacts::sanitize_rpc_endpoint(&config.rpc_url).hash(&mut hasher);
-    config.chain.hash(&mut hasher);
-    config.target_contract.hash(&mut hasher);
-    config.fork_block.hash(&mut hasher);
-    config.mainnet_seed_bundle.hash(&mut hasher);
-    config.target_abi.hash(&mut hasher);
-    config.target_invariant_manifest.hash(&mut hasher);
-    config.require_seed_bundle.hash(&mut hasher);
-    config.require_rpc_fork.hash(&mut hasher);
-    config.allow_synthetic_fallback.hash(&mut hasher);
-    hasher.finish()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         address_from_storage_word, apply_prove_live_runtime_defaults,
-        discover_eip1967_implementation, eip1967_slot, prove_live_exit_code,
-        resolve_campaign_bounds,
+        discover_eip1967_implementation, eip1967_slot, persist_failure_terminal_if_pending,
+        prove_live_exit_code, resolve_campaign_bounds, RunSetupTerminalGuard,
     };
     use revm::primitives::{Address, U256};
-    use rusty_fuzz::engine::promotion::PromotionCampaignSummary;
+    use rusty_fuzz::config::HardenedDefiConfig;
+    use rusty_fuzz::engine::fuzz_engine::{
+        effective_config_fingerprint, resolve_startup_mode, Config as EngineConfig,
+    };
+    use rusty_fuzz::engine::promotion::{PromotionCampaignSummary, PromotionConfig};
+    use rustyfuzz_artifacts::manifest::StartupMode;
     use rustyfuzz_evm::fork_db::ForkDb;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn prove_live_setup_guard_terminalizes_early_failure() {
+        let base = std::env::temp_dir().join(format!(
+            "rustyfuzz-prove-live-setup-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let layout = rustyfuzz_artifacts::RunLayout::new(&base, "setup-failure");
+        layout.materialize().unwrap();
+        layout.mark_incomplete("setup-failure").unwrap();
+        drop(RunSetupTerminalGuard::new(layout.clone(), "setup-failure"));
+        assert_eq!(
+            layout.terminal_state(),
+            Some(rustyfuzz_artifacts::RunTerminalState::Failed)
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn failure_terminal_fallback_marks_pending_failed_and_preserves_terminal() {
+        let base = std::env::temp_dir().join(format!(
+            "rustyfuzz-failure-terminal-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pending = rustyfuzz_artifacts::RunLayout::new(&base, "pending-failure");
+        pending.materialize().unwrap();
+        pending.mark_incomplete("pending-failure").unwrap();
+        persist_failure_terminal_if_pending(&pending, "pending-failure");
+        assert_eq!(
+            pending.terminal_state(),
+            Some(rustyfuzz_artifacts::RunTerminalState::Failed)
+        );
+
+        let completed = rustyfuzz_artifacts::RunLayout::new(&base, "already-done");
+        completed.materialize().unwrap();
+        completed.mark_incomplete("already-done").unwrap();
+        completed
+            .write_terminal_status(
+                "already-done",
+                rustyfuzz_artifacts::RunTerminalState::Completed,
+                None,
+                None,
+            )
+            .unwrap();
+        persist_failure_terminal_if_pending(&completed, "already-done");
+        assert_eq!(
+            completed.terminal_state(),
+            Some(rustyfuzz_artifacts::RunTerminalState::Completed)
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn fingerprint_fixture() -> EngineConfig {
+        EngineConfig {
+            rpc_url: "https://user:secret@rpc.example.test/v2/private?token=hidden".to_string(),
+            fork_block: 19_000_000,
+            target_contract: Some(Address::repeat_byte(0x11)),
+            corpus_dir: "corpus/run".to_string(),
+            report_dir: "reports/run".to_string(),
+            foundry_harness: None,
+            mainnet_seed_bundle: None,
+            in_memory_bytecode: None,
+            cores: None,
+            require_seed_bundle: false,
+            require_rpc_fork: true,
+            allow_synthetic_fallback: false,
+            hardened_defi: HardenedDefiConfig::default(),
+            target_invariant_manifest: None,
+            abi_path: None,
+            max_execs: Some(1_000),
+            duration_secs: Some(300),
+            artifact_limit: Some(25),
+            campaign_id: Some("fingerprint-test".to_string()),
+            paths_are_isolated: true,
+            min_finding_confidence: 60,
+            promotion: PromotionConfig {
+                strict_proof: true,
+                ..PromotionConfig::default()
+            },
+        }
+    }
+
+    #[test]
+    fn effective_fingerprint_distinguishes_strict_target_bounds_and_startup_modes() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let base = fingerprint_fixture();
+        let base_fingerprint = effective_config_fingerprint(
+            "evm",
+            &base,
+            StartupMode::DeterministicLiveStateProbe,
+            None,
+        )
+        .unwrap();
+        assert!(base_fingerprint.config_hash.starts_with("sha256:"));
+        assert_eq!(base_fingerprint.config_hash.len(), "sha256:".len() + 64);
+
+        let mut strict = base.clone();
+        strict.promotion.strict_proof = false;
+        let strict_fingerprint = effective_config_fingerprint(
+            "evm",
+            &strict,
+            StartupMode::DeterministicLiveStateProbe,
+            None,
+        )
+        .unwrap();
+        assert_ne!(base_fingerprint.config_hash, strict_fingerprint.config_hash);
+
+        let mut target = base.clone();
+        target.target_contract = Some(Address::repeat_byte(0x22));
+        let target_fingerprint = effective_config_fingerprint(
+            "evm",
+            &target,
+            StartupMode::DeterministicLiveStateProbe,
+            None,
+        )
+        .unwrap();
+        assert_ne!(base_fingerprint.config_hash, target_fingerprint.config_hash);
+
+        let mut bounds = base.clone();
+        bounds.max_execs = Some(2_000);
+        bounds.duration_secs = Some(600);
+        let bounds_fingerprint = effective_config_fingerprint(
+            "evm",
+            &bounds,
+            StartupMode::DeterministicLiveStateProbe,
+            None,
+        )
+        .unwrap();
+        assert_ne!(base_fingerprint.config_hash, bounds_fingerprint.config_hash);
+
+        let abi_start_fingerprint =
+            effective_config_fingerprint("evm", &base, StartupMode::AbiDerivedSeeds, None).unwrap();
+        let historical_start_fingerprint =
+            effective_config_fingerprint("evm", &base, StartupMode::HistoricalSeeds, None).unwrap();
+        assert_eq!(
+            abi_start_fingerprint.startup_mode,
+            StartupMode::AbiDerivedSeeds
+        );
+        assert_eq!(
+            historical_start_fingerprint.startup_mode,
+            StartupMode::HistoricalSeeds
+        );
+        assert_ne!(
+            abi_start_fingerprint.config_hash,
+            historical_start_fingerprint.config_hash
+        );
+    }
+
+    #[test]
+    fn startup_resolution_marks_live_probe_separately_from_abi_seeds() {
+        let mut config = fingerprint_fixture();
+        assert_eq!(
+            resolve_startup_mode(&config),
+            StartupMode::DeterministicLiveStateProbe
+        );
+
+        config.abi_path = Some("target.abi.json".to_string());
+        assert_eq!(resolve_startup_mode(&config), StartupMode::AbiDerivedSeeds);
+    }
+
+    #[test]
+    fn effective_fingerprint_uses_sanitized_rpc_identity() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let first = fingerprint_fixture();
+        let mut second = fingerprint_fixture();
+        let second_rpc = second.rpc_url.replace(
+            "user:secret@rpc.example.test/v2/private?token=hidden",
+            "rotated:credential@rpc.example.test/another/path?token=rotated",
+        );
+        second.rpc_url = second_rpc;
+
+        let first = effective_config_fingerprint(
+            "evm",
+            &first,
+            StartupMode::DeterministicLiveStateProbe,
+            None,
+        )
+        .unwrap();
+        let second = effective_config_fingerprint(
+            "evm",
+            &second,
+            StartupMode::DeterministicLiveStateProbe,
+            None,
+        )
+        .unwrap();
+        assert_eq!(first.config_hash, second.config_hash);
+    }
+
+    #[test]
+    fn effective_fingerprint_includes_resolved_runtime_environment_controls() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let names = [
+            "RUSTYFUZZ_CORES",
+            "LIBAFL_CORES",
+            "RUSTYFUZZ_EXEC_TIMEOUT_SECS",
+            "RUSTYFUZZ_STARTUP_RPC_TIMEOUT_SECS",
+            "RUSTYFUZZ_REQUIRE_RPC_FORK",
+            "RUSTYFUZZ_EXEC_RPC_BUDGET",
+        ];
+        let previous = names
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect::<Vec<_>>();
+        for name in names {
+            std::env::remove_var(name);
+        }
+
+        let config = fingerprint_fixture();
+        let baseline = effective_config_fingerprint(
+            "evm",
+            &config,
+            StartupMode::DeterministicLiveStateProbe,
+            None,
+        )
+        .unwrap();
+
+        std::env::set_var("RUSTYFUZZ_CORES", "0-1");
+        std::env::set_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS", "17");
+        std::env::set_var("RUSTYFUZZ_STARTUP_RPC_TIMEOUT_SECS", "23");
+        std::env::set_var("RUSTYFUZZ_REQUIRE_RPC_FORK", "false");
+        std::env::set_var("RUSTYFUZZ_EXEC_RPC_BUDGET", "7");
+        let overridden = effective_config_fingerprint(
+            "evm",
+            &config,
+            StartupMode::DeterministicLiveStateProbe,
+            None,
+        )
+        .unwrap();
+
+        assert_ne!(baseline.config_hash, overridden.config_hash);
+        for (name, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+    }
 
     #[test]
     fn fuzz_requires_bounds_unless_unbounded() {
@@ -791,6 +1106,7 @@ mod tests {
 
     #[test]
     fn prove_live_runtime_defaults_are_overrideable() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS");
         std::env::remove_var("RUSTYFUZZ_EXEC_RPC_BUDGET");
         apply_prove_live_runtime_defaults(300);

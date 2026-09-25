@@ -17,6 +17,7 @@ fn unique_temp_root(name: &str) -> std::path::PathBuf {
 #[tokio::test]
 async fn synthetic_abi_smoke_campaign_does_not_promote_findings() {
     let root = unique_temp_root("smoke");
+    fs::create_dir_all(&root).expect("temp root");
     let corpus_dir = root.join("corpus");
     let report_dir = root.join("reports");
     let target = Address::from_str("0x1111111111111111111111111111111111111111").expect("target");
@@ -70,8 +71,13 @@ async fn synthetic_abi_smoke_campaign_does_not_promote_findings() {
         },
     };
 
-    let campaign_report_dir = std::path::PathBuf::from(config.isolated_report_dir());
-    run_fuzz_campaign(config).await.expect("smoke campaign");
+    let canonical_root = root.join(".rustyfuzz/runs/smoke");
+    let campaign_report_dir = canonical_root.join("reports");
+    let previous_dir = std::env::current_dir().expect("current dir");
+    std::env::set_current_dir(&root).expect("set temp cwd");
+    let result = run_fuzz_campaign(config).await;
+    std::env::set_current_dir(previous_dir).expect("restore cwd");
+    result.expect("smoke campaign");
 
     let finding_dir = campaign_report_dir.join("findings");
     assert!(
@@ -95,6 +101,41 @@ async fn synthetic_abi_smoke_campaign_does_not_promote_findings() {
     .expect("campaign status");
     assert_eq!(status["state"], "finalized");
     assert_eq!(status["summary"]["promoted_findings"], 0);
+    let canonical_summary = canonical_root.join("reports/campaign_summary.json");
+    let canonical_status = canonical_root.join("campaign_status.json");
+    let terminal: serde_json::Value = serde_json::from_slice(
+        &fs::read(canonical_root.join("terminal_status.json")).expect("terminal status"),
+    )
+    .expect("terminal status json");
+    assert_eq!(
+        terminal["final_summary_path"],
+        "reports/campaign_summary.json"
+    );
+    assert!(!root.join("reports_smoke/campaign_summary.json").exists());
+    assert!(!root.join("corpus_smoke").exists());
+    let canonical_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(&canonical_summary).expect("canonical summary")).unwrap();
+    let inventory = canonical_summary["evidence_inventory"].as_array().unwrap();
+    assert!(!inventory.is_empty());
+    assert!(inventory.iter().all(|entry| {
+        let path = entry["path"].as_str().unwrap_or_default();
+        !path.is_empty()
+            && path != "config.json"
+            && entry["digest"]
+                .as_str()
+                .is_some_and(|digest| digest.starts_with("sha256:"))
+    }));
+    assert!(inventory.iter().any(|entry| {
+        entry["path"]
+            .as_str()
+            .is_some_and(|path| path.starts_with("inputs/") || path.starts_with("reports/"))
+    }));
+
+    let canonical_status: serde_json::Value =
+        serde_json::from_slice(&fs::read(&canonical_status).expect("canonical campaign status"))
+            .expect("canonical status json");
+    assert_eq!(canonical_status["campaign_id"], "smoke");
+    assert_eq!(canonical_status["phase"], "terminal");
 
     let _ = fs::remove_dir_all(root);
 }

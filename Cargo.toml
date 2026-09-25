@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/rustyfuzz-core", "crates/rustyfuzz-evm", "crates/rustyfuzz-engine", "crates/rustyfuzz-artifacts", "crates/rustyfuzz-testkit"]
+members = [".", "crates/rustyfuzz-core", "crates/rustyfuzz-evm", "crates/rustyfuzz-engine", "crates/rustyfuzz-artifacts", "crates/rustyfuzz-operations", "crates/rustyfuzz-testkit"]
 resolver = "2"
 
 [package]
@@ -44,6 +44,7 @@ rustyfuzz-core = { path = "crates/rustyfuzz-core" }
 rustyfuzz-evm = { path = "crates/rustyfuzz-evm" }
 rustyfuzz-engine = { path = "crates/rustyfuzz-engine" }
 rustyfuzz-artifacts = { path = "crates/rustyfuzz-artifacts" }
+rustyfuzz-operations = { path = "crates/rustyfuzz-operations" }
 libafl       = { version = "0.15.4", features = ["prelude"] }
 libafl_bolts = { version = "0.15.4", features = ["prelude"] }
 log          = "0.4.29"
@@ -53,7 +54,7 @@ hex          = "0.4.3"
 # EVM STACK  (feature = "evm")
 # ─────────────────────────────────────────────────────────────────────────────
 [dependencies.revm]
-version          = "38.0.0"
+version          = "43.0.3"
 default-features = false
 features         = ["std", "serde", "memory_limit", "secp256k1", "portable"]
 optional         = true
@@ -103,8 +104,14 @@ version = "0.1.89"
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 [dependencies.clap]
-version  = "4.6.1"
+version = "4.6.1"
 features = ["derive"]
+
+[dependencies.rpassword]
+version = "7.3.1"
+
+[dependencies.zeroize]
+version = "1.9.0"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING

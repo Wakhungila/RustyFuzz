@@ -1,0 +1,12 @@
+<nav aria-label="Main" id="site-nav" class="site-nav">
+{% assign groups = 'Start here,Core concepts,Run & operate,Reference' | split: ',' %}
+{% assign ordered = site.html_pages | sort: 'nav_order' %}
+{% for group in groups %}
+<div class="nav-group-label">{{ group }}</div>
+<ul class="nav-list">
+{% for item in ordered %}{% if item.section == group %}
+<li class="nav-list-item"><a class="nav-list-link" href="{{ item.url | relative_url }}">{{ item.nav_title | default: item.title }}</a></li>
+{% endif %}{% endfor %}
+</ul>
+{% endfor %}
+</nav>

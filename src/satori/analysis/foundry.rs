@@ -1,6 +1,6 @@
 use crate::satori::error::SatoriResult;
 use crate::satori::fsutil::{
-    redact_external_output, run_bounded_command, BoundedCommandOutput,
+    redact_external_output, run_bounded_external_command, BoundedCommandOutput,
     MAX_EXTERNAL_COMMAND_TIMEOUT, MAX_EXTERNAL_OUTPUT_BYTES,
 };
 use crate::satori::types::{ProjectModel, ProjectType, ToolRun};
@@ -65,15 +65,18 @@ fn skipped_tool_run(tool: &str, command: &str, reason: &str) -> ToolRun {
 fn tool_available(tool: &str) -> bool {
     let mut command = Command::new(tool);
     command.arg("--version");
-    run_bounded_command(&mut command, MAX_EXTERNAL_COMMAND_TIMEOUT)
+    run_bounded_external_command(&mut command, MAX_EXTERNAL_COMMAND_TIMEOUT)
         .map(|output| output.status.success() && !output.timed_out)
         .unwrap_or(false)
 }
 
 fn run_tool(tool: &str, args: &[&str], cwd: &Path) -> SatoriResult<ToolRun> {
     let mut command = Command::new(tool);
-    command.args(args).current_dir(cwd);
-    let output = run_bounded_command(&mut command, MAX_EXTERNAL_COMMAND_TIMEOUT)?;
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("RUSTYFUZZ_SATORI_WRITABLE_ROOT", cwd);
+    let output = run_bounded_external_command(&mut command, MAX_EXTERNAL_COMMAND_TIMEOUT)?;
     Ok(ToolRun {
         tool: tool.to_string(),
         command: format!("{} {}", tool, args.join(" ")),

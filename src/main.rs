@@ -15,6 +15,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let command = match args.command {
+        Command::Ops { command } => return cli::ops_handlers::run(command).await,
         Command::Satori { command } => {
             return rusty_fuzz::satori::cli::run(command)
                 .await

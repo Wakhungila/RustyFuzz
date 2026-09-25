@@ -7,6 +7,7 @@
 # Local assistant state and generated CI evidence (keep source tests/fixtures).
 /.opencode/
 /cargo-audit.json
+/cargo-metadata.json
 /benchmark_output.txt
 /svm.err
 __pycache__/
@@ -129,6 +130,15 @@ node_modules/
 
 # Only ignore vendor/ if you are not intentionally vendoring dependencies.
 /vendor/
+
+# ─────────────────────────────────────────────────────────────
+# Documentation site (Jekyll / just-the-docs)
+# ─────────────────────────────────────────────────────────────
+/docs-site/vendor/
+/docs-site/_site/
+/docs-site/.jekyll-cache/
+/docs-site/.jekyll-metadata
+/docs-site/.bundle/
 
 # ─────────────────────────────────────────────────────────────
 # Editors

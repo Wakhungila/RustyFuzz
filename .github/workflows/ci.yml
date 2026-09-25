@@ -36,27 +36,20 @@ jobs:
           toolchain: 1.97.1
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version 0.22.2
-      - name: Cargo audit
+      - name: Cargo audit and fail-closed policy validation
         run: |
-          audit_status=0
-          cargo audit --json > cargo-audit.json || audit_status=$?
-          echo "cargo audit exit status: ${audit_status}"
-          test -s cargo-audit.json
-          cat cargo-audit.json
-          if [ "$audit_status" -eq 0 ]; then
-            jq -e '.vulnerabilities.count == 0' cargo-audit.json
-          else
-            jq -e '
-              .vulnerabilities.count == 1 and
-              (.vulnerabilities.list | length) == 1 and
-              .vulnerabilities.list[0].advisory.id == "RUSTSEC-2025-0055" and
-              .vulnerabilities.list[0].package.name == "tracing-subscriber" and
-              .vulnerabilities.list[0].package.version == "0.2.25"
-            ' cargo-audit.json
-              cargo metadata --locked --all-features --format-version 1 |
-              jq -e '[.packages[] | select(.name == "tracing-subscriber" and .version == "0.2.25")] | length == 1'
-
-          fi
+          set +e
+          cargo audit --json > cargo-audit.json
+          audit_status=$?
+          set -e
+          cargo metadata --locked --format-version 1 > cargo-metadata.json
+          python3 scripts/validate_vulnerability_policy.py \
+            --policy security/vulnerability-policy.json \
+            --audit-report cargo-audit.json \
+            --metadata cargo-metadata.json \
+            --cargo-toml Cargo.toml \
+            --audit-exit-status "$audit_status"
+          python3 -m unittest discover -s tests -p security_policy_test.py -v
       - name: Upload audit report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -115,7 +108,7 @@ jobs:
   # Memory leak detection with sanitizers.
   # Per-crate scopes match the locally proven gates; full-workspace ASan is a
   # known issue (tests/end_to_end_smoke.rs trips an ASan runtime check) and is
-  # deliberately not a gate. See docs/reengineering/STAGE_2A_CORE_EXTRACTION.md.
+  # deliberately not a gate.
   sanitizers:
     name: Sanitizers (${{ matrix.scope }})
     runs-on: ubuntu-latest
@@ -203,11 +196,6 @@ jobs:
         run: cargo build --verbose --release --locked
 
       - name: Release checksums
-        run: ./scripts/build-release.sh dist
-      - name: Upload release checksums
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: release-${{ matrix.os }}
-          path: dist/
+        run: RUSTYFUZZ_ALLOW_UNSIGNED_RELEASE=1 ./scripts/build-release.sh dist
       - name: Build with supported optional proof feature
         run: cargo build --verbose --features z3 --locked

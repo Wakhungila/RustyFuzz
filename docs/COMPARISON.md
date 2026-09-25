@@ -3,7 +3,7 @@
 > **SUPERSEDED / HISTORICAL:** This comparison predates the Stage 0/0.5
 > baseline review. Treat feature rows as historical notes, not current
 > production-readiness claims. Use `docs/ARCHITECTURE.md`,
-> `docs/BENCHMARKING.md`, and `docs/reengineering/BASELINE.md` as the current
+> `docs/BENCHMARKING.md` as the current
 > source of truth.
 
 ## Overview

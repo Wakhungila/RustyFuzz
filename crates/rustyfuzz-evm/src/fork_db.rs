@@ -29,8 +29,7 @@ pub type EvmCacheDb = CacheDB<ForkDb>;
 
 /// Provenance recorded with every persisted fork-cache snapshot (Gate 4).
 ///
-/// Freshness / invalidation rules (also documented in
-/// `docs/reengineering/LIVE_RPC_CONSISTENCY.md`):
+/// Freshness / invalidation rules:
 /// 1. A snapshot is valid only for the exact `block_number` it was fetched at
 ///    (or `block_tag == "latest"` if unnumbered).
 /// 2. If `block_hash` was recorded, re-fetching that block must yield the same

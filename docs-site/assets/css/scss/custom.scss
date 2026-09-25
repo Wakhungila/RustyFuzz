@@ -1,0 +1,79 @@
+---
+# Front matter (even empty) tells Jekyll to process this file with Liquid.
+---
+
+// RustyFuzz docs — a clean, content-first look in the spirit of the OSS-Fuzz
+// docs: system font stack, a single blue accent, generous measure, calm tables.
+
+:root {
+  // Accent (Google-ish blue) and neutrals
+  --link-color: #1a73e8;
+  --link-color-hover: #1558b0;
+  --btn-primary-color: #1a73e8;
+  --nav-color: #5f6368;
+
+  --body-background-color: #ffffff;
+  --body-text-color: #202124;
+  --secondary-text-color: #5f6368;
+  --border-color: #dadce0;
+  --table-border-color: #e8eaed;
+  --code-background-color: #f5f7f9;
+  --code-color: #24292f;
+  --search-input-bg-color: #ffffff;
+
+  // Slightly larger, comfortable reading measure
+  --content-width: 52rem;
+  --nav-width: 15rem;
+}
+
+// Comfortable, system-font typography.
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  line-height: 1.6;
+  color: var(--body-text-color);
+}
+
+h1, h2, h3, h4 {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: #202124;
+}
+
+h1 { font-size: 2.1rem; }
+h2 { font-size: 1.5rem; margin-top: 2rem; }
+
+// Calm, readable tables and code.
+table {
+  border-collapse: collapse;
+}
+th, td { padding: 0.5rem 0.75rem; }
+
+code, pre, kbd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+
+pre {
+  border: 1px solid var(--border-color);
+  border-radius: 0.5rem;
+  padding: 0.9rem 1rem;
+  overflow-x: auto;
+}
+
+// Buttons pick up the accent.
+.btn-primary, .btn {
+  border-radius: 0.4rem;
+}
+
+// Enlarge the header/sidebar logo slightly. The source SVG is transparent and
+// tightly cropped to the mark, so `contain` shows it full-bleed at this size.
+.site-logo {
+  height: 2.5rem;
+  background-size: contain;
+  background-position: left center;
+  background-repeat: no-repeat;
+}
+
+@media (min-width: 42rem) {
+  .site-logo { height: 2.75rem; }
+}

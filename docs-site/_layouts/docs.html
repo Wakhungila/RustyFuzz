@@ -1,0 +1,21 @@
+---
+layout: default
+---
+<div class="doc-heading">
+  <p class="eyebrow">{{ page.section | default: 'Documentation' }}</p>
+  <h1>{{ page.title }}</h1>
+  <p class="doc-description">{{ page.description }}</p>
+</div>
+{% unless page.nav_order == 1 %}
+<details class="page-outline" open><summary>On this page</summary><nav aria-label="On this page"></nav></details>
+{% endunless %}
+<div class="doc-body">{{ content }}</div>
+{% assign ordered = site.html_pages | where_exp: 'p', 'p.nav_order != nil' | sort: 'nav_order' %}
+<nav class="page-pagination" aria-label="Documentation pages">
+{% for p in ordered %}
+  {% if p.url == page.url %}
+    {% unless forloop.first %}{% assign prev_index = forloop.index0 | minus: 1 %}{% assign prev = ordered[prev_index] %}<a href="{{ prev.url | relative_url }}"><span>← Previous</span>{{ prev.title }}</a>{% endunless %}
+    {% unless forloop.last %}{% assign next_index = forloop.index0 | plus: 1 %}{% assign next = ordered[next_index] %}<a href="{{ next.url | relative_url }}"><span>Next →</span>{{ next.title }}</a>{% endunless %}
+  {% endif %}
+{% endfor %}
+</nav>

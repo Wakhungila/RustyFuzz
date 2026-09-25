@@ -1,0 +1,29 @@
+title: RustyFuzz
+description: Stateful EVM fuzzing. Reproducible execution. Evidence you can inspect.
+theme: just-the-docs
+url: ""
+baseurl: ""
+lang: en
+search_enabled: true
+heading_anchors: true
+back_to_top: true
+back_to_top_text: "Back to top"
+color_scheme: light
+enable_copy_code_button: true
+defaults:
+  - scope:
+      path: ""
+      type: pages
+    values:
+      layout: docs
+      has_toc: false
+aux_links:
+  "Repository": "https://github.com/Wakhungila/RustyFuzz"
+aux_links_new_tab: true
+footer_content: "RustyFuzz documentation · EVM security research"
+exclude:
+  - vendor
+  - Gemfile
+  - Gemfile.lock
+  - README.md
+  - scripts

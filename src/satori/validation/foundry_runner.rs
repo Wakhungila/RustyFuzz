@@ -1,7 +1,7 @@
 use crate::common::fs_security::contained_path;
 use crate::satori::error::SatoriResult;
 use crate::satori::fsutil::{
-    redact_external_output, run_bounded_command, BoundedCommandOutput,
+    redact_external_output, run_bounded_external_command, BoundedCommandOutput,
     MAX_EXTERNAL_COMMAND_TIMEOUT, MAX_EXTERNAL_OUTPUT_BYTES,
 };
 use crate::satori::types::ToolRun;
@@ -229,6 +229,18 @@ pub fn maybe_run_forge_test(
         .unwrap_or(&test_path)
         .display()
         .to_string();
+    if rpc_url.is_some_and(|value| !value.trim().is_empty()) && !cfg!(test) {
+        return Ok(ToolRun {
+            tool: "forge".to_string(),
+            command: forge_display_command(Path::new(&match_path), rpc_url),
+            available: false,
+            success: false,
+            exit_code: None,
+            stdout_snippet: String::new(),
+            stderr_snippet: "RPC-backed Foundry validation is disabled under the network-isolated analyzer sandbox".to_string(),
+            artifact: Some(match_path.into()),
+        });
+    }
     let rpc_endpoint = match rpc_url.filter(|value| !value.trim().is_empty()) {
         Some(raw) => match prepare_forge_rpc(raw) {
             Ok(endpoint) => Some(endpoint),
@@ -253,7 +265,7 @@ pub fn maybe_run_forge_test(
     let command = forge_display_command(Path::new(&match_path), rpc_url);
     let mut version_command = Command::new("forge");
     version_command.arg("--version").current_dir(&project_root);
-    let version = run_bounded_command(&mut version_command, MAX_EXTERNAL_COMMAND_TIMEOUT);
+    let version = run_bounded_external_command(&mut version_command, MAX_EXTERNAL_COMMAND_TIMEOUT);
     if forge_version_is_unavailable(&version) {
         let stderr_snippet = match &version {
             Ok(output) if output.timed_out => {
@@ -301,11 +313,19 @@ pub fn maybe_run_forge_test(
                     .arg("test")
                     .arg("--match-path")
                     .arg(staged_match_path)
+                    .arg("--out")
+                    .arg(stage_dir.join("out"))
+                    .arg("--cache-path")
+                    .arg(stage_dir.join("cache"))
                     .current_dir(&project_root);
                 if let Some(rpc_endpoint) = rpc_endpoint.as_ref() {
                     configure_forge_rpc(&mut command_builder, rpc_endpoint);
                 }
-                match run_bounded_command(&mut command_builder, MAX_EXTERNAL_COMMAND_TIMEOUT) {
+                command_builder.env("RUSTYFUZZ_SATORI_WRITABLE_ROOT", &stage_dir);
+                match run_bounded_external_command(
+                    &mut command_builder,
+                    MAX_EXTERNAL_COMMAND_TIMEOUT,
+                ) {
                     Ok(output) => Ok(ToolRun {
                         tool: "forge".to_string(),
                         command,
@@ -485,6 +505,7 @@ mod tests {
         old_args_log: Option<OsString>,
         old_cwd_log: Option<OsString>,
         old_mode: Option<OsString>,
+        old_sandbox_launcher: Option<OsString>,
         _lock: MutexGuard<'static, ()>,
     }
 
@@ -502,6 +523,7 @@ mod tests {
             let args_log = bin_dir.join("args.log");
             let cwd_log = bin_dir.join("cwd.log");
             let executable = bin_dir.join("forge");
+            let sandbox_launcher = bin_dir.join("sandbox-launcher");
             fs::create_dir_all(&bin_dir)?;
             fs::write(
                 &executable,
@@ -543,8 +565,16 @@ esac
             let mut permissions = fs::metadata(&executable)?.permissions();
             permissions.set_mode(0o755);
             fs::set_permissions(&executable, permissions)?;
+            fs::write(
+                &sandbox_launcher,
+                "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = \"--\" ]; then shift; fi\nexec \"$@\"\n",
+            )?;
+            let mut permissions = fs::metadata(&sandbox_launcher)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&sandbox_launcher, permissions)?;
 
             let old_path = std::env::var_os("PATH");
+            let old_sandbox_launcher = std::env::var_os("RUSTYFUZZ_SATORI_SANDBOX_LAUNCHER");
             let old_args_log = std::env::var_os("FAKE_FORGE_ARGS_LOG");
             let old_cwd_log = std::env::var_os("FAKE_FORGE_CWD_LOG");
             let old_mode = std::env::var_os("FAKE_FORGE_MODE");
@@ -556,6 +586,7 @@ esac
             std::env::set_var("FAKE_FORGE_ARGS_LOG", &args_log);
             std::env::set_var("FAKE_FORGE_CWD_LOG", &cwd_log);
             std::env::set_var("FAKE_FORGE_MODE", "success");
+            std::env::set_var("RUSTYFUZZ_SATORI_SANDBOX_LAUNCHER", &sandbox_launcher);
             Ok(Self {
                 bin_dir,
                 args_log,
@@ -564,6 +595,7 @@ esac
                 old_args_log,
                 old_cwd_log,
                 old_mode,
+                old_sandbox_launcher,
                 _lock: lock,
             })
         }
@@ -592,6 +624,10 @@ esac
             restore("FAKE_FORGE_ARGS_LOG", self.old_args_log.take());
             restore("FAKE_FORGE_CWD_LOG", self.old_cwd_log.take());
             restore("FAKE_FORGE_MODE", self.old_mode.take());
+            restore(
+                "RUSTYFUZZ_SATORI_SANDBOX_LAUNCHER",
+                self.old_sandbox_launcher.take(),
+            );
             let _ = fs::remove_dir_all(&self.bin_dir);
         }
     }

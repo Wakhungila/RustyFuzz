@@ -11,7 +11,8 @@ pub use fsutil::FsUtilError;
 pub mod layout;
 pub mod manifest;
 
-pub use layout::RunLayout;
+pub use layout::{validate_run_id, CampaignLock, RunLayout, RunTerminalState, RunTerminalStatus};
 pub use manifest::{
-    sanitize_rpc_endpoint, ManifestError, RunManifest, RUN_MANIFEST_SCHEMA_VERSION,
+    sanitize_path_for_persistence, sanitize_rpc_endpoint, Environment, ManifestError, RunManifest,
+    RuntimeEnvironmentFingerprint, SourceIdentity, RUN_MANIFEST_SCHEMA_VERSION,
 };

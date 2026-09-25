@@ -32,6 +32,7 @@ use crate::evm::fuzz::{AbiRegistry, EvmMutator, EvmTestcaseMetadataStore, Mutati
 use crate::evm::registry::GlobalAccountRegistry;
 use crate::evm::seed_ingester::{validate_mainnet_seed_bundle, MainnetSeedBundle};
 use crate::evm::snapshot::new_evm_snapshot;
+use anyhow::Context;
 use rustyfuzz_evm::dataflow::DataflowRegistry;
 use rustyfuzz_evm::executor::EvmExecutor;
 use rustyfuzz_evm::fork_db::{execution_rpc_budget, ForkCacheProvenance, ForkDb};
@@ -49,7 +50,8 @@ use revm::state::AccountInfo;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,6 +63,12 @@ use uuid::Uuid;
 
 const DEFAULT_MUTATIONAL_STAGE_MAX_ITERATIONS: usize = 128;
 const MAX_SNAPSHOT_CORPUS_SIZE: usize = 4096;
+const MAX_WORKER_TERMINAL_BYTES: u64 = 1024 * 1024;
+const MAX_EFFECTIVE_CONFIG_INPUT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CANONICAL_EVIDENCE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_CANONICAL_EVIDENCE_FILES: usize = 100_000;
+const MAX_CANONICAL_EVIDENCE_DEPTH: usize = 64;
+const MAX_CANONICAL_SUMMARY_BYTES: usize = 12 * 1024 * 1024;
 const REQUIRED_SEED_PROVENANCE_PREFIX: &str = "rustyfuzz:required-seed";
 
 fn required_seed_inputs(bundle: &MainnetSeedBundle) -> anyhow::Result<Vec<EvmInput>> {
@@ -134,19 +142,109 @@ fn valid_fork_provenance(provenance: &ForkCacheProvenance, expected_block: u64) 
         && provenance.block_hash.is_some()
         && provenance.cache_id.is_some()
 }
+#[derive(Debug, Clone, Copy)]
+struct CampaignCancellation {
+    reason: &'static str,
+}
+
+impl std::fmt::Display for CampaignCancellation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.reason)
+    }
+}
+
+impl std::error::Error for CampaignCancellation {}
+
+fn terminal_state_for_campaign_error(
+    error: &anyhow::Error,
+) -> rustyfuzz_artifacts::RunTerminalState {
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<CampaignCancellation>().is_some())
+    {
+        rustyfuzz_artifacts::RunTerminalState::Cancelled
+    } else {
+        rustyfuzz_artifacts::RunTerminalState::Failed
+    }
+}
+
+type ExecutionProvenanceFields = (
+    super::provenance::RpcProvenance,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<u64>,
+    rustyfuzz_artifacts::SourceIdentity,
+);
+
 fn execution_provenance_fields(
     config: &Config,
     core_id: usize,
     synthetic_fork_mode: bool,
     from_checkpoint: bool,
     db: &CacheDB<ForkDb>,
-) -> (
-    super::provenance::RpcProvenance,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<u64>,
-) {
+) -> anyhow::Result<ExecutionProvenanceFields> {
+    if let Some(manifest) = load_canonical_run_manifest(config)? {
+        return Ok(execution_provenance_fields_with_manifest(
+            config,
+            core_id,
+            synthetic_fork_mode,
+            from_checkpoint,
+            db,
+            &manifest,
+        ));
+    }
+
+    let bytecode_hash = execution_target_bytecode_hash(config, db);
+    let fingerprint = effective_config_fingerprint(
+        "evm",
+        config,
+        resolve_startup_mode(config),
+        bytecode_hash.as_deref(),
+    )?;
+    Ok(execution_provenance_fields_with_fingerprint(
+        config,
+        core_id,
+        synthetic_fork_mode,
+        from_checkpoint,
+        db,
+        bytecode_hash,
+        fingerprint.config_hash,
+        rustyfuzz_artifacts::SourceIdentity::from_environment(),
+    ))
+}
+
+fn execution_provenance_fields_with_manifest(
+    config: &Config,
+    core_id: usize,
+    synthetic_fork_mode: bool,
+    from_checkpoint: bool,
+    db: &CacheDB<ForkDb>,
+    manifest: &rustyfuzz_artifacts::RunManifest,
+) -> ExecutionProvenanceFields {
+    execution_provenance_fields_with_fingerprint(
+        config,
+        core_id,
+        synthetic_fork_mode,
+        from_checkpoint,
+        db,
+        manifest.bytecode_hash.clone(),
+        manifest.config_hash.clone(),
+        manifest.source_identity.clone(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execution_provenance_fields_with_fingerprint(
+    config: &Config,
+    core_id: usize,
+    synthetic_fork_mode: bool,
+    from_checkpoint: bool,
+    db: &CacheDB<ForkDb>,
+    bytecode_hash: Option<String>,
+    config_hash: String,
+    source_identity: rustyfuzz_artifacts::SourceIdentity,
+) -> ExecutionProvenanceFields {
     let source = if from_checkpoint {
         "cache_replay"
     } else if synthetic_fork_mode {
@@ -169,36 +267,6 @@ fn execution_provenance_fields(
         fork_cache_id: fork_prov.cache_id.clone(),
         source: Some(source.to_string()),
     };
-
-    let bytecode_hash = config.target_contract.and_then(|target| {
-        let info = db.cache.accounts.get(&target)?.info()?;
-        let code = info.code?;
-        let mut hasher = Sha256::new();
-        hasher.update(code.original_byte_slice());
-        Some(format!("0x{}", hex::encode(hasher.finalize())))
-    });
-
-    let config_payload = format!(
-        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
-        rustyfuzz_artifacts::sanitize_rpc_endpoint(&config.rpc_url),
-        config.fork_block,
-        config.target_contract,
-        config.require_rpc_fork,
-        config.allow_synthetic_fallback,
-        config.mainnet_seed_bundle,
-        config.target_invariant_manifest,
-        config.abi_path,
-        config.max_execs,
-        config.duration_secs,
-        config.artifact_limit,
-        config.hardened_defi,
-        config.promotion,
-    );
-    let config_hash = Some(format!(
-        "0x{}",
-        hex::encode(Sha256::digest(config_payload.as_bytes()))
-    ));
-
     let tool_revision = Some(env!("CARGO_PKG_VERSION").to_string());
     let rng_seed = if config.hardened_defi.deterministic || config.hardened_defi.rng_seed.is_some()
     {
@@ -210,10 +278,19 @@ fn execution_provenance_fields(
     (
         rpc_provenance,
         bytecode_hash,
-        config_hash,
+        Some(config_hash),
         tool_revision,
         rng_seed,
+        source_identity,
     )
+}
+
+fn execution_target_bytecode_hash(config: &Config, db: &CacheDB<ForkDb>) -> Option<String> {
+    config.target_contract.and_then(|target| {
+        let info = db.cache.accounts.get(&target)?.info()?;
+        let code = info.code?;
+        Some(sha256_digest(code.original_byte_slice()))
+    })
 }
 
 fn mutational_stage_iterations(config: &Config) -> NonZeroUsize {
@@ -250,6 +327,7 @@ type EvmLauncherManager =
 const STATE_NOVELTY_MAP_SLOTS: usize = 2_048;
 const CAMPAIGN_SCORE_MAP_SLOTS: usize = 1_024;
 const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_STARTUP_RPC_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn log_bounded_campaign_progress(
     label: &str,
@@ -404,6 +482,474 @@ impl Config {
     }
 }
 
+/// Auditable values derived from the effective engine configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveConfigFingerprint {
+    pub config_hash: String,
+    pub startup_mode: rustyfuzz_artifacts::manifest::StartupMode,
+    pub seed_sources: Vec<rustyfuzz_artifacts::manifest::SeedSourceProvenance>,
+    pub abi_hash: Option<String>,
+    pub bytecode_hash: Option<String>,
+    pub environment: rustyfuzz_artifacts::Environment,
+    pub canonical_effective_config: serde_json::Value,
+}
+
+const MAX_CANONICAL_EFFECTIVE_CONFIG_BYTES: usize = 64 * 1024;
+
+#[derive(Serialize)]
+struct EffectiveFuzzConfigIdentityV1 {
+    schema_version: u32,
+    chain: String,
+    startup_mode: rustyfuzz_artifacts::manifest::StartupMode,
+    rpc_endpoint_sanitized: String,
+    fork_block: u64,
+    target_contract: Option<Address>,
+    corpus_dir_digest: Option<String>,
+    report_dir_digest: Option<String>,
+    foundry_harness_project_root_digest: Option<String>,
+    foundry_harness_hash: Option<String>,
+    mainnet_seed_bundle: Option<String>,
+    in_memory_bytecode_hash: Option<String>,
+    live_target_bytecode_hash: Option<String>,
+    cores: Option<String>,
+    require_seed_bundle: bool,
+    require_rpc_fork: bool,
+    allow_synthetic_fallback: bool,
+    hardened_defi: HardenedDefiIdentity,
+    target_invariant_manifest_digest: Option<String>,
+    target_invariant_manifest_hash: Option<String>,
+    abi_path_digest: Option<String>,
+    abi_hash: Option<String>,
+    bounds: CampaignBoundsIdentity,
+    campaign_id_digest: Option<String>,
+    paths_are_isolated: bool,
+    min_finding_confidence: u64,
+    seed_sources: Vec<rustyfuzz_artifacts::manifest::SeedSourceProvenance>,
+    promotion: PromotionPolicyIdentity,
+    runtime_environment: rustyfuzz_artifacts::RuntimeEnvironmentFingerprint,
+}
+
+#[derive(Serialize)]
+struct HardenedDefiIdentity {
+    checkpoint: Option<CheckpointIdentity>,
+    enabled: bool,
+    single_process: bool,
+    deterministic: bool,
+    rng_seed: Option<u64>,
+    enable_bounded_search: bool,
+    historical_seed_file_digest: Option<String>,
+    historical_seed_file_hash: Option<String>,
+    max_template_sequences: usize,
+    max_actor_roles: usize,
+    max_tx_depth: usize,
+    enable_actor_model: bool,
+    enable_economic_delta: bool,
+    enable_protocol_invariants: bool,
+    enable_exploit_templates: bool,
+    min_persist_confidence_bits: u64,
+    require_confirmation_for_poc: bool,
+}
+
+#[derive(Serialize)]
+struct CheckpointIdentity {
+    directory_digest: Option<String>,
+    every_execs: u64,
+}
+
+#[derive(Serialize)]
+struct CampaignBoundsIdentity {
+    max_execs: Option<u64>,
+    duration_secs: Option<u64>,
+    artifact_limit: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct PromotionPolicyIdentity {
+    enabled: bool,
+    no_promotion: bool,
+    external_foundry_opt_in: bool,
+    require_replay_for_report: bool,
+    require_poc_for_confirmed: bool,
+    strict_proof: bool,
+    no_synthetic_proof: bool,
+    require_foundry_poc: bool,
+    require_minimized: bool,
+    reject_heuristics: bool,
+    max_finding_noise: Option<u64>,
+    poc_out_digest: Option<String>,
+    promotion_limit: Option<u64>,
+}
+
+fn sha256_digest(bytes: impl AsRef<[u8]>) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes.as_ref())))
+}
+
+fn path_identity(path: impl AsRef<Path>) -> String {
+    sha256_digest(path.as_ref().to_string_lossy().as_bytes())
+}
+
+fn optional_file_digest(path: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    match fs::symlink_metadata(path) {
+        Ok(_) => sha256_bounded_regular_file(Path::new(path), MAX_EFFECTIVE_CONFIG_INPUT_BYTES)
+            .map(Some)
+            .with_context(|| {
+                format!(
+                    "cannot digest effective config file {}",
+                    rustyfuzz_artifacts::sanitize_path_for_persistence(path)
+                )
+            }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(anyhow::Error::from(error).context(format!(
+            "cannot inspect effective config file {}",
+            rustyfuzz_artifacts::sanitize_path_for_persistence(path)
+        ))),
+    }
+}
+
+fn effective_seed_sources(
+    config: &Config,
+) -> anyhow::Result<Vec<rustyfuzz_artifacts::manifest::SeedSourceProvenance>> {
+    let mut sources = Vec::new();
+    if let Some(bundle_id) = &config.mainnet_seed_bundle {
+        let path = Path::new(&config.corpus_dir)
+            .join("mainnet_seeds")
+            .join(bundle_id)
+            .join("manifest.json");
+        sources.push(rustyfuzz_artifacts::manifest::SeedSourceProvenance {
+            source: "mainnet_seed_bundle".to_string(),
+            identity: Some(path_identity(bundle_id)),
+            digest: optional_file_digest(path.to_str())?,
+        });
+    }
+    if let Some(path) = &config.hardened_defi.historical_seed_file {
+        sources.push(rustyfuzz_artifacts::manifest::SeedSourceProvenance {
+            source: "historical_seed_file".to_string(),
+            identity: Some(path_identity(path)),
+            digest: optional_file_digest(Some(path))?,
+        });
+    }
+    if let Some(path) = &config.abi_path {
+        sources.push(rustyfuzz_artifacts::manifest::SeedSourceProvenance {
+            source: "abi".to_string(),
+            identity: Some(path_identity(path)),
+            digest: optional_file_digest(Some(path))?,
+        });
+    }
+    if let Some(harness) = &config.foundry_harness {
+        sources.push(rustyfuzz_artifacts::manifest::SeedSourceProvenance {
+            source: "foundry_harness".to_string(),
+            identity: Some(path_identity(harness.project_root.as_path())),
+            digest: Some(sha256_digest(serde_json::to_vec(harness)?)),
+        });
+    }
+    Ok(sources)
+}
+
+/// Resolves the configured startup intent before corpus sources are observed.
+pub fn resolve_startup_mode(config: &Config) -> rustyfuzz_artifacts::manifest::StartupMode {
+    use rustyfuzz_artifacts::manifest::StartupMode;
+
+    let has_mainnet = config.mainnet_seed_bundle.is_some();
+    let has_historical = config
+        .hardened_defi
+        .historical_seed_file
+        .as_deref()
+        .is_some_and(|path| Path::new(path).is_file());
+    let has_abi = config.abi_path.is_some() || config.foundry_harness.is_some();
+    if has_mainnet {
+        StartupMode::MainnetSeedBundle
+    } else if has_historical && has_abi {
+        StartupMode::MixedTrustedSeeds
+    } else if has_historical {
+        StartupMode::HistoricalSeeds
+    } else if has_abi {
+        StartupMode::AbiDerivedSeeds
+    } else if config.allow_synthetic_fallback {
+        StartupMode::SyntheticFallback
+    } else if config.require_rpc_fork {
+        StartupMode::DeterministicLiveStateProbe
+    } else {
+        StartupMode::NoTrustedSeeds
+    }
+}
+
+/// Computes the canonical SHA-256 fingerprint of the effective configuration.
+pub fn effective_config_fingerprint(
+    chain: &str,
+    config: &Config,
+    startup_mode: rustyfuzz_artifacts::manifest::StartupMode,
+    live_target_bytecode_hash: Option<&str>,
+) -> anyhow::Result<EffectiveConfigFingerprint> {
+    let seed_sources = effective_seed_sources(config)?;
+    let abi_hash = optional_file_digest(config.abi_path.as_deref())?;
+    let target_invariant_manifest_hash =
+        optional_file_digest(config.target_invariant_manifest.as_deref())?;
+    let historical_seed_file_hash =
+        optional_file_digest(config.hardened_defi.historical_seed_file.as_deref())?;
+    let in_memory_bytecode_hash = config.in_memory_bytecode.as_deref().map(sha256_digest);
+    let foundry_harness_hash = config
+        .foundry_harness
+        .as_ref()
+        .map(|harness| serde_json::to_vec(harness).map(sha256_digest))
+        .transpose()?;
+    let bytecode_hash = in_memory_bytecode_hash
+        .clone()
+        .or_else(|| live_target_bytecode_hash.map(str::to_string));
+    let mut runtime_environment = runtime_environment_fingerprint(config.cores.as_ref())?;
+    runtime_environment.require_rpc_fork_effective = config.require_rpc_fork
+        || runtime_environment
+            .require_rpc_fork_override
+            .unwrap_or(false);
+    let environment = rustyfuzz_artifacts::Environment {
+        env_var_names: [
+            "RUSTYFUZZ_CORES",
+            "LIBAFL_CORES",
+            "RUSTYFUZZ_EXEC_TIMEOUT_SECS",
+            "RUSTYFUZZ_STARTUP_RPC_TIMEOUT_SECS",
+            "RUSTYFUZZ_REQUIRE_RPC_FORK",
+            "RUSTYFUZZ_EXEC_RPC_BUDGET",
+        ]
+        .into_iter()
+        .filter(|name| {
+            std::env::var_os(name).is_some()
+                && !matches!(*name, "RUSTYFUZZ_CORES" | "LIBAFL_CORES" if config.cores.is_some())
+        })
+        .map(str::to_string)
+        .collect(),
+        runtime: Some(runtime_environment.clone()),
+    };
+    let promotion = &config.promotion;
+    let hardened = &config.hardened_defi;
+    let identity = EffectiveFuzzConfigIdentityV1 {
+        schema_version: 1,
+        chain: chain.to_ascii_lowercase(),
+        startup_mode,
+        rpc_endpoint_sanitized: rustyfuzz_artifacts::sanitize_rpc_endpoint(&config.rpc_url),
+        fork_block: config.fork_block,
+        target_contract: config.target_contract,
+        corpus_dir_digest: Some(path_identity(&config.corpus_dir)),
+        report_dir_digest: Some(path_identity(&config.report_dir)),
+        foundry_harness_project_root_digest: config
+            .foundry_harness
+            .as_ref()
+            .map(|harness| path_identity(harness.project_root.as_path())),
+        foundry_harness_hash,
+        mainnet_seed_bundle: config.mainnet_seed_bundle.as_deref().map(path_identity),
+        in_memory_bytecode_hash,
+        live_target_bytecode_hash: live_target_bytecode_hash.map(str::to_string),
+        cores: config
+            .cores
+            .as_ref()
+            .map(|cores| sha256_digest(cores.cmdline.as_bytes())),
+        require_seed_bundle: config.require_seed_bundle,
+        require_rpc_fork: config.require_rpc_fork,
+        allow_synthetic_fallback: config.allow_synthetic_fallback,
+        hardened_defi: HardenedDefiIdentity {
+            checkpoint: hardened
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| CheckpointIdentity {
+                    directory_digest: Some(path_identity(checkpoint.directory.as_path())),
+                    every_execs: checkpoint.every_execs,
+                }),
+            enabled: hardened.enabled,
+            single_process: hardened.single_process,
+            deterministic: hardened.deterministic,
+            rng_seed: hardened.rng_seed,
+            enable_bounded_search: hardened.enable_bounded_search,
+            historical_seed_file_digest: hardened
+                .historical_seed_file
+                .as_deref()
+                .map(path_identity),
+            historical_seed_file_hash,
+            max_template_sequences: hardened.max_template_sequences,
+            max_actor_roles: hardened.max_actor_roles,
+            max_tx_depth: hardened.max_tx_depth,
+            enable_actor_model: hardened.enable_actor_model,
+            enable_economic_delta: hardened.enable_economic_delta,
+            enable_protocol_invariants: hardened.enable_protocol_invariants,
+            enable_exploit_templates: hardened.enable_exploit_templates,
+            min_persist_confidence_bits: hardened.min_persist_confidence.to_bits(),
+            require_confirmation_for_poc: hardened.require_confirmation_for_poc,
+        },
+        target_invariant_manifest_digest: config
+            .target_invariant_manifest
+            .as_deref()
+            .map(path_identity),
+        target_invariant_manifest_hash,
+        abi_path_digest: config.abi_path.as_deref().map(path_identity),
+        abi_hash: abi_hash.clone(),
+        bounds: CampaignBoundsIdentity {
+            max_execs: config.max_execs,
+            duration_secs: config.duration_secs,
+            artifact_limit: config.artifact_limit,
+        },
+        campaign_id_digest: config.campaign_id.as_deref().map(path_identity),
+        paths_are_isolated: config.paths_are_isolated,
+        min_finding_confidence: config.min_finding_confidence,
+        seed_sources: seed_sources.clone(),
+        promotion: PromotionPolicyIdentity {
+            enabled: promotion.enabled,
+            no_promotion: promotion.no_promotion,
+            external_foundry_opt_in: promotion.external_foundry_opt_in,
+            require_replay_for_report: promotion.require_replay_for_report,
+            require_poc_for_confirmed: promotion.require_poc_for_confirmed,
+            strict_proof: promotion.strict_proof,
+            no_synthetic_proof: promotion.no_synthetic_proof,
+            require_foundry_poc: promotion.require_foundry_poc,
+            require_minimized: promotion.require_minimized,
+            reject_heuristics: promotion.reject_heuristics,
+            max_finding_noise: promotion.max_finding_noise,
+            poc_out_digest: promotion.poc_out.as_deref().map(path_identity),
+            promotion_limit: promotion.promotion_limit,
+        },
+        runtime_environment,
+    };
+    let canonical_effective_config = serde_json::to_value(&identity)?;
+    let encoded = serde_json::to_vec(&canonical_effective_config)?;
+    anyhow::ensure!(
+        encoded.len() <= MAX_CANONICAL_EFFECTIVE_CONFIG_BYTES,
+        "canonical effective config exceeds {MAX_CANONICAL_EFFECTIVE_CONFIG_BYTES} bytes"
+    );
+    Ok(EffectiveConfigFingerprint {
+        config_hash: sha256_digest(encoded),
+        startup_mode,
+        seed_sources,
+        abi_hash,
+        bytecode_hash,
+        environment,
+        canonical_effective_config,
+    })
+}
+
+fn prepare_canonical_run_lifecycle_at(
+    config: Config,
+    artifacts_root: &Path,
+    owner: Option<rustyfuzz_artifacts::CampaignLock>,
+) -> anyhow::Result<(Config, rustyfuzz_artifacts::CampaignLock)> {
+    dotenvy::dotenv().ok();
+    let mut config = config.with_isolated_paths();
+    let campaign_id = config
+        .campaign_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("campaign identity is required"))?;
+    let layout = rustyfuzz_artifacts::RunLayout::new(artifacts_root, &campaign_id);
+    let owner = match owner {
+        Some(owner) if owner.run_id() == campaign_id => owner,
+        Some(_) => anyhow::bail!("campaign ownership does not match the requested run"),
+        None => layout
+            .acquire_campaign_lock()
+            .map_err(|error| anyhow::anyhow!("cannot acquire campaign ownership: {error}"))?,
+    };
+    config.corpus_dir = layout.inputs_dir().display().to_string();
+    config.report_dir = layout.reports_dir().display().to_string();
+    if let Some(checkpoint) = &mut config.hardened_defi.checkpoint {
+        checkpoint.directory = layout.root().join("checkpoints");
+    }
+    config.paths_are_isolated = true;
+    let created = match fs::symlink_metadata(layout.root()) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                anyhow::bail!("canonical run path is not a safe directory");
+            }
+            false
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            layout
+                .materialize_new()
+                .map_err(|error| anyhow::anyhow!("cannot create canonical run layout: {error}"))?;
+            layout.mark_incomplete(&campaign_id).map_err(|error| {
+                anyhow::anyhow!("cannot mark canonical run incomplete: {error}")
+            })?;
+            true
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let terminal = layout
+        .read_terminal_status()
+        .map_err(|error| anyhow::anyhow!("cannot read canonical terminal state: {error}"))?;
+    match terminal {
+        Some(status) if status.state.is_terminal() => {
+            anyhow::bail!("canonical campaign id is already terminal")
+        }
+        Some(_) => {}
+        None if !created => anyhow::bail!("canonical run has no terminal lifecycle record"),
+        None => {}
+    }
+    if layout.config_file().exists() {
+        let manifest = rustyfuzz_artifacts::RunManifest::load(&layout.config_file())
+            .map_err(|error| anyhow::anyhow!("cannot load canonical run manifest: {error}"))?;
+        if manifest.run_id != campaign_id {
+            anyhow::bail!("canonical manifest run identity does not match campaign");
+        }
+        if config
+            .hardened_defi
+            .checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.resume)
+        {
+            let current_source = rustyfuzz_artifacts::SourceIdentity::from_environment();
+            anyhow::ensure!(
+                current_source.is_resume_bindable(),
+                "checkpoint source identity is incomplete"
+            );
+            anyhow::ensure!(
+                manifest.source_identity.is_resume_bindable(),
+                "canonical manifest source identity is incomplete"
+            );
+            anyhow::ensure!(
+                manifest.source_identity == current_source,
+                "canonical manifest source or binary identity does not match resume request"
+            );
+        }
+        let live_target_bytecode_hash = if config.in_memory_bytecode.is_some() {
+            None
+        } else {
+            manifest.bytecode_hash.as_deref()
+        };
+        let fingerprint = effective_config_fingerprint(
+            "evm",
+            &config,
+            manifest.startup_mode,
+            live_target_bytecode_hash,
+        )?;
+        if manifest.config_hash != fingerprint.config_hash
+            || manifest.canonical_effective_config.as_ref()
+                != Some(&fingerprint.canonical_effective_config)
+        {
+            anyhow::bail!("canonical campaign configuration does not match resume request");
+        }
+    } else {
+        let mode = resolve_startup_mode(&config);
+        let fingerprint = effective_config_fingerprint("evm", &config, mode, None)?;
+        let mut manifest = rustyfuzz_artifacts::RunManifest::v1(
+            &campaign_id,
+            env!("CARGO_PKG_VERSION"),
+            fingerprint.config_hash.clone(),
+            "bounded",
+        );
+        manifest.source_identity = rustyfuzz_artifacts::SourceIdentity::from_environment();
+        manifest.startup_mode = fingerprint.startup_mode;
+        manifest.seed_sources = fingerprint.seed_sources;
+        manifest.abi_hash = fingerprint.abi_hash;
+        manifest.bytecode_hash = fingerprint.bytecode_hash;
+        manifest.environment = fingerprint.environment;
+        manifest.rpc_endpoint_sanitized = fingerprint
+            .canonical_effective_config
+            .get("rpc_endpoint_sanitized")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        manifest.canonical_effective_config = Some(fingerprint.canonical_effective_config);
+        manifest
+            .persist(&layout.config_file())
+            .map_err(|error| anyhow::anyhow!("cannot persist canonical run manifest: {error}"))?;
+    }
+    Ok((config, owner))
+}
+
 pub fn run_fuzz_campaign_blocking(config: Config) -> anyhow::Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -416,6 +962,43 @@ pub async fn run_fuzz_campaign(config: Config) -> anyhow::Result<()> {
 }
 
 pub async fn run_fuzz_campaign_with_cancellation(
+    config: Config,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> anyhow::Result<()> {
+    let (terminal_config, owner) =
+        prepare_canonical_run_lifecycle_at(config, Path::new(".rustyfuzz"), None)?;
+    run_fuzz_campaign_owned(terminal_config, cancellation, owner).await
+}
+
+pub async fn run_fuzz_campaign_with_cancellation_locked(
+    config: Config,
+    cancellation: Option<Arc<AtomicBool>>,
+    owner: rustyfuzz_artifacts::CampaignLock,
+) -> anyhow::Result<()> {
+    let (terminal_config, owner) =
+        prepare_canonical_run_lifecycle_at(config, Path::new(".rustyfuzz"), Some(owner))?;
+    run_fuzz_campaign_owned(terminal_config, cancellation, owner).await
+}
+
+async fn run_fuzz_campaign_owned(
+    terminal_config: Config,
+    cancellation: Option<Arc<AtomicBool>>,
+    _owner: rustyfuzz_artifacts::CampaignLock,
+) -> anyhow::Result<()> {
+    let result =
+        run_fuzz_campaign_with_cancellation_inner(terminal_config.clone(), cancellation).await;
+    if let Err(error) = &result {
+        let terminal_state = terminal_state_for_campaign_error(error);
+        if let Err(status_error) = write_run_terminal_status(&terminal_config, terminal_state, None)
+        {
+            log::error!("failed to persist run terminal status: {status_error:#}");
+        }
+        log::error!("fuzz campaign failed before terminal finalization: {error:#}");
+    }
+    result
+}
+
+async fn run_fuzz_campaign_with_cancellation_inner(
     config: Config,
     cancellation: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<()> {
@@ -617,19 +1200,27 @@ pub async fn run_fuzz_campaign_with_cancellation(
     let broker_worker_count = cores.ids.len().max(1);
     let use_launcher = !config.hardened_defi.single_process && cores.ids.len() > 1;
     if use_launcher && cancellation.is_some() {
-        let report_dir = Path::new(&config.report_dir);
-        write_campaign_status(
-            report_dir,
+        write_campaign_status_with_mirror(
+            &config,
             &serde_json::json!({
                 "schema_version": 1,
                 "state": "cancelled",
+                "phase": "terminal",
                 "terminal": true,
+                "updated_at_unix": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or_default(),
+                "integrity": "unknown",
                 "campaign_id": config.campaign_id.as_deref().expect("campaign identity is initialized before use"),
                 "run_nonce": run_nonce,
                 "reason": "multi-worker watchdog cancellation is not shared across launcher processes",
             }),
         )?;
-        anyhow::bail!("multi-worker watchdog cancellation is unsupported; use single-process mode for cancellable campaigns");
+        return Err(CampaignCancellation {
+            reason: "multi-worker watchdog cancellation is unsupported; use single-process mode for cancellable campaigns",
+        }
+        .into());
     }
     if !use_launcher {
         let result = run_single_process_campaign(
@@ -654,7 +1245,10 @@ pub async fn run_fuzz_campaign_with_cancellation(
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Relaxed))
         {
-            anyhow::bail!("fuzz campaign cancelled by watchdog after finalization");
+            return Err(CampaignCancellation {
+                reason: "fuzz campaign cancelled by watchdog after finalization",
+            }
+            .into());
         }
         return Ok(());
     }
@@ -769,14 +1363,18 @@ pub async fn run_fuzz_campaign_with_cancellation(
                 });
                 let has_trusted_abi_source =
                     config.foundry_harness.is_some() || abi_loaded || !bytecode_selectors.is_empty();
+                let mut abi_seed_candidate_count = 0usize;
+                let mut historical_seed_candidate_count = 0usize;
                 let mut hardened_seed_candidates = Vec::<SeedCandidate>::new();
                 if has_trusted_abi_source {
-                    hardened_seed_candidates.extend(seed_intelligence.generate_candidates(
+                    let generated_candidates = seed_intelligence.generate_candidates(
                         target_contract,
                         fuzzer_address,
                         &initial_abi,
                         config.foundry_harness.as_ref(),
-                    ));
+                    );
+                    abi_seed_candidate_count += generated_candidates.len();
+                    hardened_seed_candidates.extend(generated_candidates);
                     if let Some(analysis) = bytecode_analysis.as_ref() {
                         let bytecode_candidates = seed_intelligence.generate_bytecode_candidates(
                             target_contract,
@@ -784,6 +1382,7 @@ pub async fn run_fuzz_campaign_with_cancellation(
                             &analysis.function_summaries,
                         );
                         if !bytecode_candidates.is_empty() {
+                            abi_seed_candidate_count += bytecode_candidates.len();
                             log::info!(
                                 "Generated {} bytecode function-slice seed candidates",
                                 bytecode_candidates.len()
@@ -804,6 +1403,7 @@ pub async fn run_fuzz_campaign_with_cancellation(
                                     .into_iter()
                                     .filter(|candidate| candidate.target == target_contract)
                                     .collect::<Vec<_>>();
+                                historical_seed_candidate_count += target_candidates.len();
                                 log::info!(
                                     "Loaded {} historical Hardened DeFi seed candidates from {} ({} matched target)",
                                     total_candidates,
@@ -853,12 +1453,11 @@ pub async fn run_fuzz_campaign_with_cancellation(
 
                 let core_id = description.core_id();
 
-                 let mut feedback = EvmCoverageFeedback::new();
-                 let mut objective = ();
-                 let mut required_replay_inputs = Vec::new();
+                let mut feedback = EvmCoverageFeedback::new();
+                let mut objective = ();
+                let mut required_replay_inputs = Vec::new();
 
-                 let mut state = state.unwrap_or_else(|| {
-
+                let mut state = state.unwrap_or_else(|| {
                     StdState::new(
                         StdRand::with_seed(campaign_rng_seed(&config, core_id.0)),
                         InMemoryCorpus::<EvmInput>::new(),
@@ -871,6 +1470,7 @@ pub async fn run_fuzz_campaign_with_cancellation(
 
                 if state.corpus().count() == 0 {
                     let mut inserted_seed_count = 0usize;
+                    let mut mainnet_seed_count = 0usize;
                     if let Some(bundle_id) = &config.mainnet_seed_bundle {
                         let status = persistent_corpus
                             .inspect_mainnet_seed_bundle(Some(bundle_id), target_contract);
@@ -881,32 +1481,31 @@ pub async fn run_fuzz_campaign_with_cancellation(
                         )
                             .map_err(|err| libafl::Error::unknown(err.to_string()))?;
                         if let SeedBundleStatus::Loaded { .. } = status {
-                             let bundle = persistent_corpus
-                                 .load_mainnet_seed_bundle(bundle_id)
-                                 .map_err(|err| libafl::Error::unknown(err.to_string()))?;
-                             validate_mainnet_seed_bundle(
-                                 &bundle,
-                                 target_contract,
-                                 config.fork_block,
-                                 &initial_db.db.provenance(),
-                             )
-                             .map_err(|err| libafl::Error::unknown(err.to_string()))?;
-                             required_replay_inputs.extend(
-                                 required_seed_inputs(&bundle)
-                                     .map_err(|err| libafl::Error::unknown(err.to_string()))?,
-                             );
-                             {
+                            let bundle = persistent_corpus
+                                .load_mainnet_seed_bundle(bundle_id)
+                                .map_err(|err| libafl::Error::unknown(err.to_string()))?;
+                            validate_mainnet_seed_bundle(
+                                &bundle,
+                                target_contract,
+                                config.fork_block,
+                                &initial_db.db.provenance(),
+                            )
+                            .map_err(|err| libafl::Error::unknown(err.to_string()))?;
+                            required_replay_inputs.extend(
+                                required_seed_inputs(&bundle)
+                                    .map_err(|err| libafl::Error::unknown(err.to_string()))?,
+                            );
 
-                                for seed in bundle.seeds {
-                                    state.corpus_mut().add(Testcase::new(seed.input))?;
-                                    inserted_seed_count += 1;
-                                }
-                                log::info!(
-                                    "Loaded mainnet seed bundle `{}` into campaign corpus: {} seeds",
-                                    bundle_id,
-                                    inserted_seed_count
-                                );
+                            for seed in bundle.seeds {
+                                state.corpus_mut().add(Testcase::new(seed.input))?;
+                                inserted_seed_count += 1;
+                                mainnet_seed_count += 1;
                             }
+                            log::info!(
+                                "Loaded mainnet seed bundle `{}` into campaign corpus: {} seeds",
+                                bundle_id,
+                                inserted_seed_count
+                            );
                         }
                     }
 
@@ -934,7 +1533,9 @@ pub async fn run_fuzz_campaign_with_cancellation(
                                     fuzzer_address,
                                     abi_registry.as_ref(),
                                 );
-                                template_inputs.truncate(config.hardened_defi.max_template_sequences);
+                                template_inputs
+                                    .truncate(config.hardened_defi.max_template_sequences);
+                                abi_seed_candidate_count += template_inputs.len();
                                 for (mut template, template_metadata) in template_inputs {
                                     if let Some(actor_set) = hardened_actor_set.as_ref() {
                                         actor_set.apply_roles_to_sequence(&mut template.txs);
@@ -960,6 +1561,7 @@ pub async fn run_fuzz_campaign_with_cancellation(
                             abi_registry.as_ref(),
                             config.foundry_harness.as_ref(),
                         );
+                        abi_seed_candidate_count += intelligent_seeds.len();
                         for seed in intelligent_seeds {
                             let (input, metadata) = seed.into_parts(0);
                             testcase_metadata_store.insert(&input, metadata);
@@ -988,6 +1590,14 @@ pub async fn run_fuzz_campaign_with_cancellation(
                             state
                                 .corpus_mut()
                                 .add(Testcase::new(seed_input(target_contract, fuzzer_address)))?;
+                        } else if config.require_rpc_fork || campaign_requires_rpc_fork() {
+                            log::info!(
+                                "No historical seed inputs available; starting from deterministic live-state probe (not historical evidence)"
+                            );
+                            let input = seed_input(target_contract, fuzzer_address);
+                            state
+                                .corpus_mut()
+                                .add(Testcase::new(input))?;
                         } else {
                             return Err(libafl::Error::unknown(
                                 "no trusted seed inputs available and synthetic fallback is disabled; ingest a non-empty mainnet seed bundle, provide --abi/Foundry seeds, or pass --allow-synthetic-fallback for smoke testing"
@@ -995,6 +1605,17 @@ pub async fn run_fuzz_campaign_with_cancellation(
                             ));
                         }
                     }
+                    let startup_mode = observed_startup_mode(
+                        mainnet_seed_count > 0,
+                        historical_seed_candidate_count > 0,
+                        abi_seed_candidate_count > 0,
+                        config.foundry_harness.is_some() && abi_seed_candidate_count > 0,
+                        inserted_seed_count,
+                        config.require_rpc_fork || campaign_requires_rpc_fork(),
+                        config.allow_synthetic_fallback,
+                    );
+                    update_canonical_startup_mode(&config, startup_mode)
+                        .map_err(|error| libafl::Error::unknown(error.to_string()))?;
                 }
                 log_worker_corpus_sync(
                     core_id.0,
@@ -1045,13 +1666,15 @@ pub async fn run_fuzz_campaign_with_cancellation(
                     config_hash,
                     tool_revision,
                     rng_seed,
+                    source_identity,
                 ) = execution_provenance_fields(
                     &config,
                     core_id.0,
                     synthetic_fork_mode,
                     campaign_from_checkpoint,
                     &initial_db,
-                );
+                )
+                .map_err(|error| libafl::Error::unknown(error.to_string()))?;
 
                 let mut harness = |input: &EvmInput| {
                     if !budget.reserve_execution() {
@@ -1291,6 +1914,9 @@ pub async fn run_fuzz_campaign_with_cancellation(
                             rpc_provenance: rpc_provenance.clone(),
                             bytecode_hash: bytecode_hash.clone(),
                             config_hash: config_hash.clone(),
+                            run_nonce: Some(worker_run_nonce.clone()),
+                            worker_id: Some(core_id.0.to_string()),
+                            source_identity: source_identity.clone(),
                             tool_revision: tool_revision.clone(),
                             rng_seed,
                         },
@@ -1537,7 +2163,15 @@ pub async fn run_fuzz_campaign_with_cancellation(
                 .as_ref()
                 .is_some_and(|flag| flag.load(Ordering::Relaxed))
             {
-                anyhow::bail!("brokered fuzz launcher stopped after watchdog cancellation");
+                write_broker_terminal_status(
+                    &config,
+                    broker_terminal_state(true),
+                    "brokered fuzz launcher stopped after watchdog cancellation",
+                )?;
+                return Err(CampaignCancellation {
+                    reason: "brokered fuzz launcher stopped after watchdog cancellation",
+                }
+                .into());
             }
             if broker_launcher_error_was_shutdown(&err.to_string()) {
                 log::info!("Brokered fuzz launcher shut down cleanly");
@@ -1581,7 +2215,10 @@ pub async fn run_fuzz_campaign_with_cancellation(
         .as_ref()
         .is_some_and(|flag| flag.load(Ordering::Relaxed))
     {
-        anyhow::bail!("fuzz campaign cancelled by watchdog after finalization");
+        return Err(CampaignCancellation {
+            reason: "fuzz campaign cancelled by watchdog after finalization",
+        }
+        .into());
     }
     Ok(())
 }
@@ -1702,14 +2339,18 @@ async fn run_single_process_campaign(
     });
     let has_trusted_abi_source =
         config.foundry_harness.is_some() || abi_loaded || !bytecode_selectors.is_empty();
+    let mut abi_seed_candidate_count = 0usize;
+    let mut historical_seed_candidate_count = 0usize;
     let mut hardened_seed_candidates = Vec::<SeedCandidate>::new();
     if has_trusted_abi_source {
-        hardened_seed_candidates.extend(seed_intelligence.generate_candidates(
+        let generated_candidates = seed_intelligence.generate_candidates(
             target_contract,
             Address::repeat_byte(0x13),
             &initial_abi,
             config.foundry_harness.as_ref(),
-        ));
+        );
+        abi_seed_candidate_count += generated_candidates.len();
+        hardened_seed_candidates.extend(generated_candidates);
         if let Some(analysis) = bytecode_analysis.as_ref() {
             let bytecode_candidates = seed_intelligence.generate_bytecode_candidates(
                 target_contract,
@@ -1717,6 +2358,7 @@ async fn run_single_process_campaign(
                 &analysis.function_summaries,
             );
             if !bytecode_candidates.is_empty() {
+                abi_seed_candidate_count += bytecode_candidates.len();
                 log::info!(
                     "Generated {} bytecode function-slice seed candidates",
                     bytecode_candidates.len()
@@ -1737,6 +2379,7 @@ async fn run_single_process_campaign(
                         .into_iter()
                         .filter(|candidate| candidate.target == target_contract)
                         .collect::<Vec<_>>();
+                    historical_seed_candidate_count += target_candidates.len();
                     log::info!(
                         "Loaded {} historical Hardened DeFi seed candidates from {} ({} matched target)",
                         total_candidates,
@@ -1804,6 +2447,7 @@ async fn run_single_process_campaign(
     let mut required_replay_inputs = Vec::new();
     if state.corpus().count() == 0 {
         let mut inserted_seed_count = 0usize;
+        let mut mainnet_seed_count = 0usize;
         if let Some(bundle_id) = &config.mainnet_seed_bundle {
             let status =
                 persistent_corpus.inspect_mainnet_seed_bundle(Some(bundle_id), target_contract);
@@ -1827,6 +2471,7 @@ async fn run_single_process_campaign(
                         direct_seed_inputs.push(input.clone());
                         state.corpus_mut().add(Testcase::new(input))?;
                         inserted_seed_count += 1;
+                        mainnet_seed_count += 1;
                     }
                     log::info!(
                         "Loaded mainnet seed bundle `{}` into campaign corpus: {} seeds",
@@ -1872,6 +2517,7 @@ async fn run_single_process_campaign(
                     bounded_result.exhaustive,
                     bounded_result.modeled_space_size
                 );
+                abi_seed_candidate_count += bounded_result.candidates.len();
                 for outcome in bounded_result.candidates.into_iter() {
                     testcase_metadata_store
                         .insert(&outcome.candidate.input, outcome.metadata.clone());
@@ -1895,6 +2541,7 @@ async fn run_single_process_campaign(
                         abi_registry.as_ref(),
                     );
                     template_inputs.truncate(config.hardened_defi.max_template_sequences);
+                    abi_seed_candidate_count += template_inputs.len();
                     for (mut template, template_metadata) in template_inputs {
                         if let Some(actor_set) = hardened_actor_set.as_ref() {
                             actor_set.apply_roles_to_sequence(&mut template.txs);
@@ -1947,12 +2594,29 @@ async fn run_single_process_campaign(
                 let input = seed_input(target_contract, Address::repeat_byte(0x13));
                 direct_seed_inputs.push(input.clone());
                 state.corpus_mut().add(Testcase::new(input))?;
+            } else if config.require_rpc_fork || campaign_requires_rpc_fork() {
+                log::info!(
+                    "No historical seed inputs available; starting from deterministic live-state probe (not historical evidence)"
+                );
+                let input = seed_input(target_contract, Address::repeat_byte(0x13));
+                direct_seed_inputs.push(input.clone());
+                state.corpus_mut().add(Testcase::new(input))?;
             } else {
                 anyhow::bail!(
                     "no trusted seed inputs available and synthetic fallback is disabled; ingest a non-empty mainnet seed bundle, provide --abi/Foundry seeds, or pass --allow-synthetic-fallback for smoke testing"
                 );
             }
         }
+        let startup_mode = observed_startup_mode(
+            mainnet_seed_count > 0,
+            historical_seed_candidate_count > 0,
+            abi_seed_candidate_count > 0,
+            config.foundry_harness.is_some() && abi_seed_candidate_count > 0,
+            inserted_seed_count,
+            config.require_rpc_fork || campaign_requires_rpc_fork(),
+            config.allow_synthetic_fallback,
+        );
+        update_canonical_startup_mode(&config, startup_mode)?;
     }
     log_worker_corpus_sync(
         core_id,
@@ -2013,14 +2677,14 @@ async fn run_single_process_campaign(
         OwnedMutSlice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE)
     });
 
-    let (rpc_provenance, bytecode_hash, config_hash, tool_revision, rng_seed) =
+    let (rpc_provenance, bytecode_hash, config_hash, tool_revision, rng_seed, source_identity) =
         execution_provenance_fields(
             &config,
             core_id,
             synthetic_fork_mode,
             campaign_from_checkpoint || resumed,
             &initial_db,
-        );
+        )?;
 
     let mut harness = |input: &EvmInput| {
         if !budget.reserve_execution() {
@@ -2239,6 +2903,9 @@ async fn run_single_process_campaign(
                 rpc_provenance: rpc_provenance.clone(),
                 bytecode_hash: bytecode_hash.clone(),
                 config_hash: config_hash.clone(),
+                run_nonce: None,
+                worker_id: None,
+                source_identity: source_identity.clone(),
                 tool_revision: tool_revision.clone(),
                 rng_seed,
             },
@@ -2469,7 +3136,10 @@ async fn run_single_process_campaign(
         };
         write_final_campaign_summary(&config, &promotion_stats, &telemetry, state)?;
         if cancelled {
-            anyhow::bail!("fuzz campaign cancelled by watchdog");
+            return Err(CampaignCancellation {
+                reason: "fuzz campaign cancelled by watchdog",
+            }
+            .into());
         }
         if promotion_stats.promotion_failure_count() > 0
             || promotion_stats.promotion_pending_count() > 0
@@ -2539,7 +3209,10 @@ async fn run_single_process_campaign(
     };
     write_final_campaign_summary(&config, &promotion_stats, &telemetry, state)?;
     if cancelled {
-        anyhow::bail!("fuzz campaign cancelled by watchdog");
+        return Err(CampaignCancellation {
+            reason: "fuzz campaign cancelled by watchdog",
+        }
+        .into());
     }
     if promotion_stats.promotion_failure_count() > 0
         || promotion_stats.promotion_pending_count() > 0
@@ -2587,6 +3260,28 @@ fn broker_launcher_error_can_fallback(message: &str) -> bool {
         .any(|marker| normalized.contains(marker))
 }
 
+/// Resolves the runtime environment controls used by the engine so the
+/// manifest can fingerprint the same values that execution will consume.
+pub fn runtime_environment_fingerprint(
+    configured_cores: Option<&Cores>,
+) -> anyhow::Result<rustyfuzz_artifacts::RuntimeEnvironmentFingerprint> {
+    let cores = campaign_cores(configured_cores)?;
+    Ok(rustyfuzz_artifacts::RuntimeEnvironmentFingerprint {
+        core_selection: cores.cmdline,
+        execution_timeout_secs: campaign_execution_timeout().as_secs(),
+        startup_rpc_timeout_secs: startup_rpc_timeout().as_secs(),
+        require_rpc_fork_override: require_rpc_fork_override(),
+        require_rpc_fork_effective: require_rpc_fork_override().unwrap_or(false),
+        per_input_rpc_budget: execution_rpc_budget(),
+    })
+}
+
+fn require_rpc_fork_override() -> Option<bool> {
+    std::env::var("RUSTYFUZZ_REQUIRE_RPC_FORK")
+        .ok()
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
 fn campaign_cores(configured: Option<&Cores>) -> anyhow::Result<Cores> {
     if let Some(cores) = configured {
         return Ok(cores.clone());
@@ -2615,7 +3310,7 @@ fn startup_rpc_timeout() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(60))
+        .unwrap_or(DEFAULT_STARTUP_RPC_TIMEOUT)
 }
 
 fn campaign_requires_rpc_fork() -> bool {
@@ -3352,6 +4047,64 @@ fn worker_terminal_path(report_dir: &Path, worker_id: impl ToString) -> PathBuf 
         .join(format!("{}.json", worker_id.to_string()))
 }
 
+fn open_regular_nofollow(path: &Path, max_bytes: u64) -> anyhow::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("cannot open {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("cannot inspect opened artifact: {error}"))?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        anyhow::bail!("artifact is not a bounded regular file");
+    }
+    Ok(file)
+}
+
+fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
+    let mut file = open_regular_nofollow(path, max_bytes)?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        anyhow::bail!("artifact exceeds its size limit");
+    }
+    Ok(bytes)
+}
+
+fn read_worker_terminal_artifact(path: &Path) -> anyhow::Result<WorkerTerminalArtifact> {
+    let bytes = read_bounded_regular_file(path, MAX_WORKER_TERMINAL_BYTES)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn sha256_bounded_regular_file(path: &Path, max_bytes: u64) -> anyhow::Result<String> {
+    let mut file = open_regular_nofollow(path, max_bytes)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| anyhow::anyhow!("artifact size overflow"))?;
+        if total > max_bytes {
+            anyhow::bail!("artifact exceeds its size limit");
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("sha256:{}", hex::encode(digest.finalize())))
+}
+
 fn write_worker_terminal_artifact(
     config: &Config,
     run_nonce: &str,
@@ -3388,6 +4141,261 @@ fn write_worker_terminal_artifact(
     Ok(())
 }
 
+fn observed_startup_mode(
+    mainnet_seeds_used: bool,
+    historical_seeds_used: bool,
+    abi_seeds_used: bool,
+    foundry_harness_used: bool,
+    inserted_seed_count: usize,
+    require_rpc_fork: bool,
+    allow_synthetic_fallback: bool,
+) -> rustyfuzz_artifacts::manifest::StartupMode {
+    use rustyfuzz_artifacts::manifest::StartupMode;
+
+    if inserted_seed_count == 0 {
+        if require_rpc_fork {
+            return StartupMode::DeterministicLiveStateProbe;
+        }
+        if allow_synthetic_fallback {
+            return StartupMode::SyntheticFallback;
+        }
+        return StartupMode::NoTrustedSeeds;
+    }
+    if mainnet_seeds_used {
+        return StartupMode::MainnetSeedBundle;
+    }
+    if historical_seeds_used && (abi_seeds_used || foundry_harness_used) {
+        return StartupMode::MixedTrustedSeeds;
+    }
+    if historical_seeds_used {
+        return StartupMode::HistoricalSeeds;
+    }
+    if abi_seeds_used || foundry_harness_used {
+        return StartupMode::AbiDerivedSeeds;
+    }
+    StartupMode::NoTrustedSeeds
+}
+
+fn update_canonical_startup_mode(
+    config: &Config,
+    mode: rustyfuzz_artifacts::manifest::StartupMode,
+) -> anyhow::Result<()> {
+    let Some(mut manifest) = load_canonical_run_manifest(config)? else {
+        return Ok(());
+    };
+    let manifest_path = canonical_run_layout(config)
+        .expect("campaign identity is present when a canonical manifest was loaded")
+        .config_file();
+    update_run_manifest_startup_mode(config, mode, &mut manifest, &manifest_path)
+}
+
+fn update_run_manifest_startup_mode(
+    config: &Config,
+    mode: rustyfuzz_artifacts::manifest::StartupMode,
+    manifest: &mut rustyfuzz_artifacts::RunManifest,
+    manifest_path: &Path,
+) -> anyhow::Result<()> {
+    let live_target_bytecode_hash = if config.in_memory_bytecode.is_some() {
+        None
+    } else {
+        manifest.bytecode_hash.as_deref()
+    };
+    let fingerprint = effective_config_fingerprint("evm", config, mode, live_target_bytecode_hash)?;
+    manifest.config_hash = fingerprint.config_hash;
+    manifest.canonical_effective_config = Some(fingerprint.canonical_effective_config);
+    manifest.startup_mode = fingerprint.startup_mode;
+    manifest.seed_sources = fingerprint.seed_sources;
+    manifest.abi_hash = fingerprint.abi_hash;
+    manifest.bytecode_hash = fingerprint.bytecode_hash;
+    manifest.environment = fingerprint.environment;
+    manifest.persist(manifest_path)?;
+    Ok(())
+}
+
+fn load_canonical_run_manifest(
+    config: &Config,
+) -> anyhow::Result<Option<rustyfuzz_artifacts::RunManifest>> {
+    let Some(layout) = canonical_run_layout(config) else {
+        return Ok(None);
+    };
+    let manifest_path = layout.config_file();
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(rustyfuzz_artifacts::RunManifest::load(
+        &manifest_path,
+    )?))
+}
+
+fn canonical_run_layout(config: &Config) -> Option<rustyfuzz_artifacts::RunLayout> {
+    config.campaign_id.as_deref().map(|campaign_id| {
+        rustyfuzz_artifacts::RunLayout::new(Path::new(".rustyfuzz"), campaign_id)
+    })
+}
+
+fn write_run_terminal_status(
+    config: &Config,
+    state: rustyfuzz_artifacts::RunTerminalState,
+    summary_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let Some(layout) = canonical_run_layout(config) else {
+        return Ok(());
+    };
+    let campaign_id = config
+        .campaign_id
+        .as_deref()
+        .expect("campaign identity is initialized before terminal status");
+    let summary_reference =
+        summary_path.and_then(|path| path.strip_prefix(layout.root()).ok().map(Path::to_path_buf));
+    let digest = match summary_path {
+        Some(path) if path.exists() => Some(sha256_bounded_regular_file(
+            path,
+            MAX_CANONICAL_EVIDENCE_BYTES,
+        )?),
+        _ => None,
+    };
+    layout
+        .write_terminal_status(
+            campaign_id,
+            state,
+            summary_reference.as_deref().or(summary_path),
+            digest.as_deref(),
+        )
+        .map_err(anyhow::Error::from)
+}
+
+fn write_campaign_status_with_mirror(
+    config: &Config,
+    status: &impl Serialize,
+) -> anyhow::Result<()> {
+    write_campaign_status(Path::new(&config.report_dir), status)?;
+    let Some(layout) = canonical_run_layout(config) else {
+        return Ok(());
+    };
+    let value = serde_json::to_value(status)?;
+    let mut sanitized = serde_json::Map::new();
+    if let Some(object) = value.as_object() {
+        for key in [
+            "schema_version",
+            "campaign_id",
+            "state",
+            "phase",
+            "terminal",
+            "updated_at_unix",
+            "integrity",
+            "summary",
+        ] {
+            if let Some(value) = object.get(key) {
+                sanitized.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    rustyfuzz_artifacts::fsutil::write_json_atomic(
+        &layout.root().join("campaign_status.json"),
+        &serde_json::Value::Object(sanitized),
+    )?;
+    Ok(())
+}
+
+fn mirror_campaign_summary(
+    config: &Config,
+    summary: &PromotionCampaignSummary,
+) -> anyhow::Result<PathBuf> {
+    let report_dir = Path::new(&config.report_dir);
+    write_campaign_summary(report_dir, summary)?;
+    let Some(layout) = canonical_run_layout(config) else {
+        return Ok(report_dir.join("campaign_summary.json"));
+    };
+    let canonical_path = layout.reports_dir().join("campaign_summary.json");
+    let mut canonical = serde_json::to_value(summary)?;
+    canonical["evidence_inventory"] =
+        serde_json::Value::Array(build_evidence_inventory(layout.root())?);
+    let canonical_bytes = serde_json::to_vec_pretty(&canonical)?;
+    anyhow::ensure!(
+        canonical_bytes.len() <= MAX_CANONICAL_SUMMARY_BYTES,
+        "canonical campaign summary exceeds {MAX_CANONICAL_SUMMARY_BYTES} bytes"
+    );
+    rustyfuzz_artifacts::fsutil::write_atomic(&canonical_path, &canonical_bytes)?;
+    Ok(canonical_path)
+}
+
+fn build_evidence_inventory(root: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut files = Vec::new();
+    collect_evidence_files(root, root, 0, &mut files)?;
+    files.sort();
+    let mut inventory = Vec::new();
+    for relative in files {
+        let path = root.join(&relative);
+        let digest = sha256_bounded_regular_file(&path, MAX_CANONICAL_EVIDENCE_BYTES)?;
+        inventory.push(serde_json::json!({
+            "path": relative.to_string_lossy().replace('\\', "/"),
+            "digest": digest,
+        }));
+    }
+    Ok(inventory)
+}
+
+fn collect_evidence_files(
+    root: &Path,
+    directory: &Path,
+    depth: usize,
+    files: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        depth <= MAX_CANONICAL_EVIDENCE_DEPTH,
+        "canonical evidence inventory exceeds the depth limit"
+    );
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let path = entry.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("canonical evidence inventory contains a symlink");
+        }
+        if metadata.is_dir() {
+            collect_evidence_files(root, &path, depth + 1, files)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            anyhow::bail!("canonical evidence inventory contains a special file");
+        }
+        let relative = path.strip_prefix(root)?;
+        if relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            anyhow::bail!("canonical evidence inventory contains an unsafe path");
+        }
+        if relative == Path::new("config.json")
+            || relative == Path::new("reports/campaign_summary.json")
+            || relative == Path::new("campaign_status.json")
+            || relative == Path::new("terminal_status.json")
+            || relative == Path::new(".terminal_status.lock")
+        {
+            continue;
+        }
+        anyhow::ensure!(
+            files.len() < MAX_CANONICAL_EVIDENCE_FILES,
+            "canonical evidence inventory exceeds the file limit"
+        );
+        files.push(relative.to_path_buf());
+    }
+    Ok(())
+}
+
 fn write_final_campaign_summary(
     config: &Config,
     promotion_stats: &PromotionCampaignStats,
@@ -3406,18 +4414,31 @@ fn write_final_campaign_summary(
         telemetry.artifact_count(),
         telemetry.coverage_edges(),
     );
-    let report_dir = Path::new(&config.report_dir);
-    write_campaign_summary(report_dir, &summary)?;
-    write_campaign_status(
-        report_dir,
+    let summary_path = mirror_campaign_summary(config, &summary)?;
+    let terminal_state = match state {
+        "cancelled" => rustyfuzz_artifacts::RunTerminalState::Cancelled,
+        "partial" => rustyfuzz_artifacts::RunTerminalState::Partial,
+        "completed" | "finalized" => rustyfuzz_artifacts::RunTerminalState::Completed,
+        "failed" => rustyfuzz_artifacts::RunTerminalState::Failed,
+        _ => rustyfuzz_artifacts::RunTerminalState::Failed,
+    };
+    write_campaign_status_with_mirror(
+        config,
         &serde_json::json!({
             "schema_version": 1,
             "terminal": true,
             "state": state,
+            "phase": "terminal",
+            "updated_at_unix": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default(),
+            "integrity": "unknown",
             "campaign_id": campaign_id,
             "summary": summary,
         }),
-    )
+    )?;
+    write_run_terminal_status(config, terminal_state, Some(&summary_path))
 }
 
 fn merge_worker_summaries(
@@ -3463,17 +4484,40 @@ fn merge_worker_summaries(
     summary
 }
 
-fn write_broker_failure_status(config: &Config, reason: &str) -> anyhow::Result<()> {
-    write_campaign_status(
-        Path::new(&config.report_dir),
+fn broker_terminal_state(cancelled: bool) -> rustyfuzz_artifacts::RunTerminalState {
+    if cancelled {
+        rustyfuzz_artifacts::RunTerminalState::Cancelled
+    } else {
+        rustyfuzz_artifacts::RunTerminalState::Failed
+    }
+}
+
+fn write_broker_terminal_status(
+    config: &Config,
+    state: rustyfuzz_artifacts::RunTerminalState,
+    reason: &str,
+) -> anyhow::Result<()> {
+    write_campaign_status_with_mirror(
+        config,
         &serde_json::json!({
             "schema_version": 1,
             "terminal": true,
-            "state": "failed",
+            "state": match state {
+                rustyfuzz_artifacts::RunTerminalState::Cancelled => "cancelled",
+                rustyfuzz_artifacts::RunTerminalState::Failed => "failed",
+                _ => "failed",
+            },
+            "phase": "terminal",
+            "updated_at_unix": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default(),
+            "integrity": "unknown",
             "campaign_id": config.campaign_id.as_deref().expect("campaign identity is initialized before use"),
             "reason": reason,
         }),
-    )
+    )?;
+    write_run_terminal_status(config, state, None)
 }
 
 fn finalize_brokered_campaign(
@@ -3492,22 +4536,13 @@ fn finalize_brokered_campaign(
     let mut workers = Vec::with_capacity(worker_ids.len());
     for worker_id in worker_ids {
         let path = worker_terminal_path(report_dir, *worker_id);
-        let artifact = match fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<WorkerTerminalArtifact>(&bytes) {
-                Ok(artifact) => artifact,
-                Err(error) => {
-                    let reason = format!(
-                        "brokered campaign worker {worker_id} has malformed terminal artifact: {error}"
-                    );
-                    write_broker_failure_status(config, &reason)?;
-                    anyhow::bail!(reason);
-                }
-            },
+        let artifact = match read_worker_terminal_artifact(&path) {
+            Ok(artifact) => artifact,
             Err(error) => {
                 let reason = format!(
-                    "brokered campaign worker {worker_id} has no readable terminal artifact: {error}"
+                    "brokered campaign worker {worker_id} has no readable bounded terminal artifact: {error}"
                 );
-                write_broker_failure_status(config, &reason)?;
+                write_broker_terminal_status(config, broker_terminal_state(false), &reason)?;
                 anyhow::bail!(reason);
             }
         };
@@ -3528,7 +4563,7 @@ fn finalize_brokered_campaign(
         };
         if let Some(reason) = validation_error {
             let reason = format!("brokered campaign worker {worker_id}: {reason}");
-            write_broker_failure_status(config, &reason)?;
+            write_broker_terminal_status(config, broker_terminal_state(false), &reason)?;
             anyhow::bail!(reason);
         }
         workers.push(artifact);
@@ -3592,18 +4627,32 @@ fn finalize_brokered_campaign(
     } else {
         "finalized"
     };
-    write_campaign_summary(report_dir, &summary)?;
-    write_campaign_status(
-        report_dir,
+    let summary_path = mirror_campaign_summary(config, &summary)?;
+    let terminal_state = if cancelled {
+        rustyfuzz_artifacts::RunTerminalState::Cancelled
+    } else if summary.promotion_failures > 0 || summary.promotion_pending > 0 {
+        rustyfuzz_artifacts::RunTerminalState::Partial
+    } else {
+        rustyfuzz_artifacts::RunTerminalState::Completed
+    };
+    write_campaign_status_with_mirror(
+        config,
         &serde_json::json!({
             "schema_version": 1,
             "terminal": true,
             "state": state,
+            "phase": "terminal",
+            "updated_at_unix": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default(),
+            "integrity": "unknown",
             "campaign_id": expected_campaign_id,
             "run_nonce": run_nonce,
             "summary": summary,
         }),
     )?;
+    write_run_terminal_status(config, terminal_state, Some(&summary_path))?;
     if cancelled {
         anyhow::bail!("fuzz campaign cancelled before final promotion");
     }
@@ -3955,6 +5004,176 @@ mod tests {
     }
 
     #[test]
+    fn execution_provenance_uses_authoritative_manifest_config_hash() {
+        let manifest = rustyfuzz_artifacts::RunManifest::v1(
+            "hash-equality",
+            env!("CARGO_PKG_VERSION"),
+            format!("sha256:{}", "ab".repeat(32)),
+            "bounded",
+        );
+        let config = Config {
+            rpc_url: "https://rpc.example.com".to_string(),
+            fork_block: 1,
+            target_contract: None,
+            corpus_dir: "corpus".to_string(),
+            report_dir: "reports".to_string(),
+            foundry_harness: None,
+            mainnet_seed_bundle: None,
+            in_memory_bytecode: None,
+            cores: None,
+            require_seed_bundle: false,
+            require_rpc_fork: false,
+            allow_synthetic_fallback: true,
+            hardened_defi: HardenedDefiConfig::default(),
+            target_invariant_manifest: None,
+            abi_path: None,
+            max_execs: Some(1),
+            duration_secs: Some(1),
+            artifact_limit: None,
+            campaign_id: Some("hash-equality".to_string()),
+            paths_are_isolated: true,
+            min_finding_confidence: 0,
+            promotion: PromotionConfig::default(),
+        };
+        let db = CacheDB::new(ForkDb::new(config.rpc_url.clone(), config.fork_block));
+
+        let (_, _, config_hash, _, _, source_identity) =
+            execution_provenance_fields_with_manifest(&config, 0, true, false, &db, &manifest);
+
+        assert_eq!(config_hash.as_deref(), Some(manifest.config_hash.as_str()));
+        assert_eq!(source_identity, manifest.source_identity);
+    }
+
+    #[test]
+    fn observed_startup_mode_reports_live_probe_when_configured_sources_have_no_seeds() {
+        assert_eq!(
+            observed_startup_mode(false, false, false, false, 0, true, false,),
+            rustyfuzz_artifacts::manifest::StartupMode::DeterministicLiveStateProbe
+        );
+        assert_eq!(
+            observed_startup_mode(true, false, false, false, 2, true, false),
+            rustyfuzz_artifacts::manifest::StartupMode::MainnetSeedBundle
+        );
+        assert_eq!(
+            observed_startup_mode(false, true, true, false, 2, true, false),
+            rustyfuzz_artifacts::manifest::StartupMode::MixedTrustedSeeds
+        );
+    }
+
+    #[test]
+    fn observed_startup_mode_update_recomputes_authoritative_config_hash() {
+        let run_root = std::env::temp_dir().join(format!(
+            "rustyfuzz-mode-hash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&run_root).unwrap();
+        let manifest_path = run_root.join("config.json");
+        let mut config = Config {
+            rpc_url: "https://rpc.example.com".to_string(),
+            fork_block: 1,
+            target_contract: None,
+            corpus_dir: "corpus".to_string(),
+            report_dir: "reports".to_string(),
+            foundry_harness: None,
+            mainnet_seed_bundle: None,
+            in_memory_bytecode: Some(vec![0x60, 0x00]),
+            cores: None,
+            require_seed_bundle: false,
+            require_rpc_fork: true,
+            allow_synthetic_fallback: false,
+            hardened_defi: HardenedDefiConfig::default(),
+            target_invariant_manifest: None,
+            abi_path: None,
+            max_execs: Some(1),
+            duration_secs: Some(1),
+            artifact_limit: None,
+            campaign_id: Some("mode-hash".to_string()),
+            paths_are_isolated: true,
+            min_finding_confidence: 0,
+            promotion: PromotionConfig::default(),
+        };
+        let mut manifest = rustyfuzz_artifacts::RunManifest::v1(
+            "mode-hash",
+            env!("CARGO_PKG_VERSION"),
+            format!("sha256:{}", "00".repeat(32)),
+            "bounded",
+        );
+        manifest.startup_mode = rustyfuzz_artifacts::manifest::StartupMode::AbiDerivedSeeds;
+        manifest.bytecode_hash.clone_from(
+            &effective_config_fingerprint("evm", &config, manifest.startup_mode, None)
+                .unwrap()
+                .bytecode_hash,
+        );
+        let expected = effective_config_fingerprint(
+            "evm",
+            &config,
+            rustyfuzz_artifacts::manifest::StartupMode::DeterministicLiveStateProbe,
+            None,
+        )
+        .unwrap();
+        manifest.config_hash = effective_config_fingerprint(
+            "evm",
+            &config,
+            rustyfuzz_artifacts::manifest::StartupMode::AbiDerivedSeeds,
+            None,
+        )
+        .unwrap()
+        .config_hash;
+        manifest.persist(&manifest_path).unwrap();
+
+        config.campaign_id = Some("mode-hash".to_string());
+        update_run_manifest_startup_mode(
+            &config,
+            rustyfuzz_artifacts::manifest::StartupMode::DeterministicLiveStateProbe,
+            &mut manifest,
+            &manifest_path,
+        )
+        .unwrap();
+
+        let updated = rustyfuzz_artifacts::RunManifest::load(&manifest_path).unwrap();
+        assert_eq!(updated.startup_mode, expected.startup_mode);
+        assert_eq!(updated.config_hash, expected.config_hash);
+        assert_eq!(updated.seed_sources, expected.seed_sources);
+        assert_eq!(updated.abi_hash, expected.abi_hash);
+        assert_eq!(updated.bytecode_hash, expected.bytecode_hash);
+        assert_eq!(updated.environment, expected.environment);
+        let _ = fs::remove_dir_all(run_root);
+    }
+
+    #[test]
+    fn startup_cancellation_rejection_maps_to_cancelled_without_hiding_failures() {
+        let cancellation = anyhow::Error::new(CampaignCancellation {
+            reason: "multi-worker watchdog cancellation is unsupported",
+        });
+        let real_failure = anyhow::anyhow!("RPC-backed fork DB unavailable");
+
+        assert_eq!(
+            terminal_state_for_campaign_error(&cancellation),
+            rustyfuzz_artifacts::RunTerminalState::Cancelled
+        );
+        assert_eq!(
+            terminal_state_for_campaign_error(&real_failure),
+            rustyfuzz_artifacts::RunTerminalState::Failed
+        );
+    }
+
+    #[test]
+    fn broker_cancellation_maps_to_cancelled_terminal_state() {
+        assert_eq!(
+            broker_terminal_state(true),
+            rustyfuzz_artifacts::RunTerminalState::Cancelled
+        );
+        assert_eq!(
+            broker_terminal_state(false),
+            rustyfuzz_artifacts::RunTerminalState::Failed
+        );
+    }
+
+    #[test]
     fn campaign_cores_respects_libafl_env_alias() {
         std::env::set_var("LIBAFL_CORES", "0-1");
         std::env::remove_var("RUSTYFUZZ_CORES");
@@ -4126,6 +5345,175 @@ mod tests {
         assert!(log_seed_bundle_status(&status, false, true).is_ok());
         assert!(log_seed_bundle_status(&status, false, false).is_ok());
         assert!(log_seed_bundle_status(&status, true, false).is_err());
+    }
+
+    #[test]
+    fn worker_terminal_artifact_reads_are_bounded_and_regular_files_only() {
+        let root = std::env::temp_dir().join(format!(
+            "rustyfuzz-worker-terminal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let oversized = root.join("oversized.json");
+        fs::write(
+            &oversized,
+            vec![b'x'; (MAX_WORKER_TERMINAL_BYTES + 1) as usize],
+        )
+        .unwrap();
+        assert!(read_worker_terminal_artifact(&oversized).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = root.join("terminal-link.json");
+            symlink(&oversized, &link).unwrap();
+            assert!(read_worker_terminal_artifact(&link).is_err());
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_engine_entry_prepares_canonical_manifest_and_incomplete_lifecycle() {
+        let temp = std::env::temp_dir().join(format!(
+            "rustyfuzz-direct-entry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let artifacts_root = temp.join(".rustyfuzz");
+        let config = Config {
+            rpc_url: "https://rpc.example.com".to_string(),
+            fork_block: 1,
+            target_contract: None,
+            corpus_dir: temp.join("corpus").display().to_string(),
+            report_dir: temp.join("reports").display().to_string(),
+            foundry_harness: None,
+            mainnet_seed_bundle: None,
+            in_memory_bytecode: Some(vec![0x60, 0x00]),
+            cores: None,
+            require_seed_bundle: false,
+            require_rpc_fork: false,
+            allow_synthetic_fallback: true,
+            hardened_defi: HardenedDefiConfig::default(),
+            target_invariant_manifest: None,
+            abi_path: None,
+            max_execs: Some(1),
+            duration_secs: Some(1),
+            artifact_limit: Some(1),
+            campaign_id: Some("direct-entry".to_string()),
+            paths_are_isolated: true,
+            min_finding_confidence: 0,
+            promotion: PromotionConfig::default(),
+        };
+
+        let (prepared, _owner) =
+            prepare_canonical_run_lifecycle_at(config.clone(), &artifacts_root, None).unwrap();
+        assert!(prepare_canonical_run_lifecycle_at(config, &artifacts_root, None).is_err());
+        let layout = rustyfuzz_artifacts::RunLayout::new(&artifacts_root, "direct-entry");
+        assert_eq!(
+            layout.terminal_state(),
+            Some(rustyfuzz_artifacts::RunTerminalState::Incomplete)
+        );
+        let manifest = rustyfuzz_artifacts::RunManifest::load(&layout.config_file()).unwrap();
+        assert_eq!(manifest.run_id, "direct-entry");
+        assert!(manifest.canonical_effective_config.is_some());
+        assert_eq!(prepared.campaign_id.as_deref(), Some("direct-entry"));
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn canonical_resume_rejects_material_configuration_changes() {
+        let temp = std::env::temp_dir().join(format!(
+            "rustyfuzz-resume-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let artifacts_root = temp.join(".rustyfuzz");
+        let config = Config {
+            rpc_url: "https://rpc.example.com".to_string(),
+            fork_block: 1,
+            target_contract: None,
+            corpus_dir: temp.join("corpus").display().to_string(),
+            report_dir: temp.join("reports").display().to_string(),
+            foundry_harness: None,
+            mainnet_seed_bundle: None,
+            in_memory_bytecode: Some(vec![0x60, 0x00]),
+            cores: None,
+            require_seed_bundle: false,
+            require_rpc_fork: false,
+            allow_synthetic_fallback: true,
+            hardened_defi: HardenedDefiConfig::default(),
+            target_invariant_manifest: None,
+            abi_path: None,
+            max_execs: Some(1),
+            duration_secs: Some(1),
+            artifact_limit: Some(1),
+            campaign_id: Some("resume-identity".to_string()),
+            paths_are_isolated: true,
+            min_finding_confidence: 0,
+            promotion: PromotionConfig::default(),
+        };
+        let (prepared, owner) =
+            prepare_canonical_run_lifecycle_at(config, &artifacts_root, None).unwrap();
+        let mut changed = prepared;
+        changed.max_execs = Some(2);
+        drop(owner);
+        assert!(prepare_canonical_run_lifecycle_at(changed, &artifacts_root, None).is_err());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn effective_config_file_digests_are_bounded_regular_files() {
+        let path = std::env::temp_dir().join(format!(
+            "rustyfuzz-oversized-config-input-{}",
+            std::process::id()
+        ));
+        let file = File::create(&path).unwrap();
+        file.set_len(16 * 1024 * 1024 + 1).unwrap();
+        assert!(optional_file_digest(path.to_str()).is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn canonical_evidence_inventory_fails_closed_beyond_depth_limit() {
+        let root =
+            std::env::temp_dir().join(format!("rustyfuzz-evidence-depth-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut current = root.clone();
+        for _ in 0..(MAX_CANONICAL_EVIDENCE_DEPTH + 5) {
+            current = current.join("nested");
+            fs::create_dir_all(&current).unwrap();
+        }
+        fs::write(current.join("leaf.json"), b"{}").unwrap();
+        assert!(build_evidence_inventory(&root).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn canonical_evidence_inventory_fails_closed_beyond_file_limit() {
+        let root =
+            std::env::temp_dir().join(format!("rustyfuzz-evidence-files-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("config.json"), b"{}").unwrap();
+        // Exceed the producer file budget with a cheap, shallow fan-out.
+        for index in 0..(MAX_CANONICAL_EVIDENCE_FILES + 2) {
+            fs::write(root.join(format!("e{index}.json")), b"{}").unwrap();
+        }
+        assert!(build_evidence_inventory(&root).is_err());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
