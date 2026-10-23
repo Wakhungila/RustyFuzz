@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/rustyfuzz-core", "crates/rustyfuzz-evm", "crates/rustyfuzz-engine", "crates/rustyfuzz-artifacts", "crates/rustyfuzz-operations", "crates/rustyfuzz-testkit"]
+members = [".", "crates/rustyfuzz-core", "crates/rustyfuzz-evm", "crates/rustyfuzz-engine", "crates/rustyfuzz-artifacts", "crates/rustyfuzz-operations", "crates/rustyfuzz-testkit", "crates/rustyfuzz-backtest"]
 resolver = "2"
 
 # ─────────────────────────────────────────────────────────────────────────────
