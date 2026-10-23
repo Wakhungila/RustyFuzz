@@ -229,48 +229,113 @@ dividend in languages that have signed modulo, which this type does not.
 It does **not** carry a state snapshot. FACTS.md §C5 records this from the proxy
 oracle's side; it is structural, not incidental. Therefore:
 
-> **A predicate can only be evaluated over slots the sequence actually read or wrote.
-> A predicate referencing a slot that was never touched is UNEVALUABLE — not TRUE,
-> not FALSE.**
+> **A symbol can be evaluated only if the sequence read or wrote its slot, or the slot
+> can be re-read from post-sequence state. Otherwise the result is UNEVALUABLE — not
+> TRUE, not FALSE.**
 
-This is the central design constraint and the main source of `Unknown` results.
+`storage_diffs` and `storage_reads` describe what the sequence *observed*, not what
+state *is*. The on-demand re-read in §4.3 closes that gap for current values; it
+cannot close it for historical ones, which is why `old()` and `delta()` remain
+`Unknown` when no write at index `i` exists.
 
 ### 4.2 Value resolution for a symbol at transaction index `i`
 
-For a symbol bound to `(address, slot)`:
+Resolution is a **four-step** procedure. It is *not* a scan of the trace, because a
+scan is what forced the previous draft into accepting weak evidence.
 
 ```
-if a write to (address, slot) exists at tx_index <= i:
-    value = the new_value of the LATEST such write
-else if a read of (address, slot) exists at tx_index == i:
-    value = that read's value
-else if a read exists at any tx_index <= i:
-    value = the latest such read's value      # weaker evidence; see 4.3
-else:
-    UNKNOWN
+resolve(symbol, i):
+  1. if a write to (address, slot) exists at tx_index <= i:
+         value = new_value of the LATEST such write          -> Authoritative
+  2. else if a read of (address, slot) exists at tx_index == i
+        AND no write to that slot occurred after it:
+         value = that read's value                            -> Authoritative
+  3. else:  RE-READ from live post-sequence state (§4.3)
+         if the re-read succeeds                              -> Authoritative
+         else                                                 -> UNKNOWN
 ```
+
+The re-read in step 3 is what makes the model both sound *and* complete enough to be
+useful. It is affordable: see §4.3 for the measured cost path.
 
 `old(sym)` resolves to the `old_value` of the write at index `i`; if there is no
-write at `i`, `old` is `UNKNOWN` (there is no transition to speak of).
+write at `i`, `old` is `UNKNOWN` (there is no transition to speak of — and it cannot
+be re-read, because "the value immediately before this transaction" is not a property
+of current state).
 `delta(sym)` is `new - old`, hence `UNKNOWN` whenever either side is.
 
-### 4.3 Evidence strength — a distinction that must not be erased
+### 4.3 Evidence strength — `Stale` is `Unknown`, with no asymmetry
 
-A value known from a **write** is authoritative: the sequence stored it.
-A value known from a **read** is a point-in-time observation: the slot may have
-changed between the read and the moment the predicate is checked.
+**Owner ruling (2026-10-23): stale reads produce `Unknown` for BOTH satisfaction and
+violation.** The previous revision of this document proposed allowing stale evidence
+to prove *satisfaction* while forbidding it for *violation*. That was wrong, and the
+reasoning behind it was backwards.
 
-Therefore each resolution carries a confidence:
+A stale `True` is as dangerous as a stale `False`. If the predicate is `X == Y` and a
+stale read yields `X_old == Y`, the evaluator has **not** proven the predicate holds:
+`X` may have changed since. Letting the fuzzer believe a property holds when it does
+not means the search stops looking for the bug — the failure is silent, and it
+suppresses findings rather than inventing them, which makes it harder to notice.
+"Absence of proof is never proof" cuts in both directions.
 
-| source | confidence | usable for a violation claim? |
-|---|---|---|
-| write at or before `i` | `Authoritative` | yes |
-| read at exactly `i` | `Observed` | yes |
-| read before `i` | `Stale` | **no** — yields `Unknown` for a *violation*, may be used for a *satisfaction* |
+| source | confidence | usable for `True` | usable for `False` |
+|---|---|---|---|
+| write at or before `i` | `Authoritative` | yes | yes |
+| read at exactly `i`, no later write to that slot | `Authoritative` | yes | yes |
+| read before `i` with an intervening write | `Stale` | **no** | **no** |
+| successful re-read from post-sequence state (below) | `Authoritative` | yes | yes |
+| re-read unavailable | — | `Unknown` | `Unknown` |
 
-`Stale` is deliberately asymmetric: a stale value must never be used to claim a bug
-(the value may have moved), but using one to say "this looked fine" is harmless
-because the default is already not-a-finding. Absence of proof is never proof.
+`Stale` is therefore `Unknown`, full stop. No partial trust, no asymmetry to reason
+about, no class of predicate that silently degrades.
+
+#### On-demand re-read: how `Stale` becomes decidable
+
+When resolution would land on stale evidence, the evaluator takes a **fresh read from
+the post-sequence state**. If the slot has been written since the last observation,
+that fresh read is `Authoritative` — it observes the final value directly.
+
+This is sound because the predicate is checked at end-of-sequence position `i`, and
+post-sequence state *is* the state at that position. It is not sound for `old()`,
+which needs a value that current state cannot recover (§4.2).
+
+**Cost — measured, not assumed.** The previous draft implied re-reads were
+expensive and used that to justify loosening the evidence model. That was the wrong
+trade: the fix is to make re-reads cheap, and they already are.
+
+The oracle layer already has live state: `VulnerabilityOracle::check` receives
+`before: &Snapshot, after: &Snapshot` (`src/common/oracle/mod.rs:5`) and
+`Snapshot.state: Arc<RwLock<ChainState>>` (`src/common/types.rs:27`).
+
+Re-reading one slot is a cached-map lookup, not a network call:
+
+```
+revm-database-43.0.1/src/in_memory_db.rs:425-428
+        match self.cache.accounts.get(&address) {
+            Some(acc_entry) => match acc_entry.storage.get(&index) {
+                Some(entry) => Ok(*entry),          <- pure HashMap hit
+```
+
+and the fork backend returns early on a cache hit, so no RPC is issued:
+
+```
+crates/rustyfuzz-evm/src/fork_db.rs:1106-1108
+        if let Some(value) = self.inner.storage.lock().get(&(address, index)).copied() {
+            return Ok(value);
+        }
+```
+
+A slot the sequence already touched is therefore a hash lookup plus a lock; a slot it
+never touched may fall through to the fork cache, which is also in memory, and only an
+out-of-cache miss on a live fork would reach the network — the same cost the executor
+already pays for any first access. The evaluator must never perform I/O on the
+finding path, so the re-read is subject to the same node budget and RPC budget rules
+as ordinary execution (§5 item 9), and a budget exhaustion yields `Unknown`.
+
+**Re-read must be recorded.** Every re-read appends to the finding evidence
+`(address, slot, value, "re-read@post-sequence")`, so a reviewer can tell an
+`Authoritative` verdict that came from the trace from one that came from current
+state. Without that record the provenance of the verdict would be unauditable.
 
 ### 4.4 Binding symbols to slots
 
@@ -329,13 +394,14 @@ returns a default that could be mistaken for evidence.**
 |---|---|---|
 | 1 | symbol unbound in the manifest | `Error::UnboundSymbol` (compile-time, before fuzzing) |
 | 2 | symbol bound, slot never touched by the sequence | `Unknown` | 
-| 3 | only `Stale` evidence available for a violation | `Unknown` |
+| 3 | only `Stale` evidence, and the re-read also fails (§4.3) | `Unknown` — for **both** satisfaction and violation |
 | 4 | division or modulo by zero | **`0`** (EVM `DIV`/`MOD`), plus `division_by_zero_observed += 1` on the finding |
 | 5 | `sum` over a mapping with no enumerable key set | `Unknown` |
 | 6 | `sum`/`count` over an empty key set | `0` — **explicitly not `Unknown`**, because a genuinely empty set sums to zero |
 | 7 | type error (Bool used as Int, etc.) | `Error::TypeMismatch` at compile time |
 | 8 | `old`/`delta` with no write at the current index | `Unknown` |
 | 9 | evaluation cost exceeds the node budget | `Unknown` + a budget-exceeded counter |
+| 9b | re-read (§4.3) hits the RPC budget on a cache miss | `Unknown` + `reread_budget_exhausted += 1`; never blocks or retries inline |
 | 10 | unparseable predicate | `Error::Parse` with byte offset |
 | 11 | 256-bit add/sub/mul overflow | **wraps** (§3 item 1); becomes a violation only when the predicate wraps operands in `requires_no_overflow(...)` |
 | 12 | bit range out of bounds in a `Binding` | `Error::BadBinding` at compile time |
@@ -420,26 +486,28 @@ path.
 Suppose tx 0 transfers from `A11ce` to `B0b`, and tx 1 calls a `repay()` that writes
 `totalSupply` but forgets the per-user balances.
 
-| tx | slot | write? | resolved value |
-|---|---|---|---|
-| 0 | `balances[A11ce]` | old 100 → new 40 | 40 |
-| 0 | `balances[B0b]` | old 0 → new 60 | 60 |
-| 0 | `totalSupply` | unchanged, **read** 100 | 100 (Observed) |
-| 1 | `totalSupply` | old 100 → new 40 | 40 |
-| 1 | `balances[*]` | **never touched** | `Stale`/`Unknown` |
+| tx | slot | write? | resolution step | value |
+|---|---|---|---|---|
+| 0 | `balances[A11ce]` | old 100 → new 40 | 1 (write ≤ i) | 40, `Authoritative` |
+| 0 | `balances[B0b]` | old 0 → new 60 | 1 (write ≤ i) | 60, `Authoritative` |
+| 0 | `totalSupply` | unchanged, **read** 100 | 2 (read at i, no later write) | 100, `Authoritative` |
+| 1 | `totalSupply` | old 100 → new 40 | 1 (write ≤ i) | 40, `Authoritative` |
+| 1 | `balances[A11ce]` | last write at tx 0 | 3 (**re-read**) | 40, `Authoritative` |
+| 1 | `balances[B0b]` | last write at tx 0 | 3 (**re-read**) | 60, `Authoritative` |
+| 1 | `balances[C0ol]` | never touched | 3 (**re-read**) | 0, `Authoritative` |
 
-At tx 1: `sum(userBalances)` resolves `balances[A11ce]` from a tx-0 write (40),
-`balances[B0b]` from a tx-0 write (60), `balances[C0ol]` → never touched → the whole
-`sum` is `Unknown`.
+At tx 1 the three balance terms land on step 3 and are **re-read from post-sequence
+state**, which is `Authoritative` (§4.3). The `sum` is therefore decidable:
+`40 + 60 + 0 = 100` against `totalSupply = 40` → `100 == 40` is `False` → violation.
 
-**This is the correct outcome and it is also the limitation made visible:** the
-predicate cannot claim a violation at tx 1 because one term is unobserved. To make
-the case decidable, the harness must read all three balances at tx 1 (which a real
-handler would do when checking the invariant). The design therefore forces the
-harness to observe what it claims — a property worth having.
+**Note how the ruling changed this example.** The previous revision had
+`balances[C0ol]` force the whole `sum` to `Unknown`, and concluded that a harness must
+read every key to make the case decidable. With the re-read the harness needs no such
+discipline: an untouched slot resolves to its current value. The earlier conclusion
+was a consequence of the weak-evidence model, not a property worth preserving.
 
-If all three *are* read at tx 1 (40 + 60 + 0) and `totalSupply` is 40, then
-`100 == 40` is `False` → violation, with per-term evidence recorded.
+Each term's evidence records which step produced it, so a reviewer can distinguish
+"observed in the trace" from "re-read at post-sequence", as §4.3 requires.
 
 ### 6.6 What the finding must carry
 
@@ -501,7 +569,7 @@ Assuming one engineer, no parallelisation, and the existing test suite as the ga
 | 2 | Type checker (§3) + wrapping arithmetic + div/mod-by-zero counter | 1 | policy now decided; no blocking question |
 | 3 | Binding model incl. packed bit ranges (§4.4) | 2 | the packed-slot case is where bugs hide |
 | 4 | Mapping binding: finite key set + observed-key derivation | 2 | reuses `Waypoint::MappingDerivation` |
-| 5 | Value resolution with evidence strength (§4.2, §4.3) | 2 | the `Stale` asymmetry is subtle; needs its own tests |
+| 5 | Value resolution: 4-step + on-demand re-read (§4.2, §4.3) | 3 | re-read provenance must be recorded per slot; own tests |
 | 6 | Evaluator returning tri-state + all 12 failure modes (§5) | 2 | no panics |
 | 6b | `requires_no_overflow`: widened-mode re-evaluation + per-site counters | 1 | must not change the wrapping value used elsewhere (§3 item 2) |
 | 7 | `InvariantOracle` trait + campaign-loop registration | 1 | additive; must not disturb existing oracles |
@@ -509,15 +577,17 @@ Assuming one engineer, no parallelisation, and the existing test suite as the ga
 | 9 | End-to-end fixture: false predicate fires, true predicate silent (§6) | 2 | the acceptance gate for the whole layer |
 | 10 | Docs + `INCOMPLETE.md` update for unevaluable predicates | 1 | |
 
-**Total: 17 engineer-days ≈ 1–2 weeks of elapsed work** with review cycles. This
+**Total: 18 engineer-days ≈ 1–2 weeks of elapsed work** with review cycles. This
 matches `BRIEF_CORRECTIONS.md` correction 1 and `ROADMAP_v1.1.md` W2.
 
 Components 1–7 (plus 6b) are the minimum for a single end-to-end proof; 8–10 are
 required before any number is published from a predicate.
 
-The one-day increase over the previous estimate is component 6b: `requires_no_overflow`
-needs a second evaluation path in widened arithmetic plus two counters carried into
-the finding evidence (§6.6). It is not free, and it is not a flag.
+Increases over the first estimate: component 6b (+1 day) because
+`requires_no_overflow` needs a second evaluation path in widened arithmetic plus two
+counters in the finding evidence (§6.6); component 5 (+1 day) because dropping `Stale`
+entirely means implementing the on-demand re-read and recording per-slot provenance,
+rather than accepting the weaker evidence and moving on. Neither is a flag.
 
 ---
 
@@ -534,6 +604,11 @@ These block implementation and should be answered before code is written:
 2. ~~**Division / modulo by zero (§3, §5 item 4)**~~ → **DECIDED: returns `0`**
    (EVM-faithful), accompanied by a `division_by_zero_observed` counter on the
    finding so a mis-specified predicate is visible rather than silently handled.
+3. ~~**`Stale` reads (§4.3)**~~ → **DECIDED: `Unknown` for both satisfaction and
+   violation.** The agent's proposal to allow stale evidence for satisfaction only was
+   rejected: a stale `True` is as dangerous as a stale `False`, because it makes the
+   search stop looking. The fix is the on-demand re-read in §4.3 (a cached hash
+   lookup, not a network call), not a looser evidence model.
 
 Items 3 and 4 of the original list (rounding on `/`, `%` sign) are **not open** —
 they are moot under an unsigned `Int` and are explained in §3.
@@ -541,8 +616,6 @@ they are moot under an unsigned `Int` and are explained in §3.
 **Still open, needing a ruling before implementation** (referenced by name, not
 number, so this list cannot drift out of sync with §3):
 
-- **`Stale` reads (§4.3):** accept them for *satisfaction* only, as proposed, or
-  reject them entirely? *Recommendation: as proposed.*
 - **`sum` over an unobserved key (§5 item 5):** is `Unknown` acceptable, or should
   the harness be *required* to read every key before a `sum` is allowed at all?
   *Recommendation: `Unknown`, with an `unevaluable` metric so the gap is visible.*
