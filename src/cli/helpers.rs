@@ -821,7 +821,12 @@ mod tests {
     use rustyfuzz_artifacts::manifest::StartupMode;
     use rustyfuzz_evm::fork_db::ForkDb;
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Uses the crate-wide lock so these tests also exclude of the same
+    /// environment from other modules. The fingerprint under test hashes the
+    /// presence of these variables, so cross-module exclusion is required.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_support::env_lock()
+    }
 
     #[test]
     fn prove_live_setup_guard_terminalizes_early_failure() {
@@ -914,7 +919,8 @@ mod tests {
 
     #[test]
     fn effective_fingerprint_distinguishes_strict_target_bounds_and_startup_modes() {
-        let _env_guard = ENV_LOCK.lock().unwrap();
+        // Reads the same process-global environment the fingerprint hashes.
+        let _env_guard = env_guard();
         let base = fingerprint_fixture();
         let base_fingerprint = effective_config_fingerprint(
             "evm",
@@ -992,7 +998,8 @@ mod tests {
 
     #[test]
     fn effective_fingerprint_uses_sanitized_rpc_identity() {
-        let _env_guard = ENV_LOCK.lock().unwrap();
+        // Reads the same process-global environment the fingerprint hashes.
+        let _env_guard = env_guard();
         let first = fingerprint_fixture();
         let mut second = fingerprint_fixture();
         let second_rpc = second.rpc_url.replace(
@@ -1020,7 +1027,7 @@ mod tests {
 
     #[test]
     fn effective_fingerprint_includes_resolved_runtime_environment_controls() {
-        let _env_guard = ENV_LOCK.lock().unwrap();
+        let _env_guard = env_guard();
         let names = [
             "RUSTYFUZZ_CORES",
             "LIBAFL_CORES",
@@ -1106,7 +1113,7 @@ mod tests {
 
     #[test]
     fn prove_live_runtime_defaults_are_overrideable() {
-        let _env_guard = ENV_LOCK.lock().unwrap();
+        let _env_guard = env_guard();
         std::env::remove_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS");
         std::env::remove_var("RUSTYFUZZ_EXEC_RPC_BUDGET");
         apply_prove_live_runtime_defaults(300);

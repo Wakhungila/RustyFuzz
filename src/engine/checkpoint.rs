@@ -42,7 +42,11 @@ fn default_interval() -> u64 {
     1000
 }
 
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+// v5 retains pinned replay ancestry and restores the fair scheduler cursor.
+// v4 started from an unfunded root with committed storage observations.
+// Older snapshots can contain exploration funding and cannot be resumed safely
+// under these execution semantics without reconstructing the original fork.
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 5;
 pub const CHECKPOINT_CONFIG_IDENTITY_SCHEMA_VERSION: u32 = 2;
 const LEGACY_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 const MAX_CHECKPOINT_IDENTITY_INPUT_BYTES: u64 = 16 * 1024 * 1024;
@@ -176,6 +180,7 @@ pub(crate) struct SavedSnapshots {
     parents: HashMap<u64, u64>,
     children: HashMap<u64, Vec<u64>>,
     metadata: HashMap<u64, SnapshotMetadata>,
+    pinned: std::collections::HashSet<u64>,
     hotspots: Vec<((Address, B256), usize)>,
     priority: Vec<bool>,
 }
@@ -241,6 +246,7 @@ impl SavedSnapshots {
             parents: corpus.parent_map.clone(),
             children: corpus.children_map.clone(),
             metadata: corpus.metadata.clone(),
+            pinned: corpus.pinned.clone(),
             hotspots: corpus
                 .global_read_hotspots
                 .iter()
@@ -288,6 +294,7 @@ impl SavedSnapshots {
             parent_map: self.parents,
             children_map: self.children,
             metadata: self.metadata,
+            pinned: self.pinned,
             global_read_hotspots: self.hotspots.into_iter().collect(),
             priority_gap_map: self.priority.into_iter().collect(),
         })
@@ -606,6 +613,28 @@ mod tests {
             payload_digest: String::new(),
             payload_hex: String::new(),
         }
+    }
+
+    #[test]
+    fn checkpoint_resume_rejects_pre_canonical_state_semantics() {
+        let directory = temp_directory("checkpoint-old-state-semantics");
+        let mut old = envelope(source_identity("aa"));
+        old.schema_version = 4;
+        std::fs::write(
+            directory.join("checkpoint.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        let error = CheckpointSession::open_with_source_identity(
+            &config(&directory),
+            source_identity("aa"),
+        )
+        .err()
+        .unwrap();
+        assert!(error
+            .to_string()
+            .contains("unsupported checkpoint schema 4; expected 5"));
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

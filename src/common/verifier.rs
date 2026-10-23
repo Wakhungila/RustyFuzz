@@ -29,11 +29,18 @@ use std::process::Command;
 pub struct ReplayVerifier {
     executor: EvmExecutor,
     map_size: usize,
+    /// Must match the campaign's policy, or a time-dependent finding will not
+    /// reproduce: the replayed transactions would observe different blocks than
+    /// the ones that produced the finding.
+    time_warp: rustyfuzz_evm::time_warp::TimeWarp,
 }
 
 pub struct RealismVerifier {
     executor: EvmExecutor,
     map_size: usize,
+    /// Proof replay must advance blocks exactly as the campaign did, otherwise a
+    /// time-dependent finding is not reproducible from pinned state.
+    time_warp: rustyfuzz_evm::time_warp::TimeWarp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +76,18 @@ impl ReplayVerifier {
         Self {
             executor: EvmExecutor::new(),
             map_size,
+            // Defaults to the campaign default so a verifier built without
+            // explicit configuration still reproduces default campaigns.
+            time_warp: rustyfuzz_evm::time_warp::TimeWarp::DEFAULT,
+        }
+    }
+
+    /// Builds a verifier that replays under an explicit time-warp policy.
+    pub fn with_time_warp(map_size: usize, time_warp: rustyfuzz_evm::time_warp::TimeWarp) -> Self {
+        Self {
+            executor: EvmExecutor::new(),
+            map_size,
+            time_warp,
         }
     }
 
@@ -78,13 +97,26 @@ impl ReplayVerifier {
         block_env: &BlockEnv,
         input: &EvmInput,
     ) -> Result<SequenceExecutionResult> {
+        self.replay_with_coverage(base_state, block_env, input)
+            .map(|(execution, _)| execution)
+    }
+
+    pub fn replay_with_coverage(
+        &self,
+        base_state: &ChainState,
+        block_env: &BlockEnv,
+        input: &EvmInput,
+    ) -> Result<(SequenceExecutionResult, Vec<u8>)> {
         let mut state = base_state.clone();
-        let mut env = block_env.clone();
         let mut coverage = vec![0u8; self.map_size];
         let mut dataflow = DataflowRegistry::new();
         let mut tx_results = Vec::with_capacity(input.txs.len());
 
         for (tx_idx, tx) in input.txs.iter().enumerate() {
+            // Rebuild the block context for this index so replay observes the
+            // same blocks the campaign did.
+            let mut env = block_env.clone();
+            self.time_warp.apply(&mut env, tx_idx);
             let mut waypoints = Vec::new();
             let result = self.executor.execute_with_result(
                 &mut state,
@@ -98,7 +130,7 @@ impl ReplayVerifier {
             tx_results.push(result);
         }
 
-        Ok(SequenceExecutionResult {
+        let execution = SequenceExecutionResult {
             total_gas_used: tx_results.iter().map(|result| result.gas_used).sum(),
             final_coverage_hash: EvmCoverageFeedback::stable_path_hash(&coverage),
             storage_reads: tx_results
@@ -119,7 +151,8 @@ impl ReplayVerifier {
                 .collect(),
             oracle_observations: Vec::new(),
             tx_results,
-        })
+        };
+        Ok((execution, coverage))
     }
 
     pub fn replay_with_economic_views(
@@ -249,11 +282,183 @@ impl ReplayVerifier {
     }
 }
 
+/// A security condition bound to the original rule, contract and actors.
+/// Unsupported heuristic findings deliberately have no proof predicate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ViolationPredicate {
+    DeniedMint {
+        target: Address,
+        caller: Address,
+        recipient: Address,
+        mint_calldata: Vec<u8>,
+        policy_calldata: Vec<u8>,
+    },
+}
+
+impl ViolationPredicate {
+    pub fn from_finding(
+        finding: &crate::common::oracle::ProtocolFinding,
+        execution: &SequenceExecutionResult,
+    ) -> Option<Self> {
+        use crate::common::types::{CallKind, CallPhase};
+        if finding.pack != crate::common::oracle::ProtocolOraclePackKind::Erc20
+            || finding.vuln != VulnType::Other("mint authorization policy violation".into())
+        {
+            return None;
+        }
+        let target = finding.target?;
+        let mint = execution.call_trace.iter().find(|call| {
+            call.target == target
+                && Some(call.tx_index) == finding.tx_index
+                && call.kind == CallKind::Transaction
+                && call.phase == CallPhase::End
+                && call.success
+                && call.input.len() == 68
+                && call.input[..4] == [0x40, 0xc1, 0x0f, 0x19]
+                && call.input[4..16] == [0; 12]
+        })?;
+        let policy = execution.call_trace.iter().find(|call| {
+            call.tx_index.checked_add(1) == Some(mint.tx_index)
+                && call.target == target
+                && call.caller == mint.caller
+                && call.kind == CallKind::Transaction
+                && call.phase == CallPhase::End
+                && call.input.len() == 36
+                && (revm::primitives::keccak256("canMint(address)").as_slice()[..4]
+                    == call.input[..4]
+                    || revm::primitives::keccak256("isMinter(address)").as_slice()[..4]
+                        == call.input[..4])
+                && call.input[4..16] == [0; 12]
+                && call.input[16..36] == mint.caller.as_slice()[..]
+        })?;
+        let predicate = Self::DeniedMint {
+            target,
+            caller: mint.caller,
+            recipient: Address::from_slice(&mint.input[16..36]),
+            mint_calldata: mint.input.clone(),
+            policy_calldata: policy.input.clone(),
+        };
+        predicate.holds(execution).then_some(predicate)
+    }
+
+    pub fn holds(&self, execution: &SequenceExecutionResult) -> bool {
+        self.observation_indices(execution).is_some()
+    }
+
+    /// This deliberately narrow predicate requires four adjacent committed calls:
+    /// balance, explicit denied policy, mint, balance. It does not infer token
+    /// semantics from arbitrary storage changes or permit another policy/actor.
+    pub fn observation_indices(
+        &self,
+        execution: &SequenceExecutionResult,
+    ) -> Option<(usize, usize, usize, usize)> {
+        use crate::common::types::{CallKind, CallPhase, ExecutionStatus};
+        let Self::DeniedMint {
+            target,
+            caller,
+            recipient,
+            mint_calldata,
+            policy_calldata,
+        } = self;
+        if mint_calldata.len() != 68
+            || mint_calldata[..4] != [0x40, 0xc1, 0x0f, 0x19]
+            || mint_calldata[4..16] != [0; 12]
+            || mint_calldata[16..36] != recipient.as_slice()[..]
+            || U256::from_be_slice(&mint_calldata[36..]).is_zero()
+            || policy_calldata.len() != 36
+            || policy_calldata[4..16] != [0; 12]
+            || policy_calldata[16..36] != caller.as_slice()[..]
+            || ![
+                revm::primitives::keccak256("canMint(address)"),
+                revm::primitives::keccak256("isMinter(address)"),
+            ]
+            .iter()
+            .any(|selector| selector[..4] == policy_calldata[..4])
+        {
+            return None;
+        }
+        let calls: Vec<_> = execution
+            .call_trace
+            .iter()
+            .filter(|call| {
+                call.kind == CallKind::Transaction
+                    && call.phase == CallPhase::End
+                    && call.success
+                    && call.target == *target
+                    && call.caller == *caller
+                    && execution.tx_results.iter().any(|tx| {
+                        tx.tx_index == call.tx_index && tx.status == ExecutionStatus::Success
+                    })
+            })
+            .collect();
+        let balance = |call: &&crate::common::types::CallObservation| {
+            call.input.len() == 36
+                && call.input[..4] == [0x70, 0xa0, 0x82, 0x31]
+                && call.input[4..16] == [0; 12]
+                && call.input[16..36] == recipient.as_slice()[..]
+                && call.output.len() == 32
+        };
+        for mint in calls.iter().filter(|call| call.input == *mint_calldata) {
+            let Some(policy_index) = mint.tx_index.checked_sub(1) else {
+                continue;
+            };
+            let Some(before_index) = mint.tx_index.checked_sub(2) else {
+                continue;
+            };
+            let Some(policy) = calls.iter().find(|call| {
+                call.tx_index == policy_index
+                    && call.input == *policy_calldata
+                    && call.output.len() == 32
+                    && U256::from_be_slice(&call.output).is_zero()
+            }) else {
+                continue;
+            };
+            let Some(before) = calls
+                .iter()
+                .find(|call| call.tx_index == before_index && balance(call))
+            else {
+                continue;
+            };
+            let Some(after) = calls
+                .iter()
+                .find(|call| Some(call.tx_index) == mint.tx_index.checked_add(1) && balance(call))
+            else {
+                continue;
+            };
+            let probes_mutate = execution.storage_diffs.iter().any(|diff| {
+                [before.tx_index, policy.tx_index, after.tx_index].contains(&diff.tx_index)
+                    && diff.old_value != diff.new_value
+            });
+            if !probes_mutate
+                && U256::from_be_slice(&after.output) > U256::from_be_slice(&before.output)
+            {
+                return Some((
+                    before.tx_index,
+                    policy.tx_index,
+                    mint.tx_index,
+                    after.tx_index,
+                ));
+            }
+        }
+        None
+    }
+}
+
 impl RealismVerifier {
     pub fn new(map_size: usize) -> Self {
         Self {
             executor: EvmExecutor::proof(),
             map_size,
+            time_warp: rustyfuzz_evm::time_warp::TimeWarp::DEFAULT,
+        }
+    }
+
+    /// Builds a proof verifier that replays under an explicit time-warp policy.
+    pub fn with_time_warp(map_size: usize, time_warp: rustyfuzz_evm::time_warp::TimeWarp) -> Self {
+        Self {
+            executor: EvmExecutor::proof(),
+            map_size,
+            time_warp,
         }
     }
 
@@ -281,8 +486,8 @@ impl RealismVerifier {
         match (first, second) {
             (Ok(first), Ok(second)) if first == second => RealismProofReport {
                 success: true,
-                status: FindingStatus::Proved,
-                evidence_grade: EvidenceGrade::RealisticForkProof,
+                status: FindingStatus::Replayed,
+                evidence_grade: EvidenceGrade::DeterministicReplay,
                 rejection_reasons: Vec::new(),
                 execution: Some(first),
             },
@@ -303,6 +508,34 @@ impl RealismVerifier {
         }
     }
 
+    /// Repeatability is necessary but only this method checks a security condition.
+    pub fn prove_violation(
+        &self,
+        base_state: &ChainState,
+        block_env: &BlockEnv,
+        input: &EvmInput,
+        predicate: &ViolationPredicate,
+    ) -> RealismProofReport {
+        let mut report = self.prove(base_state, block_env, input);
+        if report.success {
+            if report
+                .execution
+                .as_ref()
+                .is_some_and(|execution| predicate.holds(execution))
+            {
+                report.status = FindingStatus::Proved;
+                report.evidence_grade = EvidenceGrade::RealisticForkProof;
+            } else {
+                report.success = false;
+                report.status = FindingStatus::Rejected;
+                report
+                    .rejection_reasons
+                    .push(RejectionReason::OracleWeakness);
+            }
+        }
+        report
+    }
+
     fn replay_once(
         &self,
         base_state: &ChainState,
@@ -310,12 +543,15 @@ impl RealismVerifier {
         input: &EvmInput,
     ) -> Result<SequenceExecutionResult> {
         let mut state = base_state.clone();
-        let mut env = block_env.clone();
         let mut coverage = vec![0u8; self.map_size];
         let mut dataflow = DataflowRegistry::new();
         let mut tx_results = Vec::with_capacity(input.txs.len());
 
         for (tx_idx, tx) in input.txs.iter().enumerate() {
+            // Rebuild the block context for this index so replay observes the
+            // same blocks the campaign did.
+            let mut env = block_env.clone();
+            self.time_warp.apply(&mut env, tx_idx);
             let mut waypoints = Vec::new();
             let result = self.executor.execute_with_result(
                 &mut state,
@@ -355,20 +591,23 @@ impl RealismVerifier {
 }
 
 fn preflight_realism_rejections(base_state: &ChainState, input: &EvmInput) -> Vec<RejectionReason> {
-    let mut balances = std::collections::HashMap::<Address, U256>::new();
+    if input.base_snapshot_id != 0 || !input.validate() {
+        return vec![RejectionReason::ReplayFailed];
+    }
     let ChainState::Evm(db) = base_state;
-    for tx in &input.txs {
-        let balance = *balances.entry(tx.caller).or_insert_with(|| {
-            db.basic_ref(tx.caller)
-                .ok()
-                .flatten()
-                .map(|account| account.balance)
-                .unwrap_or_default()
-        });
+    // Only the first transaction can be checked against the initial balance.
+    // Later callers may receive funds during earlier transactions. REVM checks
+    // their actual sequential balances, including gas, during proof replay.
+    if let Some(tx) = input.txs.first() {
+        let balance = db
+            .basic_ref(tx.caller)
+            .ok()
+            .flatten()
+            .map(|account| account.balance)
+            .unwrap_or_default();
         if balance < tx.value {
             return vec![RejectionReason::MissingBalance];
         }
-        balances.insert(tx.caller, balance.saturating_sub(tx.value));
     }
     Vec::new()
 }
@@ -823,8 +1062,8 @@ mod tests {
         let report = RealismVerifier::new(1024).prove(&base, &BlockEnv::default(), &input);
 
         assert!(report.success, "{report:?}");
-        assert_eq!(report.status, FindingStatus::Proved);
-        assert_eq!(report.evidence_grade, EvidenceGrade::RealisticForkProof);
+        assert_eq!(report.status, FindingStatus::Replayed);
+        assert_eq!(report.evidence_grade, EvidenceGrade::DeterministicReplay);
         assert!(report.rejection_reasons.is_empty());
         assert!(report.execution.is_some());
     }

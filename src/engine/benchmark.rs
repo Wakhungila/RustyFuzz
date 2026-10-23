@@ -1885,6 +1885,7 @@ impl ValidationRunner {
             .as_ref()
             .map(|cache| cache.snapshot.clone());
         let replay_economic_delta;
+        let proof_base;
         anyhow::ensure!(
             !live_fixture.provider_replay_only,
             "provider_replay_only is unsupported: independent eth_call requests do not preserve sequence state or prove an invariant; use local EVM replay with a pinned fork/cache"
@@ -1893,9 +1894,12 @@ impl ValidationRunner {
             prepared_replay_cache
         {
             let synthetic_profile = !cache.production_eligible();
+            proof_base = ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(
+                cache.snapshot.clone(),
+            )));
             let replay = if synthetic_profile {
                 replay_verifier.replay_with_economic_views(
-                    &ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(cache.snapshot))),
+                    &proof_base,
                     &block_env,
                     &input,
                     manifest.target_address(),
@@ -1929,8 +1933,9 @@ impl ValidationRunner {
                 )
             })?;
             ensure_fork_provenance_complete(&observed, fork_block, "live fork")?;
+            proof_base = ChainState::Evm(CacheDB::new(live_db));
             let replay = replay_verifier.replay_with_economic_views(
-                    &ChainState::Evm(CacheDB::new(live_db)),
+                    &proof_base,
                     &block_env,
                     &input,
                     manifest.target_address(),
@@ -2036,7 +2041,9 @@ impl ValidationRunner {
                 proof = proof.with_economic_delta(delta);
             }
             let replay_result = proof.verify_against(&execution, &replay_findings);
-            proof.with_replay_result(replay_result)
+            proof = proof.with_replay_result(replay_result);
+            proof.verify_original_state(&proof_base, &block_env, MAP_SIZE);
+            proof
         });
 
         let proof_confirmed = observation.proof.as_ref().is_some_and(|proof| {
@@ -2215,13 +2222,17 @@ fn execute_blind_rediscovery_benchmark(
         .transpose()?;
     let replay_verifier = ReplayVerifier::new(MAP_SIZE);
     let block_env = context.block_env.clone().unwrap_or_default();
+    let proof_base;
     let (execution, replay_backend, replay_economic_delta, synthetic_profile) = if let Some(cache) =
         prepared_replay_cache
     {
         let synthetic_profile = !cache.production_eligible();
+        proof_base = ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(
+            cache.snapshot.clone(),
+        )));
         let replay = if synthetic_profile {
             replay_verifier.replay_with_economic_views(
-                &ChainState::Evm(CacheDB::new(ForkDb::from_cache_snapshot(cache.snapshot))),
+                &proof_base,
                 &block_env,
                 &candidate_input,
                 manifest.target_address(),
@@ -2259,8 +2270,9 @@ fn execute_blind_rediscovery_benchmark(
             )
         })?;
         ensure_fork_provenance_complete(&observed, fork_block, "live fork")?;
+        proof_base = ChainState::Evm(CacheDB::new(live_db));
         let replay = replay_verifier.replay_with_economic_views(
-            &ChainState::Evm(CacheDB::new(live_db)),
+            &proof_base,
             &block_env,
             &candidate_input,
             manifest.target_address(),
@@ -2365,6 +2377,7 @@ fn execute_blind_rediscovery_benchmark(
         if let Some(delta) = replay_economic_delta.clone() {
             proof = proof.with_economic_delta(delta);
         }
+        proof.verify_original_state(&proof_base, &block_env, MAP_SIZE);
         observation.proof = Some(proof);
     }
 
@@ -4940,7 +4953,7 @@ success_criteria = ["expected_finding"]
     }
 
     #[test]
-    fn blind_rediscovery_confirms_cached_vulnerable_runtime_without_exploit_calldata() {
+    fn blind_rediscovery_does_not_confirm_initializer_heuristic_as_a_proof() {
         let runner = ValidationRunner;
         let base =
             std::env::temp_dir().join(format!("rusty_fuzz_blind_confirmed_{}", std::process::id()));
@@ -5019,11 +5032,10 @@ success_criteria = ["expected_finding"]
             report_dir: Some(base.join("reports")),
         };
         let result = runner.run_manifest_with_context(&manifest, &context);
-        assert_eq!(result.status, ValidationStatus::Found);
-        assert!(result.found);
+        assert_eq!(result.status, ValidationStatus::NotFound);
+        assert!(!result.found);
         assert!(result.replayable);
-        assert!(result.minimized);
-        assert!(result.foundry_poc_generated);
+        assert!(!result.foundry_poc_generated);
         assert_eq!(
             result.proof_status,
             Some(CounterexampleProofStatus::ConcretelyReplayed)
@@ -5055,13 +5067,15 @@ success_criteria = ["expected_finding"]
             ..ValidationObservation::default()
         };
         let synthetic = runner.evaluate_observation(&benchmark_manifest, &observation);
-        assert!(synthetic.found);
+        assert!(!synthetic.found);
         assert_eq!(
             synthetic.evidence_class,
             BenchmarkEvidenceClass::SyntheticRegression
         );
         let mut production = synthetic.clone();
         production.evidence_class = BenchmarkEvidenceClass::ProductionLive;
+        // Aggregation is tested independently of this unsupported predicate.
+        production.found = true;
         let report = ValidationRunner::report_from_results(vec![synthetic, production]);
         assert_eq!(report.benchmarks.len(), 2);
         assert_eq!(report.summary.found, 1);
@@ -5078,7 +5092,7 @@ success_criteria = ["expected_finding"]
     }
 
     #[test]
-    fn evaluates_success_criteria_from_findings() {
+    fn findings_and_repeatability_do_not_satisfy_violation_proof_criteria() {
         let runner = ValidationRunner;
         let mut benchmark_manifest = manifest();
         benchmark_manifest.poc_generation = PocGenerationExpectation::NotRequired;
@@ -5102,15 +5116,18 @@ success_criteria = ["expected_finding"]
             ..ValidationObservation::default()
         };
         let result = runner.evaluate_observation(&benchmark_manifest, &observation);
-        assert!(result.found);
-        assert_eq!(result.status, ValidationStatus::Found);
+        assert!(!result.found);
+        assert_eq!(result.status, ValidationStatus::NotFound);
         assert!(result
             .matched_criteria
             .contains(&SuccessCriterion::ExpectedFinding));
         assert!(result
             .matched_criteria
             .contains(&SuccessCriterion::SharePriceManipulation));
-        assert_eq!(result.failure_kind, BenchmarkFailureKind::Passed);
+        assert_eq!(
+            result.failure_kind,
+            BenchmarkFailureKind::RealismProofFailure
+        );
         assert_eq!(result.expected_oracle.as_deref(), Some("erc4626"));
     }
 
@@ -5176,7 +5193,7 @@ success_criteria = ["expected_finding"]
             runner
                 .evaluate_observation(&no_poc_manifest, &no_poc)
                 .failure_kind,
-            BenchmarkFailureKind::PocGenerationFailure
+            BenchmarkFailureKind::RealismProofFailure
         );
     }
 

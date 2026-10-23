@@ -637,6 +637,53 @@ impl PersistentCorpus {
         self.persist_fork_cache(id, &snapshot_db)
     }
 
+    /// Normalize worker-local snapshot inputs into portable root-based evidence.
+    /// Exploration replay reconstructs observations; promotion must separately
+    /// satisfy its concrete predicate without synthetic execution overlays.
+    pub fn persist_root_replayed_artifact(
+        &self,
+        request: CampaignArtifactRequest<'_>,
+        snapshots: &SnapshotCorpus,
+        original: &EvmCacheDb,
+        environment: &revm::context::BlockEnv,
+    ) -> anyhow::Result<CampaignArtifactOutcome> {
+        if request.input.base_snapshot_id == 0 {
+            return self.persist_campaign_artifact(CampaignArtifactRequest {
+                base_fork_state: original,
+                ..request
+            });
+        }
+        let input = snapshots.root_replay_input(request.input).ok_or_else(|| {
+            anyhow::anyhow!("snapshot lineage is missing, cyclic, or exceeds input limits")
+        })?;
+        let verifier = crate::common::verifier::ReplayVerifier::new(MAP_SIZE);
+        let base = ChainState::Evm(original.clone());
+        let (execution, coverage) = verifier.replay_with_coverage(&base, environment, &input)?;
+        anyhow::ensure!(
+            execution == verifier.replay(&base, environment, &input)?,
+            "complete root replay is nondeterministic"
+        );
+        let findings = crate::common::oracle::ProtocolOraclePack::default().evaluate(&execution);
+        anyhow::ensure!(
+            request.findings.iter().all(|expected| findings
+                .iter()
+                .any(|actual| actual.pack == expected.pack
+                    && actual.vuln == expected.vuln
+                    && actual.target == expected.target)),
+            "snapshot signal did not survive complete replay from original state"
+        );
+        self.persist_campaign_artifact(CampaignArtifactRequest {
+            input: &input,
+            execution: &execution,
+            coverage: &coverage,
+            base_fork_state: original,
+            findings: &findings,
+            // Suffix-only hypotheses cannot be relabeled as full-path proof.
+            exploit_candidate: None,
+            ..request
+        })
+    }
+
     pub fn persist_campaign_artifact(
         &self,
         request: CampaignArtifactRequest<'_>,
@@ -3203,6 +3250,9 @@ pub struct SnapshotCorpus {
     pub parent_map: HashMap<u64, u64>,
     pub children_map: HashMap<u64, Vec<u64>>,
     pub metadata: HashMap<u64, SnapshotMetadata>,
+    /// Snapshots referenced by executable testcases. Their full ancestry must
+    /// remain available until the campaign is discarded or resumed.
+    pub pinned: HashSet<u64>,
     pub global_read_hotspots: HashMap<(Address, B256), usize>,
     pub priority_gap_map: BitVec<u8, Lsb0>, // Edges identified as "uncovered" by Forge
 }
@@ -3483,6 +3533,7 @@ impl SnapshotCorpus {
             parent_map: HashMap::new(),
             children_map: HashMap::new(),
             metadata: HashMap::new(),
+            pinned: HashSet::new(),
             global_read_hotspots: HashMap::new(),
             priority_gap_map: bitvec::bitvec![u8, Lsb0; 0; MAP_SIZE],
         }
@@ -3568,28 +3619,75 @@ impl SnapshotCorpus {
         let mut chain = Vec::new();
         let mut current = id;
         loop {
-            if chain.contains(&current) {
+            if chain.contains(&current) || !self.snapshots.contains_key(&current) {
                 return None;
             }
             chain.push(current);
-            match self.parent_map.get(&current) {
-                Some(parent) if *parent != current => current = *parent,
-                _ => break,
-            }
-        }
-        chain.reverse();
-        Some(
-            chain
-                .iter()
-                .filter_map(|snapshot_id| {
-                    self.snapshots
-                        .get(snapshot_id)?
+            let parent = *self.parent_map.get(&current)?;
+            if parent == current {
+                if current != 0
+                    || self
+                        .snapshots
+                        .get(&current)?
                         .read()
                         .producing_input
-                        .clone()
-                })
-                .collect(),
-        )
+                        .is_some()
+                {
+                    return None;
+                }
+                break;
+            }
+            current = parent;
+        }
+        chain.reverse();
+        let mut inputs = Vec::new();
+        for snapshot_id in chain.into_iter().skip(1) {
+            let input = self
+                .snapshots
+                .get(&snapshot_id)?
+                .read()
+                .producing_input
+                .clone()?;
+            if input.base_snapshot_id != *self.parent_map.get(&snapshot_id)? || !input.validate() {
+                return None;
+            }
+            inputs.push(input);
+        }
+        Some(inputs)
+    }
+
+    /// Portable replay material: the complete sequence always starts at the
+    /// original root, never at an exploration-modified snapshot cache.
+    pub fn root_replay_input(&self, input: &EvmInput) -> Option<EvmInput> {
+        let mut txs = Vec::new();
+        for prefix in self.lineage_inputs(input.base_snapshot_id)? {
+            txs.extend(prefix.txs);
+            if txs.len() > crate::evm::fuzz::MAX_SEQUENCE_LENGTH {
+                return None;
+            }
+        }
+        txs.extend(input.txs.clone());
+        let replay = EvmInput::new(txs, 0);
+        replay.validate().then_some(replay)
+    }
+
+    pub fn pin_snapshot(&mut self, id: u64) -> bool {
+        if self.lineage_inputs(id).is_none() {
+            return false;
+        }
+        self.pinned.insert(id);
+        true
+    }
+
+    /// Temporary mutation pins last until the LibAFL stage finishes. Afterwards
+    /// only retained corpus references keep their ancestry alive.
+    pub fn reconcile_pins(&mut self, live: HashSet<u64>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            live.iter().all(|id| self.lineage_inputs(*id).is_some()),
+            "live corpus references incomplete snapshot lineage"
+        );
+        self.pinned = live;
+        Ok(())
     }
 
     pub fn maybe_add_post_execution_snapshot(
@@ -3601,9 +3699,15 @@ impl SnapshotCorpus {
         execution: &SequenceExecutionResult,
         max_snapshots: usize,
     ) -> Option<u64> {
+        if parent_id != input.base_snapshot_id {
+            return None;
+        }
         if !meaningful_snapshot_execution(execution) {
             return None;
         }
+        // Reject ancestry that cannot be reconstructed within the executable
+        // input limit. These states cannot safely become mutation bases.
+        self.root_replay_input(input)?;
 
         let id = self
             .snapshots
@@ -3640,7 +3744,9 @@ impl SnapshotCorpus {
         };
         self.update_snapshot_metadata_from_execution(id, execution);
         self.prune_to_limit(max_snapshots.max(1));
-        Some(inserted_id.get())
+        self.snapshots
+            .contains_key(&id)
+            .then_some(inserted_id.get())
     }
 
     fn update_snapshot_metadata_from_execution(
@@ -3690,10 +3796,11 @@ impl SnapshotCorpus {
 
     fn prune_to_limit(&mut self, max_snapshots: usize) {
         while self.snapshots.len() > max_snapshots {
+            let protected = self.ancestry_closure(&self.pinned);
             let Some((&id, _)) = self
                 .metadata
                 .iter()
-                .filter(|(id, _)| !self.is_root(**id))
+                .filter(|(id, _)| !protected.contains(id))
                 .min_by_key(|(id, metadata)| {
                     (
                         metadata.score.total(&SnapshotScoreWeights::default()),
@@ -3801,7 +3908,9 @@ impl SnapshotCorpus {
     }
 
     pub fn retain(&mut self, ids: &HashSet<u64>) {
-        let keep = self.ancestry_closure(ids);
+        let mut requested = ids.clone();
+        requested.extend(&self.pinned);
+        let keep = self.ancestry_closure(&requested);
         self.snapshots.retain(|id, _| keep.contains(id));
         self.parent_map
             .retain(|id, parent| keep.contains(id) && keep.contains(parent));
@@ -3811,7 +3920,7 @@ impl SnapshotCorpus {
 
     /// Recursively removes a snapshot and all its descendants from the corpus.
     pub fn prune_recursive(&mut self, id: u64) {
-        if self.is_root(id) {
+        if self.ancestry_closure(&self.pinned).contains(&id) {
             return;
         }
         if let Some(children) = self.children_map.remove(&id) {

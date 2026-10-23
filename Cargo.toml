@@ -2,6 +2,48 @@
 members = [".", "crates/rustyfuzz-core", "crates/rustyfuzz-evm", "crates/rustyfuzz-engine", "crates/rustyfuzz-artifacts", "crates/rustyfuzz-operations", "crates/rustyfuzz-testkit"]
 resolver = "2"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BUILD PROFILES
+#
+# Fuzzing throughput is the product: a campaign that runs 350 executions/second
+# cannot compete with one that runs 30,000. These profiles are therefore part
+# of the tool's behaviour, not cosmetic tuning. Numbers that justify them are
+# in docs/perf/.
+#
+# `target-cpu=native` is deliberately NOT set here: a binary built that way is
+# not portable, and a fuzzer is routinely shipped to other machines. Set it
+# explicitly for local campaigns:
+#     RUSTFLAGS="-C target-cpu=native" cargo build --release
+# ─────────────────────────────────────────────────────────────────────────────
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+# Debug assertions in a fuzzer turn invariant violations into aborts, which is
+# not the failure mode we want during a campaign; keep them off in release.
+debug-assertions = false
+overflow-checks   = false
+# A single symbol table keeps crash triage and backtraces usable without the
+# full debuginfo that would bloat the artifact.
+strip     = "debuginfo"
+panic     = "unwind"
+
+# Profiling build: same optimization as release plus symbols and frame pointers,
+# so `perf`/`samply` can attribute time when they are available.
+[profile.profiling]
+inherits      = "release"
+debug         = 1
+strip         = "none"
+lto           = "thin"
+codegen-units = 16
+
+# Tests must stay fast to compile while still exercising optimized EVM code
+# paths; `cargo test --release` is the throughput-sensitive option.
+[profile.bench]
+inherits = "release"
+
+
 [package]
 name = "rusty-fuzz"
 version = "0.1.0"
@@ -20,7 +62,7 @@ required-features = ["evm"]
 # Build with notifications:   cargo build --release --features "evm,notifier"
 # ─────────────────────────────────────────────────────────────────────────────
 [features]
-default  = ["evm"]
+default  = ["evm", "mimalloc-allocator"]
 evm      = [
     "dep:revm",
     "dep:alloy",
@@ -35,6 +77,10 @@ llm      = ["dep:reqwest"]
 live-tests = []
 notifier = ["dep:reqwest"]
 sgx      = []
+# Allocation-heavy workload (journal, per-tx account copies, inspector
+# temporaries). Enabled by default; disable with --no-default-features for
+# platforms without a mimalloc port, or to compare allocators.
+mimalloc-allocator = ["dep:mimalloc"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FUZZING CORE
@@ -204,4 +250,13 @@ optional = true
 [dependencies.reqwest]
 version  = "0.13.3"
 features = ["json", "blocking"]
+optional = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ALLOCATOR
+#   Drop-in replacement for the system allocator; see src/allocator.rs for why
+#   the fuzzing workload wants it.
+# ─────────────────────────────────────────────────────────────────────────────
+[dependencies.mimalloc]
+version  = "0.1.52"
 optional = true

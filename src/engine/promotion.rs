@@ -5,7 +5,7 @@ use crate::common::oracle::{
 use crate::common::types::{
     CallObservation, ChainState, ExecutionStatus, SequenceExecutionResult, Snapshot, StorageDiff,
 };
-use crate::common::verifier::{RealismVerifier, ReplayVerifier};
+use crate::common::verifier::{RealismVerifier, ReplayVerifier, ViolationPredicate};
 use crate::engine::economic_delta::TokenBalanceView;
 use crate::engine::exploit_synthesizer::synthesize_foundry_poc_with_findings;
 use crate::engine::minimizer::Minimizer;
@@ -504,7 +504,7 @@ pub fn promote_finding_artifact(
             replay_status = "success".to_string();
             lifecycle_stage = FindingLifecycleStage::Replayed;
 
-            let executor = EvmExecutor::new();
+            let executor = EvmExecutor::proof();
             let minimizer = Minimizer::new(
                 &executor,
                 &NullOracle,
@@ -512,9 +512,22 @@ pub fn promote_finding_artifact(
                 request.block_env.clone(),
             );
             let original_len = input.txs.len();
-            let target_vuln = finding.as_ref().map(|finding| finding.vuln.clone());
-            let minimized = minimizer.minimize_crash(&input, |candidate_execution| {
-                promotion_predicate(candidate_execution, target_vuln.as_ref())
+            let predicate = (input.base_snapshot_id == 0)
+                .then_some(finding.as_ref())
+                .flatten()
+                .and_then(|finding| ViolationPredicate::from_finding(finding, &execution));
+            if let Some(predicate) = &predicate {
+                let path = finding_dir.join("violation_predicate.json");
+                write_json(&path, predicate)?;
+                artifact_paths.insert("violation_predicate".into(), path.display().to_string());
+            }
+            if predicate.is_none() {
+                caveats.push("OracleWeakness: original finding has no supported concrete violation predicate; replay alone cannot prove it".into());
+            }
+            let minimized = predicate.as_ref().and_then(|predicate| {
+                minimizer.minimize_crash(&input, |candidate_execution| {
+                    predicate.holds(candidate_execution)
+                })
             });
             match minimized {
                 Some(candidate) => {
@@ -610,11 +623,18 @@ pub fn promote_finding_artifact(
                         .map(Path::new)
                         .unwrap_or(&finding_dir);
                     fs::create_dir_all(poc_dir)?;
+                    let mut selected_finding = finding.clone();
+                    selected_finding.tx_index = predicate
+                        .as_ref()
+                        .and_then(|predicate| {
+                            predicate.observation_indices(minimized_replay_execution.as_ref()?)
+                        })
+                        .map(|(_, _, mint, _)| mint);
                     match synthesize_foundry_poc_with_findings(
                         &minimized_input,
                         &finding.vuln,
                         minimized_replay_execution.as_ref(),
-                        &request.artifact.findings,
+                        std::slice::from_ref(&selected_finding),
                         poc_dir,
                         request.rpc_url,
                         request.fork_block,
@@ -690,11 +710,26 @@ pub fn promote_finding_artifact(
                 });
             }
 
-            let realism = RealismVerifier::new(MAP_SIZE).prove(
-                &ChainState::Evm(base_db.clone()),
-                request.block_env,
-                &minimized_input,
-            );
+            let realism_verifier = RealismVerifier::new(MAP_SIZE);
+            let realism = if let Some(predicate) = predicate.as_ref() {
+                realism_verifier.prove_violation(
+                    &ChainState::Evm(base_db.clone()),
+                    request.block_env,
+                    &minimized_input,
+                    predicate,
+                )
+            } else {
+                let mut feasibility = realism_verifier.prove(
+                    &ChainState::Evm(base_db.clone()),
+                    request.block_env,
+                    &minimized_input,
+                );
+                feasibility.success = false;
+                feasibility
+                    .rejection_reasons
+                    .push(RejectionReason::OracleWeakness);
+                feasibility
+            };
             let realism_path = finding_dir.join("realism_proof.json");
             write_json(&realism_path, &realism)?;
             artifact_paths.insert(
@@ -1112,18 +1147,6 @@ fn status_for_lifecycle(
         }
         FindingLifecycleStage::Replayed => FindingStatus::Replayed,
         FindingLifecycleStage::Candidate | FindingLifecycleStage::Confirmed => FindingStatus::Lead,
-    }
-}
-
-fn promotion_predicate(
-    execution: &SequenceExecutionResult,
-    target_vuln: Option<&VulnType>,
-) -> bool {
-    let findings = ProtocolOraclePack::default().evaluate(execution);
-    if let Some(target_vuln) = target_vuln {
-        findings.iter().any(|finding| &finding.vuln == target_vuln)
-    } else {
-        !findings.is_empty()
     }
 }
 

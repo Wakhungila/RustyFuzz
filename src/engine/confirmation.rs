@@ -1,4 +1,6 @@
-use crate::common::oracle::{ProtocolFinding, VulnType};
+use crate::common::oracle::ProtocolFinding;
+#[cfg(test)]
+use crate::common::oracle::VulnType;
 use crate::engine::exploit_path::MinimizedSequenceStatus;
 use crate::engine::proof::{ProofCarryingFinding, ProofConfidenceTier, ReplayVerificationStatus};
 use crate::engine::scoring::CampaignScore;
@@ -61,26 +63,14 @@ impl FindingConfirmationGate {
         let minimized_path = proof
             .is_some_and(|proof| proof.minimization_result == MinimizedSequenceStatus::Minimized);
         let actor_labels = proof.is_some_and(|proof| !proof.actor_roles.is_empty());
-        let economic_proof = proof.is_some_and(|proof| {
-            proof.economic_delta.confidence >= self.config.min_economic_confidence
-                && (proof.economic_delta.estimated_profit > revm::primitives::U256::ZERO
-                    || proof.economic_delta.suspicious_value_extraction
-                    || proof.economic_delta.accounting_anomaly
-                    || proof.economic_delta.flashloan_pressure
-                    || proof.economic_delta.price_impact_pressure
-                    || proof.economic_delta.debt_or_collateral_pressure
-                    || proof.economic_delta.share_price_pressure)
+        // Class names, economic pressure scores and an invariant ID are search
+        // hints. Only a replay-bound typed condition can supply violation evidence.
+        let invariant_or_economic_proof = proof.is_some_and(|proof| {
+            proof.violation_predicate.is_some() && proof.original_state_violation_verified
         });
-        let invariant_proof = proof.is_some_and(|proof| proof.invariant_id.is_some())
-            || findings
-                .iter()
-                .any(protocol_finding_is_invariant_or_economic);
-        let invariant_or_economic_proof = invariant_proof || economic_proof;
-        let protocol_specific_assertion = proof.is_some_and(|proof| {
-            proof.foundry_poc_path.is_some()
-                && !findings.is_empty()
-                && proof.violated_condition != "unknown-violated-condition"
-        });
+        let protocol_specific_assertion = invariant_or_economic_proof
+            && proof.is_some_and(|proof| proof.foundry_poc_path.is_some());
+        let _ = findings;
 
         let mut reasons = Vec::new();
         push_missing(
@@ -170,27 +160,6 @@ fn derive_non_confirmed_tier(
         .min(ProofConfidenceTier::Heuristic)
 }
 
-fn protocol_finding_is_invariant_or_economic(finding: &ProtocolFinding) -> bool {
-    matches!(
-        finding.vuln,
-        VulnType::InvariantViolation(_)
-            | VulnType::FlashLoanProfit
-            | VulnType::FlashLoanAttack
-            | VulnType::PriceManipulation
-            | VulnType::PriceOracleManipulation
-            | VulnType::VaultDonationAttack
-            | VulnType::VaultInflation
-            | VulnType::MevSandwichExploit
-            | VulnType::UniswapV3LiquidityAsymmetry
-            | VulnType::AccountingDesync
-            | VulnType::RebalanceValueLoss
-            | VulnType::SystemicStateCorruption
-            | VulnType::PrivilegeEscalation
-            | VulnType::ProxyUpgradeabilityViolation
-            | VulnType::BridgeInvariantViolation
-    )
-}
-
 fn push_missing(reasons: &mut Vec<String>, ok: bool, reason: &str) {
     if !ok {
         reasons.push(reason.to_string());
@@ -237,6 +206,8 @@ mod tests {
         ProofCarryingFinding {
             target: Some(Address::repeat_byte(0xaa)),
             vulnerability_class: Some("bad debt".to_string()),
+            violation_predicate: None,
+            original_state_violation_verified: false,
             invariant_id: Some("lending-health".to_string()),
             actor_roles: BTreeMap::from([(0, ActorType::Attacker)]),
             tx_sequence: vec![SingletonTx {
@@ -274,12 +245,12 @@ mod tests {
     }
 
     #[test]
-    fn gate_confirms_only_replayed_minimized_proven_poc_findings() {
+    fn gate_rejects_replayed_heuristic_even_with_score_and_poc() {
         let gate = FindingConfirmationGate::default();
         let confirmation = gate.evaluate(Some(&proof()), &[finding()], &score(1_000));
-        assert_eq!(confirmation.tier, ProofConfidenceTier::Confirmed);
-        assert!(confirmation.confirmed);
-        assert!(confirmation.high_value_artifact);
+        assert_eq!(confirmation.tier, ProofConfidenceTier::ReplayedMinimized);
+        assert!(!confirmation.confirmed);
+        assert!(!confirmation.high_value_artifact);
     }
 
     #[test]

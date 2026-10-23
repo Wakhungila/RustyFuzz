@@ -147,7 +147,7 @@ fn sigkill_resumes_real_campaign_from_checkpoint() {
     // Read AFTER death: this is the last committed checkpoint, not an earlier poll.
     let before = read(&path);
     assert!(before.completed_execs >= 8);
-    assert_eq!(before.schema_version, 3);
+    assert_eq!(before.schema_version, 5);
     assert_eq!(before.config_schema_version, 2);
     assert!(before.source_identity.is_some());
 
@@ -165,7 +165,7 @@ fn sigkill_resumes_real_campaign_from_checkpoint() {
         .join(format!("{:020}.json", before.completed_execs));
     let provenance: rusty_fuzz::engine::provenance::ExecutionProvenanceRecord =
         serde_json::from_slice(&fs::read(&provenance_path).unwrap()).unwrap();
-    assert_eq!(provenance.schema_version, 3);
+    assert_eq!(provenance.schema_version, 5);
     assert_eq!(provenance.execution_index, before.completed_execs);
     assert_eq!(provenance.budget_consumed, before.budget_consumed);
     assert_eq!(provenance.input_id, provenance.input.semantic_input_hash());

@@ -1,6 +1,4 @@
 #[cfg(feature = "evm")]
-use alloy::eips::BlockId;
-#[cfg(feature = "evm")]
 use alloy::providers::{Provider, ProviderBuilder};
 #[cfg(feature = "evm")]
 use alloy::rpc::types::eth::BlockNumberOrTag;
@@ -63,8 +61,7 @@ pub async fn create_fork_db(
     block_number: u64,
     target_contract: Option<Address>,
 ) -> anyhow::Result<EvmCacheDb> {
-    let url = validate_production_rpc_url(rpc_url).map_err(anyhow::Error::msg)?;
-    let provider = configured_provider(url)?;
+    validate_production_rpc_url(rpc_url).map_err(anyhow::Error::msg)?;
     let fork = ForkDb::new(rpc_url.to_string(), block_number);
     let provenance_db = fork.clone();
     let provenance = tokio::task::spawn_blocking(move || provenance_db.refresh_remote_provenance())
@@ -80,6 +77,11 @@ pub async fn create_fork_db(
         "live fork provenance is missing a chain id"
     );
     anyhow::ensure!(
+        provenance.chain_id == Some(1),
+        "unsupported chain {:?}: chain-specific execution semantics are required",
+        provenance.chain_id
+    );
+    anyhow::ensure!(
         provenance.block_number == Some(block_number),
         "live fork provenance is missing the requested block number"
     );
@@ -92,34 +94,69 @@ pub async fn create_fork_db(
     let mut db = CacheDB::new(fork);
 
     if let Some(target) = target_contract {
-        let code = provider
-            .get_code_at(target)
-            .block_id(BlockId::number(block_number))
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "Alloy RPC request failed while fetching target bytecode at block {block_number}"
-                )
-            })?;
-
-        anyhow::ensure!(
-            !code.is_empty(),
-            "target contract {target} has no bytecode at fork block {block_number}"
-        );
-
-        db.insert_account_info(
-            target,
-            AccountInfo::default().with_code(Bytecode::new_raw(code)),
-        );
+        db = tokio::task::spawn_blocking(move || {
+            preload_target_account(&mut db, target, block_number)?;
+            Ok::<_, anyhow::Error>(db)
+        })
+        .await
+        .context("target account worker failed")??;
     }
 
     Ok(db)
 }
 
+/// Load the complete pinned account through ForkDb so the target's balance,
+/// nonce and code come from the same backend as subsequent execution reads.
+#[cfg(feature = "evm")]
+fn preload_target_account(
+    db: &mut EvmCacheDb,
+    target: Address,
+    block_number: u64,
+) -> anyhow::Result<()> {
+    let account = db
+        .load_account(target)
+        .with_context(|| format!("failed to load target account at fork block {block_number}"))?;
+    anyhow::ensure!(
+        account
+            .info
+            .code
+            .as_ref()
+            .is_some_and(|code| !code.is_empty()),
+        "target contract {target} has no bytecode at fork block {block_number}"
+    );
+    Ok(())
+}
+
 #[cfg(feature = "evm")]
 pub async fn create_fork_block_env(rpc_url: &str, block_number: u64) -> anyhow::Result<BlockEnv> {
+    fetch_fork_block_env(rpc_url, block_number, None).await
+}
+
+#[cfg(feature = "evm")]
+pub async fn create_fork_block_env_for_provenance(
+    rpc_url: &str,
+    block_number: u64,
+    provenance: &rustyfuzz_evm::fork_db::ForkCacheProvenance,
+) -> anyhow::Result<BlockEnv> {
+    fetch_fork_block_env(rpc_url, block_number, Some(provenance)).await
+}
+
+#[cfg(feature = "evm")]
+async fn fetch_fork_block_env(
+    rpc_url: &str,
+    block_number: u64,
+    provenance: Option<&rustyfuzz_evm::fork_db::ForkCacheProvenance>,
+) -> anyhow::Result<BlockEnv> {
     let url = validate_production_rpc_url(rpc_url).map_err(anyhow::Error::msg)?;
     let provider = configured_provider(url)?;
+    let chain_id = provider
+        .get_chain_id()
+        .await
+        .map_err(|_| anyhow::anyhow!("Alloy RPC chain id request failed"))?;
+    anyhow::ensure!(
+        chain_id == 1,
+        "unsupported chain {chain_id}: chain-specific execution semantics are required"
+    );
 
     let block = provider
         .get_block_by_number(BlockNumberOrTag::Number(block_number))
@@ -128,6 +165,35 @@ pub async fn create_fork_block_env(rpc_url: &str, block_number: u64) -> anyhow::
         .context("Block not found")?;
 
     let header = block.header;
+    anyhow::ensure!(
+        header.number == block_number,
+        "RPC returned a different fork block number"
+    );
+    rustyfuzz_evm::fork_db::validate_block_hash(&format!("{:#x}", header.hash))?;
+    if let Some(provenance) = provenance {
+        anyhow::ensure!(
+            provenance.chain_id == Some(chain_id),
+            "fork header chain differs from state provenance"
+        );
+        anyhow::ensure!(
+            provenance.block_number == Some(header.number),
+            "fork header number differs from state provenance"
+        );
+        let expected = provenance
+            .block_hash
+            .as_deref()
+            .context("fork state provenance is missing a block hash")?;
+        anyhow::ensure!(
+            expected.eq_ignore_ascii_case(&format!("{:#x}", header.hash)),
+            "fork header hash differs from state provenance"
+        );
+    }
+    if header.number >= 12_965_000 {
+        anyhow::ensure!(
+            header.base_fee_per_gas.is_some(),
+            "post-London header is missing base fee"
+        );
+    }
 
     let mut block_env = BlockEnv {
         number: U256::from(header.number),
@@ -141,16 +207,17 @@ pub async fn create_fork_block_env(rpc_url: &str, block_number: u64) -> anyhow::
         // Set below with `set_blob_excess_gas_and_price`.
         blob_excess_gas_and_price: None,
 
-        // Placeholder for now. Not related to the current failure.
+        // SLOTNUM is not enabled by any supported mainnet hardfork.
         slot_num: 0,
     };
 
-    // Required when revm validates under Cancun/latest EVM rules.
-    //
-    // 3_338_477 is the Cancun blob base-fee update fraction.
-    // Use 0 for excess_blob_gas as a safe default when the provider/header
-    // does not expose the field cleanly through the current Alloy type.
-    block_env.set_blob_excess_gas_and_price(0, 3_338_477);
+    let fraction = rustyfuzz_evm::environment::mainnet_blob_fraction(header.timestamp);
+    if let Some(fraction) = fraction {
+        let excess = header
+            .excess_blob_gas
+            .context("post-Cancun header is missing excess blob gas")?;
+        block_env.set_blob_excess_gas_and_price(excess, fraction);
+    }
 
     Ok(block_env)
 }
@@ -208,4 +275,52 @@ pub fn offline_fallback_runtime_bytecode() -> Vec<u8> {
         0x60, 0x20, 0x60, 0x00, 0xf3, // PUSH1 0x20; PUSH1 0x00; RETURN
     ]);
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm::Database;
+
+    #[test]
+    fn target_preload_preserves_backend_balance_nonce_and_code() {
+        let target = Address::repeat_byte(0x42);
+        let code = Bytecode::new_raw(vec![0x60, 0x00, 0x00].into());
+        let expected = AccountInfo::new(U256::from(123_456), 17, code.hash_slow(), code.clone());
+        let backend = ForkDb::empty();
+        backend.cache_account(target, expected.clone());
+        let mut db = CacheDB::new(backend);
+        assert!(!db.cache.accounts.contains_key(&target));
+
+        // Exercise the same backend-to-execution-cache path used by live fork
+        // construction, without requiring a public RPC endpoint.
+        preload_target_account(&mut db, target, 123).unwrap();
+
+        let loaded = db.basic(target).unwrap().unwrap();
+        assert_eq!(loaded.balance, expected.balance);
+        assert_eq!(loaded.nonce, expected.nonce);
+        assert_eq!(loaded.code_hash, expected.code_hash);
+        assert_eq!(loaded.code, Some(code));
+        assert_eq!(db.cache.accounts[&target].info.balance, expected.balance);
+        assert_eq!(db.cache.accounts[&target].info.nonce, expected.nonce);
+    }
+
+    #[test]
+    fn target_preload_rejects_missing_or_empty_code() {
+        let target = Address::repeat_byte(0x42);
+        for account in [
+            None,
+            Some(AccountInfo::default().with_balance(U256::from(5))),
+        ] {
+            let backend = ForkDb::empty();
+            if let Some(account) = account {
+                backend.cache_account(target, account);
+            }
+            let mut db = CacheDB::new(backend);
+            let error = preload_target_account(&mut db, target, 123).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("has no bytecode at fork block 123"));
+        }
+    }
 }

@@ -46,7 +46,6 @@ use libafl::state::HasCorpus;
 use parking_lot::{Mutex, RwLock};
 use revm::database::CacheDB;
 use revm::primitives::{Address, U256};
-use revm::state::AccountInfo;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
@@ -1017,7 +1016,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
 
     log::info!("Initializing RustyFuzz v0.15.4 Campaign...");
 
-    let (mut initial_db, initial_env, synthetic_fork_mode) = if let Some(saved) = checkpoint_session
+    let (initial_db, initial_env, synthetic_fork_mode) = if let Some(saved) = checkpoint_session
         .as_ref()
         .and_then(|session| session.saved.as_ref())
     {
@@ -1054,7 +1053,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                 startup_timeout.as_secs()
             )),
         };
-        let db = match db_attempt {
+        let mut db = match db_attempt {
             Ok(db) => db,
             Err(err) => {
                 if require_rpc_fork || !config.allow_synthetic_fallback {
@@ -1078,7 +1077,11 @@ async fn run_fuzz_campaign_with_cancellation_inner(
 
         let env_attempt = match tokio::time::timeout(
             startup_timeout,
-            crate::evm::fork::create_fork_block_env(&config.rpc_url, config.fork_block),
+            crate::evm::fork::create_fork_block_env_for_provenance(
+                &config.rpc_url,
+                config.fork_block,
+                &db.db.provenance(),
+            ),
         )
         .await
         {
@@ -1104,6 +1107,10 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     config.fork_block,
                     err
                 );
+                synthetic_fork_mode = true;
+                // A synthetic header must never be paired with pinned live
+                // state: replace both halves of the environment together.
+                db = crate::evm::fork::create_offline_fallback_fork_db(config.target_contract);
                 crate::evm::fork::create_offline_fallback_block_env(config.fork_block)
             }
         };
@@ -1112,14 +1119,8 @@ async fn run_fuzz_campaign_with_cancellation_inner(
     };
 
     let fuzzer_address = Address::repeat_byte(0x13);
-    initial_db.insert_account_info(
-        fuzzer_address,
-        AccountInfo {
-            balance: U256::from(10u128.pow(30)),
-            ..AccountInfo::default()
-        },
-    );
-
+    // Root snapshots and artifact base caches are proof inputs. Synthetic funding
+    // belongs only in the executor's exploration clone, never in this baseline.
     let hardened_actor_set =
         if config.hardened_defi.enabled && config.hardened_defi.enable_actor_model {
             let actor_set = ActorModel::new(ActorModelConfig {
@@ -1127,9 +1128,8 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                 ..ActorModelConfig::default()
             })
             .generate([]);
-            actor_set.fund_synthetic_actors(&mut initial_db);
             log::info!(
-                "Hardened DeFi actor model active: {} actors funded",
+                "Hardened DeFi actor model active: {} actors available for exploration",
                 actor_set.actors.len()
             );
             Some(actor_set)
@@ -1643,6 +1643,13 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     objective,
                 );
 
+                // Deterministic per-transaction time advance for the unbounded
+                // harness; index 0 always sees the forked block.
+                let time_warp = rustyfuzz_evm::time_warp::TimeWarp::from_seconds(
+                    config.hardened_defi.time_warp_seconds,
+                    config.hardened_defi.time_warp_blocks,
+                );
+
                 let mut shmem_provider = StdShMemProvider::new()?;
                 let mut shmem = shmem_provider.new_shmem(MAP_SIZE)?;
                 let coverage_map_ptr = shmem.as_mut_ptr();
@@ -1676,11 +1683,19 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                 )
                 .map_err(|error| libafl::Error::unknown(error.to_string()))?;
 
+                let environment_policy = rustyfuzz_evm::environment::EnvironmentPolicy::resolve(
+                    &initial_db.db, &initial_env,
+                ).map_err(|error| libafl::Error::unknown(error.to_string()))?;
                 let mut harness = |input: &EvmInput| {
                     if !budget.reserve_execution() {
                         return ExitKind::Ok;
                     }
                     let snap_id = input.base_snapshot_id;
+                    if snap_id != 0 {
+                        log::error!("brokered inputs must use portable root state, not worker-local snapshots");
+                        return ExitKind::Crash;
+                    }
+                    let root_replay_input = input.clone();
                     let snapshot_corpus_guard = snapshot_corpus.read();
 
                     let Some(base_snap_arc) = snapshot_corpus_guard.get_snapshot(snap_id) else {
@@ -1688,17 +1703,25 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         return ExitKind::Crash;
                     };
 
-                    let mut current_state = base_snap_arc.read().state.read().clone();
+                    // Take the immutable base state once: `snapshot_base_db` is
+                    // borrowed by persistence, `current_state` is the single
+                    // mutable working copy the transactions run against.
+                    let snapshot_state_guard = base_snap_arc.read();
+                    let ChainState::Evm(snapshot_base_db) =
+                        &*snapshot_state_guard.state.read();
+                    let mut current_state = ChainState::Evm(snapshot_base_db.clone());
                     drop(snapshot_corpus_guard);
 
-                    let base_fork_state = match &current_state {
-                        ChainState::Evm(db) => db.clone(),
-                    };
-
-                    let mut current_env = initial_env.clone();
                     let mut tx_results = Vec::with_capacity(input.txs.len());
+                    *dataflow_registry.write() = DataflowRegistry::new();
 
                     for (tx_idx, tx) in input.txs.iter().enumerate() {
+                        // Advance the block context so time-dependent logic
+                        // (vesting, TWAP, accrual, deadlines) is reachable. The
+                        // advance is a pure function of the input, so replay
+                        // reproduces the same block environments.
+                        let mut current_env = initial_env.clone();
+                        time_warp.apply(&mut current_env, tx_idx);
                         let mut waypoints = Vec::new();
                         let mut df = dataflow_registry.write();
 
@@ -1905,6 +1928,8 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             execution_index: telemetry.execution_count(),
                             budget_consumed: budget.reserved(),
                             input,
+                            root_replay_input: &root_replay_input,
+                            environment_policy: environment_policy.clone(),
                             execution: &execution,
                             coverage_edges,
                             state_novelty_score: report.novelty_score(),
@@ -2001,7 +2026,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                                 execution: &execution,
                                 coverage: map_slice,
                                 state_novelty_score: report.novelty_score(),
-                                base_fork_state: &base_fork_state,
+                                base_fork_state: snapshot_base_db,
                                 score: &campaign_score,
                                 findings: &findings,
                                 exploit_candidate: exploit_candidate.as_ref(),
@@ -2228,6 +2253,22 @@ struct InitialBytecode {
     analysis: Option<BytecodeAnalysisReport>,
 }
 
+fn reconcile_snapshot_pins(
+    state: &EvmCampaignState,
+    snapshots: &RwLock<SnapshotCorpus>,
+) -> anyhow::Result<()> {
+    let mut live = HashSet::from([0]);
+    for id in state.corpus().ids() {
+        let testcase = state.corpus().get(id)?.borrow();
+        let input = testcase
+            .input()
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("corpus input is not loaded"))?;
+        live.insert(input.base_snapshot_id);
+    }
+    snapshots.write().reconcile_pins(live)
+}
+
 struct CampaignResume {
     session: Option<super::checkpoint::CheckpointSession>,
     from_checkpoint: bool,
@@ -2256,9 +2297,16 @@ async fn run_single_process_campaign(
         "live-RPC checkpointing is not implemented; refusing to checkpoint an online fork as offline");
     let start_time = Instant::now();
     let execution_timeout = campaign_execution_timeout();
+    // Deterministic per-transaction time advance, derived from configuration so
+    // a checkpointed campaign resumes with identical block semantics.
+    let time_warp = rustyfuzz_evm::time_warp::TimeWarp::from_seconds(
+        config.hardened_defi.time_warp_seconds,
+        config.hardened_defi.time_warp_blocks,
+    );
     log::info!(
-        "Launching broker-free single-process fuzz campaign with per-input timeout {:?}",
-        execution_timeout
+        "Launching broker-free single-process fuzz campaign with per-input timeout {:?}, time warp {:?}",
+        execution_timeout,
+        time_warp
     );
     let _monitor = SimpleMonitor::new(|s| {
         log::info!("Stats: {} | Duration: {:?}", s, start_time.elapsed());
@@ -2653,6 +2701,7 @@ async fn run_single_process_campaign(
         telemetry.concolic_hint_stats.clone(),
         testcase_metadata_store.clone(),
     );
+    let mutator = mutator.with_snapshot_corpus(snapshot_corpus.clone());
     let strategy_counters = mutator.strategy_counters.clone();
     if let Some(saved) = restored_strategies {
         strategy_counters.restore(saved);
@@ -2686,26 +2735,39 @@ async fn run_single_process_campaign(
             &initial_db,
         )?;
 
+    let environment_policy =
+        rustyfuzz_evm::environment::EnvironmentPolicy::resolve(&initial_db.db, &initial_env)?;
     let mut harness = |input: &EvmInput| {
         if !budget.reserve_execution() {
             return ExitKind::Ok;
         }
         let snap_id = input.base_snapshot_id;
-        let snapshot_corpus_guard = snapshot_corpus.read();
+        let mut snapshot_corpus_guard = snapshot_corpus.write();
+        let Some(root_replay_input) = snapshot_corpus_guard.root_replay_input(input) else {
+            log::error!("Input has incomplete or oversized snapshot lineage");
+            return ExitKind::Crash;
+        };
+        if !snapshot_corpus_guard.pin_snapshot(snap_id) {
+            return ExitKind::Crash;
+        }
         let Some(base_snap_arc) = snapshot_corpus_guard.get_snapshot(snap_id) else {
             log::error!("Input references missing snapshot id {}", snap_id);
             return ExitKind::Crash;
         };
 
-        let mut current_state = base_snap_arc.read().state.read().clone();
+        // One immutable base borrow for persistence, one mutable working copy
+        // for execution. This used to clone the snapshot state twice.
+        let snapshot_state_guard = base_snap_arc.read();
+        let ChainState::Evm(snapshot_base_db) = &*snapshot_state_guard.state.read();
+        let mut current_state = ChainState::Evm(snapshot_base_db.clone());
         drop(snapshot_corpus_guard);
-        let base_fork_state = match &current_state {
-            ChainState::Evm(db) => db.clone(),
-        };
-        let mut current_env = initial_env.clone();
         let mut tx_results = Vec::with_capacity(input.txs.len());
+        *dataflow_registry.write() = DataflowRegistry::new();
 
         for (tx_idx, tx) in input.txs.iter().enumerate() {
+            // Same deterministic advance as the unbounded harness.
+            let mut current_env = initial_env.clone();
+            time_warp.apply(&mut current_env, tx_idx);
             let mut waypoints = Vec::new();
             let mut df = dataflow_registry.write();
             let exec_result = ForkDb::with_thread_rpc_budget(
@@ -2894,6 +2956,8 @@ async fn run_single_process_campaign(
                 execution_index: telemetry.execution_count(),
                 budget_consumed: budget.reserved(),
                 input,
+                root_replay_input: &root_replay_input,
+                environment_policy: environment_policy.clone(),
                 execution: &execution,
                 coverage_edges,
                 state_novelty_score: report.novelty_score(),
@@ -2946,19 +3010,24 @@ async fn run_single_process_campaign(
             // SAFETY: the shared-memory allocation is readable and exactly `MAP_SIZE` bytes for the harness lifetime.
             let persisted = unsafe {
                 let map_slice = std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE);
-                persistent_corpus.persist_campaign_artifact(CampaignArtifactRequest {
-                    input,
-                    execution: &execution,
-                    coverage: map_slice,
-                    state_novelty_score: report.novelty_score(),
-                    base_fork_state: &base_fork_state,
-                    score: &campaign_score,
-                    findings: &findings,
-                    exploit_candidate: exploit_candidate.as_ref(),
-                    block_number: config.fork_block,
-                    target: Some(target_contract),
-                    reason,
-                })
+                persistent_corpus.persist_root_replayed_artifact(
+                    CampaignArtifactRequest {
+                        input,
+                        execution: &execution,
+                        coverage: map_slice,
+                        state_novelty_score: report.novelty_score(),
+                        base_fork_state: snapshot_base_db,
+                        score: &campaign_score,
+                        findings: &findings,
+                        exploit_candidate: exploit_candidate.as_ref(),
+                        block_number: config.fork_block,
+                        target: Some(target_contract),
+                        reason,
+                    },
+                    &snapshot_corpus.read(),
+                    &initial_db,
+                    &initial_env,
+                )
             };
 
             match persisted {
@@ -3084,6 +3153,7 @@ async fn run_single_process_campaign(
                 .is_some_and(|flag| flag.load(Ordering::Relaxed))
         {
             let _ = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
+            reconcile_snapshot_pins(&state, &snapshot_corpus)?;
             if let Some(session) = checkpoint_session.as_mut() {
                 if session.due(budget.reserved()) || budget.exhausted() {
                     let (saved, ids, coverage) = capture(
@@ -3167,6 +3237,7 @@ async fn run_single_process_campaign(
                 break;
             }
             fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
+            reconcile_snapshot_pins(&state, &snapshot_corpus)?;
             if session.due(budget.reserved()) {
                 let (saved, ids, coverage) = capture(
                     &state,
@@ -4796,6 +4867,142 @@ mod tests {
     use super::*;
 
     #[test]
+    fn campaign_root_funding_worker() {
+        let Some(root) = std::env::var_os("RUSTYFUZZ_ROOT_FUNDING_TEST") else {
+            return;
+        };
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        let root = PathBuf::from(root);
+        let config = Config {
+            rpc_url: "offline-test".into(),
+            fork_block: 1,
+            target_contract: Some(Address::repeat_byte(0x11)),
+            corpus_dir: root.join("corpus").display().to_string(),
+            report_dir: root.join("reports").display().to_string(),
+            foundry_harness: None,
+            mainnet_seed_bundle: None,
+            in_memory_bytecode: Some(hex::decode("60003560005500").unwrap()),
+            cores: None,
+            require_seed_bundle: false,
+            require_rpc_fork: false,
+            allow_synthetic_fallback: true,
+            hardened_defi: HardenedDefiConfig {
+                enabled: true,
+                enable_actor_model: true,
+                enable_bounded_search: false,
+                enable_economic_delta: false,
+                enable_protocol_invariants: false,
+                enable_exploit_templates: false,
+                single_process: true,
+                deterministic: true,
+                rng_seed: Some(42),
+                checkpoint: Some(super::super::checkpoint::CheckpointConfig {
+                    directory: root.join("checkpoint"),
+                    resume: false,
+                    every_execs: 1,
+                }),
+                ..Default::default()
+            },
+            target_invariant_manifest: None,
+            abi_path: None,
+            max_execs: Some(8),
+            duration_secs: Some(5),
+            artifact_limit: Some(0),
+            campaign_id: Some("root-funding".into()),
+            paths_are_isolated: true,
+            min_finding_confidence: 0,
+            promotion: PromotionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        };
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run_fuzz_campaign_with_cancellation_inner(config, None))
+            .unwrap();
+        let envelope: super::super::checkpoint::CheckpointEnvelope =
+            serde_json::from_slice(&fs::read(root.join("checkpoint/checkpoint.json")).unwrap())
+                .unwrap();
+        assert!(envelope.completed_execs > 0);
+        let saved: super::super::checkpoint::Checkpoint =
+            postcard::from_bytes(&hex::decode(envelope.payload_hex).unwrap()).unwrap();
+        let original = saved.snapshots.initial_db().unwrap();
+        let actors = ActorModel::new(ActorModelConfig::default()).generate([]);
+        for address in std::iter::once(Address::repeat_byte(0x13))
+            .chain(actors.actors.iter().map(|actor| actor.address))
+        {
+            assert!(
+                !original.cache.accounts.contains_key(&address),
+                "campaign root must not contain synthetic actor {address}"
+            );
+            assert!(
+                original
+                    .db
+                    .cache_snapshot()
+                    .accounts
+                    .iter()
+                    .filter(|entry| entry.address == address)
+                    .all(|entry| entry
+                        .info
+                        .as_ref()
+                        .is_none_or(|info| info.balance == U256::ZERO && info.nonce == 0)),
+                "fork source cache must not inherit exploration funding for {address}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_campaign_checkpoint_keeps_root_free_of_synthetic_funding() {
+        let root = std::env::temp_dir().join(format!("rustyfuzz-root-funding-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let log_path = root.join("worker.log");
+        let log = File::create(&log_path).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "engine::fuzz_engine::tests::campaign_root_funding_worker",
+                "--nocapture",
+            ])
+            .current_dir(&root)
+            .env("RUSTYFUZZ_ROOT_FUNDING_TEST", &root)
+            .env("RUSTYFUZZ_CAMPAIGN_SHUTDOWN_GRACE_SECS", "0")
+            .env("RUSTYFUZZ_GIT_REV", "proof-state-boundary-test")
+            .env("RUSTYFUZZ_SOURCE_DIRTY", "clean")
+            .env("RUSTYFUZZ_SOURCE_DIFF_SHA256", "unknown")
+            .env(
+                "RUSTYFUZZ_BINARY_SHA256",
+                format!("sha256:{}", "ab".repeat(32)),
+            )
+            .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
+            .stderr(std::process::Stdio::from(log))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!(
+                    "campaign root regression timed out: {}",
+                    fs::read_to_string(&log_path).unwrap()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            status.success(),
+            "campaign root regression failed: {}",
+            fs::read_to_string(log_path).unwrap(),
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn no_promotion_mode_blocks_high_confidence_promotion() {
         let config = PromotionConfig {
             enabled: false,
@@ -5062,6 +5269,9 @@ mod tests {
 
     #[test]
     fn observed_startup_mode_update_recomputes_authoritative_config_hash() {
+        // The fingerprint hashes the presence of RUSTYFUZZ_* variables, so this
+        // test must not run concurrently with any other test that sets them.
+        let _env_guard = crate::test_support::env_lock();
         let run_root = std::env::temp_dir().join(format!(
             "rustyfuzz-mode-hash-{}-{}",
             std::process::id(),
@@ -5175,6 +5385,7 @@ mod tests {
 
     #[test]
     fn campaign_cores_respects_libafl_env_alias() {
+        let _env_guard = crate::test_support::env_lock();
         std::env::set_var("LIBAFL_CORES", "0-1");
         std::env::remove_var("RUSTYFUZZ_CORES");
         let cores = campaign_cores(None).unwrap();
@@ -5185,6 +5396,7 @@ mod tests {
 
     #[test]
     fn execution_timeout_uses_safe_default_and_env_override() {
+        let _env_guard = crate::test_support::env_lock();
         std::env::remove_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS");
         assert_eq!(campaign_execution_timeout(), DEFAULT_EXECUTION_TIMEOUT);
         std::env::set_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS", "7");
@@ -5289,6 +5501,7 @@ mod tests {
 
     #[test]
     fn campaign_budget_reserves_shutdown_grace_for_duration_runs() {
+        let _env_guard = crate::test_support::env_lock();
         std::env::set_var("RUSTYFUZZ_CAMPAIGN_SHUTDOWN_GRACE_SECS", "2");
         let budget = CampaignBudget::new(None, Some(1), 1);
         assert!(budget.exhausted());
@@ -5317,6 +5530,7 @@ mod tests {
 
     #[test]
     fn rpc_fork_requirement_is_opt_in() {
+        let _env_guard = crate::test_support::env_lock();
         std::env::remove_var("RUSTYFUZZ_REQUIRE_RPC_FORK");
         assert!(!campaign_requires_rpc_fork());
         std::env::set_var("RUSTYFUZZ_REQUIRE_RPC_FORK", "1");
