@@ -9,7 +9,12 @@ concurrency:
 
 on:
   push:
-    branches: [ main, develop ]
+    # `backtest/**` is included because work on those branches was previously
+    # invisible to CI: the filter only covered main/develop, so a long-lived
+    # branch could accumulate hundreds of commits with no automated signal.
+    # pull_request filters on the BASE branch, so a PR into main is already
+    # covered without listing head branches here.
+    branches: [ main, develop, 'backtest/**' ]
   pull_request:
     branches: [ main, develop ]
 
