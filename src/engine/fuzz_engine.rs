@@ -16,7 +16,7 @@ use crate::engine::exploit_path::ExploitPathBuilder;
 use crate::engine::foundry_ingest::FoundryHarnessManifest;
 use crate::engine::invariant_manifest::TargetInvariantManifest;
 use crate::engine::promotion::{
-    promote_finding_artifact, write_campaign_status, write_campaign_summary,
+    promote_finding_artifact, write_campaign_status, write_campaign_summary, CampaignMeasurements,
     PromotionCampaignStats, PromotionCampaignSummary, PromotionConfig, PromotionRequest,
 };
 use crate::engine::protocol_model::CounterexampleSearchEngine;
@@ -4191,11 +4191,14 @@ fn write_worker_terminal_artifact(
         .expect("campaign identity is initialized before use");
     let summary = promotion_stats.summary(
         campaign_id,
-        telemetry.execution_count(),
-        telemetry.mutated_inputs(),
-        telemetry.seed_replays(),
-        telemetry.artifact_count(),
-        telemetry.coverage_edges(),
+        CampaignMeasurements {
+            total_executions: telemetry.execution_count(),
+            mutated_inputs: telemetry.mutated_inputs(),
+            seed_replays: telemetry.seed_replays(),
+            total_artifacts: telemetry.artifact_count(),
+            coverage_edges: telemetry.coverage_edges(),
+            time_to_first_finding_ms: telemetry.time_to_first_finding_ms(),
+        },
     );
     let worker_id = worker_id.to_string();
     rustyfuzz_artifacts::fsutil::write_json_atomic(
@@ -4479,11 +4482,14 @@ fn write_final_campaign_summary(
         .expect("campaign identity is initialized before use");
     let summary = promotion_stats.summary(
         campaign_id,
-        telemetry.execution_count(),
-        telemetry.mutated_inputs(),
-        telemetry.seed_replays(),
-        telemetry.artifact_count(),
-        telemetry.coverage_edges(),
+        CampaignMeasurements {
+            total_executions: telemetry.execution_count(),
+            mutated_inputs: telemetry.mutated_inputs(),
+            seed_replays: telemetry.seed_replays(),
+            total_artifacts: telemetry.artifact_count(),
+            coverage_edges: telemetry.coverage_edges(),
+            time_to_first_finding_ms: telemetry.time_to_first_finding_ms(),
+        },
     );
     let summary_path = mirror_campaign_summary(config, &summary)?;
     let terminal_state = match state {
@@ -4551,6 +4557,19 @@ fn merge_worker_summaries(
         summary.promotion_capped = summary
             .promotion_capped
             .saturating_add(worker.summary.promotion_capped);
+        // TTFF is a wall-clock property of the campaign, not a sum: the earliest
+        // worker finding is the campaign's first finding. One worker's `None`
+        // must not erase another's `Some`, so this is a min over the values that
+        // exist and stays `None` only when every worker is `None`.
+        summary.time_to_first_finding_ms = match (
+            summary.time_to_first_finding_ms,
+            worker.summary.time_to_first_finding_ms,
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
     }
     summary
 }
@@ -4667,11 +4686,16 @@ fn finalize_brokered_campaign(
                 .campaign_id
                 .as_deref()
                 .expect("campaign identity is initialized before use"),
-            summary.total_executions,
-            summary.mutated_inputs,
-            summary.seed_replays,
-            summary.total_artifacts,
-            summary.coverage_edges,
+            CampaignMeasurements {
+                total_executions: summary.total_executions,
+                mutated_inputs: summary.mutated_inputs,
+                seed_replays: summary.seed_replays,
+                total_artifacts: summary.total_artifacts,
+                coverage_edges: summary.coverage_edges,
+                // Brokered TTFF is the minimum across workers, so one late core
+                // cannot inflate it. None only when every worker recorded None.
+                time_to_first_finding_ms: summary.time_to_first_finding_ms,
+            },
         );
         summary.promoted_findings = promotion_summary.promoted_findings;
         summary.confirmed_findings = promotion_summary.confirmed_findings;
@@ -4865,6 +4889,39 @@ fn seed_input(target_contract: Address, fuzzer_address: Address) -> EvmInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_worker_summaries_takes_the_minimum_time_to_first_finding() {
+        let worker = |id: &str, ttff: Option<u64>| WorkerTerminalArtifact {
+            schema_version: 1,
+            campaign_id: "campaign".to_string(),
+            run_nonce: "nonce".to_string(),
+            worker_id: id.to_string(),
+            state: "completed".to_string(),
+            summary: PromotionCampaignSummary {
+                campaign_id: "campaign".to_string(),
+                time_to_first_finding_ms: ttff,
+                ..Default::default()
+            },
+        };
+
+        // The earliest finding across workers is the campaign's first finding,
+        // not the sum and not the last worker to finish.
+        let merged = merge_worker_summaries(
+            "campaign",
+            &[worker("a", Some(900)), worker("b", Some(250))],
+        );
+        assert_eq!(merged.time_to_first_finding_ms, Some(250));
+
+        // One worker's None must not erase another worker's Some.
+        let merged =
+            merge_worker_summaries("campaign", &[worker("a", None), worker("b", Some(500))]);
+        assert_eq!(merged.time_to_first_finding_ms, Some(500));
+
+        // None only when every worker is None.
+        let merged = merge_worker_summaries("campaign", &[worker("a", None), worker("b", None)]);
+        assert_eq!(merged.time_to_first_finding_ms, None);
+    }
 
     #[test]
     fn campaign_root_funding_worker() {
@@ -5087,7 +5144,13 @@ mod tests {
             enqueue_promotion_artifact(&config, &outbox, &artifact, false, &stats);
         }
 
-        let summary = stats.summary("bounded-promotion", 0, 0, 0, 5, 0);
+        let summary = stats.summary(
+            "bounded-promotion",
+            CampaignMeasurements {
+                total_artifacts: 5,
+                ..Default::default()
+            },
+        );
         assert_eq!(outbox.lock().len(), 2);
         assert_eq!(summary.promoted_findings, 0);
         assert_eq!(summary.promotion_capped, 3);

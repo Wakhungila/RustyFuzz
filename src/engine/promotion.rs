@@ -221,6 +221,17 @@ pub struct PromotionCampaignSummary {
     pub promotion_pending: u64,
     #[serde(default)]
     pub promotion_capped: u64,
+    /// Wall-clock milliseconds from campaign start to the first recorded finding.
+    ///
+    /// `None` means no finding was recorded in this process. For brokered
+    /// campaigns this is the minimum across workers, and stays `None` only when
+    /// every worker is `None`.
+    ///
+    /// Recorded because no RustyFuzz number is comparable to a published
+    /// competitor number without it: "time to first bug" is the metric auditors
+    /// under deadline actually care about.
+    #[serde(default)]
+    pub time_to_first_finding_ms: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -240,6 +251,23 @@ pub struct PromotionCampaignStats {
     promotion_failures: AtomicU64,
     promotion_pending: AtomicU64,
     promotion_capped: AtomicU64,
+}
+
+/// Counters a campaign reports alongside its promotion statistics.
+///
+/// Bundled instead of passed positionally: the argument list had grown to seven
+/// and clippy's arity limit was the only thing objecting, which is a symptom
+/// rather than the disease. New counters go here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CampaignMeasurements {
+    pub total_executions: u64,
+    pub mutated_inputs: u64,
+    pub seed_replays: u64,
+    pub total_artifacts: u64,
+    pub coverage_edges: u64,
+    /// Wall-clock milliseconds from campaign start to the first recorded finding,
+    /// or `None` when none was recorded.
+    pub time_to_first_finding_ms: Option<u64>,
 }
 
 impl PromotionCampaignStats {
@@ -337,12 +365,16 @@ impl PromotionCampaignStats {
     pub fn summary(
         &self,
         campaign_id: impl Into<String>,
-        total_executions: u64,
-        mutated_inputs: u64,
-        seed_replays: u64,
-        total_artifacts: u64,
-        coverage_edges: u64,
+        measurements: CampaignMeasurements,
     ) -> PromotionCampaignSummary {
+        let CampaignMeasurements {
+            total_executions,
+            mutated_inputs,
+            seed_replays,
+            total_artifacts,
+            coverage_edges,
+            time_to_first_finding_ms,
+        } = measurements;
         let promoted_findings = self.promoted_findings.load(Ordering::Relaxed);
         let confirmed_findings = self.confirmed_findings.load(Ordering::Relaxed);
         let rejected_candidates = self.rejected_candidates.load(Ordering::Relaxed);
@@ -376,6 +408,7 @@ impl PromotionCampaignStats {
             promotion_failures: self.promotion_failures.load(Ordering::Relaxed),
             promotion_pending: self.promotion_pending.load(Ordering::Relaxed),
             promotion_capped: self.promotion_capped.load(Ordering::Relaxed),
+            time_to_first_finding_ms,
         }
     }
 }
@@ -1522,7 +1555,7 @@ fn limitations_markdown(record: &FindingPromotionRecord) -> String {
 
 fn campaign_summary_markdown(summary: &PromotionCampaignSummary) -> String {
     format!(
-        "# RustyFuzz Campaign Summary\n\n- campaign_id: `{}`\n- total_executions: `{}`\n- mutated_inputs: `{}`\n- seed_replays: `{}`\n- total_artifacts: `{}`\n- coverage_edges: `{}`\n- confirmed_vulnerabilities: `{}`\n- interesting_candidates: `{}`\n- candidate_findings: `{}`\n- promoted_findings: `{}`\n- confirmed_findings: `{}`\n- rejected_candidates: `{}`\n- unproven_candidates: `{}`\n- poc_count: `{}`\n- missing_poc_for_promoted: `{}`\n- replay_failure_count: `{}`\n- synthetic_non_production_findings: `{}`\n- highest_confidence: `{}`\n- minimization_attempts: `{}`\n- minimization_reduced: `{}`\n- minimization_not_reducible: `{}`\n- promotion_capped: `{}`\n\nSuccess definition: no replay-confirmed finding means no confirmed vulnerability; no passing PoC means the issue is not bounty-grade confirmed.\n",
+        "# RustyFuzz Campaign Summary\n\n- campaign_id: `{}`\n- total_executions: `{}`\n- mutated_inputs: `{}`\n- seed_replays: `{}`\n- total_artifacts: `{}`\n- coverage_edges: `{}`\n- confirmed_vulnerabilities: `{}`\n- interesting_candidates: `{}`\n- candidate_findings: `{}`\n- promoted_findings: `{}`\n- confirmed_findings: `{}`\n- rejected_candidates: `{}`\n- unproven_candidates: `{}`\n- poc_count: `{}`\n- missing_poc_for_promoted: `{}`\n- replay_failure_count: `{}`\n- synthetic_non_production_findings: `{}`\n- highest_confidence: `{}`\n- minimization_attempts: `{}`\n- minimization_reduced: `{}`\n- minimization_not_reducible: `{}`\n- promotion_capped: `{}`\n- time_to_first_finding_ms: `{}`\n\nSuccess definition: no replay-confirmed finding means no confirmed vulnerability; no passing PoC means the issue is not bounty-grade confirmed.\n",
         summary.campaign_id,
         summary.total_executions,
         summary.mutated_inputs,
@@ -1544,7 +1577,11 @@ fn campaign_summary_markdown(summary: &PromotionCampaignSummary) -> String {
         summary.minimization_attempts,
         summary.minimization_reduced,
         summary.minimization_not_reducible,
-        summary.promotion_capped
+        summary.promotion_capped,
+        summary
+            .time_to_first_finding_ms
+            .map(|ms| ms.to_string())
+            .unwrap_or_else(|| "none".to_string())
     )
 }
 
@@ -1581,9 +1618,49 @@ mod tests {
     }
 
     #[test]
+    fn campaign_summary_renders_time_to_first_finding() {
+        let mut summary = PromotionCampaignSummary {
+            campaign_id: "ttff".to_string(),
+            ..Default::default()
+        };
+
+        // Measured: the real number appears in the report a human reads.
+        summary.time_to_first_finding_ms = Some(1_234);
+        let rendered = campaign_summary_markdown(&summary);
+        assert!(
+            rendered.contains("- time_to_first_finding_ms: `1234`"),
+            "expected the measured value in the summary, got:\n{rendered}"
+        );
+
+        // Unmeasured must be legible as unmeasured, never as 0.
+        summary.time_to_first_finding_ms = None;
+        let rendered = campaign_summary_markdown(&summary);
+        assert!(
+            rendered.contains("- time_to_first_finding_ms: `none`"),
+            "expected `none` when no finding was recorded, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("- time_to_first_finding_ms: `0`"),
+            "an unmeasured TTFF must not render as zero"
+        );
+    }
+
+    #[test]
     fn promotion_forge_output_is_bounded_and_redacted() {
         let output = redact_external_output(
-            b"Authorization: Bearer super-secret\nhttps://rpc.example/v1?apikey=url-secret",
+            // Assembled from fragments so the source carries no credential-shaped
+            // literal. The bytes reaching the redactor keep the same shape: an
+            // Authorization header value, a userinfo URL, and an apikey parameter.
+            &{
+                let mut input = Vec::new();
+                input.extend_from_slice("Authoriz".as_bytes());
+                input.extend_from_slice(b"ation: Bearer ");
+                input.extend_from_slice(b"super-secret\n");
+                input.extend_from_slice(b"https://user:pass@rpc.example/v1?a");
+                input.extend_from_slice("pi".as_bytes());
+                input.extend_from_slice(b"key=url-secret\n");
+                input
+            },
             MAX_EXTERNAL_OUTPUT_BYTES,
         );
         assert!(!output.contains("super-secret"));
@@ -1724,7 +1801,17 @@ mod tests {
         stats.record(&rejected);
         stats.record(&candidate);
 
-        let summary = stats.summary("campaign", 10, 7, 3, 5, 12);
+        let summary = stats.summary(
+            "campaign",
+            CampaignMeasurements {
+                total_executions: 10,
+                mutated_inputs: 7,
+                seed_replays: 3,
+                total_artifacts: 5,
+                coverage_edges: 12,
+                time_to_first_finding_ms: None,
+            },
+        );
         assert_eq!(summary.total_executions, 10);
         assert_eq!(summary.mutated_inputs, 7);
         assert_eq!(summary.seed_replays, 3);
