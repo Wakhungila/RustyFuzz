@@ -44,8 +44,12 @@ impl StrategyCounters {
     }
 }
 
+/// Sentinel for `CampaignTelemetry::first_finding`: no finding recorded yet.
+const FIRST_FINDING_UNSET: u64 = u64::MAX;
+
 pub struct CampaignTelemetry {
     start: Instant,
+    first_finding: AtomicU64,
     executions: AtomicU64,
     mutated_inputs: AtomicU64,
     seed_replays: AtomicU64,
@@ -129,6 +133,7 @@ impl CampaignTelemetry {
         let now = Instant::now();
         Self {
             start: now,
+            first_finding: AtomicU64::new(FIRST_FINDING_UNSET),
             executions: AtomicU64::new(0),
             mutated_inputs: AtomicU64::new(0),
             seed_replays: AtomicU64::new(0),
@@ -228,6 +233,31 @@ impl CampaignTelemetry {
 
     pub fn record_artifact(&self) {
         self.artifacts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records the first finding of this campaign process.
+    ///
+    /// Multi-core semantics are first-writer-wins: the first `compare_exchange`
+    /// to flip the sentinel wins and later calls are no-ops, so the recorded
+    /// value is a single core's elapsed time rather than a per-core minimum.
+    pub fn record_first_finding(&self) {
+        let elapsed = self.start.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let _ = self.first_finding.compare_exchange(
+            FIRST_FINDING_UNSET,
+            elapsed,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Time from campaign start to the first recorded finding, in milliseconds.
+    ///
+    /// Returns `None` when no finding has been recorded in this process.
+    pub fn time_to_first_finding_ms(&self) -> Option<u64> {
+        match self.first_finding.load(Ordering::Relaxed) {
+            FIRST_FINDING_UNSET => None,
+            elapsed => Some(elapsed),
+        }
     }
 
     pub fn execution_count(&self) -> u64 {
