@@ -91,6 +91,7 @@ pub enum BindingKind {
 pub struct Binding {
     /// Contract holding the storage. For a delegatecall proxy this is the storage
     /// context, not the implementation address; attribution is decided upstream.
+    /// Contract that owns the storage, or is called for a `return_value` binding.
     pub address: [u8; 20],
     pub kind: BindingKind,
     pub slot: [u8; 32],
@@ -100,6 +101,11 @@ pub struct Binding {
     pub width_bits: u16,
     /// Explicit key set for a mapping, in declaration order. Empty for a plain slot.
     pub keys: Vec<[u8; 32]>,
+    /// Zero-based index of the return word to read, for a `return_value` binding.
+    ///
+    /// `getReserves()` on the Basin Well returns `uint256[]`; a predicate reads one
+    /// element at a time, so the binding names which. Zero for every other kind.
+    pub word_index: u16,
 }
 
 impl Binding {
@@ -202,6 +208,15 @@ pub struct RawBinding {
     pub keys: Vec<String>,
     #[serde(default)]
     pub key_type: Option<String>,
+    /// Overrides `target` for a `return_value` binding: the contract actually called.
+    ///
+    /// Needed because a property often reads a *dependent* contract: the Basin
+    /// invariant `balanceOf(well) >= reserves[0]` calls the token, not the Well.
+    #[serde(default)]
+    pub call_target: Option<String>,
+    /// Which return word to read when the function returns several.
+    #[serde(default)]
+    pub word_index: Option<u16>,
 }
 
 impl BindingManifest {
@@ -305,13 +320,22 @@ fn resolve_one(symbol: &str, raw: &RawBinding, address: [u8; 20]) -> Result<Bind
         Vec::new()
     };
 
+    // A `return_value` binding may name a different contract to call, which is how a
+    // property reads a dependent contract (a token's `balanceOf`) rather than the
+    // target itself.
+    let call_address = match raw.call_target.as_deref() {
+        Some(text) => parse_address(text)?,
+        None => address,
+    };
+
     Ok(Binding {
-        address,
+        address: call_address,
         kind,
         slot,
         offset_bits,
         width_bits,
         keys,
+        word_index: raw.word_index.unwrap_or(0),
     })
 }
 

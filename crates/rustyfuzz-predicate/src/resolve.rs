@@ -117,6 +117,24 @@ pub trait StateReader {
     fn read_return(&mut self, _address: [u8; 20], _selector: [u8; 4]) -> Option<[u8; 32]> {
         None
     }
+
+    /// Return word `word_index` of a call that returns several words.
+    ///
+    /// Basin's `getReserves()` returns `uint256[]`, so a predicate reads one element at
+    /// a time and must name which. Defaults to [`StateReader::read_return`] with index
+    /// zero, so a single-word reader keeps working unchanged.
+    fn read_return_word(
+        &mut self,
+        address: [u8; 20],
+        selector: [u8; 4],
+        word_index: u16,
+    ) -> Option<[u8; 32]> {
+        if word_index == 0 {
+            self.read_return(address, selector)
+        } else {
+            None
+        }
+    }
 }
 
 /// A reader that refuses every read, for tests and for offline replay of a trace that
@@ -239,7 +257,7 @@ impl<'a> Resolver<'a> {
                 return Err(Unresolved::ReReadBudgetExhausted);
             }
             let selector = selector_from_slot(&binding.slot);
-            return match reader.read_return(binding.address, selector) {
+            return match reader.read_return_word(binding.address, selector, binding.word_index) {
                 Some(word) => self.extract_from(binding, &word, Provenance::ReRead),
                 None => Err(Unresolved::NoReturnValue {
                     address: crate::binding::hex(&binding.address),
