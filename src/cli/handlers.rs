@@ -44,7 +44,62 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let config = rusty_fuzz::config::Config::load("config.toml")?;
     let _config_ref = &config;
+    // `target` is the zero-config entry point. Rather than duplicating the campaign
+    // wiring below, it translates itself into the equivalent `Fuzz` command and falls
+    // through to the same code. Duplicating that arm would guarantee the two drift.
+    let command = match command {
+        Command::Target {
+            address,
+            rpc_url,
+            fork_block,
+            duration_secs,
+            max_execs,
+            rng_seed,
+        } => Command::Fuzz {
+            chain: None,
+            contract: Some(address),
+            rpc_url: Some(rpc_url),
+            fork_block,
+            hardened_defi: true,
+            single_process: true,
+            cores: None,
+            deterministic: true,
+            rng_seed: Some(rng_seed),
+            bounded_search: true,
+            seed_file: None,
+            require_seed_bundle: false,
+            require_rpc_fork: true,
+            allow_synthetic_fallback: false,
+            abi: None,
+            max_execs,
+            duration_secs: Some(duration_secs),
+            wall_timeout_secs: None,
+            unbounded: false,
+            artifact_limit: None,
+            campaign_id: None,
+            no_synthetic_fallback: true,
+            min_finding_confidence: 0,
+            promote_findings: true,
+            no_promote_findings: false,
+            require_replay_for_report: false,
+            require_poc_for_confirmed: false,
+            strict_proof: false,
+            no_synthetic_proof: false,
+            require_foundry_poc: false,
+            require_minimized: false,
+            reject_heuristics: false,
+            max_finding_noise: None,
+            poc_out: None,
+            promotion_limit: None,
+        },
+        other => other,
+    };
+
+    // `Target` was rewritten above, so it cannot reach here.
+    #[allow(unreachable_patterns)]
     match command {
+        // Unreachable: rewritten into `Fuzz` by the normalisation above.
+        Command::Target { .. } => unreachable!("Target is normalised before dispatch"),
         Command::Fuzz {
             chain,
             contract,

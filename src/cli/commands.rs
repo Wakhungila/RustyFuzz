@@ -10,6 +10,31 @@ pub struct Args {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum Command {
+    /// Zero-config campaign: an address, a chain and a block, nothing else.
+    ///
+    /// Deliberately a thin alias over `fuzz` rather than a second code path. Its job is
+    /// to remove the three things that stopped a fresh user: writing a harness, editing
+    /// `config.toml`, and knowing which flags the real entry point needs. Everything it
+    /// does is the same work `fuzz` does, with sensible defaults filled in.
+    Target {
+        /// Address to fuzz.
+        address: String,
+        /// RPC endpoint to fork from. Required: there is no default worth guessing.
+        #[arg(long)]
+        rpc_url: String,
+        /// Block to pin the fork at. Defaults to the endpoint's latest block.
+        #[arg(long)]
+        fork_block: Option<u64>,
+        /// Wall-clock budget in seconds.
+        #[arg(long, default_value_t = 300)]
+        duration_secs: u64,
+        /// Execution budget, if a caller prefers a count to a duration.
+        #[arg(long)]
+        max_execs: Option<u64>,
+        /// Deterministic RNG seed, for a reproducible first run.
+        #[arg(long, default_value_t = 1)]
+        rng_seed: u64,
+    },
     Fuzz {
         #[arg(long)]
         chain: Option<String>,
