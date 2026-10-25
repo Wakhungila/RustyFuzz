@@ -116,10 +116,10 @@ impl ExecutableFixture {
             self.schema_version == 1,
             "unsupported executable fixture schema_version"
         );
-        ensure!(
-            self.environment.chain_id == 1,
-            "EvmExecutor supports mainnet chain_id=1 for fixtures"
-        );
+        // Consistent with the live path: a fixture naming a chain with no profile is
+        // refused rather than executed with mainnet semantics.
+        rustyfuzz_evm::chain_profile::ChainProfile::for_chain(self.environment.chain_id)
+            .map_err(|message| anyhow::anyhow!(message))?;
         ensure!(
             self.environment.gas_limit >= 10_000_000 && self.environment.base_fee <= 1_000_000_000,
             "invalid execution gas environment"

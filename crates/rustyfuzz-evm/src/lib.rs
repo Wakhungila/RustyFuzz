@@ -4,6 +4,7 @@
 //! coverage inspector, and transaction/result domain types. Fuzzing policy,
 //! scheduling, mutators, oracles, and persistence remain in the root fuzzer.
 
+pub mod chain_profile;
 pub mod coverage;
 pub mod dataflow;
 pub mod environment;
@@ -15,6 +16,7 @@ pub mod rpc_url;
 pub mod time_warp;
 pub mod transaction;
 
+pub use chain_profile::{BlobPricing, ChainProfile, ForkSchedule, HeaderRequirements};
 pub use dataflow::DataflowRegistry;
 pub use executor::{EvmExecutor, ExecutionMode};
 pub use fork_db::{EvmCacheDb, ForkDb};

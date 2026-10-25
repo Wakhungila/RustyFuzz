@@ -15,6 +15,20 @@ pub enum Command {
         chain: Option<String>,
         #[arg(long)]
         contract: Option<String>,
+        /// RPC endpoint to fork from, overriding `config.toml`.
+        ///
+        /// Exists because pointing at any chain other than the one in the shared config
+        /// previously required editing `config.toml`, which is a usability cliff: the
+        /// file is not meant to be rewritten per test run, and it is shared.
+        #[arg(long)]
+        rpc_url: Option<String>,
+        /// Block number to pin the fork at, overriding `config.toml`.
+        ///
+        /// Must be paired with `--rpc-url` in practice; an unreachable pin makes every
+        /// benchmark skip, which is what happened when the shared config's block was not
+        /// available on the endpoint.
+        #[arg(long)]
+        fork_block: Option<u64>,
         #[arg(long, default_value_t = false)]
         hardened_defi: bool,
         #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = false)]

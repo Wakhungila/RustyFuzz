@@ -153,10 +153,11 @@ async fn fetch_fork_block_env(
         .get_chain_id()
         .await
         .map_err(|_| anyhow::anyhow!("Alloy RPC chain id request failed"))?;
-    anyhow::ensure!(
-        chain_id == 1,
-        "unsupported chain {chain_id}: chain-specific execution semantics are required"
-    );
+    // One gate, one message: the profile is the single place that decides which chains
+    // are executable. Failing here rather than later means an unsupported chain never
+    // reaches a fork, let alone a campaign.
+    rustyfuzz_evm::chain_profile::ChainProfile::for_chain(chain_id)
+        .map_err(|message| anyhow::anyhow!(message))?;
 
     let block = provider
         .get_block_by_number(BlockNumberOrTag::Number(block_number))

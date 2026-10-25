@@ -66,10 +66,12 @@ impl EnvironmentPolicy {
             let chain_id = provenance
                 .chain_id
                 .context("fork execution requires a chain id")?;
-            ensure!(
-                chain_id == 1,
-                "unsupported chain {chain_id}: chain-specific execution semantics are required"
-            );
+            // The profile decides which semantics apply, and refuses chains it does not
+            // cover rather than executing them with mainnet rules. Previously this was a
+            // bare `chain_id == 1` check, which produced "unsupported chain" only after a
+            // successful fork and gave no hint that a profile was missing.
+            let profile = crate::chain_profile::ChainProfile::for_chain(chain_id)
+                .map_err(|message| anyhow::anyhow!(message))?;
             let Some(pinned) = provenance.block_number else {
                 bail!("pinned fork execution requires a block number");
             };
@@ -110,20 +112,20 @@ impl EnvironmentPolicy {
             let number = u64::try_from(block.number)?;
             let timestamp =
                 u64::try_from(block.timestamp).context("block timestamp exceeds u64")?;
-            let spec = mainnet_spec(number, timestamp);
-            if spec >= SpecId::MERGE {
+            let spec = profile.spec_for(number, timestamp);
+            if spec >= SpecId::MERGE && profile.header.prevrandao {
                 ensure!(
                     block.prevrandao.is_some(),
                     "post-Merge header is missing prevrandao"
                 );
             }
-            if spec >= SpecId::CANCUN {
+            if spec >= SpecId::CANCUN && profile.header.excess_blob_gas {
                 ensure!(
                     block.blob_excess_gas_and_price.is_some(),
                     "post-Cancun header is missing excess blob gas"
                 );
             }
-            (chain_id, spec, mainnet_blob_fraction(timestamp))
+            (chain_id, spec, profile.blob_fraction(timestamp))
         };
         ensure!(
             block.gas_limit >= 21_000,

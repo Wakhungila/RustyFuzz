@@ -48,6 +48,8 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::Fuzz {
             chain,
             contract,
+            rpc_url,
+            fork_block,
             hardened_defi,
             single_process,
             cores,
@@ -80,6 +82,27 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             poc_out,
             promotion_limit,
         } => {
+            // Apply CLI overrides before anything reads the config, so a caller cannot
+            // accidentally use the shared file's endpoint while believing it passed
+            // `--rpc-url`. `config` is shadowed rather than mutated so the intent is
+            // visible at the top of the arm.
+            let config = {
+                let mut config = config;
+                if let Some(url) = rpc_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+                    config.rpc_url = url.to_string();
+                }
+                if let Some(block) = fork_block {
+                    config.fork_block = Some(block);
+                }
+                config
+            };
+            if rpc_url.is_none() && fork_block.is_some() {
+                anyhow::bail!(
+                    "--fork-block was given without --rpc-url; the block would be pinned \
+                     against the shared config's endpoint, which is almost never intended"
+                );
+            }
+
             let effective_chain = chain
                 .as_deref()
                 .unwrap_or(config.chain.as_str())
