@@ -83,7 +83,7 @@ impl Unresolved {
 /// Counts mapping keys the resolver could and could not observe (§9 item 4).
 ///
 /// Reported together so "checked 3 keys" is distinguishable from "checked 3,000".
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyCoverage {
     pub observed_keys: usize,
     pub unobserved_keys: usize,

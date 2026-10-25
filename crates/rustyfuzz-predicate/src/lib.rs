@@ -23,7 +23,9 @@
 pub mod binding;
 pub mod eval;
 pub mod expr;
+pub mod oracle;
 pub mod resolve;
+pub mod signal;
 pub mod types;
 
 pub use binding::{
@@ -31,10 +33,15 @@ pub use binding::{
 };
 pub use eval::{evaluate, verdict_text, BlockContext, EvalContext, Outcome, Reason};
 pub use expr::{BinOp, BlockField, Expr, ParseError, Symbol, U256Lit};
+pub use oracle::{
+    term_value, Evidence, EvidenceCounters, InvariantOracle, InvariantRegistry, InvariantSpec,
+    OracleError, PredicateOracle, SequenceView, TermEvidence, Verdict,
+};
 pub use resolve::{
     KeyCoverage, NoReRead, Provenance, ReReadBudget, ReadRecord, Resolved, Resolver, StateReader,
     Unresolved, WriteRecord,
 };
+pub use signal::Signal;
 pub use types::{
     compile, ArithmeticCounters, CheckedPredicate, CompileError, Int256, Sort, TypeError, Widened,
 };
