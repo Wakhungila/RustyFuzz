@@ -18,6 +18,7 @@ pub mod fork_setup;
 pub mod formal_spec;
 pub mod foundry_ingest;
 pub mod fuzz_engine;
+pub mod invariant_file;
 pub mod invariant_manifest;
 pub mod invariant_runtime;
 pub mod minimizer;

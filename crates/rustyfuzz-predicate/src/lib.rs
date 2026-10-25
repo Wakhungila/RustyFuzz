@@ -29,7 +29,7 @@ pub mod signal;
 pub mod types;
 
 pub use binding::{
-    extract_bits, mapping_slot, Binding, BindingError, BindingKind, BindingManifest,
+    extract_bits, mapping_slot, Binding, BindingError, BindingKind, BindingManifest, RawBinding,
 };
 pub use eval::{evaluate, verdict_text, BlockContext, EvalContext, Outcome, Reason};
 pub use expr::{BinOp, BlockField, Expr, ParseError, Symbol, U256Lit};

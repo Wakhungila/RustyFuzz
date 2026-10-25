@@ -34,6 +34,9 @@ pub enum Command {
         /// Deterministic RNG seed, for a reproducible first run.
         #[arg(long, default_value_t = 1)]
         rng_seed: u64,
+        /// JSON file of invariants to check after every transaction.
+        #[arg(long)]
+        invariants: Option<String>,
     },
     Fuzz {
         #[arg(long)]
@@ -54,6 +57,17 @@ pub enum Command {
         /// available on the endpoint.
         #[arg(long)]
         fork_block: Option<u64>,
+        /// JSON file of invariants to check after every transaction.
+        ///
+        /// Kept as a flag rather than a `config.toml` table so a campaign's invariants
+        /// travel with the invocation, not with a file shared between runs -- the same
+        /// reasoning as `--rpc-url`. See `src/engine/invariant_file.rs` for the format.
+        ///
+        /// Validation happens before the campaign starts: every invalid invariant is
+        /// reported at once, and a file declaring none is refused rather than silently
+        /// checking nothing.
+        #[arg(long)]
+        invariants: Option<String>,
         #[arg(long, default_value_t = false)]
         hardened_defi: bool,
         #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = false)]

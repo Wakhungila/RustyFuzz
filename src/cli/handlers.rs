@@ -55,11 +55,13 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             duration_secs,
             max_execs,
             rng_seed,
+            invariants,
         } => Command::Fuzz {
             chain: None,
             contract: Some(address),
             rpc_url: Some(rpc_url),
             fork_block,
+            invariants,
             hardened_defi: true,
             single_process: true,
             cores: None,
@@ -105,6 +107,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             contract,
             rpc_url,
             fork_block,
+            invariants,
             hardened_defi,
             single_process,
             cores,
@@ -156,6 +159,16 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     "--fork-block was given without --rpc-url; the block would be pinned \
                      against the shared config's endpoint, which is almost never intended"
                 );
+            }
+
+            // Parse the invariant file here, before any fork or campaign work, so a bad
+            // file fails in a second rather than after minutes of fuzzing. The registry
+            // is rebuilt inside the engine from the same path; this is the early,
+            // full-error report.
+            if let Some(path) = invariants.as_deref() {
+                let invariants_path = std::path::Path::new(path);
+                rusty_fuzz::engine::invariant_file::InvariantFile::load(invariants_path)
+                    .and_then(|file| file.build_registry())?;
             }
 
             let effective_chain = chain
@@ -285,6 +298,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     && (config.allow_synthetic_fallback || allow_synthetic_fallback),
                 hardened_defi: hardened_defi_config,
                 target_invariant_manifest: config.target_invariant_manifest.clone(),
+                predicate_invariants: invariants.clone(),
                 abi_path: abi.or(config.target_abi.clone()),
                 max_execs,
                 duration_secs,
@@ -972,6 +986,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                         hardened
                     },
                     target_invariant_manifest: Some(invariant_path),
+                    predicate_invariants: None,
                     abi_path: abi.or(config.target_abi.clone()),
                     max_execs: Some(job.max_execs),
                     duration_secs: Some(job.duration_secs),

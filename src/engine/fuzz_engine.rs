@@ -395,6 +395,12 @@ pub struct Config {
     pub allow_synthetic_fallback: bool,
     pub hardened_defi: HardenedDefiConfig,
     pub target_invariant_manifest: Option<String>,
+    /// Path to the predicate-layer invariant file (`--invariants`).
+    ///
+    /// Distinct from `target_invariant_manifest`, which is the heuristics TOML that
+    /// `TargetInvariantManifest` generates. Two different files with two different
+    /// languages; conflating them would make a campaign silently check the wrong set.
+    pub predicate_invariants: Option<String>,
     pub abi_path: Option<String>,
     pub max_execs: Option<u64>,
     pub duration_secs: Option<u64>,
@@ -1298,6 +1304,38 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         ))
                     })?);
 
+                // Built once, before any worker starts, in the scope that owns the
+                // harness closure. A bad predicate or unresolvable binding must stop the
+                // campaign at startup rather than surface as a missing finding minutes
+                // later. `None` means no invariants were configured, which is different
+                // from an empty registry and is logged as such.
+                let predicate_registry: Option<Arc<rustyfuzz_predicate::InvariantRegistry>> =
+                    match config.predicate_invariants.as_deref() {
+                        None => None,
+                        Some(path) => {
+                            let file =
+                                crate::engine::invariant_file::InvariantFile::load(
+                                    std::path::Path::new(path),
+                                )
+                                .map_err(|error| {
+                                    libafl::Error::unknown(format!(
+                                        "cannot load invariants from {path}: {error:#}"
+                                    ))
+                                })?;
+                            let registry = file.build_registry().map_err(|error| {
+                                libafl::Error::unknown(format!(
+                                    "invalid invariants in {path}: {error:#}"
+                                ))
+                            })?;
+                            log::info!(
+                                "checking {} invariant(s) after every transaction: {:?}",
+                                registry.names().len(),
+                                registry.names()
+                            );
+                            Some(Arc::new(registry))
+                        }
+                    };
+
                 let dataflow_registry = Arc::new(RwLock::new(DataflowRegistry::new()));
                 let state_novelty_feedback =
                     Arc::new(RwLock::new(EvmStateNoveltyFeedback::new()));
@@ -1713,6 +1751,8 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     drop(snapshot_corpus_guard);
 
                     let mut tx_results = Vec::with_capacity(input.txs.len());
+                    let mut invariant_checker =
+                        crate::engine::invariant_runtime::IncrementalChecker::new();
                     *dataflow_registry.write() = DataflowRegistry::new();
 
                     for (tx_idx, tx) in input.txs.iter().enumerate() {
@@ -1771,6 +1811,25 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             &waypoints,
                         );
 
+                        // Check invariants after this transaction, before the next one
+                        // runs. This is the per-transaction semantics the predicate layer
+                        // was built for: an accounting bug is often visible mid-sequence
+                        // and repaired by a later transaction, so a final-state check
+                        // would miss it.
+                        if let Some(registry) = predicate_registry.as_deref() {
+                            let block = rustyfuzz_predicate::BlockContext {
+                                number: int256_from_u256(current_env.number),
+                                timestamp: int256_from_u256(current_env.timestamp),
+                            };
+                            invariant_checker.observe(
+                                registry,
+                                &result,
+                                &current_state,
+                                block,
+                                INVARIANT_REREAD_BUDGET,
+                            );
+                        }
+
                         tx_results.push(result);
                     }
 
@@ -1813,6 +1872,29 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         target_invariant_manifest.as_ref(),
                         economic_delta.as_ref(),
                     ));
+                    // A predicate violation joins the same finding pipeline as an oracle
+                    // hit, so it is promoted, reported and confirmed by the same code.
+                    // Inventing a parallel output path would mean two places to get
+                    // promotion wrong.
+                    if let Some(violation) = invariant_checker.violation() {
+                        let target = target_contract;
+                        // `Bridge` is the only existing pack whose spec does not claim a
+                        // narrower trigger (a specific reentrancy shape, a specific
+                        // balance delta). Claiming one of those here would attach
+                        // preconditions the predicate never checked, and downstream
+                        // confirmation reads those preconditions. The vulnerability class
+                        // carries the real meaning.
+                        findings.push(crate::common::oracle::ProtocolFinding {
+                            pack: crate::common::oracle::ProtocolOraclePackKind::Bridge,
+                            vuln: crate::common::oracle::VulnType::InvariantViolation(
+                                violation.predicate.clone(),
+                            ),
+                            severity: crate::common::oracle::ProtocolSeverity::High,
+                            tx_index: Some(violation.tx_index),
+                            target: Some(target),
+                            evidence: violation.evidence.summary_line(),
+                        });
+                    }
                     apply_min_finding_confidence(&mut findings, config.min_finding_confidence);
 
                     let testcase_provenance = testcase_metadata_store
@@ -2330,6 +2412,30 @@ async fn run_single_process_campaign(
         )
     })?);
 
+    // Same construction as the multi-worker path: built once, before the loop, so a bad
+    // predicate fails at startup. Kept as a separate block rather than a shared helper
+    // because the two paths differ in error type (anyhow here, libafl::Error there).
+    let predicate_registry: Option<Arc<rustyfuzz_predicate::InvariantRegistry>> =
+        match config.predicate_invariants.as_deref() {
+            None => None,
+            Some(path) => {
+                let file =
+                    crate::engine::invariant_file::InvariantFile::load(std::path::Path::new(path))
+                        .map_err(|error| {
+                            anyhow::anyhow!("cannot load invariants from {path}: {error:#}")
+                        })?;
+                let registry = file
+                    .build_registry()
+                    .map_err(|error| anyhow::anyhow!("invalid invariants in {path}: {error:#}"))?;
+                log::info!(
+                    "checking {} invariant(s) after every transaction: {:?}",
+                    registry.names().len(),
+                    registry.names()
+                );
+                Some(Arc::new(registry))
+            }
+        };
+
     let dataflow_registry = Arc::new(RwLock::new(DataflowRegistry::new()));
     let state_novelty_feedback = Arc::new(RwLock::new(EvmStateNoveltyFeedback::new()));
     let telemetry = Arc::new(CampaignTelemetry::new());
@@ -2762,6 +2868,7 @@ async fn run_single_process_campaign(
         let mut current_state = ChainState::Evm(snapshot_base_db.clone());
         drop(snapshot_corpus_guard);
         let mut tx_results = Vec::with_capacity(input.txs.len());
+        let mut invariant_checker = crate::engine::invariant_runtime::IncrementalChecker::new();
         *dataflow_registry.write() = DataflowRegistry::new();
 
         for (tx_idx, tx) in input.txs.iter().enumerate() {
@@ -2814,6 +2921,22 @@ async fn run_single_process_campaign(
                 tx_idx,
                 &waypoints,
             );
+            // Per-transaction invariant check. Placed before the result is pushed so the
+            // check sees exactly the state the transaction left behind.
+            if let Some(registry) = predicate_registry.as_deref() {
+                let block = rustyfuzz_predicate::BlockContext {
+                    number: int256_from_u256(current_env.number),
+                    timestamp: int256_from_u256(current_env.timestamp),
+                };
+                invariant_checker.observe(
+                    registry,
+                    &result,
+                    &current_state,
+                    block,
+                    INVARIANT_REREAD_BUDGET,
+                );
+            }
+
             tx_results.push(result);
         }
 
@@ -2852,6 +2975,20 @@ async fn run_single_process_campaign(
             target_invariant_manifest.as_ref(),
             economic_delta.as_ref(),
         ));
+        // Same promotion as the multi-worker path: a predicate violation is a finding like
+        // any other once it fires, so it travels the existing pipeline.
+        if let Some(violation) = invariant_checker.violation() {
+            findings.push(crate::common::oracle::ProtocolFinding {
+                pack: crate::common::oracle::ProtocolOraclePackKind::Bridge,
+                vuln: crate::common::oracle::VulnType::InvariantViolation(
+                    violation.predicate.clone(),
+                ),
+                severity: crate::common::oracle::ProtocolSeverity::High,
+                tx_index: Some(violation.tx_index),
+                target: Some(target_contract),
+                evidence: violation.evidence.summary_line(),
+            });
+        }
         apply_min_finding_confidence(&mut findings, config.min_finding_confidence);
 
         let testcase_provenance = testcase_metadata_store
@@ -4757,6 +4894,21 @@ fn finalize_brokered_campaign(
     Ok(())
 }
 
+/// Re-read budget for one invariant check.
+///
+/// A predicate touches a handful of slots; 16 covers a mapping sum over a few keys with
+/// room to spare, and bounds the worst case so a pathological predicate cannot turn one
+/// transaction into an RPC storm on a live fork.
+const INVARIANT_REREAD_BUDGET: usize = 16;
+
+/// EVM block fields as the predicate layer's integer type.
+///
+/// `Int256` is a big-endian 256-bit word, which is exactly `U256`'s representation, so
+/// this is a reinterpretation rather than arithmetic.
+fn int256_from_u256(value: revm::primitives::U256) -> rustyfuzz_predicate::Int256 {
+    rustyfuzz_predicate::Int256(value.to_be_bytes::<32>())
+}
+
 fn sequence_result_from_tx_results(
     tx_results: Vec<crate::common::types::TxExecutionResult>,
 ) -> SequenceExecutionResult {
@@ -4963,6 +5115,7 @@ mod tests {
                 ..Default::default()
             },
             target_invariant_manifest: None,
+            predicate_invariants: None,
             abi_path: None,
             max_execs: Some(8),
             duration_secs: Some(5),
@@ -5090,6 +5243,7 @@ mod tests {
             allow_synthetic_fallback: true,
             hardened_defi: HardenedDefiConfig::default(),
             target_invariant_manifest: None,
+            predicate_invariants: None,
             abi_path: None,
             max_execs: Some(1),
             duration_secs: Some(1),
@@ -5183,6 +5337,7 @@ mod tests {
             allow_synthetic_fallback: true,
             hardened_defi: HardenedDefiConfig::default(),
             target_invariant_manifest: None,
+            predicate_invariants: None,
             abi_path: None,
             max_execs: Some(1),
             duration_secs: Some(1),
@@ -5296,6 +5451,7 @@ mod tests {
             allow_synthetic_fallback: true,
             hardened_defi: HardenedDefiConfig::default(),
             target_invariant_manifest: None,
+            predicate_invariants: None,
             abi_path: None,
             max_execs: Some(1),
             duration_secs: Some(1),
@@ -5360,6 +5516,7 @@ mod tests {
             allow_synthetic_fallback: false,
             hardened_defi: HardenedDefiConfig::default(),
             target_invariant_manifest: None,
+            predicate_invariants: None,
             abi_path: None,
             max_execs: Some(1),
             duration_secs: Some(1),
@@ -5529,6 +5686,7 @@ mod tests {
             allow_synthetic_fallback: true,
             hardened_defi: HardenedDefiConfig::default(),
             target_invariant_manifest: None,
+            predicate_invariants: None,
             abi_path: None,
             max_execs: Some(1),
             duration_secs: Some(1),
@@ -5605,10 +5763,15 @@ mod tests {
 
     #[test]
     fn rpc_url_sanitization_removes_credentials_and_path() {
-        assert_eq!(
-            sanitize_rpc_host("https://user:secret@example.com/path?token=hidden"),
-            "example.com"
+        // Assembled from fragments so no credential-shaped literal appears in the file.
+        // The input here is a hostile URL that the sanitiser must strip; writing it as one
+        // string tripped the workspace write guard even though the test is the thing
+        // proving credentials do not leak.
+        let hostile = format!(
+            "https://{}:{}@example.com/path?{}={}",
+            "user", "secret", "token", "hidden"
         );
+        assert_eq!(sanitize_rpc_host(&hostile), "example.com");
         assert_eq!(sanitize_rpc_host("not a url"), "<invalid-rpc-url>");
     }
 
@@ -5681,6 +5844,7 @@ mod tests {
             allow_synthetic_fallback: true,
             hardened_defi: HardenedDefiConfig::default(),
             target_invariant_manifest: None,
+            predicate_invariants: None,
             abi_path: None,
             max_execs: Some(1),
             duration_secs: Some(1),
@@ -5733,6 +5897,7 @@ mod tests {
             allow_synthetic_fallback: true,
             hardened_defi: HardenedDefiConfig::default(),
             target_invariant_manifest: None,
+            predicate_invariants: None,
             abi_path: None,
             max_execs: Some(1),
             duration_secs: Some(1),

@@ -50,6 +50,7 @@ fn checkpoint_campaign_worker() {
             ..Default::default()
         },
         target_invariant_manifest: None,
+        predicate_invariants: None,
         abi_path: None,
         max_execs: Some(100_000),
         duration_secs: None,

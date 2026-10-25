@@ -21,8 +21,8 @@
 
 use crate::common::types::{PredicateTerm, SequenceExecutionResult, StorageDiff};
 use rustyfuzz_predicate::{
-    Evidence, InvariantRegistry, Outcome, ReReadBudget, ReadRecord, SequenceView,
-    StateReader, WriteRecord,
+    Evidence, InvariantRegistry, Outcome, ReReadBudget, ReadRecord, SequenceView, StateReader,
+    WriteRecord,
 };
 
 /// Resolves a slot from committed state, for the on-demand re-read.
@@ -68,9 +68,13 @@ fn writes_from(diffs: &[StorageDiff]) -> Vec<WriteRecord> {
 }
 
 /// Adapts observed reads into the predicate layer's record shape.
-fn reads_from(execution: &SequenceExecutionResult) -> Vec<ReadRecord> {
-    execution
-        .storage_reads
+///
+/// A read with no value is dropped rather than recorded as zero. `None` means the read
+/// happened but its result was not captured (for example inside a reverted frame); a zero
+/// would be a fabricated observation, and a fabricated observation is how a `Unknown`
+/// becomes a confident wrong answer.
+fn reads_from(reads: &[crate::common::types::StorageAccess]) -> Vec<ReadRecord> {
+    reads
         .iter()
         .filter_map(|read| {
             read.value.map(|value| ReadRecord {
@@ -96,45 +100,70 @@ pub struct SequenceViolation {
     pub evidence: Evidence,
 }
 
-/// Checks every registered invariant after each transaction of a sequence.
+/// Accumulates a sequence one transaction at a time and checks invariants after each.
 ///
-/// Returns the first violation in transaction order. Returning early is deliberate: a
-/// sequence that breaks an invariant at step 2 and again at step 5 has one root cause, and
-/// reporting the earlier one gives the shortest counterexample.
-pub fn check_sequence(
-    registry: &InvariantRegistry,
-    execution: &SequenceExecutionResult,
-    state: &crate::common::types::ChainState,
-    block: rustyfuzz_predicate::BlockContext,
-    budget_per_check: usize,
-) -> Option<SequenceViolation> {
-    let writes = writes_from(&execution.storage_diffs);
-    let reads = reads_from(execution);
+/// This exists because the live harness produces one `TxExecutionResult` per transaction
+/// and has no whole-sequence result to hand over until the sequence is over — which is
+/// exactly the moment a per-transaction check is no longer possible. Feeding it
+/// incrementally keeps the check inside the loop, so a violation is observed at the
+/// transaction that caused it rather than reconstructed afterwards.
+///
+/// The records are accumulated rather than replaced: the predicate layer resolves a
+/// symbol to the **latest** write at or before the queried index, so an earlier write
+/// stays observable for later checks. Replacing them would make a step-2 read of a
+/// step-1 write look unobserved, i.e. `Unknown`, i.e. no signal.
+#[derive(Debug, Default)]
+pub struct IncrementalChecker {
+    writes: Vec<WriteRecord>,
+    reads: Vec<ReadRecord>,
+    /// Violation found, if any. Once set, later transactions are not checked: the first
+    /// violating transaction is the shortest counterexample, and re-reporting a
+    /// downstream consequence of the same cause adds noise without information.
+    violation: Option<SequenceViolation>,
+}
 
-    for tx_index in 0..execution.tx_results.len() {
+impl IncrementalChecker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records one transaction's observations and checks every invariant after it.
+    ///
+    /// Idempotent once a violation is found: it keeps accumulating so the sequence stays
+    /// reproducible, but stops evaluating.
+    pub fn observe(
+        &mut self,
+        registry: &InvariantRegistry,
+        result: &crate::common::types::TxExecutionResult,
+        state: &crate::common::types::ChainState,
+        block: rustyfuzz_predicate::BlockContext,
+        budget_per_check: usize,
+    ) {
+        self.writes.extend(writes_from(&result.storage_diffs));
+        self.reads.extend(reads_from(&result.storage_reads));
+        if self.violation.is_some() {
+            return;
+        }
         let view = SequenceView {
-            writes: &writes,
-            reads: &reads,
+            writes: &self.writes,
+            reads: &self.reads,
             block,
         };
         let mut reader = ChainStateReader::new(state);
         let results = registry.check_all(
             &view,
-            tx_index,
+            result.tx_index,
             &mut reader,
             ReReadBudget::new(budget_per_check),
         );
         for (outcome, evidence) in results {
-            // Only a violation produces a finding. `Unknown` and a div0-degraded pass are
-            // no-signal by §5.1, and treating either as a finding is exactly the
+            // Only a definite `False` is a violation. `Unknown` and `SatisfiedButDiv0`
+            // are no-signal by §5.1, and treating either as a finding is the
             // false-positive behaviour the layer exists to prevent.
-            if !outcome.is_violation() {
-                continue;
-            }
             if !matches!(outcome, Outcome::False) {
                 continue;
             }
-            let terms = evidence
+            let terms: Vec<PredicateTerm> = evidence
                 .terms
                 .iter()
                 .map(|term| PredicateTerm {
@@ -148,15 +177,48 @@ pub fn check_sequence(
                     tx_index: term.tx_index,
                 })
                 .collect();
-            return Some(SequenceViolation {
+            self.violation = Some(SequenceViolation {
                 predicate: evidence.predicate.clone(),
-                tx_index,
+                tx_index: result.tx_index,
                 terms,
                 evidence,
             });
+            return;
         }
     }
-    None
+
+    pub fn violation(&self) -> Option<&SequenceViolation> {
+        self.violation.as_ref()
+    }
+
+    pub fn take_violation(&mut self) -> Option<SequenceViolation> {
+        self.violation.take()
+    }
+}
+
+/// Checks every registered invariant after each transaction of a completed sequence.
+///
+/// Used for replay and for callers that already hold a whole sequence. The live harness
+/// uses [`IncrementalChecker`] instead, because it cannot wait for the end.
+///
+/// Returns the first violation in transaction order: a sequence that breaks an invariant
+/// at step 2 and again at step 5 has one root cause, and the earlier one is the shorter
+/// counterexample.
+pub fn check_sequence(
+    registry: &InvariantRegistry,
+    execution: &SequenceExecutionResult,
+    state: &crate::common::types::ChainState,
+    block: rustyfuzz_predicate::BlockContext,
+    budget_per_check: usize,
+) -> Option<SequenceViolation> {
+    let mut checker = IncrementalChecker::new();
+    for result in &execution.tx_results {
+        checker.observe(registry, result, state, block, budget_per_check);
+        if checker.violation().is_some() {
+            break;
+        }
+    }
+    checker.take_violation()
 }
 
 /// Builds a registry from `(name, predicate, manifest)` triples.
@@ -224,28 +286,51 @@ mod tests {
         }
     }"#;
 
+    /// Builds a sequence whose per-transaction results carry their own diffs.
+    ///
+    /// The diffs go on the transaction, not only on the sequence, because that is what the
+    /// engine produces: `sequence_result_from_tx_results` flattens the per-transaction
+    /// diffs. An earlier version of this fixture put everything at the sequence level,
+    /// which no real execution ever does, and it passed only because the checker then
+    /// read the sequence result instead of the transactions.
     fn execution_with(diffs: Vec<StorageDiff>, txs: usize) -> SequenceExecutionResult {
+        let mut per_tx: Vec<Vec<StorageDiff>> = vec![Vec::new(); txs];
+        for diff in diffs {
+            let index = diff.tx_index;
+            assert!(
+                index < txs,
+                "diff names tx {index} but the sequence has {txs} transaction(s)"
+            );
+            per_tx[index].push(diff);
+        }
+        let tx_results: Vec<TxExecutionResult> = per_tx
+            .into_iter()
+            .enumerate()
+            .map(|(index, storage_diffs)| TxExecutionResult {
+                tx_index: index,
+                status: ExecutionStatus::Success,
+                gas_used: 21_000,
+                output: Vec::new(),
+                coverage_hash: 0,
+                coverage_edges: 0,
+                storage_reads: Vec::new(),
+                storage_writes: Vec::new(),
+                storage_diffs,
+                call_trace: Vec::new(),
+                waypoints: Vec::new(),
+            })
+            .collect();
+        let flattened: Vec<StorageDiff> = tx_results
+            .iter()
+            .flat_map(|result| result.storage_diffs.clone())
+            .collect();
         SequenceExecutionResult {
-            tx_results: (0..txs)
-                .map(|index| TxExecutionResult {
-                    tx_index: index,
-                    status: ExecutionStatus::Success,
-                    gas_used: 21_000,
-                    output: Vec::new(),
-                    coverage_hash: 0,
-                    coverage_edges: 0,
-                    storage_reads: Vec::new(),
-                    storage_writes: Vec::new(),
-                    storage_diffs: Vec::new(),
-                    call_trace: Vec::new(),
-                    waypoints: Vec::new(),
-                })
-                .collect(),
+            tx_results,
             total_gas_used: 21_000 * txs as u64,
             final_coverage_hash: 0,
             storage_reads: Vec::new(),
             storage_writes: Vec::new(),
-            storage_diffs: diffs,
+            storage_diffs: flattened,
             call_trace: Vec::new(),
             oracle_observations: Vec::new(),
         }

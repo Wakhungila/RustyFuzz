@@ -69,6 +69,7 @@ struct CheckpointIdentity {
     allow_synthetic_fallback: bool,
     hardened_defi: HardenedDefiIdentity,
     target_invariant_manifest: Option<String>,
+    predicate_invariants: Option<String>,
     abi_path: Option<String>,
     max_execs: Option<u64>,
     duration_secs: Option<u64>,
@@ -134,6 +135,7 @@ fn checkpoint_identity_digest(config: &Config) -> anyhow::Result<String> {
             require_confirmation_for_poc: config.hardened_defi.require_confirmation_for_poc,
         },
         target_invariant_manifest: config.target_invariant_manifest.clone(),
+        predicate_invariants: None,
         abi_path: config.abi_path.clone(),
         max_execs: config.max_execs,
         duration_secs: config.duration_secs,
@@ -588,6 +590,7 @@ mod tests {
                 ..Default::default()
             },
             target_invariant_manifest: None,
+            predicate_invariants: None,
             abi_path: None,
             max_execs: Some(1),
             duration_secs: Some(1),
