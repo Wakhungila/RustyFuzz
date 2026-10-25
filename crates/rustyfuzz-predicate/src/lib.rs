@@ -21,6 +21,7 @@
 //! and never unbounded work.
 
 pub mod binding;
+pub mod eval;
 pub mod expr;
 pub mod resolve;
 pub mod types;
@@ -28,6 +29,7 @@ pub mod types;
 pub use binding::{
     extract_bits, mapping_slot, Binding, BindingError, BindingKind, BindingManifest,
 };
+pub use eval::{evaluate, verdict_text, BlockContext, EvalContext, Outcome, Reason};
 pub use expr::{BinOp, BlockField, Expr, ParseError, Symbol, U256Lit};
 pub use resolve::{
     KeyCoverage, NoReRead, Provenance, ReReadBudget, ReadRecord, Resolved, Resolver, StateReader,
