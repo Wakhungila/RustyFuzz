@@ -338,6 +338,25 @@ pub struct InvariantRegistry {
     oracles: Vec<Box<dyn InvariantOracle>>,
 }
 
+impl std::fmt::Debug for InvariantRegistry {
+    /// Prints the registered names rather than the trait objects.
+    ///
+    /// A registry is a configuration; when one is wrong, the useful information is which
+    /// invariants were registered, not an opaque pointer.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InvariantRegistry")
+            .field(
+                "names",
+                &self
+                    .oracles
+                    .iter()
+                    .map(|oracle| oracle.name())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
 impl InvariantRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -353,6 +372,11 @@ impl InvariantRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.oracles.is_empty()
+    }
+
+    /// Names of the registered invariants, in registration order.
+    pub fn names(&self) -> Vec<&str> {
+        self.oracles.iter().map(|oracle| oracle.name()).collect()
     }
 
     /// Checks every registered invariant once.

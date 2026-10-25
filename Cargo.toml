@@ -88,6 +88,7 @@ mimalloc-allocator = ["dep:mimalloc"]
 [dependencies]
 rustyfuzz-core = { path = "crates/rustyfuzz-core" }
 rustyfuzz-evm = { path = "crates/rustyfuzz-evm" }
+rustyfuzz-predicate = { path = "crates/rustyfuzz-predicate" }
 rustyfuzz-engine = { path = "crates/rustyfuzz-engine" }
 rustyfuzz-artifacts = { path = "crates/rustyfuzz-artifacts" }
 rustyfuzz-operations = { path = "crates/rustyfuzz-operations" }

@@ -4685,6 +4685,7 @@ dependencies = [
  "rustyfuzz-engine",
  "rustyfuzz-evm",
  "rustyfuzz-operations",
+ "rustyfuzz-predicate",
  "serde",
  "serde_json",
  "sha2 0.11.0",
