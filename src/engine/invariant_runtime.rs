@@ -54,7 +54,7 @@ impl StateReader for ChainStateReader<'_> {
 }
 
 /// Adapts the campaign's storage diffs into the predicate layer's record shape.
-fn writes_from(diffs: &[StorageDiff]) -> Vec<WriteRecord> {
+pub(crate) fn writes_from(diffs: &[StorageDiff]) -> Vec<WriteRecord> {
     diffs
         .iter()
         .map(|diff| WriteRecord {
@@ -73,7 +73,7 @@ fn writes_from(diffs: &[StorageDiff]) -> Vec<WriteRecord> {
 /// happened but its result was not captured (for example inside a reverted frame); a zero
 /// would be a fabricated observation, and a fabricated observation is how a `Unknown`
 /// becomes a confident wrong answer.
-fn reads_from(reads: &[crate::common::types::StorageAccess]) -> Vec<ReadRecord> {
+pub(crate) fn reads_from(reads: &[crate::common::types::StorageAccess]) -> Vec<ReadRecord> {
     reads
         .iter()
         .filter_map(|read| {
@@ -98,6 +98,25 @@ pub struct SequenceViolation {
     pub terms: Vec<PredicateTerm>,
     /// Full evidence, including counters and provenance.
     pub evidence: Evidence,
+}
+
+impl SequenceViolation {
+    /// Attach the original predicate configuration before rebuilding the proof.
+    pub fn attach_to(
+        &self,
+        candidate: &mut crate::engine::exploit_path::ExploitPathCandidate,
+        execution: &SequenceExecutionResult,
+        findings: &[crate::common::oracle::ProtocolFinding],
+    ) {
+        candidate.violated_invariant = Some(self.predicate.clone());
+        candidate.predicate_text = Some(self.predicate.clone());
+        candidate.predicate_manifest = Some(self.evidence.binding_manifest.clone());
+        candidate.predicate_tx_index = Some(self.tx_index);
+        candidate.predicate_terms = self.terms.clone();
+        candidate.proof = Some(crate::engine::proof::ProofCarryingFinding::from_candidate(
+            candidate, execution, findings,
+        ));
+    }
 }
 
 /// Accumulates a sequence one transaction at a time and checks invariants after each.
@@ -389,6 +408,27 @@ mod tests {
         let values: Vec<&str> = violation.terms.iter().map(|t| t.value.as_str()).collect();
         assert!(values.contains(&"100"));
         assert!(values.contains(&"40"));
+        let input = crate::evm::fuzz::EvmInput::new(Vec::new(), 0);
+        let score = crate::engine::scoring::CampaignScore {
+            invariant_pressure: 100,
+            ..Default::default()
+        };
+        let mut candidate = crate::engine::exploit_path::ExploitPathBuilder::from_execution(
+            &input,
+            &execution,
+            &[],
+            &score,
+        )
+        .expect("invariant pressure produces a candidate");
+        violation.attach_to(&mut candidate, &execution, &[]);
+        let proof = candidate.proof.as_ref().unwrap();
+        let predicate = proof
+            .violation_predicate
+            .as_ref()
+            .expect("bindings reach proof");
+        assert!(predicate.holds(&execution));
+        let restored = execution_with(vec![diff(0, 1, 0, 100), diff(0, 2, 0, 100)], 1);
+        assert!(!predicate.holds(&restored));
     }
 
     #[test]

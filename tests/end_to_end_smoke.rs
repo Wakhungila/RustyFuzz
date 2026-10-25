@@ -250,7 +250,15 @@ fn an_impossible_invariant_produces_a_finding_through_the_campaign() {
     let provenance: serde_json::Value =
         serde_json::from_slice(&fs::read(&violations[0]).expect("provenance json"))
             .expect("provenance is json");
-    let finding = &provenance["findings"][0];
+    let finding = provenance["findings"]
+        .as_array()
+        .expect("recorded findings")
+        .iter()
+        .find(|finding| {
+            finding["vuln"]["InvariantViolation"]
+                == "supply < supplyFrozen && supply > supplyFrozen"
+        })
+        .expect("the recorded findings must include the typed invariant violation");
     assert_eq!(
         finding["vuln"]["InvariantViolation"], "supply < supplyFrozen && supply > supplyFrozen",
         "the finding must carry the predicate as its vulnerability class"

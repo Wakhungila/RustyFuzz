@@ -20,10 +20,9 @@
 //! the packed-slot hazard the mandatory bit-range rule exists to prevent, so it is the
 //! best available test of the binding layer.
 //!
-//! What it cannot do is express Basin's own seven invariants, because each of them needs
-//! something the IR does not have. Those gaps are asserted below as *tests* rather than
-//! described in prose, so that closing them flips a test rather than requiring someone
-//! to remember.
+//! The tests cover packed storage, return-value bindings and relative tolerance.
+//! Remaining gaps, including calls with computed array arguments, are asserted below
+//! so support must be demonstrated when those gaps close.
 
 use rustyfuzz_predicate::{
     Binding, BindingManifest, BlockContext, InvariantOracle, InvariantSpec, Outcome,
@@ -326,36 +325,30 @@ fn the_conditional_zero_balance_invariant_is_expressible_with_short_circuit() {
 }
 
 // ---------------------------------------------------------------------------
-// Declared gaps: tests that fail to compile or run when the gap closes
+// Relative tolerance regression and remaining binding gaps
 // ---------------------------------------------------------------------------
 
-/// `invariant_totalSupplyMatchesFunctionCalc` needs a **relative-tolerance** comparison
-/// (`assertApproxEqRelN`). The IR has only exact operators, so the property cannot be
-/// written without changing its meaning.
+/// The relative comparison preserves Basin's `assertApproxEqRelN` rounding tolerance.
 #[test]
-fn relative_tolerance_comparison_is_not_expressible() {
-    // `totalSupply ~= functionCalc within 1e-6` has no IR spelling. Trying the obvious
-    // exact form compiles, which is the danger: it silently asserts something stronger
-    // than the real invariant, and would report false violations on rounding.
-    let exact = oracle("lpSupply == 1000000");
-    assert_eq!(
-        exact.spec().predicate,
-        "lpSupply == 1000000",
-        "an exact comparison is what an author would reach for"
-    );
-    // The tolerance form is a parse error, which is the honest outcome: the layer refuses
-    // rather than quietly weakening the property.
-    assert!(
-        PredicateOracle::new(
-            InvariantSpec {
-                name: "tolerance".to_string(),
-                predicate: "lpSupply ~= 1000000".to_string(),
-            },
-            &packed_manifest(),
-        )
-        .is_err(),
-        "there is deliberately no approximate operator yet"
-    );
+fn relative_tolerance_accepts_rounding_and_rejects_excess_error() {
+    let subject = oracle("approx_eq(lpSupply, 1000000, 100, 6)");
+    let view = SequenceView {
+        writes: &[],
+        reads: &[],
+        block: BlockContext::default(),
+    };
+    for (supply, expected) in [
+        (1_000_000, Outcome::True),
+        (1_000_001, Outcome::True),
+        (1_000_100, Outcome::True),
+        (1_000_101, Outcome::False),
+    ] {
+        let mut reader = BasinReader {
+            returns: BTreeMap::from([((well(), TOTAL_SUPPLY, 0), word(supply))]),
+        };
+        let (outcome, _) = subject.check(&view, 0, &mut reader, ReReadBudget::new(8));
+        assert_eq!(outcome, expected, "supply {supply}");
+    }
 }
 
 /// `invariant_reservesMatchFunctionCalcReserve` needs `calcReserve(...)` — a call whose

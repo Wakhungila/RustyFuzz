@@ -1971,7 +1971,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             }
                         }
                     }
-                    let exploit_candidate = counterexample_exploit_candidate.or_else(|| {
+                    let mut exploit_candidate = counterexample_exploit_candidate.or_else(|| {
                         ExploitPathBuilder::from_execution(
                         input,
                         &execution,
@@ -1979,6 +1979,12 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         &campaign_score,
                     )
                     });
+
+                    if let (Some(violation), Some(candidate)) =
+                        (invariant_checker.violation(), exploit_candidate.as_mut())
+                    {
+                        violation.attach_to(candidate, &execution, &findings);
+                    }
 
                     account_registry.write().observe_execution(&execution);
                     let mutation_strategies = mutation_strategies(&testcase_provenance);
@@ -3059,9 +3065,14 @@ async fn run_single_process_campaign(
             }
         }
 
-        let exploit_candidate = counterexample_exploit_candidate.or_else(|| {
+        let mut exploit_candidate = counterexample_exploit_candidate.or_else(|| {
             ExploitPathBuilder::from_execution(input, &execution, &findings, &campaign_score)
         });
+        if let (Some(violation), Some(candidate)) =
+            (invariant_checker.violation(), exploit_candidate.as_mut())
+        {
+            violation.attach_to(candidate, &execution, &findings);
+        }
 
         account_registry.write().observe_execution(&execution);
         let mutation_strategies = mutation_strategies(&testcase_provenance);

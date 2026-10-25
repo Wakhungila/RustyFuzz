@@ -116,6 +116,9 @@ impl From<&Outcome> for Verdict {
 /// Everything needed to re-derive one predicate's outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Evidence {
+    /// Original bindings needed to evaluate this predicate on a fresh replay.
+    #[serde(default)]
+    pub binding_manifest: String,
     /// The predicate exactly as the author wrote it.
     pub predicate: String,
     pub tx_index: usize,
@@ -198,6 +201,7 @@ pub trait InvariantOracle: Send + Sync {
 pub struct PredicateOracle {
     spec: InvariantSpec,
     checked: CheckedPredicate,
+    binding_manifest: String,
     bindings: BTreeMap<String, Binding>,
 }
 
@@ -226,6 +230,7 @@ impl PredicateOracle {
         Ok(Self {
             spec,
             checked,
+            binding_manifest: manifest_json.to_owned(),
             bindings,
         })
     }
@@ -311,6 +316,7 @@ impl InvariantOracle for PredicateOracle {
 
         let terms = self.collect_terms(view, tx_index, reader, budget);
         let evidence = Evidence {
+            binding_manifest: self.binding_manifest.clone(),
             predicate: self.spec.predicate.clone(),
             tx_index,
             verdict: Verdict::from(&outcome),
@@ -581,6 +587,7 @@ mod tests {
     fn default_counters_are_omitted_but_the_field_stays_declared() {
         // §9 item 8: written only when non-default, always present in the schema.
         let evidence = Evidence {
+            binding_manifest: String::new(),
             predicate: "x == 1".to_string(),
             tx_index: 0,
             verdict: Verdict::Held,
@@ -604,6 +611,7 @@ mod tests {
     #[test]
     fn a_non_default_counter_is_written() {
         let evidence = Evidence {
+            binding_manifest: String::new(),
             predicate: "a / b <= 10".to_string(),
             tx_index: 0,
             verdict: Verdict::HeldButDiv0,
@@ -640,6 +648,7 @@ mod tests {
     #[test]
     fn the_summary_line_names_the_predicate_tx_and_verdict() {
         let evidence = Evidence {
+            binding_manifest: String::new(),
             predicate: "sumBalances == totalSupply".to_string(),
             tx_index: 3,
             verdict: Verdict::Violated,

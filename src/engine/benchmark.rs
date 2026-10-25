@@ -4018,6 +4018,7 @@ mod tests {
             violated_invariant: Some("share inflation".to_string()),
             predicate_terms: Vec::new(),
             predicate_text: None,
+            predicate_manifest: None,
             predicate_tx_index: None,
             confidence: 85,
             required_preconditions: vec!["seed attacker with asset token".to_string()],

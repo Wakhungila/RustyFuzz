@@ -98,16 +98,16 @@ impl ProofCarryingFinding {
                 .max_by_key(|finding| finding.severity.clone())
                 .map(|finding| finding.vuln.to_string()),
             invariant_id: candidate.violated_invariant.clone(),
-            // Prefer the invariant layer's predicate when the candidate carries one: it
-            // has resolved operands and a recorded verdict, which is stronger evidence
-            // than a call-pattern match. Fall back to the heuristic shape otherwise, so
-            // the existing DeniedMint path keeps working unchanged.
+            // Preserve the authored invariant and its bindings for independent replay.
+            // Findings without that configuration can still use a DeniedMint predicate.
             violation_predicate: candidate
                 .predicate_text
                 .as_deref()
-                .and_then(|text| {
+                .zip(candidate.predicate_manifest.as_deref())
+                .and_then(|(text, manifest)| {
                     crate::common::verifier::ViolationPredicate::from_invariant_violation(
                         text,
+                        manifest,
                         candidate.predicate_tx_index.unwrap_or_default(),
                         candidate.predicate_terms.clone(),
                     )
@@ -343,6 +343,7 @@ mod tests {
             violated_invariant: Some("share inflation".to_string()),
             predicate_terms: Vec::new(),
             predicate_text: None,
+            predicate_manifest: None,
             predicate_tx_index: None,
             confidence: 90,
             required_preconditions: vec!["fund attacker".to_string()],

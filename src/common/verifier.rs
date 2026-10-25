@@ -295,8 +295,8 @@ pub enum ViolationPredicate {
     },
     /// A predicate from the invariant layer evaluated to `False`.
     ///
-    /// This is the general form the layer was built for: the predicate text plus the
-    /// terms it resolved, so the verdict can be re-derived without the evaluator.
+    /// The predicate and bindings are evaluated again on replay. Recorded terms
+    /// are human-readable evidence of the discovery, never proof of the replay.
     ///
     /// Its absence is why the baseline's five cases could not be confirmed. Every case
     /// reached `ExpectedFinding` and `InvariantViolation`, but the only predicate variant
@@ -306,6 +306,9 @@ pub enum ViolationPredicate {
     InvariantViolated {
         /// The predicate exactly as authored.
         predicate: String,
+        /// Original binding manifest. Older findings without it cannot prove a violation.
+        #[serde(default)]
+        binding_manifest: String,
         /// Transaction index at which it evaluated to false.
         tx_index: usize,
         /// Resolved terms, sufficient to recompute the verdict by hand.
@@ -320,6 +323,7 @@ impl ViolationPredicate {
     /// evidence and is rejected, which keeps the "no proof without observations" rule.
     pub fn from_invariant_violation(
         predicate: impl Into<String>,
+        binding_manifest: impl Into<String>,
         tx_index: usize,
         terms: Vec<crate::common::types::PredicateTerm>,
     ) -> Option<Self> {
@@ -329,6 +333,7 @@ impl ViolationPredicate {
         }
         Some(Self::InvariantViolated {
             predicate,
+            binding_manifest: binding_manifest.into(),
             tx_index,
             terms,
         })
@@ -380,15 +385,68 @@ impl ViolationPredicate {
     }
 
     pub fn holds(&self, execution: &SequenceExecutionResult) -> bool {
+        self.holds_with_block(execution, None)
+    }
+
+    fn holds_with_block(
+        &self,
+        execution: &SequenceExecutionResult,
+        block: Option<rustyfuzz_predicate::BlockContext>,
+    ) -> bool {
         match self {
             Self::DeniedMint { .. } => self.observation_indices(execution).is_some(),
-            // An invariant violation is proven by its evidence, not by re-deriving a
-            // call pattern here: the predicate layer already resolved every term and
-            // recorded provenance. Re-checking would duplicate the evaluator and could
-            // disagree with it, which is worse than trusting the recorded verdict.
             Self::InvariantViolated {
-                predicate, terms, ..
-            } => !predicate.trim().is_empty() && !terms.is_empty(),
+                predicate,
+                binding_manifest,
+                tx_index,
+                ..
+            } => {
+                use rustyfuzz_predicate::{
+                    InvariantOracle, InvariantSpec, NoReRead, Outcome, PredicateOracle,
+                    ReReadBudget, SequenceView,
+                };
+                if !execution
+                    .tx_results
+                    .iter()
+                    .any(|tx| tx.tx_index == *tx_index)
+                {
+                    return false;
+                }
+                // Sequence results do not carry block headers. Without an explicit
+                // replay environment, a block-dependent predicate cannot be proved.
+                if block.is_none()
+                    && predicate
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .any(|token| token == "block")
+                {
+                    return false;
+                }
+                let Ok(oracle) = PredicateOracle::new(
+                    InvariantSpec {
+                        name: "replay".into(),
+                        predicate: predicate.clone(),
+                    },
+                    binding_manifest,
+                ) else {
+                    return false;
+                };
+                let writes =
+                    crate::engine::invariant_runtime::writes_from(&execution.storage_diffs);
+                let reads = crate::engine::invariant_runtime::reads_from(&execution.storage_reads);
+                let view = SequenceView {
+                    writes: &writes,
+                    reads: &reads,
+                    block: block.unwrap_or_default(),
+                };
+                // Only observations from this replay may resolve operands. Missing
+                // slots stay Unknown; recorded discovery terms are never consulted.
+                matches!(
+                    oracle
+                        .check(&view, *tx_index, &mut NoReRead, ReReadBudget::new(0))
+                        .0,
+                    Outcome::False
+                )
+            }
         }
     }
 
@@ -570,11 +628,21 @@ impl RealismVerifier {
     ) -> RealismProofReport {
         let mut report = self.prove(base_state, block_env, input);
         if report.success {
-            if report
-                .execution
-                .as_ref()
-                .is_some_and(|execution| predicate.holds(execution))
-            {
+            if report.execution.as_ref().is_some_and(|execution| {
+                let tx_index = match predicate {
+                    ViolationPredicate::InvariantViolated { tx_index, .. } => *tx_index,
+                    _ => 0,
+                };
+                let mut env = block_env.clone();
+                self.time_warp.apply(&mut env, tx_index);
+                predicate.holds_with_block(
+                    execution,
+                    Some(rustyfuzz_predicate::BlockContext {
+                        number: rustyfuzz_predicate::Int256(env.number.to_be_bytes()),
+                        timestamp: rustyfuzz_predicate::Int256(env.timestamp.to_be_bytes()),
+                    }),
+                )
+            }) {
                 report.status = FindingStatus::Proved;
                 report.evidence_grade = EvidenceGrade::RealisticForkProof;
             } else {
@@ -1303,35 +1371,167 @@ mod invariant_predicate_tests {
         }
     }
 
-    #[test]
-    fn an_invariant_violation_with_terms_holds() {
-        let predicate = ViolationPredicate::from_invariant_violation(
-            "sum(userBalances) == totalSupply",
-            1,
-            vec![term("userBalances", "100"), term("totalSupply", "40")],
+    const MANIFEST: &str = r#"{
+        "target": "0x00000000000000000000000000000000000000aa",
+        "symbols": { "x": { "kind": "slot", "slot": "0x1", "offset_bits": 0, "width_bits": 256 } }
+    }"#;
+
+    fn predicate(text: &str, tx_index: usize) -> ViolationPredicate {
+        ViolationPredicate::from_invariant_violation(
+            text,
+            MANIFEST,
+            tx_index,
+            vec![term("x", "99")],
         )
-        .expect("a predicate with terms must be accepted");
-        // `holds` for this variant is evidence-based, not a re-derived call pattern.
-        let execution = crate::common::types::SequenceExecutionResult {
-            tx_results: Vec::new(),
-            total_gas_used: 0,
-            final_coverage_hash: 0,
-            storage_reads: Vec::new(),
-            storage_writes: Vec::new(),
-            storage_diffs: Vec::new(),
-            call_trace: Vec::new(),
-            oracle_observations: Vec::new(),
-        };
+        .expect("recorded violation")
+    }
+
+    fn fixture(values: &[u64]) -> (ChainState, EvmInput) {
+        use crate::common::types::SingletonTx;
+        use revm::{bytecode::Bytecode, primitives::Bytes, state::AccountInfo};
+        let caller = Address::repeat_byte(0x55);
+        let target = Address::with_last_byte(0xaa);
+        let mut db = CacheDB::new(ForkDb::empty());
+        db.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(10u128.pow(30)),
+                ..Default::default()
+            },
+        );
+        // Store calldata word 0 into slot 1.
+        let code = Bytecode::new_raw(Bytes::from(hex::decode("60003560015500").unwrap()));
+        db.insert_account_info(
+            target,
+            AccountInfo {
+                code_hash: code.hash_slow(),
+                code: Some(code),
+                ..Default::default()
+            },
+        );
+        let txs = values
+            .iter()
+            .map(|value| SingletonTx {
+                caller,
+                to: target,
+                value: U256::ZERO,
+                input: U256::from(*value).to_be_bytes::<32>().to_vec(),
+                is_victim: false,
+            })
+            .collect();
+        (ChainState::Evm(db), EvmInput::new(txs, 0))
+    }
+
+    #[test]
+    fn stale_recorded_terms_do_not_prove_a_satisfied_replay() {
+        let (base, input) = fixture(&[7]);
+        let predicate = predicate("x == 7", 0);
+        let verifier = RealismVerifier::new(1024);
+        let replay = verifier.prove(&base, &BlockEnv::default(), &input);
+        assert!(replay.success, "{replay:?}");
+        assert!(!predicate.holds(replay.execution.as_ref().unwrap()));
+        let report = verifier.prove_violation(&base, &BlockEnv::default(), &input, &predicate);
+        assert!(!report.success);
+        assert_eq!(report.status, FindingStatus::Rejected);
+        assert_eq!(report.evidence_grade, EvidenceGrade::DeterministicReplay);
+        assert_eq!(
+            report.rejection_reasons,
+            vec![RejectionReason::OracleWeakness]
+        );
+    }
+
+    #[test]
+    fn replay_proves_a_real_violation_at_the_recorded_transaction() {
+        let (base, input) = fixture(&[7, 8]);
+        let predicate = predicate("x == 8", 0);
+        let report = RealismVerifier::new(1024).prove_violation(
+            &base,
+            &BlockEnv::default(),
+            &input,
+            &predicate,
+        );
+        assert!(report.success, "{report:?}");
+        assert_eq!(report.status, FindingStatus::Proved);
+        assert_eq!(report.evidence_grade, EvidenceGrade::RealisticForkProof);
+        let execution = report.execution.unwrap();
         assert!(predicate.holds(&execution));
+        assert!(!self::predicate("x == 8", 1).holds(&execution));
+        assert!(!self::predicate("x == 8", 2).holds(&execution));
+        let json = serde_json::to_string(&predicate).unwrap();
+        assert!(serde_json::from_str::<ViolationPredicate>(&json)
+            .unwrap()
+            .holds(&execution));
+    }
+
+    #[test]
+    fn unknown_div0_and_invalid_configuration_cannot_prove_a_violation() {
+        let (base, input) = fixture(&[7]);
+        let execution = ReplayVerifier::new(1024)
+            .replay(&base, &BlockEnv::default(), &input)
+            .unwrap();
+        for text in ["old(x) == 0", "x / 0 == 0", "x ==", "block.number == 10"] {
+            assert!(!predicate(text, 0).holds(&execution), "{text}");
+        }
+        let mut missing = execution.clone();
+        missing.storage_diffs.clear();
+        missing.storage_reads.clear();
+        assert!(!predicate("x == 8", 0).holds(&missing));
+        let invalid =
+            ViolationPredicate::from_invariant_violation("x == 8", "{}", 0, vec![term("x", "99")])
+                .unwrap();
+        assert!(!invalid.holds(&execution));
+        let mut legacy = serde_json::to_value(predicate("x == 8", 0)).unwrap();
+        legacy["InvariantViolated"]
+            .as_object_mut()
+            .unwrap()
+            .remove("binding_manifest");
+        assert!(!serde_json::from_value::<ViolationPredicate>(legacy)
+            .unwrap()
+            .holds(&execution));
+    }
+
+    #[test]
+    fn proof_evaluates_block_fields_with_the_replayed_time_warp() {
+        let (base, input) = fixture(&[7, 8]);
+        let env = BlockEnv {
+            number: U256::from(100),
+            timestamp: U256::from(1000),
+            ..Default::default()
+        };
+        let verifier = RealismVerifier::with_time_warp(
+            1024,
+            rustyfuzz_evm::time_warp::TimeWarp::from_seconds(60, 2),
+        );
+        let satisfied = predicate(
+            "x == 8 && block.number == 102 && block.timestamp == 1060",
+            1,
+        );
+        let report = verifier.prove_violation(&base, &env, &input, &satisfied);
+        assert_eq!(report.status, FindingStatus::Rejected);
+        assert_eq!(
+            report.rejection_reasons,
+            vec![RejectionReason::OracleWeakness]
+        );
+        let violated = predicate("x == 8 && block.number == 100", 1);
+        let report = verifier.prove_violation(&base, &env, &input, &violated);
+        assert!(report.success, "{report:?}");
+        assert_eq!(report.status, FindingStatus::Proved);
     }
 
     #[test]
     fn a_violation_without_terms_is_not_a_predicate() {
         // The rule that makes this variant trustworthy: no observations, no proof.
-        assert!(ViolationPredicate::from_invariant_violation("x == y", 0, Vec::new()).is_none());
         assert!(
-            ViolationPredicate::from_invariant_violation("   ", 0, vec![term("a", "1")]).is_none()
+            ViolationPredicate::from_invariant_violation("x == y", MANIFEST, 0, Vec::new())
+                .is_none()
         );
+        assert!(ViolationPredicate::from_invariant_violation(
+            "   ",
+            MANIFEST,
+            0,
+            vec![term("a", "1")]
+        )
+        .is_none());
     }
 
     #[test]
@@ -1341,6 +1541,7 @@ mod invariant_predicate_tests {
         // test pins that a plain invariant violation now satisfies the is_some() half.
         let predicate = ViolationPredicate::from_invariant_violation(
             "approx_eq(lpSupply, functionCalc, 100, 6) && lpSupply <= functionCalc",
+            MANIFEST,
             3,
             vec![term("lpSupply", "1000001"), term("functionCalc", "1000000")],
         )

@@ -84,6 +84,7 @@ impl CounterexampleCandidate {
             // candidate cannot acquire one by accident.
             predicate_terms: Vec::new(),
             predicate_text: None,
+            predicate_manifest: None,
             predicate_tx_index: None,
             confidence: self.confidence,
             required_preconditions: self.replay_checks.clone(),
