@@ -193,11 +193,24 @@ occurrence increments **`division_by_zero_observed`** on the finding, so the aud
 sees the predicate was degenerate without the evaluator fabricating a value or
 silently suppressing the result.
 
-The counter is diagnostic only. It does not by itself downgrade, suppress, or promote
-a finding — the tri-state rule (§5) is unchanged, and a `False` verdict still stands
-as a violation. What it does is make the degenerate case *legible*: a reviewer
-looking at a finding with `division_by_zero_observed > 0` knows to distrust the
-predicate before distrusting the contract.
+**A non-zero counter changes the verdict (owner ruling, 2026-10-25).** The counter is
+not merely diagnostic. Division by zero can hide bugs: a predicate like `a / b <= X`
+*passes* when `b == 0`, because EVM `DIV` yields `0` and `0 <= X` holds. Reporting a
+plain `True` there would be the evaluator actively suppressing a real chance that the
+contract is broken.
+
+Therefore, when `division_by_zero_observed > 0`:
+
+- a would-be `True` is reported as **`Satisfied(div0 observed)`**, never a plain pass;
+- a would-be `False` still stands as a violation, because a violated predicate is not
+  made more reliable by arithmetic degeneracy — but the counter is carried into the
+  evidence;
+- the counter appears **in the finding text**, not buried in a metrics blob, so a
+  reader sees it without opening JSON.
+
+The distinction between `True` and `Satisfied(div0 observed)` matters because the
+scheduler treats them differently (§5.1): only a clean `True` is a pass. A
+div0-degraded satisfaction is "no signal", the same as `Unknown`.
 
 #### 4. Rounding on `/`: truncating toward zero (EVM `DIV`)
 
@@ -380,8 +393,10 @@ If neither holds, `sum(map)` is `UNKNOWN`. It is never `0`.
   attribution is already handled upstream; the binder does not re-derive it).
 - Transient storage (EIP-1153) — separate slot space, would need its own binding kind.
   Flagged as an extension, not silently omitted.
-- Slots whose value depends on `block.timestamp` at evaluation time (time warp).
-  The evaluator reads what the sequence produced, not what the clock says.
+- Writing `block.timestamp` or `block.number` from a predicate. They are **read-only**
+  (owner ruling, §9 item 6): a predicate may read the block environment as the
+  sequence observed it, but it may never set it. Setting would let an invariant
+  fabricate the very condition it checks.
 
 ---
 
@@ -405,6 +420,8 @@ returns a default that could be mistaken for evidence.**
 | 10 | unparseable predicate | `Error::Parse` with byte offset |
 | 11 | 256-bit add/sub/mul overflow | **wraps** (§3 item 1); becomes a violation only when the predicate wraps operands in `requires_no_overflow(...)` |
 | 12 | bit range out of bounds in a `Binding` | `Error::BadBinding` at compile time |
+| 12b | `offset_bits`/`width_bits` omitted in a manifest | **`Error::BadBinding` at manifest load**, before any fuzzing. Message: `binding X: offset_bits/width_bits required (no default)` |
+| 13 | `sum` over a mapping where some keys were never observed | `Unknown`, plus `unobserved_keys` **and `observed_keys` counts** in the metric, so "checked 3 keys" is distinguishable from "checked 3,000" |
 
 ### The tri-state rule
 
@@ -421,6 +438,40 @@ The evaluator returns `True` / `False` / `Unknown`. The campaign loop must obey:
 `crates/rustyfuzz-backtest` already models exactly this distinction
 (`PocOutcome::Inconclusive` is outside the numerator), and the predicate layer must
 feed it rather than bypass it.
+
+### 5.1 `Unknown` is "no signal" — the scheduler rule
+
+Owner ruling (2026-10-25): **`Unknown` must never auto-promote to a finding OR to a
+pass.** Treat it as no signal.
+
+The scheduler today has no notion of `Unknown` at all — scoring is driven by
+`CampaignScore` with no tri-state concept (`crates/rustyfuzz-engine/src/scheduler/mod.rs`).
+So this has to be built, and it has three obligations:
+
+| verdict | finding? | scheduler signal? |
+|---|---|---|
+| `False` (violated) | **yes** — subject to replay + PoC | strong positive |
+| `True` (clean pass) | no | weak negative: the property holds here |
+| `Satisfied(div0 observed)` | no | **no signal** — not a pass |
+| `Unknown` | **no** | **no signal** — not a pass, not a penalty |
+
+Concretely, `Unknown` must not:
+
+- increment a "satisfied" or "clean" counter;
+- raise a novelty or priority score;
+- be recorded as evidence that a property holds;
+- suppress a future evaluation of the same predicate on a later sequence.
+
+And it must:
+
+- be counted in the `unevaluable` metric reported alongside rediscovery;
+- carry why it was unknown (`UnobservedKeys { observed, unobserved }`,
+  `StaleEvidence`, `BudgetExceeded`, `NoWriteAtCurrentIndex`, …) so the gap is
+  diagnosable rather than opaque.
+
+The reason for the strictness: an `Unknown` that scores as a pass gives the search a
+false reason to stop looking, which is the same failure mode as the stale-`True` the
+owner rejected in §4.3 — and it is worse, because it is invisible in the report.
 
 ---
 
@@ -516,19 +567,31 @@ evaluator: the predicate text, the resolved value of every term with its
 `(address, slot, tx_index, source)`, the arithmetic, and the verdict. A finding that
 says only "invariant violated" is not evidence.
 
-Two arithmetic diagnostics are part of that evidence, because both indicate the
-predicate itself may be degenerate or may be asserting overflow intent:
+Arithmetic and coverage diagnostics are part of that evidence, because each one tells
+a reviewer that the predicate itself may be degenerate:
 
 | counter | source | what a reviewer should conclude |
 |---|---|---|
 | `division_by_zero_observed` | §3 item 3 | the predicate divided by zero; distrust the predicate before the contract |
 | `overflow_checked_sites` | §3 item 2 | how many `requires_no_overflow(...)` checks the verdict depends on |
 | `overflow_violations` | §3 item 2 | `> 0` means an auditor-declared no-overflow requirement was broken |
+| `observed_keys` | §9 item 4 | how many mapping keys the `sum` actually covered |
+| `unobserved_keys` | §9 item 4 | how many it could not; `> 0` forces `Unknown` |
 
-A `False` verdict with `division_by_zero_observed > 0` is still reported as a
-violation per §5, but its evidence must show the counter so the claim can be
-challenged on sight. This is the same principle as `UNKNOWN` in the tri-state rule:
-make the weakness visible rather than silently correct for it.
+**Placement rule (owner ruling, §9 item 8):** a counter is written **only when
+non-default**, but it is **always declared in the schema**. So a consumer distinguishes
+"counter was zero" from "this evaluator version does not have that counter" without
+guessing.
+
+`division_by_zero_observed` additionally appears **in the human-readable finding text**,
+not only in the structured blob, because it changes the verdict (`True` becomes
+`Satisfied(div0 observed)`) and a reader must see why on the face of the report.
+
+A `False` verdict with `division_by_zero_observed > 0` still stands as a violation
+(§5): arithmetic degeneracy does not make a violated predicate more reliable, but it
+does not erase a violation either. Its evidence carries the counter so the claim can be
+challenged on sight. Same principle as `Unknown` in the tri-state rule: make the
+weakness visible rather than silently correct for it.
 
 ---
 
@@ -570,15 +633,23 @@ Assuming one engineer, no parallelisation, and the existing test suite as the ga
 | 3 | Binding model incl. packed bit ranges (§4.4) | 2 | the packed-slot case is where bugs hide |
 | 4 | Mapping binding: finite key set + observed-key derivation | 2 | reuses `Waypoint::MappingDerivation` |
 | 5 | Value resolution: 4-step + on-demand re-read (§4.2, §4.3) | 3 | re-read provenance must be recorded per slot; own tests |
-| 6 | Evaluator returning tri-state + all 12 failure modes (§5) | 2 | no panics |
+| 6 | Evaluator returning tri-state + all 15 failure modes (§5) | 2 | no panics |
 | 6b | `requires_no_overflow`: widened-mode re-evaluation + per-site counters | 1 | must not change the wrapping value used elsewhere (§3 item 2) |
 | 7 | `InvariantOracle` trait + campaign-loop registration | 1 | additive; must not disturb existing oracles |
+| 7b | `Unknown` is "no signal" in the scheduler (§5.1) | 2 | the scheduler has no tri-state today; this is new plumbing, not a flag |
 | 8 | Finding evidence serialisation (§6.6) | 1 | needed for replay to be checkable |
 | 9 | End-to-end fixture: false predicate fires, true predicate silent (§6) | 2 | the acceptance gate for the whole layer |
 | 10 | Docs + `INCOMPLETE.md` update for unevaluable predicates | 1 | |
 
-**Total: 18 engineer-days ≈ 1–2 weeks of elapsed work** with review cycles. This
+**Total: 20 engineer-days ≈ 2 weeks of elapsed work** with review cycles. This
 matches `BRIEF_CORRECTIONS.md` correction 1 and `ROADMAP_v1.1.md` W2.
+
+Growth over the first estimate, itemised: +1 for component 6b
+(`requires_no_overflow` needs a widened re-evaluation path), +1 for component 5
+(dropping `Stale` means implementing the re-read and per-slot provenance), +2 for
+component 7b (`Unknown` must not score as a passing signal, and the scheduler has no
+tri-state concept to hook into — `crates/rustyfuzz-engine/src/scheduler/mod.rs` has
+no `Unknown` anywhere). None of these is a flag.
 
 Components 1–7 (plus 6b) are the minimum for a single end-to-end proof; 8–10 are
 required before any number is published from a predicate.
@@ -591,50 +662,33 @@ rather than accepting the weaker evidence and moving on. Neither is a flag.
 
 ---
 
-## 9. Open questions for owner review
+## 9. Rulings
 
-These block implementation and should be answered before code is written:
+**All items decided by owner ruling, 2026-10-25.** Nothing here blocks implementation.
 
-**Answered by owner ruling (2026-10-23):**
+| # | question | ruling |
+|---|---|---|
+| 1 | Overflow policy | **256-bit wrapping** for add/sub/mul, plus explicit `requires_no_overflow(expr)` |
+| 2 | Division / modulo by zero | **returns `0`** (EVM), counter `division_by_zero_observed`; **non-zero counter degrades a pass** to `Satisfied(div0 observed)` |
+| 3 | `Stale` reads | **`Unknown` for both** satisfaction and violation, with on-demand re-read |
+| 4 | `sum` over an unobserved key | **`Unknown`** + `unevaluable` metric carrying **both `observed_keys` and `unobserved_keys`** counts. The harness is **not** required to read every key — mappings cannot be enumerated, and requiring it would make `sum` unusable |
+| 5 | Bit-range omitted | **Refuse the binding, at manifest load, not at evaluation.** A predicate that only breaks mid-campaign wastes the run. Error text: `binding X: offset_bits/width_bits required (no default)` |
+| 6 | `block.timestamp` in v1 | **Include, read-only.** A predicate may read it; it may not set it. Deterministic advancement by the time warp is the condition that makes this safe |
+| 7 | `requires_no_overflow` naming | **Long form.** It appears in finding text a human reads, so clarity beats brevity. An alias can be added later without breaking anything |
+| 8 | Counter placement | **Only when non-default, but always declared in the schema.** Consumers never guess whether a counter was omitted or unsupported |
 
-1. ~~**Overflow policy (§3)**~~ → **DECIDED: 256-bit wrapping**, with an explicit
-   `requires_no_overflow(expr)` operator for auditors who want overflow itself to be
-   the finding. Rationale: a predicate models contract semantics; checked arithmetic
-   would suppress real findings wherever a contract wraps intentionally.
-2. ~~**Division / modulo by zero (§3, §5 item 4)**~~ → **DECIDED: returns `0`**
-   (EVM-faithful), accompanied by a `division_by_zero_observed` counter on the
-   finding so a mis-specified predicate is visible rather than silently handled.
-3. ~~**`Stale` reads (§4.3)**~~ → **DECIDED: `Unknown` for both satisfaction and
-   violation.** The agent's proposal to allow stale evidence for satisfaction only was
-   rejected: a stale `True` is as dangerous as a stale `False`, because it makes the
-   search stop looking. The fix is the on-demand re-read in §4.3 (a cached hash
-   lookup, not a network call), not a looser evidence model.
+Two items from earlier rounds that are worth restating because they are easy to
+lose in implementation:
 
-Items 3 and 4 of the original list (rounding on `/`, `%` sign) are **not open** —
-they are moot under an unsigned `Int` and are explained in §3.
+- **Division by zero must not masquerade as a clean pass.** `a / b <= X` passes when
+  `b == 0`, because EVM `DIV` yields `0`. A predicate with a non-zero div0 counter
+  reports `Satisfied(div0 observed)`, and that counter appears **in the finding
+  text**, not in a metrics blob (§3 item 3).
+- **`Unknown` is never a signal.** It must not promote to a finding, must not count
+  as a pass, and must not raise scheduler priority (§5.1).
 
-**Still open, needing a ruling before implementation** (referenced by name, not
-number, so this list cannot drift out of sync with §3):
-
-- **`sum` over an unobserved key (§5 item 5):** is `Unknown` acceptable, or should
-  the harness be *required* to read every key before a `sum` is allowed at all?
-  *Recommendation: `Unknown`, with an `unevaluable` metric so the gap is visible.*
-- **Bit-range default:** when a manifest omits `offset_bits`/`width_bits`, default to
-  the full slot, or refuse the binding? *Recommendation: refuse — silence about
-  packing is how access-control predicates break.*
-- **Scope of `block.timestamp`:** include it (§2 grammar) given that the time warp
-  already advances it deterministically, or leave it out of v1? *Recommendation:
-  include; it is already deterministic and several classes need it.*
-- **`requires_no_overflow` naming:** keep the long form, or alias it to a shorter
-  operator (e.g. `no_ovf(...)`)? It appears in every finding that uses it, so the
-  name is part of the report a human reads. *Recommendation: keep the long form —
-  the finding text should be self-explanatory without a legend.*
-- **Counter placement (§6.6):** are `division_by_zero_observed`,
-  `overflow_checked_sites` and `overflow_violations` carried on every finding, or only
-  when non-default? *Recommendation: only when non-default, but always present in the
-  serialised schema so a consumer never guesses.*
-
----
+Items 3 and 4 of the original arithmetic list (rounding on `/`, `%` sign) were never
+open — they are moot under an unsigned `Int` (§3).
 
 ## 10. What this document does not claim
 
