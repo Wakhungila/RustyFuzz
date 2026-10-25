@@ -78,6 +78,13 @@ impl CounterexampleCandidate {
             actor_roles: self.actor_roles,
             profit_delta: self.profit_delta,
             violated_invariant: self.violated_invariant,
+            // The counterexample search has no predicate evidence: it reasons over a
+            // model, not over resolved storage terms. Leaving these empty is honest --
+            // `from_invariant_violation` rejects a predicate with no terms, so such a
+            // candidate cannot acquire one by accident.
+            predicate_terms: Vec::new(),
+            predicate_text: None,
+            predicate_tx_index: None,
             confidence: self.confidence,
             required_preconditions: self.replay_checks.clone(),
             replayability_status: self.replayability_status,

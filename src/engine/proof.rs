@@ -98,9 +98,27 @@ impl ProofCarryingFinding {
                 .max_by_key(|finding| finding.severity.clone())
                 .map(|finding| finding.vuln.to_string()),
             invariant_id: candidate.violated_invariant.clone(),
-            violation_predicate: findings.iter().find_map(|finding| {
-                crate::common::verifier::ViolationPredicate::from_finding(finding, execution)
-            }),
+            // Prefer the invariant layer's predicate when the candidate carries one: it
+            // has resolved operands and a recorded verdict, which is stronger evidence
+            // than a call-pattern match. Fall back to the heuristic shape otherwise, so
+            // the existing DeniedMint path keeps working unchanged.
+            violation_predicate: candidate
+                .predicate_text
+                .as_deref()
+                .and_then(|text| {
+                    crate::common::verifier::ViolationPredicate::from_invariant_violation(
+                        text,
+                        candidate.predicate_tx_index.unwrap_or_default(),
+                        candidate.predicate_terms.clone(),
+                    )
+                })
+                .or_else(|| {
+                    findings.iter().find_map(|finding| {
+                        crate::common::verifier::ViolationPredicate::from_finding(
+                            finding, execution,
+                        )
+                    })
+                }),
             original_state_violation_verified: false,
             actor_roles: candidate.actor_roles.clone(),
             tx_sequence: candidate.sequence.clone(),
@@ -323,6 +341,9 @@ mod tests {
             actor_roles: BTreeMap::new(),
             profit_delta: Some(revm::primitives::U256::from(1)),
             violated_invariant: Some("share inflation".to_string()),
+            predicate_terms: Vec::new(),
+            predicate_text: None,
+            predicate_tx_index: None,
             confidence: 90,
             required_preconditions: vec!["fund attacker".to_string()],
             replayability_status: ReplayabilityStatus::Replayable,

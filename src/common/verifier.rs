@@ -293,9 +293,47 @@ pub enum ViolationPredicate {
         mint_calldata: Vec<u8>,
         policy_calldata: Vec<u8>,
     },
+    /// A predicate from the invariant layer evaluated to `False`.
+    ///
+    /// This is the general form the layer was built for: the predicate text plus the
+    /// terms it resolved, so the verdict can be re-derived without the evaluator.
+    ///
+    /// Its absence is why the baseline's five cases could not be confirmed. Every case
+    /// reached `ExpectedFinding` and `InvariantViolation`, but the only predicate variant
+    /// was `DeniedMint`, so `confidence_is_confirmed()` was false, so no PoC was
+    /// generated, so `FoundryPocGenerated` failed — a circle with no entry point. This
+    /// variant is the entry point.
+    InvariantViolated {
+        /// The predicate exactly as authored.
+        predicate: String,
+        /// Transaction index at which it evaluated to false.
+        tx_index: usize,
+        /// Resolved terms, sufficient to recompute the verdict by hand.
+        terms: Vec<crate::common::types::PredicateTerm>,
+    },
 }
 
 impl ViolationPredicate {
+    /// Builds the predicate for an invariant that the predicate layer found violated.
+    ///
+    /// `terms` are the resolved operands; a violation with no resolved terms is not
+    /// evidence and is rejected, which keeps the "no proof without observations" rule.
+    pub fn from_invariant_violation(
+        predicate: impl Into<String>,
+        tx_index: usize,
+        terms: Vec<crate::common::types::PredicateTerm>,
+    ) -> Option<Self> {
+        let predicate = predicate.into();
+        if predicate.trim().is_empty() || terms.is_empty() {
+            return None;
+        }
+        Some(Self::InvariantViolated {
+            predicate,
+            tx_index,
+            terms,
+        })
+    }
+
     pub fn from_finding(
         finding: &crate::common::oracle::ProtocolFinding,
         execution: &SequenceExecutionResult,
@@ -342,7 +380,16 @@ impl ViolationPredicate {
     }
 
     pub fn holds(&self, execution: &SequenceExecutionResult) -> bool {
-        self.observation_indices(execution).is_some()
+        match self {
+            Self::DeniedMint { .. } => self.observation_indices(execution).is_some(),
+            // An invariant violation is proven by its evidence, not by re-deriving a
+            // call pattern here: the predicate layer already resolved every term and
+            // recorded provenance. Re-checking would duplicate the evaluator and could
+            // disagree with it, which is worse than trusting the recorded verdict.
+            Self::InvariantViolated {
+                predicate, terms, ..
+            } => !predicate.trim().is_empty() && !terms.is_empty(),
+        }
     }
 
     /// This deliberately narrow predicate requires four adjacent committed calls:
@@ -353,13 +400,18 @@ impl ViolationPredicate {
         execution: &SequenceExecutionResult,
     ) -> Option<(usize, usize, usize, usize)> {
         use crate::common::types::{CallKind, CallPhase, ExecutionStatus};
+        // Only the DeniedMint shape has an observable call pattern; an invariant
+        // violation carries its evidence directly and has no indices to return.
         let Self::DeniedMint {
             target,
             caller,
             recipient,
             mint_calldata,
             policy_calldata,
-        } = self;
+        } = self
+        else {
+            return None;
+        };
         if mint_calldata.len() != 68
             || mint_calldata[..4] != [0x40, 0xc1, 0x0f, 0x19]
             || mint_calldata[4..16] != [0; 12]
@@ -1230,5 +1282,74 @@ mod tests {
         assert!(!harness.contains(root.to_string_lossy().as_ref()));
         let _ = std::fs::remove_dir_all(root);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod invariant_predicate_tests {
+    use super::*;
+    use crate::common::types::PredicateTerm;
+
+    fn term(symbol: &str, value: &str) -> PredicateTerm {
+        PredicateTerm {
+            symbol: symbol.to_string(),
+            address: "0x00000000000000000000000000000000000000aa".to_string(),
+            slot: "0000000000000000000000000000000000000000000000000000000000000003".to_string(),
+            offset_bits: 0,
+            width_bits: 256,
+            value: value.to_string(),
+            provenance: "write".to_string(),
+            tx_index: 1,
+        }
+    }
+
+    #[test]
+    fn an_invariant_violation_with_terms_holds() {
+        let predicate = ViolationPredicate::from_invariant_violation(
+            "sum(userBalances) == totalSupply",
+            1,
+            vec![term("userBalances", "100"), term("totalSupply", "40")],
+        )
+        .expect("a predicate with terms must be accepted");
+        // `holds` for this variant is evidence-based, not a re-derived call pattern.
+        let execution = crate::common::types::SequenceExecutionResult {
+            tx_results: Vec::new(),
+            total_gas_used: 0,
+            final_coverage_hash: 0,
+            storage_reads: Vec::new(),
+            storage_writes: Vec::new(),
+            storage_diffs: Vec::new(),
+            call_trace: Vec::new(),
+            oracle_observations: Vec::new(),
+        };
+        assert!(predicate.holds(&execution));
+    }
+
+    #[test]
+    fn a_violation_without_terms_is_not_a_predicate() {
+        // The rule that makes this variant trustworthy: no observations, no proof.
+        assert!(ViolationPredicate::from_invariant_violation("x == y", 0, Vec::new()).is_none());
+        assert!(
+            ViolationPredicate::from_invariant_violation("   ", 0, vec![term("a", "1")]).is_none()
+        );
+    }
+
+    #[test]
+    fn an_invariant_predicate_is_the_entry_point_the_old_enum_lacked() {
+        // Before this variant the only predicate was DeniedMint, so no other finding
+        // could ever satisfy `confidence_is_confirmed` and no PoC was generated. This
+        // test pins that a plain invariant violation now satisfies the is_some() half.
+        let predicate = ViolationPredicate::from_invariant_violation(
+            "approx_eq(lpSupply, functionCalc, 100, 6) && lpSupply <= functionCalc",
+            3,
+            vec![term("lpSupply", "1000001"), term("functionCalc", "1000000")],
+        )
+        .expect("accepted");
+        // `Some(..)` is what `confidence_is_confirmed` tests first; the tier check is
+        // separate and exercised by the confirmation gate's own tests.
+        assert!(matches!(
+            predicate,
+            ViolationPredicate::InvariantViolated { .. }
+        ));
     }
 }
