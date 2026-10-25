@@ -4780,6 +4780,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyfuzz-predicate"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "rustyfuzz-testkit"
 version = "0.1.0"
 
