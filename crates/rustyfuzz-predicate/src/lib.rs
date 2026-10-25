@@ -20,9 +20,13 @@
 //! capped before tokenisation. Exceeding either is a typed error, never a panic
 //! and never unbounded work.
 
+pub mod binding;
 pub mod expr;
 pub mod types;
 
+pub use binding::{
+    extract_bits, mapping_slot, Binding, BindingError, BindingKind, BindingManifest,
+};
 pub use expr::{BinOp, BlockField, Expr, ParseError, Symbol, U256Lit};
 pub use types::{
     compile, ArithmeticCounters, CheckedPredicate, CompileError, Int256, Sort, TypeError, Widened,
