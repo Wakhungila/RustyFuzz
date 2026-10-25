@@ -463,36 +463,56 @@ fn eval_binary(
     let right_eval = eval_expr(right, ctx, reader, budget, counters, coverage);
 
     if op.is_comparison() {
-        let (left_value, left_prov) = (left_eval.int(), left_eval.boolean());
-        let (right_value, right_bool) = (right_eval.int(), right_eval.boolean());
-        // Comparisons are typed, so both sides share a sort; handle each.
-        if let (Some((a, pa)), Some((b, pb))) = (left_value, right_value) {
-            let result = match op {
+        // Both sides must have resolved, or the comparison is undecidable. This check
+        // comes first: reading `.int()` and `.boolean()` eagerly and then branching
+        // silently dropped the int-vs-bool-literal case, which is the one real code
+        // needs (`verify(...) == false`).
+        let (
+            Eval::Known {
+                value: left_value,
+                provenance: left_prov,
+            },
+            Eval::Known {
+                value: right_value,
+                provenance: right_prov,
+            },
+        ) = (left_eval, right_eval)
+        else {
+            return Eval::Unknown;
+        };
+        let provenance = weaker(left_prov, right_prov);
+        let result = match (left_value, right_value) {
+            (Value::Int(a), Value::Int(b)) => match op {
                 BinOp::Eq => a == b,
                 BinOp::NotEq => a != b,
                 BinOp::Lt => a < b,
                 BinOp::LtEq => a <= b,
                 BinOp::Gt => a > b,
                 BinOp::GtEq => a >= b,
-                _ => unreachable!("checked is_comparison"),
-            };
-            return Eval::Known {
-                value: Value::Bool(result),
-                provenance: weaker(pa, pb),
-            };
-        }
-        if let (Some((a, pa)), Some((b, pb))) = (left_prov, right_bool) {
-            let result = match op {
+                _ => return Eval::Unknown,
+            },
+            (Value::Bool(a), Value::Bool(b)) => match op {
                 BinOp::Eq => a == b,
                 BinOp::NotEq => a != b,
-                _ => false,
-            };
-            return Eval::Known {
-                value: Value::Bool(result),
-                provenance: weaker(pa, pb),
-            };
-        }
-        return Eval::Unknown;
+                _ => return Eval::Unknown,
+            },
+            // Int against a boolean literal: the ABI word a verifier returns is an
+            // integer, so `verify(...) == false` must mean "the returned word is zero".
+            // The type checker only permits this against a literal (§3), so there is
+            // exactly one sensible reading and no silent coercion of two values.
+            (Value::Int(word), Value::Bool(literal)) | (Value::Bool(literal), Value::Int(word)) => {
+                let is_true = !word.is_zero();
+                match op {
+                    BinOp::Eq => is_true == literal,
+                    BinOp::NotEq => is_true != literal,
+                    _ => return Eval::Unknown,
+                }
+            }
+        };
+        return Eval::Known {
+            value: Value::Bool(result),
+            provenance,
+        };
     }
 
     let (Some((a, pa)), Some((b, pb))) = (left_eval.int(), right_eval.int()) else {

@@ -66,13 +66,20 @@ pub enum BindingError {
     UnboundSymbol { symbol: String },
 }
 
-/// What kind of storage location a symbol denotes.
+/// What a symbol denotes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingKind {
-    /// A single slot, possibly a sub-range of it.
+    /// A single storage slot, possibly a sub-range of it.
     Slot,
     /// A mapping rooted at `base_slot`, with an explicit key set.
     Mapping,
+    /// The return word of a pure/view function call.
+    ///
+    /// Exists because a whole class of real properties is a statement about a
+    /// function's *answer* rather than about stored state: a proof verifier's
+    /// invariant is "this forged proof does not verify", which lives in a return
+    /// value. Without this kind such a property is inexpressible.
+    ReturnValue,
 }
 
 /// A resolved storage location for one symbol.
@@ -106,7 +113,7 @@ impl Binding {
     /// the key to 32 bytes and `p` is the base slot as a 32-byte word.
     pub fn slot_for_key(&self, key: &[u8; 32]) -> [u8; 32] {
         match self.kind {
-            BindingKind::Slot => self.slot,
+            BindingKind::Slot | BindingKind::ReturnValue => self.slot,
             BindingKind::Mapping => mapping_slot(key, &self.slot),
         }
     }
@@ -119,6 +126,11 @@ impl Binding {
     /// Number of keys the manifest declared for a mapping.
     pub fn declared_key_count(&self) -> usize {
         self.keys.len()
+    }
+
+    /// True when the symbol is a function's return word rather than storage.
+    pub fn is_return_value(&self) -> bool {
+        matches!(self.kind, BindingKind::ReturnValue)
     }
 }
 
@@ -179,7 +191,9 @@ pub struct BindingManifest {
 pub struct RawBinding {
     pub kind: String,
     /// Slot for `slot` kind; base slot for `mapping`.
-    pub slot: String,
+    /// Storage slot for `slot`/`mapping`; absent for `return_value`.
+    #[serde(default)]
+    pub slot: Option<String>,
     #[serde(default)]
     pub offset_bits: Option<u16>,
     #[serde(default)]
@@ -248,16 +262,31 @@ fn resolve_one(symbol: &str, raw: &RawBinding, address: [u8; 20]) -> Result<Bind
         });
     }
 
-    let slot = parse_word("slot", &raw.slot)?;
     let kind = match raw.kind.as_str() {
         "slot" => BindingKind::Slot,
         "mapping" => BindingKind::Mapping,
+        "return_value" => BindingKind::ReturnValue,
         other => {
             return Err(BindingError::UnknownKind {
                 symbol: symbol.to_string(),
                 kind: other.to_string(),
             })
         }
+    };
+
+    // A return-value binding names an ABI-encoded word, not a storage slot, so it
+    // carries the selector for identification and a zero slot placeholder.
+    let slot = if matches!(kind, BindingKind::ReturnValue) {
+        match raw.slot.as_deref() {
+            Some(text) if !text.trim().is_empty() => parse_word("slot", text)?,
+            _ => [0u8; 32],
+        }
+    } else {
+        let text = raw.slot.as_deref().ok_or_else(|| BindingError::BadHex {
+            field: "slot",
+            value: String::new(),
+        })?;
+        parse_word("slot", text)?
     };
 
     let keys = if matches!(kind, BindingKind::Mapping) {

@@ -69,6 +69,8 @@ pub enum Unresolved {
     BadBitRange { offset: u16, width: u16 },
     #[error("re-read budget exhausted")]
     ReReadBudgetExhausted,
+    #[error("no return value for {selector} at {address}")]
+    NoReturnValue { address: String, selector: String },
 }
 
 impl Unresolved {
@@ -106,6 +108,15 @@ impl KeyCoverage {
 pub trait StateReader {
     /// Current value of `slot` at `address`, or `None` if unavailable.
     fn read_slot(&mut self, address: [u8; 20], slot: [u8; 32]) -> Option<[u8; 32]>;
+
+    /// Return word of the function identified by `selector` at `address`.
+    ///
+    /// Defaults to `None` so a storage-only reader keeps compiling; a caller that
+    /// binds a `return_value` symbol must supply an implementation, and a missing one
+    /// surfaces as `Unresolved` rather than as a wrong value.
+    fn read_return(&mut self, _address: [u8; 20], _selector: [u8; 4]) -> Option<[u8; 32]> {
+        None
+    }
 }
 
 /// A reader that refuses every read, for tests and for offline replay of a trace that
@@ -219,6 +230,24 @@ impl<'a> Resolver<'a> {
                 symbol: format!("{symbol} (a mapping must be used via sum/count)"),
             });
         }
+
+        // A return-value symbol has no storage history: the only authoritative source
+        // is asking the function. It is therefore step 3 only, and a reader that cannot
+        // answer leaves it Unresolved rather than defaulting to zero.
+        if binding.is_return_value() {
+            if !budget.take() {
+                return Err(Unresolved::ReReadBudgetExhausted);
+            }
+            let selector = selector_from_slot(&binding.slot);
+            return match reader.read_return(binding.address, selector) {
+                Some(word) => self.extract_from(binding, &word, Provenance::ReRead),
+                None => Err(Unresolved::NoReturnValue {
+                    address: crate::binding::hex(&binding.address),
+                    selector: crate::binding::hex(&selector),
+                }),
+            };
+        }
+
         let (address, slot) = (binding.address, binding.slot);
 
         // Step 1: a committed write at or before this point is authoritative.
@@ -415,6 +444,16 @@ impl<'a> Resolver<'a> {
         )?;
         Ok(Resolved { value, provenance })
     }
+}
+
+/// Reads the 4-byte selector carried in a `return_value` binding's word.
+///
+/// The manifest writes it as a short hex quantity (`0xdeadbeef`), and `parse_word`
+/// left-pads short quantities, so the selector occupies the **last** four bytes.
+/// Reading the first four silently yielded a zero selector, which looked like a
+/// missing function rather than a bug.
+fn selector_from_slot(word: &[u8; 32]) -> [u8; 4] {
+    [word[28], word[29], word[30], word[31]]
 }
 
 /// Orders provenance by descending trust, so a sum can report its weakest term.

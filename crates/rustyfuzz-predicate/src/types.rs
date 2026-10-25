@@ -105,9 +105,41 @@ pub fn sort_of(expr: &Expr) -> Result<Sort, TypeError> {
         Expr::Binary(op, left, right) => {
             let left_sort = sort_of(left)?;
             let right_sort = sort_of(right)?;
-            classify_binary(*op, left_sort, right_sort)?
+            if left_sort != right_sort && compares_against_bool_literal(*op, left, right) {
+                // Int-vs-boolean-literal comparison, e.g. `verify(...) == false`.
+                Sort::Bool
+            } else {
+                classify_binary(*op, left_sort, right_sort)?
+            }
         }
     })
+}
+
+/// True when one side is a literal `true`/`false` and the other is not a boolean.
+///
+/// Motivated by real code: a proof verifier's answer arrives as an ABI word, so the
+/// natural way to write "this forgery does not verify" is `verify(...) == false`. At the
+/// ABI level that word is an integer, so requiring a separate boolean sort would make
+/// the most common property in this domain inexpressible.
+///
+/// The allowance is deliberately narrow: it applies **only** to `==` and `!=`, and
+/// **only** when one side is a boolean *literal*. Two non-literal values of different
+/// sorts remain a type error, so `flag == count` is still rejected and the rule that a
+/// boolean value cannot be silently coerced to an integer still holds.
+fn compares_against_bool_literal(op: BinOp, left: &Expr, right: &Expr) -> bool {
+    if !matches!(op, BinOp::Eq | BinOp::NotEq) {
+        return false;
+    }
+    match (left, right) {
+        (Expr::Bool(_), other) | (other, Expr::Bool(_)) => {
+            // A boolean literal against a symbol whose value is an ABI word is the case
+            // real code needs: `verify(...) == false`. A boolean literal against an
+            // integer *literal* is not: `1 == true` has no defensible reading, so it
+            // stays a type error.
+            !matches!(other, Expr::Bool(_) | Expr::Int(_))
+        }
+        _ => false,
+    }
 }
 
 fn classify_binary(op: BinOp, left: Sort, right: Sort) -> Result<Sort, TypeError> {
@@ -487,6 +519,27 @@ mod tests {
             matches!(error, CompileError::Type(TypeError::OperandMismatch { .. })),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn a_symbol_may_be_compared_against_a_bool_literal_but_an_int_literal_may_not() {
+        // Real code needs `verify(...) == false`, where the symbol's value is an ABI
+        // word. The allowance must not spill over into `1 == true`, which has no
+        // defensible reading.
+        assert!(
+            compile("verifierAnswer == false").is_ok(),
+            "a symbol against a bool literal must be allowed"
+        );
+        assert!(
+            compile("verifierAnswer != true").is_ok(),
+            "!= must be allowed too"
+        );
+        assert!(
+            compile("1 == true").is_err(),
+            "an int literal against a bool literal must stay a type error"
+        );
+        // Ordering against a bool literal is never meaningful.
+        assert!(compile("verifierAnswer < true").is_err());
     }
 
     #[test]
