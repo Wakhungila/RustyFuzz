@@ -239,6 +239,12 @@ impl PredicateOracle {
     }
 
     /// Builds term evidence for the symbols this predicate touched.
+    ///
+    /// This runs **after** evaluation and re-resolves each symbol to record the value
+    /// the evaluator saw. It gets a fresh budget rather than sharing the evaluator's,
+    /// because the evaluator has already consumed its allowance and a starved evidence
+    /// pass would silently omit terms from a finding — the evidence would then look
+    /// complete while being partial.
     fn collect_terms(
         &self,
         view: &SequenceView<'_>,
@@ -248,12 +254,14 @@ impl PredicateOracle {
     ) -> Vec<TermEvidence> {
         let resolver = Resolver::new(&self.bindings, view.writes, view.reads, tx_index);
         let mut terms = Vec::new();
-        // A fresh budget per term would be unbounded overall; share one by giving each
-        // term a slice of the caller's budget.
-        let per_term = (budget.remaining() / self.bindings.len().max(1)).max(1);
+        // Each symbol gets enough allowance for its own key set, so a mapping with N
+        // keys is never starved by an unrelated term. The total is bounded by the
+        // caller's budget multiplied by the binding count, which keeps the work finite
+        // while letting complete evidence be recorded (§5 item 9b).
+        let per_symbol = budget.remaining().max(1);
         for (name, binding) in &self.bindings {
             let symbol = crate::Symbol(name.split('.').map(str::to_string).collect());
-            let mut local = ReReadBudget::new(per_term);
+            let mut local = ReReadBudget::new(per_symbol + binding.declared_key_count());
             let resolved = if binding.is_mapping() {
                 resolver
                     .resolve_sum(&symbol, reader, &mut local)

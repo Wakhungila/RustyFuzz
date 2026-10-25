@@ -35,7 +35,7 @@ pub use eval::{evaluate, verdict_text, BlockContext, EvalContext, Outcome, Reaso
 pub use expr::{BinOp, BlockField, Expr, ParseError, Symbol, U256Lit};
 pub use oracle::{
     term_value, Evidence, EvidenceCounters, InvariantOracle, InvariantRegistry, InvariantSpec,
-    OracleError, PredicateOracle, SequenceView, TermEvidence, Verdict,
+    OracleError, PredicateOracle, ProvenanceLabel, SequenceView, TermEvidence, Verdict,
 };
 pub use resolve::{
     KeyCoverage, NoReRead, Provenance, ReReadBudget, ReadRecord, Resolved, Resolver, StateReader,
