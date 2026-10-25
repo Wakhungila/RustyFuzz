@@ -81,6 +81,7 @@ enum Token {
     OrOr,
     Bang,
     Dot,
+    Comma,
     Eof,
 }
 
@@ -195,6 +196,7 @@ fn lex(input: &str) -> Result<Vec<SpannedToken>, ParseError> {
             '>' => Token::Gt,
             '!' => Token::Bang,
             '.' => Token::Dot,
+            ',' => Token::Comma,
             other => return Err(ParseError::UnexpectedChar { ch: other, offset }),
         };
         tokens.push(SpannedToken { token, offset });
@@ -426,6 +428,52 @@ impl Parser {
     /// Handles what follows an identifier: a call (`sum(...)`), a dotted path, or a
     /// bare symbol.
     fn parse_ident_tail(&mut self, name: String) -> Result<Expr, ParseError> {
+        // `approx_eq(a, b, tol, prec)` takes two expressions and two numeric literals,
+        // so it is routed before the symbol-call path.
+        if name == "approx_eq" {
+            if !matches!(self.peek(), Token::LParen) {
+                return Err(ParseError::Expected {
+                    expected: "`(` after approx_eq",
+                    offset: self.offset(),
+                });
+            }
+            self.advance();
+            let left = self.parse_arith()?;
+            if !matches!(self.advance(), Token::Comma) {
+                return Err(ParseError::Expected {
+                    expected: "`,` after approx_eq's first argument",
+                    offset: self.offset(),
+                });
+            }
+            let right = self.parse_arith()?;
+            if !matches!(self.advance(), Token::Comma) {
+                return Err(ParseError::Expected {
+                    expected: "`,` after approx_eq's second argument",
+                    offset: self.offset(),
+                });
+            }
+            let tolerance_bps = self.parse_u64_literal("tolerance")?;
+            if !matches!(self.advance(), Token::Comma) {
+                return Err(ParseError::Expected {
+                    expected: "`,` before approx_eq's precision",
+                    offset: self.offset(),
+                });
+            }
+            let precision = self.parse_u64_literal("precision")?;
+            if !matches!(self.advance(), Token::RParen) {
+                return Err(ParseError::Expected {
+                    expected: "`)`",
+                    offset: self.offset(),
+                });
+            }
+            return Ok(Expr::ApproxEq {
+                left: Box::new(left),
+                right: Box::new(right),
+                tolerance_bps,
+                precision,
+            });
+        }
+
         // `requires_no_overflow` takes an arithmetic expression, not a symbol, so it
         // must be routed before the symbol-call path below.
         if name == "requires_no_overflow" {
@@ -506,6 +554,30 @@ impl Parser {
         }
 
         Ok(Expr::Symbol(Symbol(segments)))
+    }
+
+    /// Reads a non-negative integer literal that must fit in a u64.
+    ///
+    /// Tolerances and precisions are small by construction; a value beyond u64 is an
+    /// authoring error rather than something to wrap.
+    fn parse_u64_literal(&mut self, what: &'static str) -> Result<u64, ParseError> {
+        match self.advance() {
+            Token::Int { value, .. } => {
+                if value[..24].iter().any(|byte| *byte != 0) {
+                    return Err(ParseError::Expected {
+                        expected: what,
+                        offset: self.offset(),
+                    });
+                }
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&value[24..]);
+                Ok(u64::from_be_bytes(bytes))
+            }
+            _ => Err(ParseError::Expected {
+                expected: what,
+                offset: self.offset(),
+            }),
+        }
     }
 
     fn parse_symbol(&mut self) -> Result<Symbol, ParseError> {

@@ -69,6 +69,20 @@ pub fn sort_of(expr: &Expr) -> Result<Sort, TypeError> {
         Expr::Old(_) | Expr::Delta(_) => Sort::Int,
         Expr::Sum(_) | Expr::Count(_) => Sort::Int,
         Expr::BlockEnv(BlockField::Number | BlockField::Timestamp) => Sort::Int,
+        Expr::ApproxEq { left, right, .. } => {
+            // Both sides are integers and the result is a boolean, exactly like a
+            // comparison. A non-integer operand is a type error for the same reason.
+            let left_sort = sort_of(left)?;
+            let right_sort = sort_of(right)?;
+            if left_sort != Sort::Int || right_sort != Sort::Int {
+                return Err(TypeError::OperandMismatch {
+                    op: "approx_eq",
+                    left: left_sort,
+                    right: right_sort,
+                });
+            }
+            Sort::Bool
+        }
         Expr::RequiresNoOverflow(inner) => {
             let inner_sort = sort_of(inner)?;
             if inner_sort != Sort::Int {
@@ -472,6 +486,10 @@ fn collect_symbols(expr: &Expr, out: &mut Vec<Symbol>) {
         }
         Expr::RequiresNoOverflow(inner) | Expr::Neg(inner) | Expr::Not(inner) => {
             collect_symbols(inner, out)
+        }
+        Expr::ApproxEq { left, right, .. } => {
+            collect_symbols(left, out);
+            collect_symbols(right, out);
         }
         Expr::Binary(_, left, right) => {
             collect_symbols(left, out);

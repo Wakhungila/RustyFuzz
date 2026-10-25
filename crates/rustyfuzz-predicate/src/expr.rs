@@ -27,6 +27,19 @@ pub enum Expr {
     BlockEnv(BlockField),
     /// `requires_no_overflow(expr)`.
     RequiresNoOverflow(Box<Expr>),
+    /// `approx_eq(a, b, tolerance_bps, precision)`.
+    ///
+    /// Models Foundry's `assertApproxEqRelN`, whose semantics are
+    /// `(|a - b| * 10^precision) / b <= tolerance_bps`. Exists because a well's LP
+    /// supply is a calculated quantity, so its invariant is "within N significant
+    /// digits", not "exactly equal"; an exact comparison would report false violations
+    /// on every rounding difference.
+    ApproxEq {
+        left: Box<Expr>,
+        right: Box<Expr>,
+        tolerance_bps: u64,
+        precision: u64,
+    },
     /// Unary negation, which wraps (§3 item 1).
     Neg(Box<Expr>),
     /// Logical negation.

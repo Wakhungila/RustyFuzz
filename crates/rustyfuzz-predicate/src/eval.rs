@@ -306,6 +306,30 @@ fn eval_expr(
                 Eval::Unknown
             }
         },
+        Expr::ApproxEq {
+            left,
+            right,
+            tolerance_bps,
+            precision,
+        } => {
+            // Foundry's `assertApproxEqRelN(a, b, maxPercentDelta, precision)`:
+            //   if b == 0 -> require a == 0
+            //   percentDelta = (|a - b| * 10^precision) / b
+            //   pass iff percentDelta <= maxPercentDelta
+            // Reproduced exactly, including the b == 0 special case and the integer
+            // division, because a looser reading would report false violations on
+            // rounding differences the target's own test tolerates.
+            let left_value = eval_expr(left, ctx, reader, budget, counters, coverage).int();
+            let right_value = eval_expr(right, ctx, reader, budget, counters, coverage).int();
+            let (Some((a, pa)), Some((b, pb))) = (left_value, right_value) else {
+                return Eval::Unknown;
+            };
+            let passed = approx_eq_rel(a, b, *tolerance_bps, *precision);
+            Eval::Known {
+                value: Value::Bool(passed),
+                provenance: weaker(pa, pb),
+            }
+        }
         Expr::RequiresNoOverflow(inner) => {
             // Evaluates the operand twice: once wrapping (the value the contract
             // would compute) and once widened (whether it fit). The wrapping value is
@@ -542,6 +566,61 @@ fn eval_binary(
     Eval::Known {
         value: Value::Int(value),
         provenance,
+    }
+}
+
+/// `assertApproxEqRelN` semantics, transcribed.
+///
+/// `(|a - b| * 10^precision) / b <= tolerance_bps`, with `b == 0` requiring `a == 0`.
+///
+/// Two details matter and are easy to get wrong:
+///
+/// * the special case is on **b**, not on either argument: a zero *expected* value
+///   demands exact equality;
+/// * the division is integer and happens **after** the scaling, so a large `precision`
+///   loses no information while a small one deliberately does.
+///
+/// Overflow of `|a - b| * 10^precision` is possible for extreme values. It yields
+/// `false` rather than wrapping, because a silently wrapped delta would make an
+/// enormous discrepancy look tiny — the one error direction that hides a bug.
+fn approx_eq_rel(a: Int256, b: Int256, tolerance_bps: u64, precision: u64) -> bool {
+    if b.is_zero() {
+        // "If the expected is 0, actual must be too."
+        return a.is_zero();
+    }
+    let delta = if a > b {
+        a.wrapping_sub(b)
+    } else {
+        b.wrapping_sub(a)
+    };
+    // 10^precision, saturating at the largest scaled value we can represent.
+    let Some(scale) = pow10(precision) else {
+        // A precision beyond any representable scale means an authoring error. Treat it
+        // as an unsatisfiable tolerance rather than pretending it passes.
+        return false;
+    };
+    let Some(scaled) = checked_mul(delta, scale) else {
+        return false;
+    };
+    let percent_delta = scaled.evm_div(b);
+    percent_delta <= Int256::from_u64(tolerance_bps)
+}
+
+/// 10^`exponent`, or `None` when it does not fit in 256 bits.
+fn pow10(exponent: u64) -> Option<Int256> {
+    let mut value = Int256::ONE;
+    let ten = Int256::from_u64(10);
+    for _ in 0..exponent {
+        value = checked_mul(value, ten)?;
+    }
+    Some(value)
+}
+
+/// Multiplication that fails instead of wrapping, for the tolerance computation.
+fn checked_mul(a: Int256, b: Int256) -> Option<Int256> {
+    match crate::types::Widened::mul(a, b) {
+        crate::types::Widened::Fits(value) => Some(value),
+        crate::types::Widened::Overflowed => None,
     }
 }
 
