@@ -18,6 +18,7 @@ use crate::engine::exploit_path::{
 };
 use crate::engine::exploit_synthesizer::synthesize_foundry_poc_with_findings;
 use crate::engine::flashloan::validate_flashloan_profit;
+use crate::engine::invariant_file::InvariantFile;
 use crate::engine::proof::{ProofCarryingFinding, ProofConfidenceTier};
 use crate::engine::protocol_model::CounterexampleSearchEngine;
 use crate::engine::scoring::CampaignScore;
@@ -85,6 +86,7 @@ pub enum PocGenerationExpectation {
 }
 
 const MAX_BENCHMARK_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_INVARIANT_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_BENCHMARK_MANIFESTS: usize = 10_000;
 const MAX_BENCHMARK_FIXTURE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CARGO_WORKSPACE_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -94,6 +96,7 @@ enum BenchmarkReadKind {
     Manifest,
     Fixture,
     WorkspaceManifest,
+    InvariantFile,
 }
 
 impl BenchmarkReadKind {
@@ -102,6 +105,7 @@ impl BenchmarkReadKind {
             Self::Manifest => "benchmark manifest",
             Self::Fixture => "benchmark fixture",
             Self::WorkspaceManifest => "Cargo workspace manifest",
+            Self::InvariantFile => "benchmark invariant file",
         }
     }
 }
@@ -666,6 +670,10 @@ pub struct BenchmarkManifest {
     pub mode: BenchmarkMode,
     pub target: Option<String>,
     pub fixture: Option<String>,
+    /// Optional authored predicates and bindings for offline executable fixtures.
+    /// The path is relative to the workspace root and participates in the input digest.
+    #[serde(default)]
+    pub invariant_file: Option<String>,
     #[serde(skip)]
     pub manifest_root: Option<PathBuf>,
     #[serde(skip)]
@@ -818,6 +826,50 @@ impl BenchmarkManifest {
         .with_context(|| format!("bound benchmark fixture {}", canonical.display()))?;
         Ok(Some(canonical))
     }
+
+    fn resolve_invariant_file_path(&self) -> Result<Option<PathBuf>> {
+        let Some(raw_path) = self.invariant_file.as_deref() else {
+            return Ok(None);
+        };
+        let relative = Path::new(raw_path);
+        anyhow::ensure!(
+            !relative.is_absolute()
+                && relative.components().all(|component| {
+                    matches!(component, std::path::Component::Normal(_))
+                }),
+            "benchmark invariant file path must be relative to the manifest workspace root and contain no traversal"
+        );
+        let root = self
+            .manifest_root
+            .as_deref()
+            .context("benchmark manifest has no authoritative root")?
+            .canonicalize()
+            .with_context(|| format!("canonicalize benchmark manifest root {}", self.id))?;
+        let candidate = root.join(relative);
+        let mut component = Some(candidate.as_path());
+        while let Some(path) = component {
+            let metadata = fs::symlink_metadata(path)?;
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "benchmark invariant file path must not contain symlink components"
+            );
+            component = path.parent();
+        }
+        let canonical = candidate
+            .canonicalize()
+            .with_context(|| format!("canonicalize benchmark invariant file {raw_path}"))?;
+        anyhow::ensure!(
+            canonical.starts_with(&root),
+            "benchmark invariant file escapes the manifest workspace root"
+        );
+        bounded_file_metadata(
+            &canonical,
+            BenchmarkReadKind::InvariantFile,
+            MAX_INVARIANT_FILE_BYTES,
+        )
+        .with_context(|| format!("bound benchmark invariant file {}", canonical.display()))?;
+        Ok(Some(canonical))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -849,11 +901,19 @@ struct SyntheticBenchmarkFixture {
 #[derive(Debug, Clone, Deserialize)]
 struct LiveBenchmarkFixture {
     #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
     fork_cache: Option<ForkDbCacheSnapshot>,
     #[serde(default)]
     fork_cache_profile: Option<LiveForkCacheProfile>,
     #[serde(default)]
     provider_replay_only: bool,
+    #[serde(default)]
+    offline_replay: bool,
+    #[serde(default)]
+    chain_id: Option<u64>,
+    #[serde(default)]
+    block_number: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1011,6 +1071,19 @@ pub struct BenchmarkReportDigests {
     pub config_digest: String,
     pub manifest_digest: String,
     pub fixture_digest: Option<String>,
+    #[serde(default)]
+    pub invariant_file_digest: Option<String>,
+}
+
+/// PoC validation is separate from generating a PoC file.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PocValidationStatus {
+    #[default]
+    NotAttempted,
+    Passed,
+    Failed,
+    Inconclusive,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1053,6 +1126,8 @@ pub struct BenchmarkValidationResult {
     #[serde(default)]
     pub proof: Option<ProofCarryingFinding>,
     pub foundry_poc_generated: bool,
+    #[serde(default)]
+    pub poc_validation_status: PocValidationStatus,
     #[serde(default)]
     pub failure_kind: BenchmarkFailureKind,
     #[serde(default)]
@@ -1121,12 +1196,6 @@ pub struct ValidationContext {
     pub fork_block: Option<u64>,
     pub block_env: Option<BlockEnv>,
     pub report_dir: Option<PathBuf>,
-}
-
-impl ValidationContext {
-    fn live_fork_ready(&self) -> bool {
-        self.rpc_url.is_some() && self.fork_block.is_some() && self.block_env.is_some()
-    }
 }
 
 impl ValidationRunner {
@@ -1250,6 +1319,18 @@ impl ValidationRunner {
                 "manifest does not declare success criteria".to_string(),
             );
         }
+        if manifest.invariant_file.is_some()
+            && !matches!(
+                manifest.mode,
+                BenchmarkMode::ExecutableEvm | BenchmarkMode::MainnetFork
+            )
+        {
+            return self.failed_result(
+                manifest,
+                "authored invariant files are currently supported only for executable_evm fixtures and stateful mainnet_fork replay"
+                    .to_string(),
+            );
+        }
         match manifest.mode {
             BenchmarkMode::ExecutableEvm => {
                 let execute = || -> Result<BenchmarkValidationResult> {
@@ -1258,21 +1339,160 @@ impl ValidationRunner {
                         .context("missing executable fixture path")?;
                     let fixture = load_executable_fixture(&path)?;
                     anyhow::ensure!(Some(fixture.target) == manifest.target_address(), "fixture target differs from manifest target");
-                    let (execution, mut evidence) = fixture.execute(&path)?;
-                    let findings = ProtocolOraclePack::default().evaluate(&execution);
+                    let invariant_file = manifest
+                        .resolve_invariant_file_path()?
+                        .map(|path| {
+                            let raw = read_benchmark_text(
+                                &path,
+                                BenchmarkReadKind::InvariantFile,
+                                MAX_INVARIANT_FILE_BYTES,
+                            )?;
+                            InvariantFile::from_json(&raw)
+                                .with_context(|| format!("parse invariant file {}", path.display()))
+                        })
+                        .transpose()?;
+                    let registry = invariant_file
+                        .as_ref()
+                        .map(InvariantFile::build_registry)
+                        .transpose()?;
+                    if let Some(invariant_file) = &invariant_file {
+                        let invariant_target = Address::from_str(&invariant_file.target)
+                            .context("invariant file target is not a valid address")?;
+                        anyhow::ensure!(
+                            invariant_target == fixture.target,
+                            "invariant file target differs from executable fixture target"
+                        );
+                        anyhow::ensure!(
+                            invariant_file.symbols.values().all(|binding| binding.kind != "return_value"),
+                            "offline executable benchmark predicates currently require storage bindings; return_value bindings are not executable in this replay path"
+                        );
+                        anyhow::ensure!(
+                            fixture.transactions.iter().all(|tx| {
+                                tx.timestamp == fixture.environment.timestamp
+                            }),
+                            "authored predicate replay currently requires every transaction timestamp to match the fixture's initial timestamp"
+                        );
+                    }
+                    let super::executable_fixture::ExecutableFixtureReplay {
+                        execution,
+                        mut evidence,
+                        invariant_violation,
+                        proof_base,
+                        block_env,
+                        input,
+                    } = fixture.execute_with_invariants(&path, registry.as_ref())?;
+                    let mut findings = ProtocolOraclePack::default().evaluate(&execution);
                     let (matching, unmatched): (Vec<_>, Vec<_>) = findings.iter().cloned()
                         .partition(|finding| manifest.vulnerability_class.matches_finding(finding));
                     evidence.matching_signals = matching;
                     evidence.unmatched_signals = unmatched;
-                     let observation = ValidationObservation { findings,
-                         executions: Some(execution.tx_results.len() as u64), synthetic_profile: false, ..Default::default() };
+                    let mut exploit_candidate = None;
+                    let mut proof = None;
+                    if let (Some(invariant_file), Some(violation)) =
+                        (invariant_file.as_ref(), invariant_violation.as_ref())
+                    {
+                        let invariant_name = invariant_file
+                            .invariants
+                            .iter()
+                            .find(|entry| entry.predicate == violation.predicate)
+                            .map(|entry| entry.name.as_str())
+                            .context("predicate checker returned an unregistered invariant")?;
+                        findings.push(ProtocolFinding {
+                            pack: protocol_pack_for_class(&manifest.vulnerability_class),
+                            vuln: VulnType::InvariantViolation(violation.predicate.clone()),
+                            severity: ProtocolSeverity::High,
+                            tx_index: Some(violation.tx_index),
+                            target: Some(fixture.target),
+                            evidence: format!(
+                                "authored invariant `{invariant_name}` violated: {}; expected: {}",
+                                violation.predicate,
+                                manifest.expected_invariant.as_deref().unwrap_or("authored invariant")
+                            ),
+                        });
+                        let state_novelty = synthetic_state_novelty(&execution);
+                        let score = crate::engine::scoring::CampaignScorer::default().score(
+                            &input,
+                            &execution,
+                            &state_novelty,
+                            &findings,
+                            &[],
+                        );
+                        let mut candidate = ExploitPathBuilder::from_execution(
+                            &input,
+                            &execution,
+                            &findings,
+                            &score,
+                        )
+                        .context("authored predicate violation did not produce a proof candidate")?;
+                        violation.attach_to(&mut candidate, &execution, &findings);
+                        let mut finding_proof = candidate
+                            .proof
+                            .take()
+                            .context("authored predicate candidate has no proof record")?;
+                        let original_replay = finding_proof
+                            .verify_original_state_with_time_warp(
+                                &proof_base,
+                                &block_env,
+                                MAP_SIZE,
+                                rustyfuzz_evm::time_warp::TimeWarp::NONE,
+                            )
+                            .context("authored predicate could not be replayed from fixture state")?;
+                        if !original_replay
+                            .execution
+                            .as_ref()
+                            .is_some_and(|replayed| executable_replay_matches(&execution, replayed))
+                        {
+                            finding_proof.original_state_violation_verified = false;
+                            finding_proof = finding_proof.with_replay_result(
+                                crate::engine::proof::ReplayVerificationStatus::Mismatch {
+                                    reason: "fresh original-state replay transaction effects differed from executable fixture run".to_string(),
+                                },
+                            );
+                        }
+                        let confirmation = FindingConfirmationGate::new(
+                            FindingConfirmationConfig {
+                                min_confirmed_score: 0,
+                                require_minimized: false,
+                                require_actor_labels: false,
+                                require_protocol_assertion: false,
+                                ..FindingConfirmationConfig::default()
+                            },
+                        )
+                        .evaluate(Some(&finding_proof), &findings, &score);
+                        finding_proof.confidence_tier = confirmation.tier;
+                        candidate.proof = Some(finding_proof.clone());
+                        exploit_candidate = Some(candidate);
+                        proof = Some(finding_proof);
+                    }
+                    let observation = ValidationObservation {
+                        findings,
+                        exploit_candidate,
+                        proof,
+                        proof_status: None,
+                        executions: Some(execution.tx_results.len() as u64),
+                        synthetic_profile: true,
+                        ..Default::default()
+                    };
                     let mut result = self.evaluate_observation(manifest, &observation);
-                    // Negative controls measure raw oracle false positives, not
-                    // proof-generation success. No proof/candidate is constructed.
-                    result.found = !evidence.matching_signals.is_empty();
-                    result.status = if result.found { ValidationStatus::Found } else { ValidationStatus::NotFound };
-                    result.reason = format!("executed {} EVM transactions; {} matching signals; {} unmatched signals",
-                        evidence.transactions.len(), evidence.matching_signals.len(), evidence.unmatched_signals.len());
+                    if registry.is_none() {
+                        // Existing controls without authored predicates continue to measure
+                        // raw oracle signals; they are not proof-confirmed results.
+                        result.found = !evidence.matching_signals.is_empty();
+                        result.status = if result.found { ValidationStatus::Found } else { ValidationStatus::NotFound };
+                    }
+                    result.reason = format!(
+                        "executed {} local EVM transactions; {} matching oracle signals; {} unmatched signals; predicate proof {}",
+                        evidence.transactions.len(),
+                        evidence.matching_signals.len(),
+                        evidence.unmatched_signals.len(),
+                        if result.proof.as_ref().is_some_and(|proof| proof.confidence_is_confirmed()) {
+                            "confirmed"
+                        } else if registry.is_some() {
+                            "not confirmed"
+                        } else {
+                            "not configured"
+                        }
+                    );
                     result.runtime = Some(evidence);
                     Ok(result)
                 };
@@ -1321,11 +1541,13 @@ impl ValidationRunner {
                 }
             }
             BenchmarkMode::MainnetFork => {
-                if !context.live_fork_ready() {
+                if context.block_env.is_none()
+                    || manifest.fork_block.or(context.fork_block).is_none()
+                {
                     return self.skipped_result(
                         manifest,
                         ValidationStatus::SkippedByConfig,
-                        "mainnet-fork benchmark requires rpc_url, fork_block, and block env in validation context"
+                        "mainnet-fork benchmark requires a pinned fork_block and block environment; use an offline_replay fixture with a verified fork cache to omit rpc_url"
                             .to_string(),
                     );
                 }
@@ -1505,6 +1727,7 @@ impl ValidationRunner {
                 .or_else(|| candidate.map(|candidate| candidate.proof_status.clone())),
             proof: proof.cloned(),
             foundry_poc_generated,
+            poc_validation_status: PocValidationStatus::NotAttempted,
             failure_kind,
             expected_oracle: manifest.expected_oracle.clone(),
             expected_minimum_evidence_grade: manifest.expected_minimum_evidence_grade.clone(),
@@ -1584,6 +1807,7 @@ impl ValidationRunner {
             proof_status: None,
             proof: None,
             foundry_poc_generated: false,
+            poc_validation_status: PocValidationStatus::NotAttempted,
             failure_kind,
             expected_oracle: manifest.expected_oracle.clone(),
             expected_minimum_evidence_grade: manifest.expected_minimum_evidence_grade.clone(),
@@ -1644,6 +1868,7 @@ impl ValidationRunner {
             proof_status: None,
             proof: None,
             foundry_poc_generated: false,
+            poc_validation_status: PocValidationStatus::NotAttempted,
             failure_kind: BenchmarkFailureKind::SetupFailure,
             expected_oracle: manifest.expected_oracle.clone(),
             expected_minimum_evidence_grade: manifest.expected_minimum_evidence_grade.clone(),
@@ -1822,10 +2047,7 @@ impl ValidationRunner {
         fixture_path: &Path,
         context: &ValidationContext,
     ) -> Result<ValidationObservation> {
-        let rpc_url = context
-            .rpc_url
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("missing RPC URL in validation context"))?;
+        let rpc_url = context.rpc_url.as_deref();
         let fork_block = manifest.fork_block.or(context.fork_block).ok_or_else(|| {
             anyhow::anyhow!("missing fork block in validation context or manifest")
         })?;
@@ -1847,6 +2069,55 @@ impl ValidationRunner {
         .with_context(|| format!("read live benchmark fixture {}", fixture_path.display()))?;
         let live_fixture = serde_json::from_str::<LiveBenchmarkFixture>(&raw)
             .with_context(|| format!("parse live benchmark fixture {}", fixture_path.display()))?;
+        let invariant_file = manifest
+            .resolve_invariant_file_path()?
+            .map(|path| {
+                let raw = read_benchmark_text(
+                    &path,
+                    BenchmarkReadKind::InvariantFile,
+                    MAX_INVARIANT_FILE_BYTES,
+                )?;
+                InvariantFile::from_json(&raw)
+                    .with_context(|| format!("parse invariant file {}", path.display()))
+            })
+            .transpose()?;
+        let invariant_registry = invariant_file
+            .as_ref()
+            .map(InvariantFile::build_registry)
+            .transpose()?;
+        let fixture_target = live_fixture
+            .target
+            .as_deref()
+            .map(Address::from_str)
+            .transpose()
+            .context("live fixture target is not a valid address")?;
+        if live_fixture.offline_replay {
+            anyhow::ensure!(
+                fixture_target == manifest.target_address(),
+                "offline replay fixture target differs from benchmark manifest target"
+            );
+        }
+        if let Some(invariant_file) = &invariant_file {
+            let target = Address::from_str(&invariant_file.target)
+                .context("invariant file target is not a valid address")?;
+            anyhow::ensure!(
+                Some(target) == manifest.target_address(),
+                "invariant file target differs from benchmark manifest target"
+            );
+            if let Some(fixture_target) = fixture_target {
+                anyhow::ensure!(
+                    fixture_target == target,
+                    "invariant file target differs from live fixture target"
+                );
+            }
+            anyhow::ensure!(
+                invariant_file
+                    .symbols
+                    .values()
+                    .all(|binding| binding.kind != "return_value"),
+                "stateful mainnet-fork replay currently requires storage bindings; return_value bindings are not executable in this replay path"
+            );
+        }
         let intelligence = SeedIntelligence::default();
         let mut candidates = intelligence
             .parse_historical_seed_json(&raw)
@@ -1869,26 +2140,68 @@ impl ValidationRunner {
 
         let started = std::time::Instant::now();
         let replay_verifier = ReplayVerifier::new(MAP_SIZE);
-        let prepared_replay_cache = select_replay_cache(&live_fixture, manifest)?
-            .map(|selection| {
-                prepare_replay_cache(selection, fork_block, |snapshot| {
-                    validate_cached_fork_snapshot(snapshot, rpc_url, fork_block).map_err(|error| {
-                        anyhow::anyhow!(
-                            "explicit cached fork fixture failed live validation: {}",
-                            sanitize_report_error(&error.to_string())
-                        )
-                    })
+        let cache_selection = select_replay_cache(&live_fixture, manifest)?;
+        let prepared_replay_cache = match (live_fixture.offline_replay, cache_selection) {
+            (true, Some(ReplayCacheSelection::Explicit(snapshot))) => {
+                snapshot
+                    .verify_content_digest()
+                    .map_err(|error| anyhow::anyhow!("offline fork snapshot integrity: {error}"))?;
+                ensure_fork_provenance_complete(
+                    &snapshot.provenance,
+                    fork_block,
+                    "offline fork snapshot",
+                )?;
+                snapshot
+                    .ensure_consistent(Some(fork_block), None, None, None, true)
+                    .map_err(|error| anyhow::anyhow!("offline fork snapshot provenance: {error}"))?;
+                anyhow::ensure!(
+                    live_fixture.chain_id == snapshot.provenance.chain_id,
+                    "offline replay fixture chain_id does not match fork snapshot provenance"
+                );
+                anyhow::ensure!(
+                    live_fixture.block_number == Some(fork_block),
+                    "offline replay fixture block_number does not match pinned fork block"
+                );
+                Some(PreparedReplayCache {
+                    snapshot,
+                    synthetic_profile: true,
                 })
-            })
-            .transpose()?;
+            }
+            (true, Some(ReplayCacheSelection::ProfileSynthetic(_))) => {
+                anyhow::bail!("offline_replay requires an explicit fork_cache snapshot, not a synthetic profile")
+            }
+            (true, None) => anyhow::bail!(
+                "offline_replay requires an explicit fork_cache snapshot; no RPC or provider-only fallback is permitted"
+            ),
+            (false, selection) => {
+                let rpc_url = rpc_url.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "live fork replay requires rpc_url; set offline_replay=true only when the fixture contains an explicit pinned fork_cache"
+                    )
+                })?;
+                selection
+                    .map(|selection| {
+                        prepare_replay_cache(selection, fork_block, |snapshot| {
+                            validate_cached_fork_snapshot(snapshot, rpc_url, fork_block)
+                                .map_err(|error| {
+                                    anyhow::anyhow!(
+                                        "explicit cached fork fixture failed live validation: {}",
+                                        sanitize_report_error(&error.to_string())
+                                    )
+                                })
+                        })
+                    })
+                    .transpose()?
+            }
+        };
         let minimization_snapshot = prepared_replay_cache
             .as_ref()
             .map(|cache| cache.snapshot.clone());
         let replay_economic_delta;
         let proof_base;
         anyhow::ensure!(
-            !live_fixture.provider_replay_only,
-            "provider_replay_only is unsupported: independent eth_call requests do not preserve sequence state or prove an invariant; use local EVM replay with a pinned fork/cache"
+            !live_fixture.provider_replay_only || live_fixture.offline_replay,
+            "provider_replay_only cannot prove a stateful sequence by itself; attach an explicit pinned fork_cache and opt into offline_replay, or provide a stateful live fork"
         );
         let (execution, replay_backend, synthetic_profile) = if let Some(cache) =
             prepared_replay_cache
@@ -1908,7 +2221,7 @@ impl ValidationRunner {
                 replay_provenance_equivalent_explicit_cache(
                     &replay_verifier,
                     &cache.snapshot,
-                    rpc_url,
+                    rpc_url.context("validated explicit cache requires an RPC URL")?,
                     fork_block,
                     &block_env,
                     &input,
@@ -1917,12 +2230,17 @@ impl ValidationRunner {
             };
             replay_economic_delta = Some(replay.delta);
             let backend = if synthetic_profile {
-                "synthetic-fork-cache-profile"
+                if live_fixture.offline_replay {
+                    "offline-pinned-fork-cache"
+                } else {
+                    "synthetic-fork-cache-profile"
+                }
             } else {
                 "cached-fork-fixture"
             };
             (replay.execution, backend, synthetic_profile)
         } else {
+            let rpc_url = rpc_url.context("live fork replay requires an RPC URL")?;
             let live_db = ForkDb::new(rpc_url.to_string(), fork_block);
             let observed = live_db.refresh_remote_provenance().map_err(|error| {
                 anyhow::anyhow!(
@@ -1947,7 +2265,40 @@ impl ValidationRunner {
             (replay.execution, "rpc-live-fork", false)
         };
         let elapsed_secs = started.elapsed().as_secs_f64();
-        let findings = ProtocolOraclePack::default().evaluate(&execution);
+        let mut findings = ProtocolOraclePack::default().evaluate(&execution);
+        let invariant_violation = invariant_registry.as_ref().and_then(|registry| {
+            crate::engine::invariant_runtime::check_observed_sequence(
+                registry,
+                &execution,
+                &block_env,
+                rustyfuzz_evm::time_warp::TimeWarp::DEFAULT,
+            )
+        });
+        if let (Some(invariant_file), Some(violation)) =
+            (invariant_file.as_ref(), invariant_violation.as_ref())
+        {
+            let invariant_name = invariant_file
+                .invariants
+                .iter()
+                .find(|entry| entry.predicate == violation.predicate)
+                .map(|entry| entry.name.as_str())
+                .context("predicate checker returned an unregistered invariant")?;
+            findings.push(ProtocolFinding {
+                pack: protocol_pack_for_class(&manifest.vulnerability_class),
+                vuln: VulnType::InvariantViolation(violation.predicate.clone()),
+                severity: ProtocolSeverity::High,
+                tx_index: Some(violation.tx_index),
+                target: manifest.target_address(),
+                evidence: format!(
+                    "authored invariant `{invariant_name}` violated: {}; expected: {}",
+                    violation.predicate,
+                    manifest
+                        .expected_invariant
+                        .as_deref()
+                        .unwrap_or("authored invariant")
+                ),
+            });
+        }
         let state_novelty = synthetic_state_novelty(&execution);
         let mut score = crate::engine::scoring::CampaignScorer::default().score(
             &input,
@@ -1980,12 +2331,17 @@ impl ValidationRunner {
                 .candidate
                 .map(|candidate| candidate.into_exploit_path_candidate())
         });
+        if let (Some(candidate), Some(violation)) =
+            (exploit_candidate.as_mut(), invariant_violation.as_ref())
+        {
+            violation.attach_to(candidate, &execution, &findings);
+        }
         if let Some(candidate) = exploit_candidate.as_mut() {
             candidate.minimized_sequence_status = live_minimized_status(
                 manifest,
                 &input,
                 &block_env,
-                rpc_url,
+                rpc_url.unwrap_or_default(),
                 fork_block,
                 minimization_snapshot.as_ref(),
                 synthetic_profile,
@@ -2007,7 +2363,12 @@ impl ValidationRunner {
             foundry_poc_path: None,
             synthetic_profile,
             false_positive_notes: vec![format!(
-                "live-fork benchmark from `{}`",
+                "{} from `{}`",
+                if live_fixture.offline_replay {
+                    "offline cached fork replay"
+                } else {
+                    "live-fork benchmark"
+                },
                 fixture_path.display()
             )],
         };
@@ -2042,7 +2403,36 @@ impl ValidationRunner {
             }
             let replay_result = proof.verify_against(&execution, &replay_findings);
             proof = proof.with_replay_result(replay_result);
-            proof.verify_original_state(&proof_base, &block_env, MAP_SIZE);
+            if invariant_registry.is_some() {
+                if let Some(replay_report) = proof.verify_original_state_with_time_warp(
+                    &proof_base,
+                    &block_env,
+                    MAP_SIZE,
+                    rustyfuzz_evm::time_warp::TimeWarp::DEFAULT,
+                ) {
+                    if !replay_report.execution.as_ref().is_some_and(|replayed| {
+                        executable_replay_matches(&execution, replayed)
+                    }) {
+                        proof.original_state_violation_verified = false;
+                        proof = proof.with_replay_result(
+                            crate::engine::proof::ReplayVerificationStatus::Mismatch {
+                                reason: "fresh original-state replay transaction effects differed from observed fork replay".to_string(),
+                            },
+                        );
+                    }
+                }
+            } else {
+                proof.verify_original_state(&proof_base, &block_env, MAP_SIZE);
+            }
+            let confirmation = FindingConfirmationGate {
+                config: FindingConfirmationConfig {
+                    require_protocol_assertion: false,
+                    require_actor_labels: false,
+                    ..FindingConfirmationConfig::default()
+                },
+            }
+            .evaluate(Some(&proof), &findings, &score);
+            proof.confidence_tier = confirmation.tier;
             proof
         });
 
@@ -2066,30 +2456,38 @@ impl ValidationRunner {
                     )
             })
         {
-            let Some(strongest) = findings
-                .iter()
-                .max_by_key(|finding| finding.severity.clone())
-            else {
-                anyhow::bail!(
-                    "live-fork replay was proof-confirmed but produced no protocol finding for PoC generation"
+            if let Some(rpc_url) = rpc_url {
+                let Some(strongest) = findings
+                    .iter()
+                    .max_by_key(|finding| finding.severity.clone())
+                else {
+                    anyhow::bail!(
+                        "live-fork replay was proof-confirmed but produced no protocol finding for PoC generation"
+                    );
+                };
+                let poc_dir = report_dir.join("validation").join(&manifest.id);
+                fs::create_dir_all(&poc_dir).with_context(|| {
+                    format!("create validation artifact dir {}", poc_dir.display())
+                })?;
+                let poc_path = synthesize_foundry_poc_with_findings(
+                    &input,
+                    &strongest.vuln,
+                    Some(&execution),
+                    &findings,
+                    &poc_dir,
+                    rpc_url,
+                    fork_block,
+                )?;
+                observation.foundry_poc_path = Some(PathBuf::from(poc_path.clone()));
+                observation.artifact_path = observation.foundry_poc_path.clone();
+                if let Some(proof) = observation.proof.take() {
+                    observation.proof = Some(proof.with_foundry_poc_path(&poc_path));
+                }
+            } else {
+                observation.false_positive_notes.push(
+                    "Foundry PoC generation was not attempted because offline replay has no RPC endpoint"
+                        .to_string(),
                 );
-            };
-            let poc_dir = report_dir.join("validation").join(&manifest.id);
-            fs::create_dir_all(&poc_dir)
-                .with_context(|| format!("create validation artifact dir {}", poc_dir.display()))?;
-            let poc_path = synthesize_foundry_poc_with_findings(
-                &input,
-                &strongest.vuln,
-                Some(&execution),
-                &findings,
-                &poc_dir,
-                rpc_url,
-                fork_block,
-            )?;
-            observation.foundry_poc_path = Some(PathBuf::from(poc_path.clone()));
-            observation.artifact_path = observation.foundry_poc_path.clone();
-            if let Some(proof) = observation.proof.take() {
-                observation.proof = Some(proof.with_foundry_poc_path(&poc_path));
             }
         }
 
@@ -3185,6 +3583,16 @@ fn load_manifest_file(path: &Path, manifest_root: &Path) -> Result<BenchmarkMani
     };
     manifest.manifest_root = Some(manifest_root.to_path_buf());
     manifest.resolved_fixture = manifest.resolve_fixture_path()?;
+    if let Some(invariant_path) = manifest.resolve_invariant_file_path()? {
+        let raw = read_benchmark_text(
+            &invariant_path,
+            BenchmarkReadKind::InvariantFile,
+            MAX_INVARIANT_FILE_BYTES,
+        )?;
+        let invariant_file = InvariantFile::from_json(&raw)
+            .with_context(|| format!("parse invariant file {}", invariant_path.display()))?;
+        invariant_file.build_registry()?;
+    }
     Ok(manifest)
 }
 
@@ -3237,18 +3645,32 @@ fn benchmark_report_digests(
         .ok()
         .map(|raw| sha256_digest(raw.as_bytes()))
     });
+    let resolved_invariant_file = manifest.resolve_invariant_file_path().ok().flatten();
+    let invariant_file_digest = resolved_invariant_file.as_deref().and_then(|path| {
+        read_benchmark_text(
+            path,
+            BenchmarkReadKind::InvariantFile,
+            MAX_INVARIANT_FILE_BYTES,
+        )
+        .ok()
+        .map(|raw| sha256_digest(raw.as_bytes()))
+    });
     let mut input_payload = Vec::new();
     input_payload.extend_from_slice(b"manifest:");
     input_payload.extend_from_slice(manifest_digest.as_bytes());
     input_payload.push(b'\0');
     input_payload.extend_from_slice(b"fixture:");
     input_payload.extend_from_slice(fixture_digest.as_deref().unwrap_or("").as_bytes());
+    input_payload.push(b'\0');
+    input_payload.extend_from_slice(b"invariant_file:");
+    input_payload.extend_from_slice(invariant_file_digest.as_deref().unwrap_or("").as_bytes());
     let config_payload = benchmark_config_payload(manifest, context);
     BenchmarkReportDigests {
         input_digest: sha256_digest(&input_payload),
         config_digest: sha256_digest(&serde_json::to_vec(&config_payload).unwrap_or_default()),
         manifest_digest,
         fixture_digest,
+        invariant_file_digest,
     }
 }
 
@@ -3287,13 +3709,61 @@ fn evidence_class(mode: BenchmarkMode, synthetic_profile: bool) -> BenchmarkEvid
     }
 }
 
+fn protocol_pack_for_class(class: &VulnerabilityClass) -> ProtocolOraclePackKind {
+    match class {
+        VulnerabilityClass::Erc20MintInflation | VulnerabilityClass::ApprovalAllowanceAbuse => {
+            ProtocolOraclePackKind::Erc20
+        }
+        VulnerabilityClass::Erc4626ShareInflation
+        | VulnerabilityClass::DonationInflationAttack
+        | VulnerabilityClass::FeeAccountingMismatch
+        | VulnerabilityClass::RoundingPrecisionLoss
+        | VulnerabilityClass::StaleAccounting
+        | VulnerabilityClass::Reentrancy => ProtocolOraclePackKind::Erc4626,
+        VulnerabilityClass::AmmInvariantViolation => ProtocolOraclePackKind::Amm,
+        VulnerabilityClass::LiquidationAbuse => ProtocolOraclePackKind::Lending,
+        VulnerabilityClass::GovernanceTimelockBypass => ProtocolOraclePackKind::Governance,
+        VulnerabilityClass::BridgeReplayFinalizationBug => ProtocolOraclePackKind::Bridge,
+        VulnerabilityClass::AccessControlBypass => ProtocolOraclePackKind::ProxyUpgradeability,
+        VulnerabilityClass::OracleManipulation => ProtocolOraclePackKind::RuntimePanic,
+    }
+}
+
+fn executable_replay_matches(
+    observed: &SequenceExecutionResult,
+    replayed: &SequenceExecutionResult,
+) -> bool {
+    // Fixture and verifier coverage instrumentation differ; compare transaction effects,
+    // not coverage bookkeeping, to establish replay equivalence.
+    observed.total_gas_used == replayed.total_gas_used
+        && observed.storage_reads == replayed.storage_reads
+        && observed.storage_writes == replayed.storage_writes
+        && observed.storage_diffs == replayed.storage_diffs
+        && observed.call_trace == replayed.call_trace
+        && observed.tx_results.len() == replayed.tx_results.len()
+        && observed
+            .tx_results
+            .iter()
+            .zip(&replayed.tx_results)
+            .all(|(observed, replayed)| {
+                observed.tx_index == replayed.tx_index
+                    && observed.status == replayed.status
+                    && observed.gas_used == replayed.gas_used
+                    && observed.output == replayed.output
+                    && observed.storage_reads == replayed.storage_reads
+                    && observed.storage_writes == replayed.storage_writes
+                    && observed.storage_diffs == replayed.storage_diffs
+                    && observed.call_trace == replayed.call_trace
+            })
+}
+
 fn evidence_class_for_manifest(manifest: &BenchmarkManifest) -> BenchmarkEvidenceClass {
     if matches!(
         manifest.mode,
-        BenchmarkMode::MainnetFork | BenchmarkMode::BlindRediscovery
+        BenchmarkMode::ExecutableEvm | BenchmarkMode::MainnetFork | BenchmarkMode::BlindRediscovery
     ) {
-        // A skipped or failed live benchmark has not authenticated RPC/cache
-        // provenance, so it must not enter production-live aggregates.
+        // Offline bytecode fixtures and unverified live benchmarks are regression
+        // evidence, not authenticated production observations.
         BenchmarkEvidenceClass::SyntheticRegression
     } else {
         evidence_class(manifest.mode.clone(), false)
@@ -3425,10 +3895,10 @@ fn calibration_from_results(
         average_executions_to_signal: average_u64(&execs),
         useful_seed_sources: {
             let mut sources = Vec::new();
-            if results.iter().any(|result| result.runtime.is_some()) {
+            if all_results.iter().any(|result| result.runtime.is_some()) {
                 sources.push("executable EVM fixture transaction sequences".to_string());
             }
-            if results.iter().any(|result| result.runtime.is_none()) {
+            if all_results.iter().any(|result| result.runtime.is_none()) {
                 sources.extend([
                     "benchmark seed hints".to_string(),
                     "manual selector hints".to_string(),
@@ -3895,6 +4365,7 @@ mod tests {
             mode: BenchmarkMode::LocalFixture,
             target: Some("0x1111111111111111111111111111111111111111".to_string()),
             fixture: None,
+            invariant_file: None,
             manifest_root: None,
             resolved_fixture: None,
             chain: None,
@@ -4060,6 +4531,7 @@ mod tests {
             mode: BenchmarkMode::LocalFixture,
             target: Some("0x1111111111111111111111111111111111111111".to_string()),
             fixture: Some(fixture),
+            invariant_file: None,
             manifest_root: Some(manifest_root),
             resolved_fixture: None,
             chain: None,
@@ -4101,6 +4573,7 @@ mod tests {
             mode: BenchmarkMode::MainnetFork,
             target: Some("0x1111111111111111111111111111111111111111".to_string()),
             fixture: Some(fixture),
+            invariant_file: None,
             manifest_root: Some(manifest_root),
             resolved_fixture: None,
             chain: Some("evm".to_string()),
@@ -4476,9 +4949,13 @@ success_criteria = ["expected_finding", "invariant_violation"]
     #[test]
     fn explicit_fork_cache_is_production_only_after_provenance_validation() {
         let fixture = LiveBenchmarkFixture {
+            target: None,
             fork_cache: Some(validated_cache_snapshot(123)),
             fork_cache_profile: None,
             provider_replay_only: false,
+            offline_replay: false,
+            chain_id: Some(1),
+            block_number: Some(123),
         };
         let cache = select_replay_cache(
             &fixture,
@@ -4515,9 +4992,13 @@ success_criteria = ["expected_finding", "invariant_violation"]
     #[test]
     fn profile_fork_cache_stays_synthetic_and_skips_explicit_validation() {
         let fixture = LiveBenchmarkFixture {
+            target: None,
             fork_cache: None,
             fork_cache_profile: Some(LiveForkCacheProfile::Noop),
             provider_replay_only: false,
+            offline_replay: false,
+            chain_id: Some(1),
+            block_number: Some(123),
         };
         let cache = select_replay_cache(
             &fixture,
@@ -4539,6 +5020,185 @@ success_criteria = ["expected_finding", "invariant_violation"]
         assert_eq!(validation_calls, 0);
         assert!(prepared.synthetic_profile);
         assert!(!prepared.production_eligible());
+    }
+
+    #[test]
+    fn pinned_offline_fork_snapshot_executes_without_rpc_and_stays_synthetic() {
+        let base = std::env::temp_dir().join(format!(
+            "rustyfuzz-offline-fork-replay-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&base).expect("create temporary fixture directory");
+        let fixture_path = base.join("offline.json");
+        let invariant_path = base.join("offline-invariants.json");
+        let target = Address::repeat_byte(0x11);
+        let caller = Address::repeat_byte(0xaa);
+        let cache_db = ForkDb::empty();
+        cache_db.cache_account(
+            caller,
+            AccountInfo {
+                balance: U256::from(10u128.pow(30)),
+                ..AccountInfo::default()
+            },
+        );
+        cache_db.cache_account(
+            target,
+            AccountInfo::default().with_code(Bytecode::new_raw(
+                vec![0x60, 0x01, 0x60, 0x00, 0x55, 0x00].into(),
+            )),
+        );
+        let mut snapshot = cache_db.cache_snapshot();
+        snapshot.block_tag = "123".to_string();
+        snapshot.provenance = ForkCacheProvenance {
+            provider_sanitized: "https://rpc.example".to_string(),
+            chain_id: Some(1),
+            block_number: Some(123),
+            block_hash: Some(format!("0x{:064x}", 123)),
+            fetched_at_unix: Some(1),
+            cache_id: Some("offline-fixture-cache".to_string()),
+        };
+        snapshot.content_digest = snapshot
+            .calculate_content_digest()
+            .expect("calculate cache content digest");
+        let fixture = serde_json::json!({
+            "offline_replay": true,
+            "provider_replay_only": true,
+            "chain_id": 1,
+            "block_number": 123,
+            "target": target,
+            "fork_cache": snapshot,
+            "transactions": [{
+                "from": caller,
+                "to": target,
+                "value": "0",
+                "input": "0x60000000",
+                "success": true
+            }]
+        });
+        fs::write(
+            &fixture_path,
+            serde_json::to_vec(&fixture).expect("serialize offline fixture"),
+        )
+        .expect("write offline fixture");
+        fs::write(
+            &invariant_path,
+            serde_json::to_vec(&serde_json::json!({
+                "target": target,
+                "symbols": {
+                    "owner": {
+                        "kind": "slot",
+                        "slot": "0x0",
+                        "offset_bits": 0,
+                        "width_bits": 256
+                    }
+                },
+                "invariants": [{
+                    "name": "ownerMustStayZero",
+                    "predicate": "owner == 0"
+                }]
+            }))
+            .unwrap(),
+        )
+        .expect("write authored invariant file");
+        let manifest = live_manifest(
+            fixture_path.to_str().expect("UTF-8 fixture path"),
+            VulnerabilityClass::AccessControlBypass,
+        );
+        let mut manifest = manifest;
+        manifest.invariant_file = Some("offline-invariants.json".to_string());
+        let result = ValidationRunner.run_manifest_with_context(
+            &manifest,
+            &ValidationContext {
+                rpc_url: None,
+                fork_block: Some(123),
+                block_env: Some(BlockEnv::default()),
+                report_dir: Some(base.join("reports")),
+            },
+        );
+        let _ = fs::remove_dir_all(&base);
+
+        assert_eq!(
+            result.status,
+            ValidationStatus::NotFound,
+            "{}",
+            result.reason
+        );
+        assert!(result.executed);
+        assert!(!result.found);
+        assert_eq!(
+            result.evidence_class,
+            BenchmarkEvidenceClass::SyntheticRegression
+        );
+        let proof = result
+            .proof
+            .as_ref()
+            .expect("observed invariant violation produces a proof record");
+        assert!(proof.original_state_violation_verified);
+        assert!(proof.confidence_is_confirmed());
+        assert!(proof.violation_predicate.is_some());
+        assert!(!result.foundry_poc_generated);
+        assert_eq!(
+            result.poc_validation_status,
+            PocValidationStatus::NotAttempted
+        );
+        assert!(result
+            .false_positive_notes
+            .iter()
+            .any(|note| { note.contains("offline-pinned-fork-cache") }));
+        assert!(result
+            .false_positive_notes
+            .iter()
+            .any(|note| { note.contains("unauthenticated cached fork snapshot") }));
+    }
+
+    #[test]
+    fn offline_fork_replay_refuses_to_fall_back_without_a_snapshot() {
+        let base = std::env::temp_dir().join(format!(
+            "rustyfuzz-offline-fork-no-snapshot-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&base).expect("create temporary fixture directory");
+        let fixture_path = base.join("offline.json");
+        fs::write(
+            &fixture_path,
+            serde_json::to_vec(&serde_json::json!({
+                "offline_replay": true,
+                "provider_replay_only": true,
+                "chain_id": 1,
+                "block_number": 123,
+                "target": "0x1111111111111111111111111111111111111111",
+                "transactions": [{
+                    "from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "to": "0x1111111111111111111111111111111111111111",
+                    "value": "0",
+                    "input": "0x60000000",
+                    "success": true
+                }]
+            }))
+            .unwrap(),
+        )
+        .expect("write provider-only fixture");
+        let manifest = live_manifest(
+            fixture_path.to_str().expect("UTF-8 fixture path"),
+            VulnerabilityClass::AccessControlBypass,
+        );
+        let result = ValidationRunner.run_manifest_with_context(
+            &manifest,
+            &ValidationContext {
+                rpc_url: None,
+                fork_block: Some(123),
+                block_env: Some(BlockEnv::default()),
+                report_dir: None,
+            },
+        );
+        let _ = fs::remove_dir_all(&base);
+
+        assert_eq!(result.status, ValidationStatus::FailedExecution);
+        assert!(!result.executed && !result.found);
+        assert!(result
+            .reason
+            .contains("offline_replay requires an explicit fork_cache snapshot"));
+        assert!(result.proof.is_none() && result.artifact_path.is_none());
     }
 
     #[test]
@@ -4749,7 +5409,7 @@ success_criteria = ["expected_finding"]
         assert!(
             result
                 .reason
-                .contains("provider_replay_only is unsupported"),
+                .contains("provider_replay_only cannot prove a stateful sequence"),
             "{}",
             result.reason
         );
@@ -4899,6 +5559,7 @@ success_criteria = ["expected_finding"]
             mode: BenchmarkMode::BlindRediscovery,
             target: Some("0x1111111111111111111111111111111111111111".to_string()),
             fixture: Some("blind.json".to_string()),
+            invariant_file: None,
             manifest_root: Some(base.clone()),
             resolved_fixture: None,
             chain: Some("evm".to_string()),
@@ -4991,6 +5652,7 @@ success_criteria = ["expected_finding"]
             mode: BenchmarkMode::BlindRediscovery,
             target: Some("0x1111111111111111111111111111111111111111".to_string()),
             fixture: Some("blind-confirmed.json".to_string()),
+            invariant_file: None,
             manifest_root: Some(base.clone()),
             resolved_fixture: None,
             chain: Some("evm".to_string()),

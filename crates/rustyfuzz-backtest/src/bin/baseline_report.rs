@@ -121,8 +121,8 @@ fn main() {
         "header": {
             "schema_version": 1,
             "generated_by": "cargo run -p rustyfuzz-backtest --bin baseline_report",
-            "commit_hash": std::env::var("GIT_COMMIT_HASH").unwrap_or_else(|_| "b3bafb44d297f3fae357659fa0f647327ecbe4da".to_string()),
-            "working_tree": "dirty (pre-existing changes; see docs/reality/FACTS.md capture)",
+            "commit_hash": std::env::var("GIT_COMMIT_HASH").unwrap_or_else(|_| "unknown".to_string()),
+            "working_tree": std::env::var("GIT_WORKING_TREE").unwrap_or_else(|_| "unknown".to_string()),
             "note": "Corpus is 7 Tier-1 cases, NOT 150. See docs/backtest/BRIEF_CORRECTIONS.md correction 5.",
             "sources": [
                 {"path": args[1], "summary": historical.summary},

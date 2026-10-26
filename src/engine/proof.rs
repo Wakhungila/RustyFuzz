@@ -163,15 +163,26 @@ impl ProofCarryingFinding {
         environment: &revm::context::BlockEnv,
         map_size: usize,
     ) -> Option<crate::common::verifier::RealismProofReport> {
+        self.verify_original_state_with_time_warp(
+            base,
+            environment,
+            map_size,
+            rustyfuzz_evm::time_warp::TimeWarp::DEFAULT,
+        )
+    }
+
+    pub fn verify_original_state_with_time_warp(
+        &mut self,
+        base: &crate::common::types::ChainState,
+        environment: &revm::context::BlockEnv,
+        map_size: usize,
+        time_warp: rustyfuzz_evm::time_warp::TimeWarp,
+    ) -> Option<crate::common::verifier::RealismProofReport> {
         self.original_state_violation_verified = false;
         let predicate = self.violation_predicate.as_ref()?;
         let input = crate::evm::fuzz::EvmInput::new(self.tx_sequence.clone(), 0);
-        let report = crate::common::verifier::RealismVerifier::new(map_size).prove_violation(
-            base,
-            environment,
-            &input,
-            predicate,
-        );
+        let report = crate::common::verifier::RealismVerifier::with_time_warp(map_size, time_warp)
+            .prove_violation(base, environment, &input, predicate);
         self.original_state_violation_verified =
             report.success && report.status == crate::common::oracle::FindingStatus::Proved;
         self.replay_result = if self.original_state_violation_verified {

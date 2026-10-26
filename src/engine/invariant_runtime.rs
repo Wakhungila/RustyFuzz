@@ -21,8 +21,8 @@
 
 use crate::common::types::{PredicateTerm, SequenceExecutionResult, StorageDiff};
 use rustyfuzz_predicate::{
-    Evidence, InvariantRegistry, Outcome, ReReadBudget, ReadRecord, SequenceView, StateReader,
-    WriteRecord,
+    BlockContext, Evidence, InvariantRegistry, Outcome, ReReadBudget, ReadRecord, SequenceView,
+    StateReader, WriteRecord,
 };
 
 /// Resolves a slot from committed state, for the on-demand re-read.
@@ -238,6 +238,71 @@ pub fn check_sequence(
         }
     }
     checker.take_violation()
+}
+
+/// Checks only the storage evidence captured by replay, without querying state.
+///
+/// This is used for cached/offline replays where no provider may be available. A
+/// predicate that needs an unobserved slot remains `Unknown`; the checker never
+/// invents a zero value or consults recorded discovery terms.
+pub(crate) fn check_observed_sequence(
+    registry: &InvariantRegistry,
+    execution: &SequenceExecutionResult,
+    initial_block: &revm::context::BlockEnv,
+    time_warp: rustyfuzz_evm::time_warp::TimeWarp,
+) -> Option<SequenceViolation> {
+    let all_writes = writes_from(&execution.storage_diffs);
+    let all_reads = reads_from(&execution.storage_reads);
+    for result in &execution.tx_results {
+        let writes = all_writes
+            .iter()
+            .filter(|write| write.tx_index <= result.tx_index)
+            .cloned()
+            .collect::<Vec<_>>();
+        let reads = all_reads
+            .iter()
+            .filter(|read| read.tx_index <= result.tx_index)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut block = initial_block.clone();
+        time_warp.apply(&mut block, result.tx_index);
+        let view = SequenceView {
+            writes: &writes,
+            reads: &reads,
+            block: BlockContext {
+                number: rustyfuzz_predicate::Int256(block.number.to_be_bytes()),
+                timestamp: rustyfuzz_predicate::Int256(block.timestamp.to_be_bytes()),
+            },
+        };
+        let mut reader = rustyfuzz_predicate::NoReRead;
+        for (outcome, evidence) in
+            registry.check_all(&view, result.tx_index, &mut reader, ReReadBudget::new(0))
+        {
+            if matches!(outcome, Outcome::False) {
+                let terms = evidence
+                    .terms
+                    .iter()
+                    .map(|term| PredicateTerm {
+                        symbol: term.symbol.clone(),
+                        address: term.address.clone(),
+                        slot: term.slot.clone(),
+                        offset_bits: term.offset_bits,
+                        width_bits: term.width_bits,
+                        value: term.value.clone(),
+                        provenance: format!("{:?}", term.provenance).to_ascii_lowercase(),
+                        tx_index: term.tx_index,
+                    })
+                    .collect();
+                return Some(SequenceViolation {
+                    predicate: evidence.predicate.clone(),
+                    tx_index: result.tx_index,
+                    terms,
+                    evidence,
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Builds a registry from `(name, predicate, manifest)` triples.

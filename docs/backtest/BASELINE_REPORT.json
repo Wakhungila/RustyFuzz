@@ -1,13 +1,13 @@
 {
   "header": {
-    "commit_hash": "b3bafb44d297f3fae357659fa0f647327ecbe4da",
+    "commit_hash": "39b25e6346e88fc5efb6588eae98d1ef524c021e",
     "counting_rule": "A case counts toward rediscovery only if the minimized sequence replays deterministically AND the PoC demonstrates the violation. Fail = false positive. Inconclusive = excluded from the numerator and reported separately.",
     "generated_by": "cargo run -p rustyfuzz-backtest --bin baseline_report",
     "note": "Corpus is 7 Tier-1 cases, NOT 150. See docs/backtest/BRIEF_CORRECTIONS.md correction 5.",
     "schema_version": 1,
     "sources": [
       {
-        "path": "/tmp/rf-bt/validate3.json",
+        "path": "docs/backtest/runs/2026-10-25-replay-predicate/validate_historical.json",
         "summary": {
           "executed": 0,
           "failed_execution": 2,
@@ -19,7 +19,7 @@
         }
       },
       {
-        "path": "/tmp/rf-bt/validate_kv.json",
+        "path": "docs/backtest/runs/2026-10-25-replay-predicate/validate_known_vulnerable.json",
         "summary": {
           "executed": 5,
           "failed_execution": 0,
@@ -31,7 +31,7 @@
         }
       }
     ],
-    "working_tree": "dirty (pre-existing changes; see docs/reality/FACTS.md capture)"
+    "working_tree": "runtime measurement: tracked source clean; untracked docs/CODEX_HANDOFF.md; generator metadata correction applied after measurement"
   },
   "report": {
     "cases": [

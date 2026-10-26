@@ -30,8 +30,10 @@ this gap.
 ## 2. The five `local_fixture` cases: `chain` and `fork_block` are intentionally absent
 
 All five carry `mode = "local_fixture"` and target synthetic addresses in the
-`0x6200…0001`–`0x6200…0005` range. They are executed against locally deployed
-bytecode, **not** against a chain fork, so there is no chain and no block to record.
+`0x6200…0001`–`0x6200…0005` range. Their JSON fixtures describe expected outcomes;
+the validator reconstructs observations without deploying or executing bytecode.
+There is no chain and no block to record. These differ from the separate
+`executable_evm` controls, which do execute bytecode.
 
 `chain = null` and `fork_block = null` below are **deliberate and correct**, not
 missing data. Writing a real chain id or a plausible block number here would be
@@ -62,8 +64,9 @@ intent explicitly so a later reader does not "fix" it by inventing values.
 
 ### Why this matters for measurement
 
-These five cases can only ever demonstrate that **oracles fire on known-vulnerable
-bytecode**. They cannot demonstrate that a real deployed protocol was exploited.
+These five cases demonstrate behavior against **reconstructed fixture observations**.
+They do not demonstrate an oracle firing on executed bytecode or a real deployed
+protocol being exploited.
 `BASELINE_REPORT.md` reports them separately from the two historical cases for
 exactly this reason, and their five `not_found` results are counted as false
 positives against a pre-recorded expectation, not against a live contract.

@@ -3,6 +3,7 @@ class = "erc20_mint_inflation"
 mode = "executable_evm"
 target = "0x6200000000000000000000000000000000000101"
 fixture = "benchmarks/historical/negative_controls/fixtures/erc20-owner-mint.json"
+invariant_file = "benchmarks/historical/erc20-owner-mint.invariants.json"
 expected_invariant = "unauthorized mint increases attacker balance and total supply"
 expected_selectors = ["mint(address,uint256)", "balanceOf(address)", "totalSupply()"]
 expected_attacker = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
