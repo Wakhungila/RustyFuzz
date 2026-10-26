@@ -594,3 +594,120 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod captured_snapshot_tests {
+    //! Proves a real captured snapshot can actually resolve a predicate.
+    //!
+    //! A snapshot that loads but yields `Unknown` for every term is useless, and the
+    //! difference is invisible without a test that runs the evaluator over it. The values
+    //! here are the ones measured from mainnet at block 15,201,793 (see
+    //! `docs/backtest/runs/2026-10-26-state-audit/AUDIT.md`); the fixture is a literal copy
+    //! so this test needs no network.
+
+    use rustyfuzz_predicate::{
+        BindingManifest, BlockContext, EvalContext, Outcome, ReReadBudget, Resolver, SequenceView,
+        WriteRecord,
+    };
+    use std::str::FromStr;
+
+    /// Slot 59 of the Audius governance proxy: the proposal counter, 84 before the exploit.
+    const PROPOSAL_COUNT_SLOT: &str =
+        "0x000000000000000000000000000000000000000000000000000000000000003b";
+    const GOVERNANCE_PROXY: &str = "0x4deca517d6817b6510798b7328f2314d3003abac";
+
+    fn manifest() -> String {
+        serde_json::json!({
+            "target": GOVERNANCE_PROXY,
+            "symbols": {
+                "proposalCount": {
+                    "kind": "slot",
+                    "slot": PROPOSAL_COUNT_SLOT,
+                    "offset_bits": 0,
+                    "width_bits": 256
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn evaluate(predicate: &str, observed: Option<u64>) -> Outcome {
+        let address = revm::primitives::Address::from_str(GOVERNANCE_PROXY).unwrap();
+        let slot = revm::primitives::B256::from_str(PROPOSAL_COUNT_SLOT).unwrap();
+
+        let writes: Vec<WriteRecord> = observed
+            .map(|value| {
+                let mut word = [0u8; 32];
+                word[24..].copy_from_slice(&value.to_be_bytes());
+                vec![WriteRecord {
+                    tx_index: 0,
+                    address: address.into_array(),
+                    slot: slot.0,
+                    old_value: [0u8; 32],
+                    new_value: word,
+                }]
+            })
+            .unwrap_or_default();
+
+        let bindings = BindingManifest::from_json(&manifest())
+            .unwrap()
+            .resolve()
+            .unwrap();
+        let checked = rustyfuzz_predicate::compile(predicate).unwrap();
+        let view = SequenceView {
+            writes: &writes,
+            reads: &[],
+            block: BlockContext::default(),
+        };
+        // The resolver needs the writes: they are what a symbol resolves against. Passing
+        // `&[]` here made every term Unknown and the test caught it.
+        let resolver = Resolver::new(&bindings, &writes, &[], 0);
+        let _ = &view;
+        let ctx = EvalContext {
+            bindings: &bindings,
+            resolver: &resolver,
+            block: BlockContext::default(),
+            tx_index: 0,
+        };
+        let mut reader = rustyfuzz_predicate::NoReRead;
+        let (outcome, _, _) =
+            rustyfuzz_predicate::evaluate(checked.expr(), &ctx, &mut reader, ReReadBudget::new(0));
+        outcome
+    }
+
+    #[test]
+    fn a_captured_value_resolves_and_the_predicate_evaluates() {
+        // 84 is the measured pre-exploit counter, and it satisfies the bound.
+        let outcome = evaluate("proposalCount < 1000000", Some(84));
+        assert!(
+            outcome.is_clean_pass(),
+            "a captured value must resolve, not stay Unknown: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn the_same_predicate_fails_on_a_value_that_breaks_the_bound() {
+        // The pair matters: passing above could be a predicate that always passes.
+        let outcome = evaluate("proposalCount < 10", Some(84));
+        assert!(
+            outcome.is_violation(),
+            "84 must violate `proposalCount < 10`: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn an_uncaptured_slot_is_unknown_rather_than_zero() {
+        // The central promise of the capture format. With no write and no reader, the term
+        // has no value; reporting 0 here would make `proposalCount < 10` pass and hide a
+        // real violation.
+        let outcome = evaluate("proposalCount < 10", None);
+        assert!(
+            matches!(outcome, Outcome::Unknown(_)),
+            "an absent slot must be Unknown, never a confidant zero: {outcome:?}"
+        );
+        assert!(
+            !outcome.is_clean_pass() && !outcome.is_violation(),
+            "Unknown is neither a pass nor a violation"
+        );
+    }
+}

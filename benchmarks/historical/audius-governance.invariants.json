@@ -1,0 +1,37 @@
+{
+  "target": "0x4DEcA517D6817B6510798b7328F2314d3003AbAC",
+  "symbols": {
+    "guardian": {
+      "kind": "slot",
+      "slot": "0x37",
+      "offset_bits": 0,
+      "width_bits": 160
+    },
+    "proposalCount": {
+      "kind": "slot",
+      "slot": "0x3b",
+      "offset_bits": 0,
+      "width_bits": 256
+    },
+    "implementation": {
+      "kind": "slot",
+      "slot": "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc",
+      "offset_bits": 0,
+      "width_bits": 160
+    }
+  },
+  "invariants": [
+    {
+      "name": "proposalCountIsMonotonicAndBounded",
+      "predicate": "proposalCount < 1000000"
+    },
+    {
+      "name": "guardianIsSet",
+      "predicate": "guardian != 0"
+    },
+    {
+      "name": "implementationIsASetAddress",
+      "predicate": "implementation != 0"
+    }
+  ]
+}
