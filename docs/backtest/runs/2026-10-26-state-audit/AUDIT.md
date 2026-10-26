@@ -156,3 +156,60 @@ Result: 2 accounts, 0 slots, 2 code blobs, `content_digest` reproduced independe
   for block 15.2M on mainnet, but unverified for anything else.
 - The five `known_vulnerable` cases remain expectation-only fixtures with no executable
   bytecode. Nothing here changes that; they still cannot be reported as rediscoveries.
+
+
+---
+
+## 5. Follow-up: the state change was located (2026-10-26, later the same day)
+
+Finding 2 said the governance system is where the exploit acts. Measuring it produced the
+specific slot.
+
+Scanning the governance proxy's storage for small counters at the pre-exploit block found:
+
+| slot | value | what it is |
+|---|---|---|
+| 55 | 3 | guardian count / role constant |
+| 57 | 1 | flag |
+| **59** | **84** | **proposal counter** |
+| 61 | 1 | flag |
+
+Across the exploit block, slot 59 goes **84 → 85**, and it is the only slot in 0–79 that
+changes. The two logs emitted by that proxy carry proposal ids `0x54` = 84 and `0x55` = 85,
+which corroborates the counter reading rather than merely being consistent with it.
+
+Slot 55 reads 3, and the transaction's own log topics include a `3` — so 55 is plausibly
+`guardian`/role storage. It is bound as `guardian` in the invariants file at 160 bits; that
+naming is an inference from the log shape, not from a storage layout, and is marked as such
+here rather than presented as established.
+
+### What the transaction actually did
+
+Decoding the governance log with topic1 = 85 gives a string array `["Hello", "World"]`.
+So this transaction **created proposal 85** with placeholder content. It did not upgrade an
+implementation (the EIP-1967 pointers on all three proxies are unchanged), and it did not
+write governance slots 0–79 except the counter.
+
+That reading does not match what the case name — "governance reinitialization" — invites a
+reader to assume, and it does not match `expected_exploit_shape`, which says
+"reinitialize governance proxy state -> submit malicious proposal". Either the fixture's
+expectations describe a different transaction than the one it pins, or the reinitialization
+happened in an earlier transaction that this fixture does not include. **This needs the
+owner's decision, not a guess**: the honest options are to correct the fixture's
+expectations, or to extend the fixture to a multi-transaction sequence starting from the
+earlier reinitialization.
+
+### What is now capturable, and what is not
+
+Capturable and captured: `guardian` (0x37), `proposalCount` (0x3b), `implementation`
+(EIP-1967) on the governance proxy, plus the proxy's code, the implementation's code
+(16,882 bytes, fetched by following the pointer automatically) and the attacker contract.
+
+Not capturable: the proposal bodies. They live behind a mapping keyed by proposal id, and
+they are not reachable by scanning the linear slot range — verified, slots 60–71 are
+unchanged. Recovering them needs either the implementation's storage layout (so the mapping's
+base slot is known and `keccak256(abi.encode(85, base))` can be computed) or a
+`debug_traceTransaction` this endpoint does not serve.
+
+So the replay's remaining unknown is *which mapping slots the implementation reads*, and that
+is a storage-layout question, not a capture question.
