@@ -380,6 +380,22 @@ pub fn accounts_from_fixture(fixture_path: &Path) -> Result<Vec<Address>> {
             }
         }
     }
+    // An explicit list lets a caller name contracts the transaction reaches indirectly.
+    //
+    // This is not redundant with the transaction's parties: the Audius attacker contract
+    // embeds six addresses, including a Uniswap router and WETH, and a replay that omits
+    // them reverts on a call into empty code rather than reporting missing state.
+    if let Some(extra) = value.get("extra_accounts").and_then(|v| v.as_array()) {
+        for raw in extra {
+            let raw = raw
+                .as_str()
+                .ok_or_else(|| anyhow!("extra_accounts must contain address strings"))?;
+            out.insert(
+                Address::from_str(raw)
+                    .with_context(|| format!("extra_accounts entry {raw:?} is not an address"))?,
+            );
+        }
+    }
     if out.is_empty() {
         return Err(anyhow!(
             "fixture {} names no accounts; it has no target and no transactions",

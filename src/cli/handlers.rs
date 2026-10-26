@@ -1341,6 +1341,8 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             benchmarks,
             output,
             broker_free: _,
+            rpc_url,
+            fork_block,
         } => {
             let manifests = ValidationRunner::load_manifests(&benchmarks)?;
             let runner = ValidationRunner;
@@ -1351,8 +1353,44 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                         | rusty_fuzz::engine::benchmark::BenchmarkMode::BlindRediscovery
                 )
             });
+            // Resolve the endpoint and the block for this run.
+            //
+            // `fork_block` from the CLI pins EVERY case, which is what a single-target
+            // comparison wants. Without it each manifest keeps its own `fork_block` and the
+            // context's value is only a fallback: a historical corpus pins different blocks
+            // per case, and one global value would validate the wrong state for all but one.
+            let rpc_url = rpc_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(str::to_string);
+            let effective_rpc = rpc_url.clone().unwrap_or_else(|| config.rpc_url.clone());
+            let pinned_block = fork_block.or(config.fork_block);
+            let per_manifest_blocks: Vec<Option<u64>> = manifests
+                .iter()
+                .map(|manifest| manifest.fork_block)
+                .collect();
+            let distinct_blocks: std::collections::BTreeSet<u64> =
+                per_manifest_blocks.iter().flatten().copied().collect();
+            if fork_block.is_none() && distinct_blocks.len() > 1 {
+                // The context carries a single block env, so a corpus with two pins cannot
+                // share one. Say so rather than silently validating one of them.
+                log::warn!(
+                    "case corpus pins {} distinct fork blocks ({:?}); a single block environment \
+                     is used for this run. Pass --fork-block to pin one value deliberately.",
+                    distinct_blocks.len(),
+                    distinct_blocks
+                );
+            }
             let block_env = if needs_rpc {
-                campaign_block_env(&config).await.ok()
+                match pinned_block {
+                    Some(block) => {
+                        rusty_fuzz::evm::fork::create_fork_block_env(&effective_rpc, block)
+                            .await
+                            .ok()
+                    }
+                    None => campaign_block_env(&config).await.ok(),
+                }
             } else {
                 None
             };
@@ -1362,8 +1400,8 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 .map(std::path::Path::to_path_buf)
                 .or_else(|| Some(std::path::PathBuf::from(&config.report_dir)));
             let context = rusty_fuzz::engine::benchmark::ValidationContext {
-                rpc_url: Some(config.rpc_url.clone()),
-                fork_block: config.fork_block,
+                rpc_url: Some(effective_rpc),
+                fork_block: pinned_block,
                 block_env,
                 report_dir,
             };

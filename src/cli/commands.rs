@@ -377,6 +377,17 @@ pub enum Command {
         output: Option<String>,
         #[arg(long, default_value_t = true)]
         broker_free: bool,
+        /// RPC endpoint for mainnet_fork cases, overriding `config.toml`.
+        #[arg(long)]
+        rpc_url: Option<String>,
+        /// Fork block for every mainnet_fork case, overriding both `config.toml` and each
+        /// manifest.
+        ///
+        /// Without an override each manifest uses its own `fork_block`, which is what a
+        /// historical corpus needs: the cases pin different blocks, and one global value
+        /// would silently validate the wrong state for all but one of them.
+        #[arg(long)]
+        fork_block: Option<u64>,
     },
     Satori {
         #[command(subcommand)]

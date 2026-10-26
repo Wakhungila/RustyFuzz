@@ -3,31 +3,48 @@ class = "access_control_bypass"
 mode = "mainnet_fork"
 target = "0xbdbb5945f252bc3466a319cdcc3ee8056bf2e569"
 fixture = "benchmarks/historical/fixtures/audius-governance-reinitialization-2022.json"
+# Storage-bound predicates for the governance proxy the exploit actually acts on. Bound from
+# measured slots: 0x3b is the proposal counter (84 -> 85 across the exploit block).
+invariant_file = "benchmarks/historical/audius-governance.invariants.json"
 chain = "evm"
 fork_block = 15201793
 setup_requirements = [
-  "Ethereum mainnet fork at the block before the first public Audius attack transaction",
-  "historical exploit contract exists at 0xbdbb5945f252bc3466a319cdcc3ee8056bf2e569",
-  "RPC-backed replay of the public governance reinitialization transaction"
+  "Ethereum mainnet fork at the block before the first public Audius attack transaction (15201793)",
+  "historical exploit contract exists at 0xbdbb5945f252bc3466a319cdcc3ee8056bf2e569; its owner slot already holds the attacker at that block",
+  "the governance system acted on is the Audius admin proxy 0x4DEcA517D6817B6510798b7328F2314d3003AbAC, not the manifest target",
+  "RPC-backed replay of transaction 0xfefd829e246002a8fd061eede7501bccb6e244a9aacea0ebceaecef5d877a984, measured to execute in block 15201794"
 ]
-success_invariant = "access control"
+success_invariant = "governance proposal counter advances under attacker authority"
 target_profile_expectation = ["governance", "proxy", "access-control-heavy", "historical-mainnet"]
-exploit_template_expectation = "reinitialize governance proxy state -> submit malicious proposal"
+exploit_template_expectation = "attacker contract invokes governance with guardian-equivalent authority and creates a proposal"
 expected_invariant_family = "access-control"
 expected_minimum_confidence = 50
 expected_replayable = true
 expected_poc_generated = true
+# Corrected 2026-10-26 from measured chain state. The previous text said
+# "reinitialize governance proxy state -> submit malicious proposal", but at this pin the
+# transaction does something narrower and different:
+#   - it does NOT upgrade any implementation (all three EIP-1967 pointers are unchanged
+#     across the exploit block);
+#   - it does NOT mutate the AUDIO token (no Transfer logs, token impl pointer unchanged);
+#   - it DOES advance the governance proxy's proposal counter, slot 0x3b, from 84 to 85,
+#     emitting two logs whose topic1 values are 0x54 and 0x55 (84 and 85), with proposal 85
+#     carrying the string array ["Hello","World"].
+# The discrepancy is recorded in docs/backtest/runs/2026-10-26-state-audit/AUDIT.md.
 expected_exploit_shape = [
   "historical exploit contract entrypoint replays on pre-exploit fork state",
-  "unauthorized governance/proxy state mutation evidence is observed",
+  "governance proposal counter advances by one under the attacker's authority",
   "proof-carrying replay produces a Foundry PoC"
 ]
 expected_selectors = ["0x5bc7c6ac"]
 expected_attacker = "0xa0c7bd318d69424603cbf91e9969870f21b8ab4c"
-expected_victim = "0x18aaa7115705e8be94bffebde57af9bfc265b998"
+# The AUDIO token was the presumed victim, but this transaction emits no Transfer log and the
+# token's EIP-1967 implementation pointer is identical before and after. It is not touched
+# here, so it is no longer claimed as the victim.
+expected_victim = "0x4DEcA517D6817B6510798b7328F2314d3003AbAC"
 success_criteria = ["expected_finding", "invariant_violation", "replayable_artifact", "foundry_poc_generated", "minimized_path"]
 replay_command = "cargo run --release -- validate --benchmarks benchmarks/historical --output reports/historical_validation_report.json"
 poc_generation = "required"
 max_duration_secs = 600
-seed_hints = ["0x5bc7c6ac", "initialize", "submitProposal"]
-notes = "Historical Audius exploit replay candidate. The fixture uses public transaction 0xfefd829e246002a8fd061eede7501bccb6e244a9aacea0ebceaecef5d877a984 against Ethereum state at block 15201793. This is an authorized regression benchmark, not live-chain execution."
+seed_hints = ["0x5bc7c6ac", "initialize", "submitProposal", "guardian"]
+notes = "Historical Audius exploit replay candidate. The fixture uses public transaction 0xfefd829e246002a8fd061eede7501bccb6e244a9aacea0ebceaecef5d877a984 against Ethereum state at block 15201793, the block BEFORE the transaction executes in 15201794. Expectations were corrected on 2026-10-26 against measured chain state; see docs/backtest/runs/2026-10-26-state-audit/AUDIT.md. The manifest target is the attacker's contract, not the vulnerable system. This is an authorized regression benchmark, not live-chain execution."

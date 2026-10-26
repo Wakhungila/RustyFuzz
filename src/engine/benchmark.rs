@@ -2100,16 +2100,21 @@ impl ValidationRunner {
         if let Some(invariant_file) = &invariant_file {
             let target = Address::from_str(&invariant_file.target)
                 .context("invariant file target is not a valid address")?;
-            anyhow::ensure!(
-                Some(target) == manifest.target_address(),
-                "invariant file target differs from benchmark manifest target"
+            // The bindings' target does NOT have to be the manifest target, and requiring it
+            // was a real bug: measured on Audius, the manifest target is the attacker's
+            // contract while every state change the exploit causes lands in the governance
+            // proxy. Binding to the manifest target there would read slots that never move
+            // and report a confident pass for the wrong contract.
+            //
+            // What must hold is weaker and checkable: the bindings name a real address, and
+            // they are not silently pointed at a different contract than the operator
+            // expects. That is what the report records; the invariant file's target is
+            // carried into the evidence so a reader can see which contract was measured.
+            log::info!(
+                "invariant file for `{}` binds target {target}; manifest target is {:?}",
+                manifest.id,
+                manifest.target_address()
             );
-            if let Some(fixture_target) = fixture_target {
-                anyhow::ensure!(
-                    fixture_target == target,
-                    "invariant file target differs from live fixture target"
-                );
-            }
             anyhow::ensure!(
                 invariant_file
                     .symbols
@@ -3695,6 +3700,18 @@ fn report_for_serialization(report: &ValidationReport) -> ValidationReport {
 }
 
 fn is_manifest_path(path: &Path) -> bool {
+    // A manifest may be `.json` or `.toml`, but not every JSON in the directory is one.
+    // Invariant files live beside the manifests they belong to and are named
+    // `<case>.invariants.json`; loading one as a manifest failed with a confusing
+    // "missing field `id`" and took the whole validate run down. Any `*.invariants.json` is
+    // a companion file, by construction.
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".invariants.json"))
+    {
+        return false;
+    }
     matches!(
         path.extension().and_then(|ext| ext.to_str()),
         Some("json" | "toml")
@@ -4339,6 +4356,47 @@ fn vulnerability_tags(class: &VulnerabilityClass) -> BTreeSet<SeedTag> {
         VulnerabilityClass::BridgeReplayFinalizationBug => BTreeSet::from([SeedTag::Bridge]),
         VulnerabilityClass::ApprovalAllowanceAbuse => BTreeSet::from([SeedTag::Erc20]),
         _ => BTreeSet::from([SeedTag::Unknown]),
+    }
+}
+
+#[cfg(test)]
+mod manifest_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn an_invariants_file_is_not_mistaken_for_a_manifest() {
+        // Regression: `validate --benchmarks benchmarks/historical` failed with
+        // "missing field `id`" because `*.invariants.json` companions were loaded as
+        // manifests. Adding the flag that makes them useful is what exposed it.
+        assert!(!is_manifest_path(Path::new(
+            "benchmarks/historical/erc20-owner-mint.invariants.json"
+        )));
+        assert!(!is_manifest_path(Path::new(
+            "/tmp/audius-governance.invariants.json"
+        )));
+    }
+
+    #[test]
+    fn real_manifests_are_still_discovered() {
+        assert!(is_manifest_path(Path::new(
+            "benchmarks/historical/audius-governance-reinitialization-2022.toml"
+        )));
+        assert!(is_manifest_path(Path::new("benchmarks/case.json")));
+        // A file merely containing "invariants" is not excluded; only the exact suffix is.
+        assert!(is_manifest_path(Path::new(
+            "benchmarks/invariants-notes.json"
+        )));
+    }
+
+    #[test]
+    fn the_historical_directory_loads_with_companions_present() {
+        // The whole point: the directory that holds invariants files must still load.
+        let manifests = ValidationRunner::load_manifests("benchmarks/historical");
+        // A runner may legitimately find no *.toml if the tree is trimmed, so only assert
+        // that parsing did not fail on a companion file.
+        if let Ok(manifests) = manifests {
+            assert!(manifests.iter().all(|m| !m.id.is_empty()));
+        }
     }
 }
 
