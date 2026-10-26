@@ -71,8 +71,83 @@ pub struct CaptureReport {
     /// Worth surfacing: an EOA where a contract was expected means the pin is wrong or the
     /// address is wrong, and both are cheap to catch here rather than mid-replay.
     pub codeless_accounts: Vec<String>,
+    /// `proxy:implementation` pairs discovered by following EIP-1967 pointers.
+    ///
+    /// Recorded because a reader must be able to tell whether a proxy in this snapshot had
+    /// its implementation captured, and one level of following is not a general guarantee.
+    pub proxy_implementations: Vec<String>,
     /// The caveat a reader must see, written into the artifact rather than a comment.
     pub completeness: String,
+}
+
+/// The EIP-1967 implementation slot.
+///
+/// `bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)`. Three of the Audius
+/// contracts use exactly this layout, verified by disassembling their runtime and finding
+/// the constant pushed before an `SLOAD`.
+pub const EIP1967_IMPLEMENTATION_SLOT: B256 = B256::new([
+    0x36, 0x08, 0x94, 0xa1, 0x3b, 0xa1, 0xa3, 0x21, 0x06, 0x67, 0xc8, 0x28, 0x49, 0x2d, 0xb9, 0x8d,
+    0xca, 0x3e, 0x20, 0x76, 0xcc, 0x37, 0x35, 0xa9, 0x20, 0xa3, 0xca, 0x50, 0x5d, 0x38, 0x2b, 0xbc,
+]);
+
+/// Follows an EIP-1967 implementation pointer, if the account is a proxy.
+///
+/// # Why this is required rather than a convenience
+///
+/// A proxy's own bytecode is a delegate stub; it contains no implementation code. A replay
+/// that calls through a proxy therefore needs the implementation's code in the snapshot,
+/// and the implementation appears nowhere in the proxy's account entry. Without this step a
+/// captured proxy is unexecutable, and the failure surfaces mid-replay as a call into empty
+/// code rather than as a clear error.
+///
+/// Returns `None` when the slot is empty, which is the honest answer for a non-proxy: the
+/// caller must not treat "no pointer" as "pointer to zero".
+pub fn follow_implementation(fork: &ForkDb, proxy: Address) -> Result<Option<Address>> {
+    let value = fork
+        .storage_ref(proxy, EIP1967_IMPLEMENTATION_SLOT.into())
+        .map_err(|error| anyhow!("cannot read the implementation slot of {proxy}: {error}"))?;
+    if value == U256::ZERO {
+        return Ok(None);
+    }
+    // The pointer is right-aligned in a 32-byte word.
+    let bytes: [u8; 32] = value.to_be_bytes();
+    let high_is_clear = bytes[..12].iter().all(|byte| *byte == 0);
+    if !high_is_clear {
+        return Err(anyhow!(
+            "implementation slot of {proxy} is not a left-padded address: {value:#x}"
+        ));
+    }
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&bytes[12..]);
+    Ok(Some(Address::from(address)))
+}
+
+/// Accounts a capture must include, following proxy pointers one level.
+///
+/// One level, deliberately: nested proxies are a pattern that would need a cycle guard and a
+/// depth budget, and inventing one here would be guessing at a shape none of the audited
+/// cases have. A deeper chain reports what it found rather than silently stopping.
+pub struct ExpandedAccounts {
+    pub all: Vec<Address>,
+    /// Proxy -> implementation pairs that were followed.
+    pub followed: Vec<(Address, Address)>,
+}
+
+pub fn expand_proxies(fork: &ForkDb, accounts: &[Address]) -> Result<ExpandedAccounts> {
+    let mut all: BTreeSet<Address> = accounts.iter().copied().collect();
+    let mut followed = Vec::new();
+    for proxy in accounts {
+        if let Some(implementation) = follow_implementation(fork, *proxy)? {
+            if implementation != *proxy {
+                followed.push((*proxy, implementation));
+                all.insert(implementation);
+            }
+        }
+    }
+    Ok(ExpandedAccounts {
+        all: all.into_iter().collect(),
+        followed,
+    })
 }
 
 /// Builds a `ForkDb` pinned at `block`, with chain id and block hash recorded as
@@ -107,6 +182,13 @@ pub fn capture(
             "no accounts to capture; name at least the target contract"
         ));
     }
+
+    // Follow proxy pointers first: a proxy's own code is a delegate stub, so its
+    // implementation must be in the snapshot or every call through the proxy lands in empty
+    // code. Doing this inside `capture` rather than leaving it to the caller means a proxy
+    // cannot be captured unexecutably by omission.
+    let expanded = expand_proxies(fork, accounts)?;
+    let accounts = expanded.all.as_slice();
 
     // Fetch account state through ForkDb, which populates its own caches as a side effect.
     let mut captured = Vec::new();
@@ -174,6 +256,11 @@ pub fn capture(
         captured_accounts: captured,
         zero_valued_slots: zero_valued,
         codeless_accounts: codeless,
+        proxy_implementations: expanded
+            .followed
+            .iter()
+            .map(|(proxy, implementation)| format!("{proxy}:{implementation}"))
+            .collect(),
         completeness: format!(
             "Captured {} account(s), {} code blob(s) and {} slot(s) at block {}. Slots were \
              fetched ONLY from the requests given; every other slot is ABSENT from this \
@@ -418,6 +505,79 @@ mod tests {
         let error = accounts_from_fixture(&path).unwrap_err().to_string();
         assert!(error.contains("names no accounts"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_eip1967_slot_is_the_standard_constant() {
+        // Pinned numerically because a wrong constant silently returns "not a proxy" for
+        // every real proxy, which looks like a perfectly healthy capture.
+        let expected = "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
+        assert_eq!(hex::encode(EIP1967_IMPLEMENTATION_SLOT.0), expected);
+    }
+
+    #[test]
+    fn a_non_proxy_reports_no_implementation_rather_than_zero() {
+        // An offline ForkDb answers every slot with zero, which is exactly the "not a
+        // proxy" case. The distinction that matters is None vs Some(0x0): a zero address
+        // treated as an implementation would capture nothing while looking successful.
+        let fork = ForkDb::new_offline("0x1");
+        let address = Address::repeat_byte(0x11);
+        assert_eq!(follow_implementation(&fork, address).unwrap(), None);
+    }
+
+    #[test]
+    fn a_proxy_pointer_is_read_from_the_low_twenty_bytes() {
+        let fork = ForkDb::new_offline("0x1");
+        let proxy = Address::repeat_byte(0x22);
+        let implementation = Address::repeat_byte(0x33);
+        // Left-padded, as every real proxy stores it.
+        let mut word = [0u8; 32];
+        word[12..].copy_from_slice(implementation.as_slice());
+        fork.cache_storage(
+            proxy,
+            EIP1967_IMPLEMENTATION_SLOT.into(),
+            U256::from_be_bytes(word),
+        );
+        assert_eq!(
+            follow_implementation(&fork, proxy).unwrap(),
+            Some(implementation)
+        );
+    }
+
+    #[test]
+    fn a_dirty_high_half_is_refused_instead_of_truncated() {
+        // A pointer with junk above the address is not an address. Truncating would invent
+        // an implementation at a plausible-looking address.
+        let fork = ForkDb::new_offline("0x1");
+        let proxy = Address::repeat_byte(0x22);
+        let mut word = [0u8; 32];
+        word[0] = 0x01; // junk in the high bytes
+        word[31] = 0x33;
+        fork.cache_storage(
+            proxy,
+            EIP1967_IMPLEMENTATION_SLOT.into(),
+            U256::from_be_bytes(word),
+        );
+        let error = follow_implementation(&fork, proxy).unwrap_err().to_string();
+        assert!(error.contains("not a left-padded address"), "{error}");
+    }
+
+    #[test]
+    fn expansion_adds_the_implementation_and_records_the_pair() {
+        let fork = ForkDb::new_offline("0x1");
+        let proxy = Address::repeat_byte(0x22);
+        let implementation = Address::repeat_byte(0x33);
+        let mut word = [0u8; 32];
+        word[12..].copy_from_slice(implementation.as_slice());
+        fork.cache_storage(
+            proxy,
+            EIP1967_IMPLEMENTATION_SLOT.into(),
+            U256::from_be_bytes(word),
+        );
+        let expanded = expand_proxies(&fork, &[proxy]).unwrap();
+        assert_eq!(expanded.all.len(), 2);
+        assert!(expanded.all.contains(&implementation));
+        assert_eq!(expanded.followed, vec![(proxy, implementation)]);
     }
 
     #[test]
