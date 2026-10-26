@@ -224,6 +224,42 @@ pub enum Command {
         #[arg(long)]
         output: Option<String>,
     },
+    /// Capture a real fork snapshot for offline historical replay.
+    ///
+    /// The offline replay path accepts only a `ForkDbCacheSnapshot` with a matching digest
+    /// and pinned provenance, and nothing else in the tool could produce one. This is that
+    /// producer.
+    ///
+    /// Only the slots you name are captured. Every other slot is ABSENT from the snapshot,
+    /// so a replay that reads one reports Unknown rather than a fabricated zero — which is
+    /// the only honest option, since a mapping cannot be enumerated over JSON-RPC.
+    Capture {
+        /// RPC endpoint to capture from. Must be an archive node for a historical block.
+        #[arg(long)]
+        rpc_url: String,
+        /// Block to capture. For a historical exploit, this is the block the exploit
+        /// transaction *executes in* — the fixture's `fork_block` names the block before.
+        #[arg(long)]
+        block: u64,
+        /// Historical fixture whose target and transaction parties are captured.
+        #[arg(long)]
+        fixture: String,
+        /// Invariants file whose plain storage bindings are also captured.
+        ///
+        /// Mappings and return values are skipped: a mapping needs a key we do not have,
+        /// and a return value is not storage.
+        #[arg(long)]
+        invariants: Option<String>,
+        /// Extra slot to capture, as `0xaddress:0xslot`. Repeatable.
+        #[arg(long = "slot", num_args = 1)]
+        slots: Vec<String>,
+        /// Where to write the snapshot.
+        #[arg(long)]
+        output: String,
+        /// Where to write the capture report. Defaults to `<output>.report.json`.
+        #[arg(long)]
+        report: Option<String>,
+    },
     Job {
         #[command(subcommand)]
         command: JobCommand,

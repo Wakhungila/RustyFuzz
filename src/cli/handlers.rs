@@ -871,6 +871,76 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 println!("{report_json}");
             }
         }
+        Command::Capture {
+            rpc_url,
+            block,
+            fixture,
+            invariants,
+            slots,
+            output,
+            report,
+        } => {
+            // Validate every input before touching the network: a malformed slot or a
+            // missing fixture must fail in milliseconds, not after a multi-second fetch.
+            let fixture_path = std::path::Path::new(&fixture);
+            let accounts = rusty_fuzz::evm::fork_capture::accounts_from_fixture(fixture_path)?;
+
+            let mut slot_requests = Vec::new();
+            if let Some(path) = invariants.as_deref() {
+                slot_requests.extend(
+                    rusty_fuzz::evm::fork_capture::slot_requests_from_invariants(
+                        std::path::Path::new(path),
+                    )?,
+                );
+            }
+            for raw in &slots {
+                let (address, slot) = raw
+                    .split_once(':')
+                    .ok_or_else(|| anyhow::anyhow!("--slot {raw:?} is not `0xaddress:0xslot`"))?;
+                slot_requests.push(rusty_fuzz::evm::fork_capture::SlotRequest {
+                    address: address.to_string(),
+                    slot: slot.to_string(),
+                    source: "explicit --slot".to_string(),
+                });
+            }
+
+            let report_path = report
+                .clone()
+                .unwrap_or_else(|| format!("{output}.report.json"));
+
+            let (chain_id, fork) = rusty_fuzz::evm::fork_capture::connect(&rpc_url, block)?;
+            let (snapshot, capture_report) = rusty_fuzz::evm::fork_capture::capture(
+                &fork,
+                chain_id,
+                block,
+                &accounts,
+                &slot_requests,
+            )?;
+            rusty_fuzz::evm::fork_capture::write_snapshot(
+                &snapshot,
+                &capture_report,
+                std::path::Path::new(&output),
+                std::path::Path::new(&report_path),
+            )?;
+
+            println!(
+                "captured {} account(s), {} slot(s), {} code blob(s) at block {}",
+                capture_report.accounts,
+                capture_report.slots,
+                capture_report.codes,
+                capture_report.block_number
+            );
+            println!("snapshot: {output}");
+            println!("report:   {report_path}");
+            if !capture_report.codeless_accounts.is_empty() {
+                println!(
+                    "note: {} account(s) hold no code at this block: {}",
+                    capture_report.codeless_accounts.len(),
+                    capture_report.codeless_accounts.join(", ")
+                );
+            }
+            println!("{}", capture_report.completeness);
+        }
         Command::Invariants {
             target,
             abi_report,

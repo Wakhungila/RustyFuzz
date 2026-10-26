@@ -17,4 +17,6 @@ pub mod etherscan_abi_fetcher;
 #[cfg(feature = "evm")]
 pub mod fork;
 #[cfg(feature = "evm")]
+pub mod fork_capture;
+#[cfg(feature = "evm")]
 pub mod seed_ingester;
