@@ -3,6 +3,14 @@
  "chain_id": 1,
  "block_number": 15201793,
  "target": "0xbdbb5945f252bc3466a319cdcc3ee8056bf2e569",
+ "extra_accounts": [
+  "0x18aaa7115705e8be94bffebde57af9bfc265b998",
+  "0x4d7968ebfd390d5e7926cb3587c39eff2f9fb225",
+  "0x4deca517d6817b6510798b7328f2314d3003abac",
+  "0x7a250d5630b4cf539739df2c5dacb4c659f2488d",
+  "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+  "0xe6d97b2099f142513be7a2a068be040656ae4591"
+ ],
  "transactions": [
   {
    "hash": "0xfefd829e246002a8fd061eede7501bccb6e244a9aacea0ebceaecef5d877a984",

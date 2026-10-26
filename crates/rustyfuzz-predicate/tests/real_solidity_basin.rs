@@ -250,6 +250,8 @@ fn the_balance_covers_reserves_invariant_holds_and_can_fail() {
         writes: &writes,
         reads: &reads,
         block: BlockContext::default(),
+
+        call_outputs: &[],
     };
     let (outcome, evidence) = subject.check(&view, 0, &mut reader, ReReadBudget::new(8));
     assert!(
@@ -293,6 +295,8 @@ fn the_conditional_zero_balance_invariant_is_expressible_with_short_circuit() {
         writes: &writes,
         reads: &[],
         block: BlockContext::default(),
+
+        call_outputs: &[],
     };
     let mut reader = BasinReader {
         returns: BTreeMap::from([((well(), TOTAL_SUPPLY, 0), word(0))]),
@@ -336,6 +340,8 @@ fn relative_tolerance_accepts_rounding_and_rejects_excess_error() {
         writes: &[],
         reads: &[],
         block: BlockContext::default(),
+
+        call_outputs: &[],
     };
     for (supply, expected) in [
         (1_000_000, Outcome::True),
@@ -423,6 +429,8 @@ fn a_missing_call_result_is_unknown_and_no_signal() {
         writes: &writes,
         reads: &reads,
         block: BlockContext::default(),
+
+        call_outputs: &[],
     };
     let (outcome, evidence) = subject.check(&view, 0, &mut reader, ReReadBudget::new(8));
     assert!(matches!(outcome, Outcome::Unknown(_)), "got {outcome:?}");

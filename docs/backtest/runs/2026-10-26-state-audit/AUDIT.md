@@ -139,12 +139,18 @@ Capture:
 ```
 RUSTYFUZZ_RPC_API_KEY= \
 RUSTYFUZZ_RPC_API_KEY_ALLOWED_ORIGINS=https://eth-mainnet.g.alchemy.com \
-  rusty-fuzz capture --rpc-url <endpoint> --block 15201794 \
+  rusty-fuzz capture --rpc-url <endpoint> --block 15201793 \
     --fixture benchmarks/historical/fixtures/audius-governance-reinitialization-2022.json \
     --output /tmp/rf-capture/audius.json
 ```
 
-Result: 2 accounts, 0 slots, 2 code blobs, `content_digest` reproduced independently.
+  Capture the fixture's pinned parent state at block `15201793`; the exploit transaction
+  itself is in block `15201794`. `--mapping-slot contract:base:key` can capture
+  an explicitly derived `mapping(address => value)` entry when the contract's storage layout
+  establishes its base slot. Do not use the post-transaction block as the replay cache.
+
+  The earlier result (2 accounts, 0 slots, 2 code blobs) was not sufficient for replay;
+  `content_digest` verified byte integrity only.
 
 ---
 

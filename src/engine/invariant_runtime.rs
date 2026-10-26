@@ -87,6 +87,37 @@ pub(crate) fn reads_from(reads: &[crate::common::types::StorageAccess]) -> Vec<R
         .collect()
 }
 
+/// Adapts one transaction's observed calls into the predicate layer's call-output
+/// records: at most one per transaction, the successful top-level call's output.
+///
+/// This is what makes a `return_value` binding resolvable from replay-derivable
+/// evidence. The filters mirror what execution records: a transaction has exactly one
+/// top-level call, so "the output of tx *i*" is unambiguous; failed calls are dropped
+/// because a reverted call has no meaningful return data; and `CallKind::Transaction`
+/// marks the top-level frame.
+pub(crate) fn call_outputs_from(
+    call_trace: &[crate::common::types::CallObservation],
+    tx_index: usize,
+) -> Vec<rustyfuzz_predicate::resolve::CallOutputRecord> {
+    call_trace
+        .iter()
+        .filter(|call| {
+            call.tx_index == tx_index
+                && call.kind == crate::common::types::CallKind::Transaction
+                && call.phase == crate::common::types::CallPhase::End
+                && call.success
+        })
+        .map(|call| {
+            rustyfuzz_predicate::resolve::CallOutputRecord::new(
+                call.tx_index,
+                call.target.into_array(),
+                &call.input,
+                &call.output,
+            )
+        })
+        .collect()
+}
+
 /// One violation discovered mid-sequence.
 #[derive(Debug, Clone)]
 pub struct SequenceViolation {
@@ -135,6 +166,10 @@ impl SequenceViolation {
 pub struct IncrementalChecker {
     writes: Vec<WriteRecord>,
     reads: Vec<ReadRecord>,
+    /// Successful top-level call outputs, one per transaction at most. Accumulated like
+    /// the storage records so a predicate over a `return_value` binding resolves from
+    /// the same transaction it names.
+    call_outputs: Vec<rustyfuzz_predicate::resolve::CallOutputRecord>,
     /// Violation found, if any. Once set, later transactions are not checked: the first
     /// violating transaction is the shortest counterexample, and re-reporting a
     /// downstream consequence of the same cause adds noise without information.
@@ -160,12 +195,15 @@ impl IncrementalChecker {
     ) {
         self.writes.extend(writes_from(&result.storage_diffs));
         self.reads.extend(reads_from(&result.storage_reads));
+        self.call_outputs
+            .extend(call_outputs_from(&result.call_trace, result.tx_index));
         if self.violation.is_some() {
             return;
         }
         let view = SequenceView {
             writes: &self.writes,
             reads: &self.reads,
+            call_outputs: &self.call_outputs,
             block,
         };
         let mut reader = ChainStateReader::new(state);
@@ -266,9 +304,11 @@ pub(crate) fn check_observed_sequence(
             .collect::<Vec<_>>();
         let mut block = initial_block.clone();
         time_warp.apply(&mut block, result.tx_index);
+        let call_outputs = call_outputs_from(&execution.call_trace, result.tx_index);
         let view = SequenceView {
             writes: &writes,
             reads: &reads,
+            call_outputs: &call_outputs,
             block: BlockContext {
                 number: rustyfuzz_predicate::Int256(block.number.to_be_bytes()),
                 timestamp: rustyfuzz_predicate::Int256(block.timestamp.to_be_bytes()),

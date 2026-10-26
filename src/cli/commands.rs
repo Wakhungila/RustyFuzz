@@ -237,8 +237,8 @@ pub enum Command {
         /// RPC endpoint to capture from. Must be an archive node for a historical block.
         #[arg(long)]
         rpc_url: String,
-        /// Block to capture. For a historical exploit, this is the block the exploit
-        /// transaction *executes in* — the fixture's `fork_block` names the block before.
+        /// State block to capture. For historical replay, use the pre-transaction
+        /// block (normally the exploit transaction's block number minus one).
         #[arg(long)]
         block: u64,
         /// Historical fixture whose target and transaction parties are captured.
@@ -253,6 +253,12 @@ pub enum Command {
         /// Extra slot to capture, as `0xaddress:0xslot`. Repeatable.
         #[arg(long = "slot", num_args = 1)]
         slots: Vec<String>,
+        /// Address-mapping storage entry, as `0xcontract:0xbase-slot:0xkey-address`.
+        ///
+        /// Use only when the contract's storage layout establishes the base slot.
+        /// Repeatable.
+        #[arg(long = "mapping-slot", num_args = 1)]
+        mapping_slots: Vec<String>,
         /// Where to write the snapshot.
         #[arg(long)]
         output: String,

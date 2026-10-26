@@ -6,6 +6,7 @@
 use super::commands::{Command, JobCommand};
 use super::helpers::*;
 use alloy::providers::Provider;
+use anyhow::Context;
 use libafl_bolts::core_affinity::Cores;
 
 use revm::database::CacheDB;
@@ -877,6 +878,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             fixture,
             invariants,
             slots,
+            mapping_slots,
             output,
             report,
         } => {
@@ -902,6 +904,12 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     slot: slot.to_string(),
                     source: "explicit --slot".to_string(),
                 });
+            }
+            for raw in &mapping_slots {
+                slot_requests.push(
+                    rusty_fuzz::evm::fork_capture::address_mapping_slot_request(raw)
+                        .with_context(|| format!("invalid --mapping-slot {raw:?}"))?,
+                );
             }
 
             let report_path = report

@@ -51,6 +51,40 @@ pub struct SlotRequest {
     pub source: String,
 }
 
+/// Derives and requests a Solidity `mapping(address => value)` entry.
+///
+/// The CLI syntax is `contract:base-slot:key-address`; the map key is ABI-left-padded
+/// before hashing, matching Solidity's `keccak256(abi.encode(key, baseSlot))`.
+pub fn address_mapping_slot_request(text: &str) -> Result<SlotRequest> {
+    let mut parts = text.split(':');
+    let contract_text = parts.next().unwrap_or_default();
+    let base_slot_text = parts.next().unwrap_or_default();
+    let key_text = parts.next().unwrap_or_default();
+    if contract_text.is_empty()
+        || base_slot_text.is_empty()
+        || key_text.is_empty()
+        || parts.next().is_some()
+    {
+        return Err(anyhow!(
+            "mapping slot {text:?} is not `0xcontract:0xbase-slot:0xkey-address`"
+        ));
+    }
+    let contract = Address::from_str(contract_text)
+        .with_context(|| format!("mapping slot contract {contract_text:?} is not an address"))?;
+    let key = Address::from_str(key_text)
+        .with_context(|| format!("mapping slot key {key_text:?} is not an address"))?;
+    let base_slot = parse_word(base_slot_text)
+        .with_context(|| format!("mapping base slot {base_slot_text:?}"))?;
+    let mut key_word = [0u8; 32];
+    key_word[12..].copy_from_slice(&key.into_array());
+    let derived_slot = rustyfuzz_predicate::mapping_slot(&key_word, &base_slot.0);
+    Ok(SlotRequest {
+        address: contract.to_string(),
+        slot: format!("0x{}", hex::encode(derived_slot)),
+        source: format!("address mapping key {key_text} at base slot {base_slot_text}"),
+    })
+}
+
 /// What the capture produced, and what it could not.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureReport {
@@ -440,6 +474,35 @@ mod tests {
     }
 
     #[test]
+    fn address_mapping_request_derives_solidity_mapping_slot() {
+        let request = address_mapping_slot_request(
+            "0x00000000000000000000000000000000000000aa:0x3:0x00000000000000000000000000000000000000bb",
+        )
+        .unwrap();
+        assert_eq!(
+            request.slot,
+            "0xfdd2c69b6fd14d892433c62908349b8d67b5c0bcb5423efea3adca2edce5e83c"
+        );
+        assert!(request.source.contains("address mapping key"));
+    }
+
+    #[test]
+    fn address_mapping_request_rejects_ambiguous_or_invalid_fields() {
+        for request in [
+            "0xaa:0x3",
+            "0xaa:0x3:0xbb:0xcc",
+            "0xnot-an-address:0x3:0xbb",
+            "0xaa:0x3:0xnot-an-address",
+            "0xaa:3:0xbb",
+        ] {
+            assert!(
+                address_mapping_slot_request(request).is_err(),
+                "accepted malformed mapping request {request:?}"
+            );
+        }
+    }
+
+    #[test]
     fn an_empty_account_list_is_refused_rather_than_producing_an_empty_snapshot() {
         let fork = ForkDb::new_offline("0x1");
         let error = capture(&fork, 1, 1, &[], &[]).unwrap_err().to_string();
@@ -492,6 +555,9 @@ mod tests {
                 "chain_id": 1,
                 "block_number": 15201793,
                 "target": "0xbdbb5945f252bc3466a319cdcc3ee8056bf2e569",
+                "extra_accounts": [
+                    "0x18aaa7115705e8be94bffebde57af9bfc265b998"
+                ],
                 "transactions": [{
                     "from": "0xa0c7bd318d69424603cbf91e9969870f21b8ab4c",
                     // For Euler this is the exploit contract, NOT the protocol target.
@@ -505,9 +571,11 @@ mod tests {
         let accounts = accounts_from_fixture(&path).unwrap();
         // The target must be present even though no transaction names it: Euler's `to` is
         // the exploit contract, and omitting the protocol would replay against nothing.
-        assert_eq!(accounts.len(), 3);
+        assert_eq!(accounts.len(), 4);
         assert!(accounts
             .contains(&Address::from_str("0xbdbb5945f252bc3466a319cdcc3ee8056bf2e569").unwrap()));
+        assert!(accounts
+            .contains(&Address::from_str("0x18aaa7115705e8be94bffebde57af9bfc265b998").unwrap()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -674,6 +742,8 @@ mod captured_snapshot_tests {
             writes: &writes,
             reads: &[],
             block: BlockContext::default(),
+
+            call_outputs: &[],
         };
         // The resolver needs the writes: they are what a symbol resolves against. Passing
         // `&[]` here made every term Unknown and the test caught it.

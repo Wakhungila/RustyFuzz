@@ -2424,10 +2424,19 @@ fn executable_matching_signal_is_found_without_a_proof() {
     manifest.fixture = Some(path.file_name().unwrap().to_string_lossy().into_owned());
     manifest.manifest_root = Some(path.parent().unwrap().to_path_buf());
     manifest.resolved_fixture = None;
+    // The probe lives outside the repo tree, so the source control's invariant file
+    // (repo-relative) can no longer resolve; this test is about the matching signal
+    // without a proof, which is orthogonal to authored predicates.
+    manifest.invariant_file = None;
     let report = ValidationRunner.run_manifests(&[manifest]);
     std::fs::remove_file(path).unwrap();
     let result = &report.benchmarks[0];
-    assert_eq!(result.status, ValidationStatus::Found);
+    assert_eq!(
+        result.status,
+        ValidationStatus::Found,
+        "reason: {}",
+        result.reason
+    );
     assert!(result.found);
     assert!(!result.runtime.as_ref().unwrap().matching_signals.is_empty());
     assert!(
@@ -2459,11 +2468,14 @@ fn gate2_vulnerable_counterparts_trigger_each_protected_class() {
         if !result.executed || !result.found {
             missed.push(result.benchmark_id.clone());
         }
-        if result.benchmark_id == "positive-erc20-owner-mint" {
-            let proof = result
-                .proof
-                .as_ref()
-                .expect("the authored invariant should produce a proof");
+        // Every gate2 control now carries an authored invariant file, and every
+        // vulnerable counterpart must produce a confirmed, replay-verified proof —
+        // storage-slot predicates and return-value predicates alike.
+        let proof = result
+            .proof
+            .as_ref()
+            .expect("every gate2 vulnerable counterpart should produce a proof");
+        {
             assert_eq!(
                 proof.confidence_tier,
                 rusty_fuzz::engine::proof::ProofConfidenceTier::Confirmed
@@ -2484,8 +2496,6 @@ fn gate2_vulnerable_counterparts_trigger_each_protected_class() {
                 rusty_fuzz::engine::benchmark::BenchmarkEvidenceClass::SyntheticRegression
             );
             assert!(result.digests.invariant_file_digest.is_some());
-        } else {
-            assert!(result.proof.is_none() && result.proof_status.is_none());
         }
     }
     assert!(

@@ -636,6 +636,7 @@ fn weaker(a: Provenance, b: Provenance) -> Provenance {
         Provenance::PreValue => 1,
         Provenance::ObservedRead => 2,
         Provenance::ReRead => 3,
+        Provenance::CallOutput => 4,
     };
     if rank(a) >= rank(b) {
         a

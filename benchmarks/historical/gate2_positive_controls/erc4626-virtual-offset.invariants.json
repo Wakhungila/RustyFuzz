@@ -1,0 +1,18 @@
+{
+  "target": "0x6200000000000000000000000000000000000202",
+  "symbols": {
+    "depositShares": {
+      "kind": "return_value",
+      "slot": "0x6e553f65",
+      "offset_bits": 0,
+      "width_bits": 256,
+      "word_index": 0
+    }
+  },
+  "invariants": [
+    {
+      "name": "DepositReturnsNonzeroShares",
+      "predicate": "depositShares > 0"
+    }
+  ]
+}

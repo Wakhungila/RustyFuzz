@@ -3,6 +3,7 @@ class = "erc4626_share_inflation"
 mode = "executable_evm"
 target = "0x6200000000000000000000000000000000000202"
 fixture = "benchmarks/historical/negative_controls/fixtures/erc4626-virtual-offset.json"
+invariant_file = "benchmarks/historical/gate2_positive_controls/erc4626-virtual-offset.invariants.json"
 expected_invariant = "attacker donation changes victim share price"
 expected_selectors = ["deposit(uint256,address)", "convertToShares(uint256)"]
 expected_attacker = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

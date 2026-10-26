@@ -193,6 +193,8 @@ fn check(
         writes,
         reads: &reads[..reads_len],
         block: BlockContext::default(),
+
+        call_outputs: &[],
     };
     let mut reader = rustyfuzz_predicate::NoReRead;
     oracle.check(&view, tx_index, &mut reader, ReReadBudget::new(16))
@@ -269,6 +271,8 @@ fn an_unevaluable_predicate_is_no_signal_on_either_trace() {
         writes: &writes,
         reads: &[],
         block: BlockContext::default(),
+
+        call_outputs: &[],
     };
     let mut reader = rustyfuzz_predicate::NoReRead;
     let (outcome, evidence) = oracle.check(&view, 1, &mut reader, ReReadBudget::new(4));
@@ -298,6 +302,8 @@ fn a_re_read_recovers_a_case_the_trace_alone_cannot_decide() {
         writes: &writes,
         reads: partial,
         block: BlockContext::default(),
+
+        call_outputs: &[],
     };
     // Post-sequence state still holds 40 / 60 / 0 and the accumulator was written to 40.
     let mut reader = state(&[(ALICE, 40), (BOB, 60), (CAROL, 0)]);
@@ -374,6 +380,8 @@ fn a_requires_no_overflow_fixture_fires_only_when_the_sum_wraps() {
         writes: &safe,
         reads: &[],
         block: BlockContext::default(),
+
+        call_outputs: &[],
     };
     let mut reader = rustyfuzz_predicate::NoReRead;
     let (outcome, _) = oracle.check(&view, 1, &mut reader, ReReadBudget::new(8));
@@ -404,6 +412,8 @@ fn a_requires_no_overflow_fixture_fires_only_when_the_sum_wraps() {
         writes: &overflowing,
         reads: &[],
         block: BlockContext::default(),
+
+        call_outputs: &[],
     };
     let mut reader = rustyfuzz_predicate::NoReRead;
     let (outcome, evidence) = oracle.check(&view, 1, &mut reader, ReReadBudget::new(8));
@@ -458,6 +468,8 @@ fn a_div0_degraded_pass_is_never_reported_as_satisfied() {
         writes: &writes,
         reads: &[],
         block: BlockContext::default(),
+
+        call_outputs: &[],
     };
     let mut reader = rustyfuzz_predicate::NoReRead;
     let (outcome, evidence) = oracle.check(&view, 1, &mut reader, ReReadBudget::new(8));
@@ -481,6 +493,8 @@ fn the_registry_reports_one_finding_among_several_invariants() {
         writes: &writes,
         reads: &reads,
         block: BlockContext::default(),
+
+        call_outputs: &[],
     };
     let mut reader = rustyfuzz_predicate::NoReRead;
     let results = registry.check_all(&view, 1, &mut reader, ReReadBudget::new(16));

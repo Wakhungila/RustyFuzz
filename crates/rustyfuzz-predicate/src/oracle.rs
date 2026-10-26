@@ -15,7 +15,8 @@
 use crate::binding::{Binding, BindingManifest};
 use crate::eval::{self, BlockContext, EvalContext, Outcome, Reason};
 use crate::resolve::{
-    KeyCoverage, Provenance, ReReadBudget, ReadRecord, Resolver, StateReader, WriteRecord,
+    CallOutputRecord, KeyCoverage, Provenance, ReReadBudget, ReadRecord, Resolver, StateReader,
+    WriteRecord,
 };
 use crate::types::{compile, CheckedPredicate, Int256};
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,7 @@ pub enum ProvenanceLabel {
     ObservedRead,
     PreValue,
     ReRead,
+    CallOutput,
 }
 
 impl From<Provenance> for ProvenanceLabel {
@@ -52,6 +54,7 @@ impl From<Provenance> for ProvenanceLabel {
             Provenance::ObservedRead => ProvenanceLabel::ObservedRead,
             Provenance::PreValue => ProvenanceLabel::PreValue,
             Provenance::ReRead => ProvenanceLabel::ReRead,
+            Provenance::CallOutput => ProvenanceLabel::CallOutput,
         }
     }
 }
@@ -174,6 +177,11 @@ pub enum OracleError {
 pub struct SequenceView<'a> {
     pub writes: &'a [WriteRecord],
     pub reads: &'a [ReadRecord],
+    /// Successful top-level call outputs of the sequence, one per transaction at most.
+    ///
+    /// Empty is the default posture for storage-only predicates; a `return_value`
+    /// symbol then stays `Unknown` instead of resolving to something fabricated.
+    pub call_outputs: &'a [CallOutputRecord],
     pub block: BlockContext,
 }
 
@@ -257,7 +265,8 @@ impl PredicateOracle {
         reader: &mut dyn StateReader,
         budget: ReReadBudget,
     ) -> Vec<TermEvidence> {
-        let resolver = Resolver::new(&self.bindings, view.writes, view.reads, tx_index);
+        let resolver = Resolver::new(&self.bindings, view.writes, view.reads, tx_index)
+            .with_call_outputs(view.call_outputs);
         let mut terms = Vec::new();
         // Each symbol gets enough allowance for its own key set, so a mapping with N
         // keys is never starved by an unrelated term. The total is bounded by the
@@ -304,7 +313,8 @@ impl InvariantOracle for PredicateOracle {
         reader: &mut dyn StateReader,
         budget: ReReadBudget,
     ) -> (Outcome, Evidence) {
-        let resolver = Resolver::new(&self.bindings, view.writes, view.reads, tx_index);
+        let resolver = Resolver::new(&self.bindings, view.writes, view.reads, tx_index)
+            .with_call_outputs(view.call_outputs);
         let ctx = EvalContext {
             bindings: &self.bindings,
             resolver: &resolver,
@@ -544,6 +554,8 @@ mod tests {
             writes: &writes,
             reads: &[],
             block: BlockContext::default(),
+
+            call_outputs: &[],
         };
         let mut reader = NoReRead;
         let (outcome, evidence) = oracle.check(&view, 1, &mut reader, ReReadBudget::new(8));
@@ -574,6 +586,8 @@ mod tests {
             writes: &writes,
             reads: &[],
             block: BlockContext::default(),
+
+            call_outputs: &[],
         };
         let mut reader = NoReRead;
         let (_, evidence) = oracle.check(&view, 1, &mut reader, ReReadBudget::new(8));
@@ -635,6 +649,8 @@ mod tests {
             writes: &[],
             reads: &[],
             block: BlockContext::default(),
+
+            call_outputs: &[],
         };
         let mut reader = NoReRead;
         let (outcome, evidence) = oracle.check(&view, 1, &mut reader, ReReadBudget::new(8));
@@ -687,6 +703,8 @@ mod tests {
             writes: &writes,
             reads: &[],
             block: BlockContext::default(),
+
+            call_outputs: &[],
         };
         let mut reader = NoReRead;
         let results = registry.check_all(&view, 1, &mut reader, ReReadBudget::new(8));
@@ -706,6 +724,8 @@ mod tests {
             writes: &[],
             reads: &[],
             block: BlockContext::default(),
+
+            call_outputs: &[],
         };
         let mut reader = NoReRead;
         assert!(registry

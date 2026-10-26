@@ -157,3 +157,7 @@ htmlcov/
 # ─────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+
+# Foundry build artifacts (regenerable)
+/benchmarks/historical/out/
+/benchmarks/historical/cache/

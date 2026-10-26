@@ -417,7 +417,7 @@ impl ViolationPredicate {
                 if block.is_none()
                     && predicate
                         .split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .any(|token| token == "block")
+                        .any(|word| word == "block")
                 {
                     return false;
                 }
@@ -433,9 +433,16 @@ impl ViolationPredicate {
                 let writes =
                     crate::engine::invariant_runtime::writes_from(&execution.storage_diffs);
                 let reads = crate::engine::invariant_runtime::reads_from(&execution.storage_reads);
+                // Call outputs are re-derived from this replay's own trace, mirroring
+                // storage: recorded discovery evidence is never consulted.
+                let call_outputs = crate::engine::invariant_runtime::call_outputs_from(
+                    &execution.call_trace,
+                    *tx_index,
+                );
                 let view = SequenceView {
                     writes: &writes,
                     reads: &reads,
+                    call_outputs: &call_outputs,
                     block: block.unwrap_or_default(),
                 };
                 // Only observations from this replay may resolve operands. Missing

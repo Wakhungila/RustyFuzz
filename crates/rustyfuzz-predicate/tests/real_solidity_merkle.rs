@@ -88,6 +88,8 @@ fn evaluate_with(reader_word: Option<[u8; 32]>) -> (Outcome, rustyfuzz_predicate
         writes: &[],
         reads: &[],
         block: BlockContext::default(),
+
+        call_outputs: &[],
     };
     predicate.check(&view, 0, &mut reader, ReReadBudget::new(4))
 }
@@ -238,6 +240,8 @@ fn an_unused_write_record_does_not_disturb_a_return_value_binding() {
         writes: &writes,
         reads: &[],
         block: BlockContext::default(),
+
+        call_outputs: &[],
     };
     let (outcome, _) = predicate.check(&view, 0, &mut reader, ReReadBudget::new(4));
     assert!(

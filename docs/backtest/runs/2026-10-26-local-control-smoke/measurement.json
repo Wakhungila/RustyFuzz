@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "run_kind": "local_control_smoke",
+  "measured_at": "2026-10-26",
+  "source": {
+    "head_commit": "9a8586f",
+    "branch": "backtest/v1",
+    "worktree_was_dirty": true
+  },
+  "environment": {
+    "rustyfuzz": "workspace dev build",
+    "cargo": "1.97.1",
+    "rustc": "1.97.1",
+    "forge": "1.7.1",
+    "echidna": "2.3.3",
+    "ityfuzz": "not installed"
+  },
+  "external_corpus": {
+    "repository": "https://github.com/crytic/not-so-smart-contracts",
+    "local_path": "/home/pin0ccs/Desktop/not-so-smart-contracts",
+    "commit": "020dbdbde3e0c2e8de5f3944e7455e438b0995d5",
+    "license": "Apache-2.0",
+    "worktree": "clean",
+    "source_files_copied_into_rustyfuzz": false,
+    "note": "Cloned for local fixture reconnaissance only; this smoke run did not fuzz this corpus."
+  },
+  "runs": [
+    {
+      "suite": "paired ERC-20 owner-mint positive and negative controls",
+      "commands": [
+        "cargo run --quiet --offline --locked -p rusty-fuzz --bin rusty-fuzz -- validate --benchmarks benchmarks/historical/gate2_positive_controls/erc20-owner-mint.toml --output docs/backtest/runs/2026-10-26-local-control-smoke/erc20-positive.json --broker-free",
+        "cargo run --quiet --offline --locked -p rusty-fuzz --bin rusty-fuzz -- validate --benchmarks benchmarks/historical/negative_controls/erc20-owner-mint.toml --output docs/backtest/runs/2026-10-26-local-control-smoke/erc20-negative.json --broker-free",
+        "forge test --root benchmarks/historical --match-path gate2_positive_controls/test/OwnerMintPair.t.sol -vv"
+      ],
+      "artifacts": {
+        "rustyfuzz_vulnerable_report": "erc20-positive.json",
+        "rustyfuzz_safe_report": "erc20-negative.json",
+        "foundry_poc_validation_log": "erc20-foundry-poc-validation.log",
+        "foundry_test": "../../../../benchmarks/historical/gate2_positive_controls/test/OwnerMintPair.t.sol"
+      },
+      "rustyfuzz_vulnerable_result": {
+        "execution": "3 local EVM transactions",
+        "per_case_status": "found",
+        "evidence_class": "SyntheticRegression",
+        "proof_status": "ConcretelyReplayed",
+        "confidence_tier": "confirmed",
+        "replay_result": "verified",
+        "explicit_violation_predicate": "sum(attackerBalance) == 0",
+        "original_state_violation_verified": true,
+        "poc_validation_status": "not_attempted"
+      },
+      "rustyfuzz_safe_result": {
+        "execution": "6 local EVM transactions",
+        "per_case_status": "not_found",
+        "evidence_class": "SyntheticRegression",
+        "proof_status": null,
+        "poc_validation_status": "not_attempted"
+      },
+      "separate_foundry_poc_validation": {
+        "result": "passed",
+        "tests_passed": 2,
+        "tests_failed": 0,
+        "properties": [
+          "unauthorized vulnerable mint increases attacker balance and totalSupply",
+          "unauthorized safe mint reverts and preserves attacker balance and totalSupply"
+        ],
+        "important_scope": "This is a separately authored and executed local Foundry regression/PoC test, not a RustyFuzz-generated PoC artifact; RustyFuzz correctly continues to report poc_validation_status=not_attempted."
+      },
+      "interpretation": "This pair now has independently replayed explicit invariant evidence for the vulnerable fixture and a separately executed Foundry test for the vulnerable/safe properties. It is synthetic local regression evidence, not a real protocol rediscovery."
+    },
+    {
+      "suite": "benchmarks/historical/gate2_positive_controls",
+      "command": "cargo run --quiet --offline --locked -p rusty-fuzz --bin rusty-fuzz -- validate --benchmarks benchmarks/historical/gate2_positive_controls --output /tmp/rustyfuzz-gate2-positive-controls.json --broker-free",
+      "raw_report": "positive-controls.json",
+      "summary": {
+        "cases": 5,
+        "executed": 5,
+        "per_case_status_found": 5,
+        "aggregate_found": 0,
+        "aggregate_not_found": 0,
+        "confirmed_predicate_proofs": 1,
+        "poc_validation_attempted": 0
+      },
+      "interpretation": "Local EVM transactions executed and oracle signals were produced. Only positive-erc20-owner-mint has a confirmed predicate proof; the other four cases lack proof confirmation. All PoC validations are not_attempted. These synthetic controls are not real-world rediscoveries."
+    },
+    {
+      "suite": "benchmarks/historical/negative_controls",
+      "command": "cargo run --quiet --offline --locked -p rusty-fuzz --bin rusty-fuzz -- validate --benchmarks benchmarks/historical/negative_controls --output /tmp/rustyfuzz-negative-controls.json --broker-free",
+      "raw_report": "negative-controls.json",
+      "calibration_report": "negative-controls-calibration.json",
+      "summary": {
+        "cases": 10,
+        "executed": 10,
+        "not_found": 10,
+        "confirmed_predicate_proofs": 0,
+        "poc_validation_attempted": 0
+      },
+      "interpretation": "All ten local negative controls executed and returned not_found. This is a useful negative-control smoke test, not a peer comparison or production benchmark."
+    }
+  ],
+  "workspace_tests": {
+    "command": "cargo test --workspace --locked --offline",
+    "result": "passed"
+  },
+  "limitations": [
+    "The positive suite reports per-case local signal status as found while its aggregate production-live found count remains 0; these are different evidence scopes and must not be conflated.",
+    "Four positive controls have no confirmed predicate proof.",
+    "PoC generation/validation was not attempted for these suites.",
+    "ItyFuzz was unavailable, so no matched-budget comparison was run.",
+    "Echidna is installed, but was not run because no equivalent Foundry property harness and matched campaign budget were prepared.",
+    "The external vulnerable-contract corpus was cloned but not executed.",
+    "No historical baseline report was changed."
+  ]
+}
