@@ -213,3 +213,87 @@ base slot is known and `keccak256(abi.encode(85, base))` can be computed) or a
 
 So the replay's remaining unknown is *which mapping slots the implementation reads*, and that
 is a storage-layout question, not a capture question.
+
+
+---
+
+## 6. First real offline historical replay (2026-10-26)
+
+The Audius case now executes offline. It has never executed before.
+
+```
+before:  status=skipped_by_config        executed=0
+after:   status=not_found                executed=1
+```
+
+`executed: 1` is the substantive change. Everything else below is detail.
+
+### What made it execute
+
+Three fixes, in dependency order:
+
+1. **`*.invariants.json` was being loaded as a manifest.** `validate --benchmarks
+   benchmarks/historical` failed with `missing field 'id'` from the moment `8c6ae77`
+   added a companion file to that directory. Pre-existing, unrelated to this session's
+   work, and it made the whole corpus un-runnable.
+2. **`validate` had no way to pin a block.** `fork_block` came only from `config.toml`,
+   whose value is a placeholder, so every `mainnet_fork` case returned
+   `skipped_by_config`. Added `--rpc-url` and `--fork-block`.
+3. **The invariant file's target had to equal the manifest target.** Wrong for this case:
+   the manifest target is the attacker's contract, the state is in the governance proxy.
+   Relaxed, with the binding target carried into the report so a reader can see which
+   contract was measured.
+
+### What the replay does now
+
+Measured with temporary instrumentation, since removed:
+
+| state of the capture | gas used | slots read | predicate outcomes |
+|---|---|---|---|
+| 4 accounts, governance slots only | 24,316 | 1 | all `Unknown` |
+| + attacker contract, token, router, WETH, both impls | 24,316 | 1 | all `Unknown` |
+| + attacker owner slot 0 | **131,078** | **16** | `implementation != 0` → **True** |
+
+So a predicate does evaluate against a captured historical snapshot. That was the open
+question and it is now answered yes.
+
+### Why it still reverts, stated precisely
+
+The replay's transaction reverts (gas 131,078 against the real 730,454). The attacker
+contract's entry point begins with `SLOAD(0)` / `CALLER` / `EQ` — `onlyOwner` on its own
+owner slot. Binding that slot raised gas five-fold and moved one predicate from `Unknown`
+to `True`, so the capture is being consulted; something later in the call still fails.
+
+The attacker contract embeds six external addresses:
+
+```
+0x18aaa7115705e8be94bffebde57af9bfc265b998   AUDIO token
+0x4d7968ebfd390d5e7926cb3587c39eff2f9fb225   discovery proxy
+0x4deca517d6817b6510798b7328f2314d3003abac   governance proxy
+0x7a250d5630b4cf539739df2c5dacb4c659f2488d   Uniswap V2 router
+0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2   WETH
+0xe6d97b2099f142513be7a2a068be040656ae4591   third Audius proxy
+```
+
+All six are captured. What is not captured is the storage *those* contracts read when
+called — token balances for the attacker's address, WETH balances, router pair addresses,
+discovery stakes. Each is a mapping lookup, so each needs its key named or its base slot
+derived.
+
+### What this means for the plan
+
+The gap has narrowed from "historical replay is unreachable" to "the replay needs a
+specific, enumerable set of slots". Two ways forward, and the second is better:
+
+- Add slots by hand each time the replay reverts, which is slow and case-specific.
+- **Derive them from the implementation's storage layout**: with the base slot of
+  `balances` known, `keccak256(abi.encode(address, base))` gives the exact slot, and the
+  capture can fetch it. That generalises to every case and is the same machinery
+  `crates/rustyfuzz-predicate` already has for mapping bindings.
+
+### Corrections to earlier statements in this file
+
+Section 5 said the remaining unknown was "which mapping slots the implementation reads".
+That is still true, but the *immediate* blocker is narrower and simpler: the token and WETH
+balances of the accounts the attacker contract talks to. Stated here so the next reader
+does not chase the harder question first.
