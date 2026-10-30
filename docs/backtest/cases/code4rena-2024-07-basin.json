@@ -1,0 +1,42 @@
+{
+  "case_id": "code4rena-2024-07-basin",
+  "source": {
+    "url": "https://github.com/code-423n4/2024-07-basin",
+    "commit": "bbe3cafed46822b0d0b1e0b80f9dee623012bd92",
+    "contest": "Code4rena 2024-07 Basin",
+    "local_path": "~/Desktop/2024-07-basin"
+  },
+  "purpose": "Phase 2 target: real stateful Foundry invariant tests with setUp() and handler-driven sequences.",
+  "not_vendored": true,
+  "why_not_vendored": "Third-party contest code is not copied into this repository. Reproducibility comes from URL + commit in this manifest.",
+
+  "verification": {
+    "build": "forge build succeeds (192 artifacts)",
+    "invariant_suite": "forge test --match-path test/invariant/Invariants.t.sol",
+    "invariant_result": "7 passed, 0 failed, 23.44s",
+    "foundry_invariant_config": "{ runs = 50, depth = 500, fail_on_revert = true }",
+    "handler_selectors": 14,
+    "calls_per_selector": "~1725 to ~1854 in the recorded run",
+    "solc": "as resolved by foundry.toml (src=src, libs=[lib, node_modules])"
+  },
+
+  "invariants": [
+    { "name": "invariant_totalSupplyMatchesFunctionCalc", "needs": "function-return values + approximate comparison", "expressible_today": false },
+    { "name": "invariant_reservesMatchFunctionCalcReserve", "needs": "function-return values + approximate comparison", "expressible_today": false },
+    { "name": "invariant_token0WellBalanceAndReserves", "needs": "ERC20 balanceOf(well) >= reserves[0]", "expressible_today": false },
+    { "name": "invariant_token1WellBalanceAndReserves", "needs": "ERC20 balanceOf(well) >= reserves[1]", "expressible_today": false },
+    { "name": "invariant_wellTokenBalancesShouldNeverBeZeroWithLPSupply", "needs": "conditional on totalSupply != 0", "expressible_today": false },
+    { "name": "invariant_lpSupplyShouldNeverBeZeroIfReservesAreInThePool", "needs": "nested conditionals", "expressible_today": false },
+    { "name": "invariant_callSummary", "needs": "logging only, not a property", "expressible_today": false }
+  ],
+
+  "storage_layout_finding": {
+    "slot": "0x4bba01c388049b5ebd30398b65e8ad45b632802c5faf4964e58085ea8ab03715",
+    "derivation": "bytes32(uint256(keccak256(\"reserves.storage.slot\")) - 1)",
+    "independently_verified": true,
+    "packing": "two uint128 reserves packed in one slot: reserve0 = shr(128, shl(128, sload(slot))) i.e. bits 0..128, reserve1 = shr(128, sload(slot)) i.e. bits 128..256",
+    "significance": "a real packed-slot case in production code. Reading the whole slot for either reserve returns both, which is exactly the bug the mandatory bit-range rule prevents."
+  },
+
+  "declared_limitation": "Every invariant here depends on function calls that return values (getReserves, totalSupply, balanceOf, calcLpTokenSupply) rather than on raw storage words alone. The predicate IR supports a single scalar return word per symbol; it cannot yet express multi-return calls (uint256[] reserves), calls on other contracts (balanceOf of a token), or approximate comparison with a relative tolerance. Phase 2.1 therefore requires extending the IR, not merely wiring it."
+}

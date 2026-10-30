@@ -1,5 +1,6 @@
 use bitvec::prelude::{BitVec, Lsb0};
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 pub use crate::evm::fuzz::EvmInput;
@@ -20,6 +21,25 @@ pub use rustyfuzz_evm::execution::{
 };
 pub use rustyfuzz_evm::execution::{MAX_TOTAL_WAYPOINTS, MAX_WAYPOINTS_PER_TX};
 pub use rustyfuzz_evm::transaction::SingletonTx;
+
+/// One resolved term of a predicate, carried into a finding's evidence.
+///
+/// Mirrors `rustyfuzz_predicate::TermEvidence` but lives here so the proof and report
+/// types do not depend on the predicate crate's internals. Values are decimal strings
+/// because the evidence is read by humans before it is parsed by machines.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PredicateTerm {
+    pub symbol: String,
+    pub address: String,
+    pub slot: String,
+    pub offset_bits: u16,
+    pub width_bits: u16,
+    pub value: String,
+    /// `write`, `observed_read`, `pre_value` or `re_read`, so a reviewer can tell a
+    /// trace observation from a re-read.
+    pub provenance: String,
+    pub tx_index: usize,
+}
 
 #[derive(Clone)]
 pub struct Snapshot {

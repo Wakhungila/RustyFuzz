@@ -21,6 +21,34 @@ Current benchmark classes include local fixtures, cached-fork/blind
 rediscovery fixtures, historical fixtures, live-fork manifests, and Daedaluzz
 fixtures.
 
+## Local comparison campaigns
+
+The target-matched vulnerable/safe control-pair runner is
+`benchmarks/comparison/run.py`. RustyFuzz comparison campaigns run against the
+shared local Anvil deployment with chain ID 1 and Cancun-compatible block
+semantics. The runner checks target bytecode at the pinned block and validates
+each campaign's fork provenance and execution records before reporting metrics.
+Campaign output is isolated by run ID; prior results are not removed.
+
+RustyFuzz comparison runs are measurement-only: promotion is disabled so proof
+generation failures do not contaminate execution, coverage, or state-exploration
+measurements. These runs cannot establish a confirmed finding or a clean
+negative. Their status is `measurement_only`; a zero-candidate result must not
+be presented as a vulnerability verdict. The mint pair uses the EVM
+authorization oracle rather than a blanket `totalSupply == 0` predicate, which
+would also fail for legitimate authorized minting.
+
+The per-sequence report includes execution outcomes, ABI-recognized target
+calls, successful target calls, coverage/trace novelty, sequence depth, state
+novelty, and candidate counts. `coverage_edges_max_sequence` is the maximum
+edge count for one sequence, not a campaign-wide unique-edge union.
+
+Historical vulnerable/safe EVM fixtures are exercised offline by
+`cargo test --test benchmarks`. They are replayable validation fixtures, not a
+claim that a live deployed protocol was fuzzed. Mainnet-fork manifests require
+separate authorization, pinned-state validation, and an isolated local fork;
+the benchmark runner must never submit generated transactions to a live chain.
+
 ## Target v0.2 Measurements
 
 Future benchmark reports should keep orchestration outside the fuzzing kernel

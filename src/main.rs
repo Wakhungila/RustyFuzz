@@ -26,3 +26,11 @@ async fn main() -> anyhow::Result<()> {
 
     cli::handlers::run(command).await
 }
+
+/// Test-only helpers, shared with the library through the same source file.
+///
+/// The binary target declares its own `mod cli` instead of linking the library,
+/// so it needs its own include of this module.
+#[cfg(test)]
+#[path = "test_support.rs"]
+mod test_support;

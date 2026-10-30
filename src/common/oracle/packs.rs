@@ -7,6 +7,168 @@ use revm::primitives::{keccak256, Address, B256, U256};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Result of establishing whether a caller may upgrade a proxy.
+///
+/// The original implementation emitted `High` for any successful call to an
+/// upgrade selector, with no privilege check and no proof that the
+/// implementation slot moved. That produced a confirmed false positive on a live
+/// UUPS proxy (`0x4783C67b...`, Robinhood Chain) where the entry point is
+/// supposed to be reachable. Because this oracle gates backtest credibility, the
+/// deliberate choice is to miss an unauthorised upgrade rather than report a
+/// legitimate one.
+///
+/// # Why "unknown" is the common case, not an edge case
+///
+/// `SequenceExecutionResult` carries `storage_diffs` (committed writes only) and
+/// `storage_reads` (values actually loaded). It carries no full state snapshot.
+/// So when a proxy admin slot was neither read nor written during the sequence,
+/// the caller privilege is genuinely unobservable here - there is no value to
+/// compare against. Reporting `High` in that situation is exactly the false
+/// positive this gate exists to prevent, so nothing is reported.
+///
+/// Suppressed candidates are deliberately not emitted as findings: doing so would
+/// inflate finding counts and pollute the false-positive metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyUpgradePrivilege {
+    /// The recorded admin value equals the caller: the caller may upgrade.
+    Privileged,
+    /// The recorded admin value differs from the caller: the caller may not.
+    Unprivileged,
+    /// No admin value is observable in this execution evidence.
+    Unknown,
+}
+
+/// Establishes the upgrading caller privilege from the evidence available.
+///
+/// Preference order:
+/// 1. The EIP-1967 admin slot, read during this transaction (a load is direct
+///    evidence and needs no accompanying write).
+/// 2. The EIP-1967 admin slot, written during this sequence (the new value is the
+///    authority after the write).
+/// 3. The EIP-1967 admin slot returned as call output, when a getter was invoked.
+/// 4. The conventional owner slot (slot 0), read during this transaction.
+///    Many proxies and UUPS implementations keep privilege there instead of in
+///    the EIP-1967 admin slot.
+///
+/// Anything else yields `Unknown`.
+fn proxy_upgrade_privilege(
+    execution: &SequenceExecutionResult,
+    call: &CallObservation,
+    admin_slot: B256,
+) -> ProxyUpgradePrivilege {
+    // 1. A read of the admin slot in this transaction is the strongest signal.
+    if let Some(value) = execution
+        .storage_reads
+        .iter()
+        .filter(|read| read.address == call.target && read.tx_index == call.tx_index)
+        .filter(|read| read.slot == admin_slot)
+        .find_map(|read| read.value)
+    {
+        return classify_admin(value, call.caller);
+    }
+
+    // 2. A committed write to the admin slot.
+    if let Some(diff) = execution
+        .storage_diffs
+        .iter()
+        .filter(|diff| diff.address == call.target && diff.slot == admin_slot)
+        .find(|diff| diff.old_value != diff.new_value)
+    {
+        return classify_admin(diff.new_value, call.caller);
+    }
+
+    // 3. Admin exposed as return data by a getter called in this transaction.
+    if let Some(value) = admin_from_call_output(execution, call) {
+        return classify_admin(value, call.caller);
+    }
+
+    // 4. Conventional owner slot at slot 0.
+    if admin_slot != owner_slot() {
+        if let Some(value) = execution
+            .storage_reads
+            .iter()
+            .filter(|read| read.address == call.target && read.tx_index == call.tx_index)
+            .filter(|read| read.slot == owner_slot())
+            .find_map(|read| read.value)
+        {
+            return classify_admin(value, call.caller);
+        }
+    }
+
+    ProxyUpgradePrivilege::Unknown
+}
+
+fn classify_admin(admin: U256, caller: Address) -> ProxyUpgradePrivilege {
+    // A zero admin means initialisation never happened, so no caller holds the
+    // role. That is an initializer defect and is reported by the initializer
+    // branch, not here.
+    if admin.is_zero() {
+        return ProxyUpgradePrivilege::Unknown;
+    }
+    if address_from_word(admin) == caller {
+        ProxyUpgradePrivilege::Privileged
+    } else {
+        ProxyUpgradePrivilege::Unprivileged
+    }
+}
+
+/// Interprets a 32-byte admin word as an address (low 20 bytes).
+fn address_from_word(word: U256) -> Address {
+    let bytes = word.to_be_bytes::<32>();
+    Address::from_slice(&bytes[12..])
+}
+
+fn owner_slot() -> B256 {
+    B256::from(U256::ZERO.to_be_bytes::<32>())
+}
+
+/// Looks for an admin/owner value in the return data of a getter invoked in the
+/// same transaction as `call`, on the same target.
+fn admin_from_call_output(
+    execution: &SequenceExecutionResult,
+    call: &CallObservation,
+) -> Option<U256> {
+    let admin_getters: Vec<[u8; 4]> = ["admin()", "owner()", "proxyAdmin()"]
+        .iter()
+        .map(|s| sig(s))
+        .collect();
+
+    execution
+        .call_trace
+        .iter()
+        .filter(|other| {
+            other.phase == CallPhase::End
+                && other.success
+                && other.target == call.target
+                && other.tx_index == call.tx_index
+                && other.output.len() >= 32
+        })
+        .filter(|other| selector(other).is_some_and(|sel| admin_getters.contains(&sel)))
+        .map(|other| U256::from_be_slice(&other.output[..32]))
+        .next()
+}
+
+/// True when the call changed the EIP-1967 implementation slot on its target.
+///
+/// This is the "did the upgrade actually happen" half of the gate. A call that
+/// merely reached `upgradeToAndCall` wrote nothing, and must not produce a
+/// finding.
+fn implementation_slot_changed(
+    execution: &SequenceExecutionResult,
+    call: &CallObservation,
+    implementation_slot: B256,
+) -> bool {
+    execution.storage_diffs.iter().any(|diff| {
+        diff.address == call.target
+            && diff.slot == implementation_slot
+            && diff.old_value != diff.new_value
+            // The write must belong to this call transaction: a later
+            // transaction changing the implementation is not evidence that this
+            // caller performed the upgrade.
+            && diff.tx_index == call.tx_index
+    })
+}
+
 const ERC20_TRANSFER: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
 const ERC20_TRANSFER_FROM: [u8; 4] = [0x23, 0xb8, 0x72, 0xdd];
 const ERC20_APPROVE: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
@@ -918,6 +1080,21 @@ impl ProtocolOraclePack {
         }
     }
 
+    /// Proxy upgradeability, with a privilege gate.
+    ///
+    /// A reachable upgrade entry point is not a vulnerability. Both branches below
+    /// fire only when the evidence shows *unauthorised* state mutation:
+    ///
+    /// * an initializer that ran and wrote EIP-1967 proxy slots, or
+    /// * an upgrade entry point that moved the implementation slot while the
+    ///   caller was not the recorded admin/owner.
+    ///
+    /// When the proxy admin cannot be established from the execution evidence
+    /// (no admin-slot read, no admin-slot write, no admin getter output, no
+    /// `owner()` read), the upgrade case is suppressed rather than reported. A
+    /// deliberate false negative is preferable here: this oracle gates backtest
+    /// credibility, and the previous behaviour reported every successful
+    /// `upgradeTo` call as High, including the owner's own upgrades.
     fn evaluate_proxy_upgradeability(
         &self,
         execution: &SequenceExecutionResult,
@@ -937,6 +1114,9 @@ impl ProtocolOraclePack {
         let implementation_slot = eip1967_slot("eip1967.proxy.implementation");
         let admin_slot = eip1967_slot("eip1967.proxy.admin");
 
+        // Branch 1: an external initializer that wrote proxy-critical slots after
+        // the fork/deployment state. Running an initializer on live state is
+        // itself the defect; privilege does not make it acceptable.
         for call in calls_with_selectors(execution, &initializer_selectors) {
             if !call.success {
                 continue;
@@ -968,61 +1148,48 @@ impl ProtocolOraclePack {
             });
         }
 
-        for diff in execution.storage_diffs.iter().filter(|diff| {
-            diff.old_value != diff.new_value
-                && (diff.slot == implementation_slot || diff.slot == admin_slot)
-        }) {
-            let role = if diff.slot == implementation_slot {
-                "implementation"
-            } else {
-                "admin"
-            };
-            let selector_context = execution
-                .call_trace
-                .iter()
-                .find(|call| {
-                    call.tx_index == diff.tx_index
-                        && call.target == diff.address
-                        && call.phase == CallPhase::End
-                })
-                .and_then(selector);
-            let upgrade_like = selector_context.is_some_and(|sel| {
-                upgrade_selectors.contains(&sel) || initializer_selectors.contains(&sel)
-            });
-            findings.push(ProtocolFinding {
-                pack: ProtocolOraclePackKind::ProxyUpgradeability,
-                vuln: VulnType::ProxyUpgradeabilityViolation,
-                severity: if role == "admin" || upgrade_like {
-                    ProtocolSeverity::Critical
-                } else {
-                    ProtocolSeverity::High
-                },
-                tx_index: Some(diff.tx_index),
-                target: Some(diff.address),
-                evidence: format!(
-                    "EIP-1967 {role} slot mutated old={} new={} selector={} upgrade_like={upgrade_like}",
-                    diff.old_value,
-                    diff.new_value,
-                    selector_context
-                        .map(hex::encode)
-                        .unwrap_or_else(|| "none".to_string())
-                ),
-            });
-        }
-
+        // Branch 2: an upgrade entry point that actually moved the implementation
+        // slot, performed by a caller that is not the recorded admin/owner.
+        //
+        // Note: the previous implementation also had an unconditional
+        // "any EIP-1967 slot was mutated" branch here, which reported the owner's
+        // own legitimate upgrade as Critical. That branch is folded into this one
+        // so a single event yields exactly one finding and privilege is always
+        // consulted.
         for call in calls_with_selectors(execution, &upgrade_selectors) {
-            if call.success {
-                findings.push(ProtocolFinding {
-                    pack: ProtocolOraclePackKind::ProxyUpgradeability,
-                    vuln: VulnType::ProxyUpgradeabilityViolation,
-                    severity: ProtocolSeverity::High,
-                    tx_index: Some(call.tx_index),
-                    target: Some(call.target),
-                    evidence: format!(
-                        "successful upgrade entrypoint {} reached through fuzzed input",
-                        selector_hex(call)
-                    ),
-                });
+            if !call.success {
+                continue;
+            }
+            if !implementation_slot_changed(execution, call, implementation_slot) {
+                // The entry point ran but did not move the implementation
+                // (no-op upgrade, short-circuit, or an unrelated write).
+                continue;
+            }
+            match proxy_upgrade_privilege(execution, call, admin_slot) {
+                ProxyUpgradePrivilege::Unprivileged => {
+                    findings.push(ProtocolFinding {
+                        pack: ProtocolOraclePackKind::ProxyUpgradeability,
+                        vuln: VulnType::ProxyUpgradeabilityViolation,
+                        severity: ProtocolSeverity::High,
+                        tx_index: Some(call.tx_index),
+                        target: Some(call.target),
+                        evidence: format!(
+                            "unauthorised caller {:?} changed the EIP-1967 implementation slot via {} (recorded admin/owner differs from caller)",
+                            call.caller,
+                            selector_hex(call)
+                        ),
+                    });
+                }
+                // The caller is the recorded admin/owner: a legitimate upgrade.
+                ProxyUpgradePrivilege::Privileged => {}
+                // Privilege is unobservable from this evidence. Suppress.
+                ProxyUpgradePrivilege::Unknown => {
+                    log::debug!(
+                        "suppressed proxy upgrade finding for {} on {:?}: admin privilege unobservable in this execution",
+                        selector_hex(call),
+                        call.target
+                    );
+                }
             }
         }
     }
@@ -1467,26 +1634,219 @@ mod tests {
         }));
     }
 
+    /// Replaces the previous `flags_eip1967_implementation_slot_mutation`.
+    ///
+    /// The old test asserted that *any* EIP-1967 implementation-slot mutation
+    /// produced a Critical finding. That is the false-positive behaviour being
+    /// fixed: an owner's own legitimate upgrade also mutates that slot. The
+    /// contract is now "mutating the slot is necessary but not sufficient", so
+    /// this test pins both halves:
+    ///
+    /// * with no observable admin, the mutation alone is suppressed, and
+    /// * with the caller recorded as a non-admin, it is reported.
     #[test]
-    fn flags_eip1967_implementation_slot_mutation() {
+    fn eip1967_implementation_slot_mutation_requires_an_unprivileged_caller() {
+        let target = addr(0xaa);
+        let attacker = addr(0x01);
+        let admin = addr(0x02);
         let diff = StorageDiff {
             tx_index: 0,
-            address: addr(0xaa),
+            address: target,
             slot: eip1967_slot("eip1967.proxy.implementation"),
             old_value: U256::ZERO,
             new_value: U256::from(0xbb),
             pc: 0,
         };
-        let findings = ProtocolOraclePack::default().evaluate(&execution(
-            vec![call(sig("upgradeTo(address)"))],
-            vec![diff],
-        ));
 
-        assert!(findings.iter().any(|finding| {
-            finding.pack == ProtocolOraclePackKind::ProxyUpgradeability
-                && finding.severity == ProtocolSeverity::Critical
-                && finding.evidence.contains("implementation slot mutated")
-        }));
+        // (a) Slot mutation alone, admin unobservable -> suppressed.
+        let without_admin = ProtocolOraclePack::default().evaluate(&execution(
+            vec![call(sig("upgradeTo(address)"))],
+            vec![diff.clone()],
+        ));
+        assert!(
+            proxy_findings(&without_admin).is_empty(),
+            "an implementation-slot mutation with no observable admin must not be reported"
+        );
+
+        // (b) Same mutation with the caller shown to be a non-admin -> reported.
+        let mut with_admin = execution(
+            vec![upgrade_call(attacker, target, sig("upgradeTo(address)"))],
+            vec![diff],
+        );
+        with_admin.storage_reads.push(admin_read(0, target, admin));
+        let findings = ProtocolOraclePack::default().evaluate(&with_admin);
+        let proxy = proxy_findings(&findings);
+        assert_eq!(proxy.len(), 1, "expected exactly one proxy finding");
+        assert_eq!(proxy[0].severity, ProtocolSeverity::High);
+        assert!(
+            proxy[0].evidence.contains("unauthorised caller"),
+            "evidence must name the privilege failure, got {}",
+            proxy[0].evidence
+        );
+    }
+
+    // ---- Proxy upgrade authorisation gate -------------------------------
+    //
+    // The three cases below are the regression contract for the fix to the
+    // ProxyUpgradeabilityViolation false positive. Before the fix the first and
+    // the third case both emitted a High finding, because the oracle only
+    // checked `call.success`.
+
+    use crate::common::types::StorageAccess;
+
+    fn upgrade_call(
+        caller: Address,
+        target: Address,
+        upgrade_selector: [u8; 4],
+    ) -> CallObservation {
+        let mut input = upgrade_selector.to_vec();
+        input.extend_from_slice(&[0; 12]);
+        input.extend_from_slice(addr(0xbb).as_slice());
+        observation(
+            0,
+            caller,
+            target,
+            CallKind::Transaction,
+            true,
+            input,
+            Vec::new(),
+        )
+    }
+
+    fn implementation_write(tx_index: usize, target: Address, to: U256) -> StorageDiff {
+        StorageDiff {
+            tx_index,
+            address: target,
+            slot: eip1967_slot("eip1967.proxy.implementation"),
+            old_value: U256::ZERO,
+            new_value: to,
+            pc: 0,
+        }
+    }
+
+    fn admin_read(tx_index: usize, target: Address, admin: Address) -> StorageAccess {
+        let mut word = [0u8; 32];
+        word[12..].copy_from_slice(admin.as_slice());
+        StorageAccess {
+            tx_index,
+            address: target,
+            slot: eip1967_slot("eip1967.proxy.admin"),
+            value: Some(U256::from_be_bytes(word)),
+            pc: 0,
+        }
+    }
+
+    fn proxy_findings(findings: &[ProtocolFinding]) -> Vec<&ProtocolFinding> {
+        findings
+            .iter()
+            .filter(|finding| {
+                finding.pack == ProtocolOraclePackKind::ProxyUpgradeability
+                    && finding.vuln == VulnType::ProxyUpgradeabilityViolation
+            })
+            .collect()
+    }
+
+    #[test]
+    fn proxy_upgrade_unauthorized_caller_is_flagged() {
+        let target = addr(0xaa);
+        let attacker = addr(0x01);
+        let admin = addr(0x02);
+        let mut execution = execution(
+            vec![upgrade_call(attacker, target, sig("upgradeTo(address)"))],
+            vec![implementation_write(0, target, U256::from(0xbb))],
+        );
+        // The proxy recorded a different admin, and that admin was read here.
+        execution.storage_reads.push(admin_read(0, target, admin));
+
+        let findings = ProtocolOraclePack::default().evaluate(&execution);
+        let proxy = proxy_findings(&findings);
+        assert_eq!(
+            proxy.len(),
+            1,
+            "an unauthorised caller that moved the implementation slot must be reported once, got {:?}",
+            proxy.iter().map(|f| &f.evidence).collect::<Vec<_>>()
+        );
+        assert_eq!(proxy[0].severity, ProtocolSeverity::High);
+        assert!(
+            proxy[0].evidence.contains("unauthorised caller"),
+            "evidence should name the privilege failure, got {}",
+            proxy[0].evidence
+        );
+    }
+
+    #[test]
+    fn proxy_upgrade_admin_caller_is_not_flagged() {
+        let target = addr(0xaa);
+        let admin = addr(0x02);
+        let mut execution = execution(
+            vec![upgrade_call(admin, target, sig("upgradeTo(address)"))],
+            vec![implementation_write(0, target, U256::from(0xbb))],
+        );
+        // The caller *is* the recorded admin: a legitimate upgrade.
+        execution.storage_reads.push(admin_read(0, target, admin));
+
+        let findings = ProtocolOraclePack::default().evaluate(&execution);
+        assert!(
+            proxy_findings(&findings).is_empty(),
+            "the admin upgrading its own proxy is not a vulnerability, got {:?}",
+            proxy_findings(&findings)
+                .iter()
+                .map(|f| &f.evidence)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn proxy_upgrade_without_implementation_change_is_not_flagged() {
+        let target = addr(0xaa);
+        let attacker = addr(0x01);
+        let admin = addr(0x02);
+        let mut execution = execution(
+            vec![upgrade_call(
+                attacker,
+                target,
+                sig("upgradeToAndCall(address,bytes)"),
+            )],
+            // Writes an unrelated slot: the implementation slot never moved.
+            vec![StorageDiff {
+                tx_index: 0,
+                address: target,
+                slot: B256::from(U256::from(7).to_be_bytes::<32>()),
+                old_value: U256::ZERO,
+                new_value: U256::from(1),
+                pc: 0,
+            }],
+        );
+        execution.storage_reads.push(admin_read(0, target, admin));
+
+        let findings = ProtocolOraclePack::default().evaluate(&execution);
+        assert!(
+            proxy_findings(&findings).is_empty(),
+            "reaching an upgrade entry point without changing the implementation slot is not \
+             an upgrade, got {:?}",
+            proxy_findings(&findings)
+                .iter()
+                .map(|f| &f.evidence)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn proxy_upgrade_with_unknown_admin_is_suppressed() {
+        // Documents the deliberate false-negative bias: when the admin cannot be
+        // established from the evidence, nothing is reported.
+        let target = addr(0xaa);
+        let attacker = addr(0x01);
+        let execution = execution(
+            vec![upgrade_call(attacker, target, sig("upgradeTo(address)"))],
+            vec![implementation_write(0, target, U256::from(0xbb))],
+        );
+
+        let findings = ProtocolOraclePack::default().evaluate(&execution);
+        assert!(
+            proxy_findings(&findings).is_empty(),
+            "with no observable admin the oracle must stay silent rather than guess"
+        );
     }
 
     fn observation(

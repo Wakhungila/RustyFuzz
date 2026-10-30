@@ -12,12 +12,14 @@ const ZEN_MAX_RESPONSE_BYTES: usize = 1_048_576;
 // Different-protocol models (Responses/SystemOne) are deliberately excluded.
 pub const FREE_CHAT_MODELS: &[&str] = &[
     "big-pickle",
-    "space-bunny-free",
+    "beam-free",
+    "flint-40b-free",
     "mimo-v2.6-flash-free",
-    "mimo-v2.5-free",
-    "ling-3.0-flash-fin-free",
-    "nemotron-3-ultra-free",
+    "nemotron-3.5-super-vl-free",
     "nemotron-3.5-lightning-free",
+    "jev-1.13-free",
+    "deepseek-v4.1-flash-free",
+    "glm-5.3-flash-free",
 ];
 
 #[derive(Debug, Clone)]
@@ -44,8 +46,16 @@ impl ZenClient {
     }
 
     pub async fn complete_json(&self, prompt: &str) -> SatoriResult<(String, bool)> {
+        self.complete_json_for(prompt, &self.model).await
+    }
+
+    pub async fn complete_json_for(
+        &self,
+        prompt: &str,
+        model: &str,
+    ) -> SatoriResult<(String, bool)> {
         let prompt = redact_prompt_for_external_transmission(prompt);
-        let identity = format!("opencode-zen/chat-v1/{}", self.model);
+        let identity = format!("opencode-zen/chat-v1/{}", model);
         let key = ResponseCache::key(&identity, &prompt);
         let cache = self.cache.clone();
         let cache_key = key.clone();
@@ -60,7 +70,7 @@ impl ZenClient {
             validate_json(&cached.response_text)?;
             return Ok((cached.response_text, true));
         }
-        let response = complete_json_impl(&self.model, &prompt).await?;
+        let response = complete_json_impl(model, &prompt).await?;
         validate_json(&response)?;
         let cache = self.cache.clone();
         let cached = CachedResponse {
@@ -72,6 +82,34 @@ impl ZenClient {
             .await
             .map_err(|error| anyhow::anyhow!("Zen cache writer failed: {error}"))??;
         Ok((response, false))
+    }
+
+    fn candidate_models(&self, fallback_models: &[String]) -> Vec<String> {
+        let mut candidates: Vec<String> = vec![self.model.clone()];
+        for fallback in fallback_models {
+            let fallback = fallback.trim();
+            if fallback.is_empty() || candidates.iter().any(|candidate| candidate == fallback) {
+                continue;
+            }
+            candidates.push(fallback.to_string());
+        }
+        candidates
+    }
+
+    pub async fn complete_json_with_fallbacks(
+        &self,
+        prompt: &str,
+        fallback_models: &[String],
+    ) -> SatoriResult<(String, bool)> {
+        let candidates = self.candidate_models(fallback_models);
+        let mut last_error: Option<anyhow::Error> = None;
+        for model in candidates {
+            match self.complete_json_for(prompt, &model).await {
+                Ok(result) => return Ok(result),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Satori Zen: no available model candidate for completion")))
     }
 }
 
@@ -270,6 +308,22 @@ mod tests {
         assert!(ZenClient::new("opencode/big-pickle", ResponseCache::new("unused")).is_ok());
         assert!(validate_json("```json\n{}\n```").is_err());
         assert!(validate_json("[]").is_err());
+    }
+
+    #[test]
+    fn fallback_candidates_start_with_primary_and_dedupe_fallbacks() {
+        let client = ZenClient::new("flint-40b-free", ResponseCache::new("unused")).unwrap();
+        let fallbacks = vec![
+            "big-pickle".to_string(),
+            "  ".to_string(),
+            "flint-40b-free".to_string(),
+            "beam-free".to_string(),
+        ];
+        assert_eq!(
+            client.candidate_models(&fallbacks),
+            vec!["flint-40b-free", "big-pickle", "beam-free"]
+        );
+        assert_eq!(client.candidate_models(&[]), vec!["flint-40b-free"]);
     }
     #[cfg(feature = "llm")]
     #[test]

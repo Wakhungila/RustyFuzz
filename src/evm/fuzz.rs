@@ -64,6 +64,9 @@ pub struct EvmMutator {
     pub testcase_metadata: EvmTestcaseMetadataStore,
     /// Per-strategy attempt/mutated counters (Stage 3.6, additive telemetry).
     pub strategy_counters: Arc<StrategyCounters>,
+    /// Worker-local snapshot catalog. Brokered workers deliberately leave this
+    /// unset: their snapshot handles are not portable across processes.
+    snapshot_corpus: Option<Arc<RwLock<crate::evm::corpus::SnapshotCorpus>>>,
 }
 
 /// Named mutation strategy buckets (attempt order fixed by probability table).
@@ -112,6 +115,13 @@ where
     fn mutate(&mut self, state: &mut S, input: &mut EvmInput) -> Result<MutationResult, Error> {
         let rand = state.rand_mut();
         let mut metadata = self.testcase_metadata.get_or_default(input);
+        if self.snapshot_corpus.is_some()
+            && rand.below(NonZero::new(5).unwrap()) == 0
+            && self.rebase_on_snapshot(rand, input, &mut metadata)
+        {
+            self.testcase_metadata.insert(input, metadata);
+            return Ok(MutationResult::Mutated);
+        }
         let has_concolic_hints = { !self.concolic_hints.lock().is_empty() };
         if has_concolic_hints
             && rand.below(NonZero::new(100).unwrap()) < 15
@@ -190,12 +200,20 @@ impl EvmMutator {
             decode_cache: RwLock::new(LruCache::new(MAX_DECODE_CACHE_SIZE)),
             testcase_metadata: EvmTestcaseMetadataStore::default(),
             strategy_counters: Arc::new(StrategyCounters::default()),
+            snapshot_corpus: None,
         }
     }
 
     /// Checks if adding `count` transactions would exceed the maximum sequence length
     fn can_add_transactions(&self, input: &EvmInput, count: usize) -> bool {
-        input.txs.len() + count <= MAX_SEQUENCE_LENGTH
+        let len = match &self.snapshot_corpus {
+            Some(corpus) => match corpus.read().root_replay_input(input) {
+                Some(replay) => replay.txs.len(),
+                None => return false,
+            },
+            None => input.txs.len(),
+        };
+        len.saturating_add(count) <= MAX_SEQUENCE_LENGTH
     }
 
     pub fn with_concolic_hints(
@@ -228,7 +246,53 @@ impl EvmMutator {
             decode_cache: RwLock::new(LruCache::new(MAX_DECODE_CACHE_SIZE)),
             testcase_metadata,
             strategy_counters: Arc::new(StrategyCounters::default()),
+            snapshot_corpus: None,
         }
+    }
+
+    pub fn with_snapshot_corpus(
+        mut self,
+        corpus: Arc<RwLock<crate::evm::corpus::SnapshotCorpus>>,
+    ) -> Self {
+        self.snapshot_corpus = Some(corpus);
+        self
+    }
+
+    fn rebase_on_snapshot<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
+    ) -> bool {
+        let Some(catalog) = self.snapshot_corpus.as_ref() else {
+            return false;
+        };
+        if input.txs.is_empty() {
+            return false;
+        }
+        let mut corpus = catalog.write();
+        let Some(id) = corpus.select_snapshot(rand) else {
+            return false;
+        };
+        if id == 0 || id == input.base_snapshot_id {
+            return false;
+        }
+        let action = input.txs[rand.below(NonZero::new(input.txs.len()).unwrap())].clone();
+        let rebased = EvmInput::new(vec![action], id);
+        if corpus.root_replay_input(&rebased).is_none() || !corpus.pin_snapshot(id) {
+            return false;
+        }
+        *input = rebased;
+        metadata.waypoints.clear();
+        metadata.mutation_provenance.clear();
+        self.record_mutation(
+            metadata,
+            "snapshot_rebase",
+            Some(0),
+            selector_for_calldata(&input.txs[0].input),
+            "continued from a retained state with complete root replay lineage",
+        );
+        true
     }
 
     /// Records a strategy attempt without touching RNG or selection.
@@ -562,7 +626,9 @@ impl EvmMutator {
             return self.retarget_tx_to_known_abi(rand, input, metadata, idx);
         }
 
-        let tuple_type = self.type_cache.read().get(&selector).cloned().or_else(|| {
+        // Drop the read guard before filling a cache miss under the write lock.
+        let cached_type = { self.type_cache.read().get(&selector).cloned() };
+        let tuple_type = cached_type.or_else(|| {
             self.abi_registry.functions.get(&selector).map(|types| {
                 let t = DynSolType::Tuple(types.clone());
                 self.type_cache.write().insert(selector, t.clone());

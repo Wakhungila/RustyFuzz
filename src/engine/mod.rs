@@ -18,7 +18,9 @@ pub mod fork_setup;
 pub mod formal_spec;
 pub mod foundry_ingest;
 pub mod fuzz_engine;
+pub mod invariant_file;
 pub mod invariant_manifest;
+pub mod invariant_runtime;
 pub mod minimizer;
 // OrderingConstraintMutator is regression-tested but not exposed until formal
 // specs are deliberately routed into the active mutation pipeline.

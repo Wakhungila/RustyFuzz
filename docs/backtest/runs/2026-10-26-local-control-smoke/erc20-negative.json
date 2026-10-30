@@ -1,0 +1,466 @@
+{
+  "generated_at_unix_secs": 1793028958,
+  "summary": {
+    "total": 1,
+    "executed": 1,
+    "found": 0,
+    "not_found": 1,
+    "not_run": 0,
+    "not_run_missing_fixture": 0,
+    "not_run_missing_target": 0,
+    "not_run_missing_success_criteria": 0,
+    "not_run_unsupported_mode": 0,
+    "failed_execution": 0,
+    "skipped_by_config": 0
+  },
+  "coverage": {
+    "total_classes": 12,
+    "covered_classes": 12,
+    "benchmarked_classes": 2,
+    "confirmed_classes": 0,
+    "entries": [
+      {
+        "class": "access_control_failure",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "governance/access-control oracle"
+        ],
+        "invariants": [
+          "unauthorized privileged state mutation"
+        ],
+        "seed_templates": [
+          "access-control-sensitive selector retry"
+        ],
+        "state_machines": [
+          "access-control",
+          "governance"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "price_oracle_manipulation",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "oracle freshness invariant"
+        ],
+        "invariants": [
+          "price dependency without freshness/bounds"
+        ],
+        "seed_templates": [
+          "oracle read -> state-changing action"
+        ],
+        "state_machines": [
+          "lending",
+          "amm"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "logic_accounting_error",
+        "benchmark_ids": [
+          "negative-erc20-owner-mint"
+        ],
+        "found": 0,
+        "executed": 1,
+        "oracles": [
+          "protocol invariant evaluator"
+        ],
+        "invariants": [
+          "accounting conservation failure"
+        ],
+        "seed_templates": [
+          "deposit/withdraw accounting flow"
+        ],
+        "state_machines": [
+          "vault",
+          "lending"
+        ],
+        "gaps": [
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "reentrancy",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "reentrancy oracle"
+        ],
+        "invariants": [
+          "unsafe external call state transition"
+        ],
+        "seed_templates": [
+          "callback-sensitive transfer/deposit"
+        ],
+        "state_machines": [
+          "vault",
+          "rewards"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "flash_loan_economic_attack",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "economic delta engine"
+        ],
+        "invariants": [
+          "transient price/solvency manipulation"
+        ],
+        "seed_templates": [
+          "swap -> dependent action -> reverse swap"
+        ],
+        "state_machines": [
+          "amm",
+          "lending"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "unchecked_external_call",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "call trace observer"
+        ],
+        "invariants": [
+          "unsafe external call state transition"
+        ],
+        "seed_templates": [
+          "external call around state write"
+        ],
+        "state_machines": [
+          "generic"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "governance_timelock_failure",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "governance oracle"
+        ],
+        "invariants": [
+          "queue/execute delay bypass"
+        ],
+        "seed_templates": [
+          "propose -> vote -> queue -> execute"
+        ],
+        "state_machines": [
+          "governance"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "upgradeability_proxy_error",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "access-control oracle"
+        ],
+        "invariants": [
+          "initializer or implementation mutation"
+        ],
+        "seed_templates": [
+          "initialize/reinitialize/upgradeTo"
+        ],
+        "state_machines": [
+          "access-control"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "signature_replay_bug",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "replay invariant"
+        ],
+        "invariants": [
+          "replayable message/signature reuse"
+        ],
+        "seed_templates": [
+          "permit/execute replay"
+        ],
+        "state_machines": [
+          "bridge",
+          "token"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "denial_of_service_griefing",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "status/revert classifier"
+        ],
+        "invariants": [
+          "persistent liveness failure"
+        ],
+        "seed_templates": [
+          "griefable state transition"
+        ],
+        "state_machines": [
+          "generic"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "precision_rounding_loss",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "economic delta engine"
+        ],
+        "invariants": [
+          "precision or rounding loss"
+        ],
+        "seed_templates": [
+          "small amount boundary mutations"
+        ],
+        "state_machines": [
+          "vault",
+          "amm"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "unsafe_token_handling",
+        "benchmark_ids": [
+          "negative-erc20-owner-mint"
+        ],
+        "found": 0,
+        "executed": 1,
+        "oracles": [
+          "erc20/accounting invariant"
+        ],
+        "invariants": [
+          "fee/rebase/return-value accounting mismatch"
+        ],
+        "seed_templates": [
+          "transfer/transferFrom around accounting"
+        ],
+        "state_machines": [
+          "token",
+          "vault"
+        ],
+        "gaps": [
+          "no confirmed replayed finding yet"
+        ]
+      }
+    ]
+  },
+  "calibration": {
+    "benchmark_count": 0,
+    "synthetic_regression_count": 1,
+    "pass_rate": 0.0,
+    "replay_success_rate": 0.0,
+    "minimized_success_rate": 0.0,
+    "poc_generation_rate": 0.0,
+    "average_time_to_signal_secs": null,
+    "average_executions_to_signal": null,
+    "useful_seed_sources": [
+      "executable EVM fixture transaction sequences"
+    ],
+    "false_positive_budget_notes": [],
+    "threshold_recommendations": [
+      "PoC generation is not yet represented in this validation pack; require it for bounty-grade confirmations",
+      "current benchmark pack has no negative controls after confirmation; keep at least one negative/noisy fixture in larger calibration runs"
+    ]
+  },
+  "benchmarks": [
+    {
+      "evidence_class": "SyntheticRegression",
+      "runtime": {
+        "schema_version": 1,
+        "fixture": "/home/pin0ccs/Desktop/RustyFuzz/benchmarks/historical/negative_controls/fixtures/erc20-owner-mint.json",
+        "fixture_hash": "a5563aa2b2416a0c763d2cac04d323ee12e9b190d1c54aff29c0b33022497ee3",
+        "runtime_code_hash": "72fccc72dbdcc9931fe7e08be10352492f7304ce25b9056ef625a59bb20ca62f",
+        "backend": "EvmExecutor::proof/revm-mainnet-default",
+        "transactions": [
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000101",
+            "calldata": "0xc2ba47440000000000000000000000001111111111111111111111111111111111111111",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "gas_used": 22080,
+            "coverage_edges": 116,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0x1111111111111111111111111111111111111111",
+            "to": "0x6200000000000000000000000000000000000101",
+            "calldata": "0x40c10f19000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0000000000000000000000000000000000000000000000056bc75e2d63100000",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x",
+            "gas_used": 66553,
+            "coverage_edges": 179,
+            "storage_diffs": 2,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000101",
+            "calldata": "0xc2ba4744000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "gas_used": 22080,
+            "coverage_edges": 116,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000101",
+            "calldata": "0x40c10f19000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000000000000000000000000000000000000000de0b6b3a7640000",
+            "timestamp": 1000,
+            "status": "Revert",
+            "output": "0x08c379a0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000056f776e6572000000000000000000000000000000000000000000000000000000",
+            "gas_used": 22580,
+            "coverage_edges": 139,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000101",
+            "calldata": "0x70a08231000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000056bc75e2d63100000",
+            "gas_used": 23973,
+            "coverage_edges": 110,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000101",
+            "calldata": "0x70a08231000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "gas_used": 23973,
+            "coverage_edges": 110,
+            "storage_diffs": 0,
+            "call_traces": 3
+          }
+        ],
+        "matching_signals": [],
+        "unmatched_signals": []
+      },
+      "benchmark_id": "negative-erc20-owner-mint",
+      "digests": {
+        "input_digest": "sha256:85b49bf31668710bcdb6968fb7dbf20f269f5c422a37f6870a929681a0345257",
+        "config_digest": "sha256:654858c51300700102e66bda5862edbe8b0de9d4c95fadc91554122ea329a48b",
+        "manifest_digest": "sha256:2bb14a20cbab36b2eb1caac85d53b1d5e4abe903a28837c18c8d6464cf1ef126",
+        "fixture_digest": "sha256:662585ed78c7070b579f98d6d96d23ed0c88768df62eeeae347dd8c0101dadc2",
+        "invariant_file_digest": "sha256:1f800c3086bfe954f9a64357a12ded3bbd934b2099b7c65c1b59a6c3e8a3b36c"
+      },
+      "class": "erc20_mint_inflation",
+      "target_profile": [
+        "erc20/token",
+        "supply-accounting"
+      ],
+      "expected_exploit_shape": [],
+      "exploit_classes": [
+        "logic_accounting_error",
+        "unsafe_token_handling"
+      ],
+      "status": "not_found",
+      "reason": "executed 6 local EVM transactions; 0 matching oracle signals; 0 unmatched signals; predicate proof not confirmed",
+      "executed": true,
+      "found": false,
+      "observed_finding": null,
+      "finding_type": null,
+      "expected_invariant": "unauthorized mint increases attacker balance and total supply",
+      "invariant_id": "unauthorized mint increases attacker balance and total supply",
+      "selected_exploit_template": null,
+      "equivalence_class": null,
+      "synthesized_sequence": [],
+      "search_driver": null,
+      "confidence": 5,
+      "exploit_path_length": null,
+      "minimized": false,
+      "replayable": false,
+      "proof_status": null,
+      "proof": null,
+      "foundry_poc_generated": false,
+      "poc_validation_status": "not_attempted",
+      "failure_kind": "OracleDidNotTrigger",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": 6,
+      "time_to_signal_secs": null,
+      "false_positive_notes": [],
+      "artifact_path": null,
+      "matched_criteria": [],
+      "missing_criteria": [
+        "expected_finding",
+        "invariant_violation"
+      ]
+    }
+  ]
+}

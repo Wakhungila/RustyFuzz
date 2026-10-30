@@ -1,0 +1,1563 @@
+{
+  "generated_at_unix_secs": 1793028354,
+  "summary": {
+    "total": 10,
+    "executed": 10,
+    "found": 0,
+    "not_found": 10,
+    "not_run": 0,
+    "not_run_missing_fixture": 0,
+    "not_run_missing_target": 0,
+    "not_run_missing_success_criteria": 0,
+    "not_run_unsupported_mode": 0,
+    "failed_execution": 0,
+    "skipped_by_config": 0
+  },
+  "coverage": {
+    "total_classes": 12,
+    "covered_classes": 12,
+    "benchmarked_classes": 6,
+    "confirmed_classes": 0,
+    "entries": [
+      {
+        "class": "access_control_failure",
+        "benchmark_ids": [
+          "negative-governance-delayed-execute",
+          "negative-governance-quorum"
+        ],
+        "found": 0,
+        "executed": 2,
+        "oracles": [
+          "governance/access-control oracle"
+        ],
+        "invariants": [
+          "unauthorized privileged state mutation"
+        ],
+        "seed_templates": [
+          "access-control-sensitive selector retry"
+        ],
+        "state_machines": [
+          "access-control",
+          "governance"
+        ],
+        "gaps": [
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "price_oracle_manipulation",
+        "benchmark_ids": [
+          "negative-amm-balanced-swap",
+          "negative-amm-no-flashloan",
+          "negative-lending-healthy-liquidation",
+          "negative-lending-repaid-borrow"
+        ],
+        "found": 0,
+        "executed": 4,
+        "oracles": [
+          "oracle freshness invariant"
+        ],
+        "invariants": [
+          "price dependency without freshness/bounds"
+        ],
+        "seed_templates": [
+          "oracle read -> state-changing action"
+        ],
+        "state_machines": [
+          "lending",
+          "amm"
+        ],
+        "gaps": [
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "logic_accounting_error",
+        "benchmark_ids": [
+          "negative-erc20-burn-only",
+          "negative-erc20-owner-mint",
+          "negative-erc4626-virtual-offset",
+          "negative-erc4626-zero-donation",
+          "negative-lending-healthy-liquidation",
+          "negative-lending-repaid-borrow"
+        ],
+        "found": 0,
+        "executed": 6,
+        "oracles": [
+          "protocol invariant evaluator"
+        ],
+        "invariants": [
+          "accounting conservation failure"
+        ],
+        "seed_templates": [
+          "deposit/withdraw accounting flow"
+        ],
+        "state_machines": [
+          "vault",
+          "lending"
+        ],
+        "gaps": [
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "reentrancy",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "reentrancy oracle"
+        ],
+        "invariants": [
+          "unsafe external call state transition"
+        ],
+        "seed_templates": [
+          "callback-sensitive transfer/deposit"
+        ],
+        "state_machines": [
+          "vault",
+          "rewards"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "flash_loan_economic_attack",
+        "benchmark_ids": [
+          "negative-amm-balanced-swap",
+          "negative-amm-no-flashloan",
+          "negative-lending-healthy-liquidation",
+          "negative-lending-repaid-borrow"
+        ],
+        "found": 0,
+        "executed": 4,
+        "oracles": [
+          "economic delta engine"
+        ],
+        "invariants": [
+          "transient price/solvency manipulation"
+        ],
+        "seed_templates": [
+          "swap -> dependent action -> reverse swap"
+        ],
+        "state_machines": [
+          "amm",
+          "lending"
+        ],
+        "gaps": [
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "unchecked_external_call",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "call trace observer"
+        ],
+        "invariants": [
+          "unsafe external call state transition"
+        ],
+        "seed_templates": [
+          "external call around state write"
+        ],
+        "state_machines": [
+          "generic"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "governance_timelock_failure",
+        "benchmark_ids": [
+          "negative-governance-delayed-execute",
+          "negative-governance-quorum"
+        ],
+        "found": 0,
+        "executed": 2,
+        "oracles": [
+          "governance oracle"
+        ],
+        "invariants": [
+          "queue/execute delay bypass"
+        ],
+        "seed_templates": [
+          "propose -> vote -> queue -> execute"
+        ],
+        "state_machines": [
+          "governance"
+        ],
+        "gaps": [
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "upgradeability_proxy_error",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "access-control oracle"
+        ],
+        "invariants": [
+          "initializer or implementation mutation"
+        ],
+        "seed_templates": [
+          "initialize/reinitialize/upgradeTo"
+        ],
+        "state_machines": [
+          "access-control"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "signature_replay_bug",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "replay invariant"
+        ],
+        "invariants": [
+          "replayable message/signature reuse"
+        ],
+        "seed_templates": [
+          "permit/execute replay"
+        ],
+        "state_machines": [
+          "bridge",
+          "token"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "denial_of_service_griefing",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "status/revert classifier"
+        ],
+        "invariants": [
+          "persistent liveness failure"
+        ],
+        "seed_templates": [
+          "griefable state transition"
+        ],
+        "state_machines": [
+          "generic"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "precision_rounding_loss",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "economic delta engine"
+        ],
+        "invariants": [
+          "precision or rounding loss"
+        ],
+        "seed_templates": [
+          "small amount boundary mutations"
+        ],
+        "state_machines": [
+          "vault",
+          "amm"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "unsafe_token_handling",
+        "benchmark_ids": [
+          "negative-erc20-burn-only",
+          "negative-erc20-owner-mint",
+          "negative-erc4626-virtual-offset",
+          "negative-erc4626-zero-donation"
+        ],
+        "found": 0,
+        "executed": 4,
+        "oracles": [
+          "erc20/accounting invariant"
+        ],
+        "invariants": [
+          "fee/rebase/return-value accounting mismatch"
+        ],
+        "seed_templates": [
+          "transfer/transferFrom around accounting"
+        ],
+        "state_machines": [
+          "token",
+          "vault"
+        ],
+        "gaps": [
+          "no confirmed replayed finding yet"
+        ]
+      }
+    ]
+  },
+  "calibration": {
+    "benchmark_count": 0,
+    "synthetic_regression_count": 10,
+    "pass_rate": 0.0,
+    "replay_success_rate": 0.0,
+    "minimized_success_rate": 0.0,
+    "poc_generation_rate": 0.0,
+    "average_time_to_signal_secs": null,
+    "average_executions_to_signal": null,
+    "useful_seed_sources": [
+      "executable EVM fixture transaction sequences"
+    ],
+    "false_positive_budget_notes": [],
+    "threshold_recommendations": [
+      "PoC generation is not yet represented in this validation pack; require it for bounty-grade confirmations",
+      "current benchmark pack has no negative controls after confirmation; keep at least one negative/noisy fixture in larger calibration runs"
+    ]
+  },
+  "benchmarks": [
+    {
+      "evidence_class": "SyntheticRegression",
+      "runtime": {
+        "schema_version": 1,
+        "fixture": "/home/pin0ccs/Desktop/RustyFuzz/benchmarks/historical/negative_controls/fixtures/amm-balanced-swap.json",
+        "fixture_hash": "21b79e506f8ee492552227d2ba8462b2ad4e43c9421c3602e2249648d134ebc6",
+        "runtime_code_hash": "2538a8869f88178b16036e4a6b6485fe1b12f62f49a4973160892cdd384d7d97",
+        "backend": "EvmExecutor::proof/revm-mainnet-default",
+        "transactions": [
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x7000000000000000000000000000000000000001",
+            "calldata": "0xa9059cbb000000000000000000000000620000000000000000000000000000000000030100000000000000000000000000000000000000000000000000000000000003e8",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "gas_used": 32450,
+            "coverage_edges": 244,
+            "storage_diffs": 2,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000301",
+            "calldata": "0x022c0d9f000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003e7000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x",
+            "gas_used": 74759,
+            "coverage_edges": 679,
+            "storage_diffs": 4,
+            "call_traces": 9
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000301",
+            "calldata": "0x0902f1ac",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x00000000000000000000000000000000000000000000000000000000000f462800000000000000000000000000000000000000000000000000000000000f3e590000000000000000000000000000000000000000000000000000000000000000",
+            "gas_used": 25514,
+            "coverage_edges": 68,
+            "storage_diffs": 0,
+            "call_traces": 3
+          }
+        ],
+        "matching_signals": [],
+        "unmatched_signals": []
+      },
+      "benchmark_id": "negative-amm-balanced-swap",
+      "digests": {
+        "input_digest": "sha256:3fe408aaf22b11d26fae7420195112e5d0bd8b747e1f4f3b4ac620497391972e",
+        "config_digest": "sha256:1908fe4e526d3822e3128a8640af3e882016e58881d0989f5994651d0087dd62",
+        "manifest_digest": "sha256:e1ada17c7b2979808f049343cfccf5dd3721208885968646e34db2e06e63ba1f",
+        "fixture_digest": "sha256:540c359df033c358f70873aeffb6e43763d07afbb4666b5b2546a69dfe1ac403",
+        "invariant_file_digest": null
+      },
+      "class": "amm_invariant_violation",
+      "target_profile": [
+        "amm/dex/pool"
+      ],
+      "expected_exploit_shape": [],
+      "exploit_classes": [
+        "price_oracle_manipulation",
+        "flash_loan_economic_attack"
+      ],
+      "status": "not_found",
+      "reason": "executed 3 local EVM transactions; 0 matching oracle signals; 0 unmatched signals; predicate proof not configured",
+      "executed": true,
+      "found": false,
+      "observed_finding": null,
+      "finding_type": null,
+      "expected_invariant": "swap breaks reserve product and extracts attacker profit",
+      "invariant_id": "swap breaks reserve product and extracts attacker profit",
+      "selected_exploit_template": null,
+      "equivalence_class": null,
+      "synthesized_sequence": [],
+      "search_driver": null,
+      "confidence": 5,
+      "exploit_path_length": null,
+      "minimized": false,
+      "replayable": false,
+      "proof_status": null,
+      "proof": null,
+      "foundry_poc_generated": false,
+      "poc_validation_status": "not_attempted",
+      "failure_kind": "OracleDidNotTrigger",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": 3,
+      "time_to_signal_secs": null,
+      "false_positive_notes": [],
+      "artifact_path": null,
+      "matched_criteria": [],
+      "missing_criteria": [
+        "expected_finding",
+        "reserve_manipulation",
+        "invariant_violation"
+      ]
+    },
+    {
+      "evidence_class": "SyntheticRegression",
+      "runtime": {
+        "schema_version": 1,
+        "fixture": "/home/pin0ccs/Desktop/RustyFuzz/benchmarks/historical/negative_controls/fixtures/amm-no-flashloan.json",
+        "fixture_hash": "5e497aadeb4ea83c965e30d207289d40b48de56fe2bb4a8c2865999d15a0f93d",
+        "runtime_code_hash": "2538a8869f88178b16036e4a6b6485fe1b12f62f49a4973160892cdd384d7d97",
+        "backend": "EvmExecutor::proof/revm-mainnet-default",
+        "transactions": [
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000302",
+            "calldata": "0x9ab603b90000000000000000000000000000000000000000000000000000000000000064",
+            "timestamp": 1000,
+            "status": "Revert",
+            "output": "0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000014666c617368206c6f616e732064697361626c6564000000000000000000000000",
+            "gas_used": 21581,
+            "coverage_edges": 99,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000302",
+            "calldata": "0x022c0d9f00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000064000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000010100000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": 1000,
+            "status": "Revert",
+            "output": "0x08c379a00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000001263616c6c6261636b732064697361626c65640000000000000000000000000000",
+            "gas_used": 23800,
+            "coverage_edges": 167,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000302",
+            "calldata": "0x0902f1ac",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x00000000000000000000000000000000000000000000000000000000000f424000000000000000000000000000000000000000000000000000000000000f42400000000000000000000000000000000000000000000000000000000000000000",
+            "gas_used": 25514,
+            "coverage_edges": 68,
+            "storage_diffs": 0,
+            "call_traces": 3
+          }
+        ],
+        "matching_signals": [],
+        "unmatched_signals": []
+      },
+      "benchmark_id": "negative-amm-no-flashloan",
+      "digests": {
+        "input_digest": "sha256:b525cfffeb70bb7a7d1f2a4dffccefba80fcc91261a1fc295f1d5c0f0d551136",
+        "config_digest": "sha256:1908fe4e526d3822e3128a8640af3e882016e58881d0989f5994651d0087dd62",
+        "manifest_digest": "sha256:82afe3d19aa671385f5c0b918ce7eedd64ca46d0dc86fdf2ce111e69220e0190",
+        "fixture_digest": "sha256:e5e833beb43032d71a3740e2bcd208c153a80dfc74e3f28a9b7d8ba73561e6e0",
+        "invariant_file_digest": null
+      },
+      "class": "amm_invariant_violation",
+      "target_profile": [
+        "amm/dex/pool"
+      ],
+      "expected_exploit_shape": [],
+      "exploit_classes": [
+        "price_oracle_manipulation",
+        "flash_loan_economic_attack"
+      ],
+      "status": "not_found",
+      "reason": "executed 3 local EVM transactions; 0 matching oracle signals; 0 unmatched signals; predicate proof not configured",
+      "executed": true,
+      "found": false,
+      "observed_finding": null,
+      "finding_type": null,
+      "expected_invariant": "swap breaks reserve product and extracts attacker profit",
+      "invariant_id": "swap breaks reserve product and extracts attacker profit",
+      "selected_exploit_template": null,
+      "equivalence_class": null,
+      "synthesized_sequence": [],
+      "search_driver": null,
+      "confidence": 5,
+      "exploit_path_length": null,
+      "minimized": false,
+      "replayable": false,
+      "proof_status": null,
+      "proof": null,
+      "foundry_poc_generated": false,
+      "poc_validation_status": "not_attempted",
+      "failure_kind": "OracleDidNotTrigger",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": 3,
+      "time_to_signal_secs": null,
+      "false_positive_notes": [],
+      "artifact_path": null,
+      "matched_criteria": [],
+      "missing_criteria": [
+        "expected_finding",
+        "reserve_manipulation",
+        "invariant_violation"
+      ]
+    },
+    {
+      "evidence_class": "SyntheticRegression",
+      "runtime": {
+        "schema_version": 1,
+        "fixture": "/home/pin0ccs/Desktop/RustyFuzz/benchmarks/historical/negative_controls/fixtures/erc20-burn-only.json",
+        "fixture_hash": "f918222bc106ddea9371223ec40374ab447def7490c7eee197d2fbfdfd992d20",
+        "runtime_code_hash": "094f7765a6f0792c027e4a0dc9612dd99909cad0ec8a019272c967d6ce77f455",
+        "backend": "EvmExecutor::proof/revm-mainnet-default",
+        "transactions": [
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000102",
+            "calldata": "0x42966c680000000000000000000000000000000000000000000000008ac7230489e80000",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x",
+            "gas_used": 31958,
+            "coverage_edges": 136,
+            "storage_diffs": 2,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000102",
+            "calldata": "0x40c10f19000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000000000000000000000000000000000000000de0b6b3a7640000",
+            "timestamp": 1000,
+            "status": "Revert",
+            "output": "0x",
+            "gas_used": 22580,
+            "coverage_edges": 43,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000102",
+            "calldata": "0x70a08231000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x000000000000000000000000000000000000000000000004e1003b28d9280000",
+            "gas_used": 23973,
+            "coverage_edges": 104,
+            "storage_diffs": 0,
+            "call_traces": 3
+          }
+        ],
+        "matching_signals": [],
+        "unmatched_signals": []
+      },
+      "benchmark_id": "negative-erc20-burn-only",
+      "digests": {
+        "input_digest": "sha256:cfc55e6059dfd7a697c1c1840aae4f0aa3420cc453db0ca233ed0f5afa6fd3ea",
+        "config_digest": "sha256:1908fe4e526d3822e3128a8640af3e882016e58881d0989f5994651d0087dd62",
+        "manifest_digest": "sha256:ab3bd8b4de1e32e8162c5b580817bea3f27ddcbb0ef679ae6157ead8b250e03a",
+        "fixture_digest": "sha256:b7d782be6343f22ba22756b8697431172eea308991fb7f6eb53858ef95f26fb0",
+        "invariant_file_digest": null
+      },
+      "class": "erc20_mint_inflation",
+      "target_profile": [
+        "erc20/token",
+        "supply-accounting"
+      ],
+      "expected_exploit_shape": [],
+      "exploit_classes": [
+        "logic_accounting_error",
+        "unsafe_token_handling"
+      ],
+      "status": "not_found",
+      "reason": "executed 3 local EVM transactions; 0 matching oracle signals; 0 unmatched signals; predicate proof not configured",
+      "executed": true,
+      "found": false,
+      "observed_finding": null,
+      "finding_type": null,
+      "expected_invariant": "unauthorized mint increases attacker balance and total supply",
+      "invariant_id": "unauthorized mint increases attacker balance and total supply",
+      "selected_exploit_template": null,
+      "equivalence_class": null,
+      "synthesized_sequence": [],
+      "search_driver": null,
+      "confidence": 5,
+      "exploit_path_length": null,
+      "minimized": false,
+      "replayable": false,
+      "proof_status": null,
+      "proof": null,
+      "foundry_poc_generated": false,
+      "poc_validation_status": "not_attempted",
+      "failure_kind": "OracleDidNotTrigger",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": 3,
+      "time_to_signal_secs": null,
+      "false_positive_notes": [],
+      "artifact_path": null,
+      "matched_criteria": [],
+      "missing_criteria": [
+        "expected_finding",
+        "invariant_violation"
+      ]
+    },
+    {
+      "evidence_class": "SyntheticRegression",
+      "runtime": {
+        "schema_version": 1,
+        "fixture": "/home/pin0ccs/Desktop/RustyFuzz/benchmarks/historical/negative_controls/fixtures/erc20-owner-mint.json",
+        "fixture_hash": "a5563aa2b2416a0c763d2cac04d323ee12e9b190d1c54aff29c0b33022497ee3",
+        "runtime_code_hash": "72fccc72dbdcc9931fe7e08be10352492f7304ce25b9056ef625a59bb20ca62f",
+        "backend": "EvmExecutor::proof/revm-mainnet-default",
+        "transactions": [
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000101",
+            "calldata": "0xc2ba47440000000000000000000000001111111111111111111111111111111111111111",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "gas_used": 22080,
+            "coverage_edges": 116,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0x1111111111111111111111111111111111111111",
+            "to": "0x6200000000000000000000000000000000000101",
+            "calldata": "0x40c10f19000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0000000000000000000000000000000000000000000000056bc75e2d63100000",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x",
+            "gas_used": 66553,
+            "coverage_edges": 179,
+            "storage_diffs": 2,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000101",
+            "calldata": "0xc2ba4744000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "gas_used": 22080,
+            "coverage_edges": 116,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000101",
+            "calldata": "0x40c10f19000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000000000000000000000000000000000000000de0b6b3a7640000",
+            "timestamp": 1000,
+            "status": "Revert",
+            "output": "0x08c379a0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000056f776e6572000000000000000000000000000000000000000000000000000000",
+            "gas_used": 22580,
+            "coverage_edges": 139,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000101",
+            "calldata": "0x70a08231000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000056bc75e2d63100000",
+            "gas_used": 23973,
+            "coverage_edges": 110,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000101",
+            "calldata": "0x70a08231000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "gas_used": 23973,
+            "coverage_edges": 110,
+            "storage_diffs": 0,
+            "call_traces": 3
+          }
+        ],
+        "matching_signals": [],
+        "unmatched_signals": []
+      },
+      "benchmark_id": "negative-erc20-owner-mint",
+      "digests": {
+        "input_digest": "sha256:85b49bf31668710bcdb6968fb7dbf20f269f5c422a37f6870a929681a0345257",
+        "config_digest": "sha256:1908fe4e526d3822e3128a8640af3e882016e58881d0989f5994651d0087dd62",
+        "manifest_digest": "sha256:2bb14a20cbab36b2eb1caac85d53b1d5e4abe903a28837c18c8d6464cf1ef126",
+        "fixture_digest": "sha256:662585ed78c7070b579f98d6d96d23ed0c88768df62eeeae347dd8c0101dadc2",
+        "invariant_file_digest": "sha256:1f800c3086bfe954f9a64357a12ded3bbd934b2099b7c65c1b59a6c3e8a3b36c"
+      },
+      "class": "erc20_mint_inflation",
+      "target_profile": [
+        "erc20/token",
+        "supply-accounting"
+      ],
+      "expected_exploit_shape": [],
+      "exploit_classes": [
+        "logic_accounting_error",
+        "unsafe_token_handling"
+      ],
+      "status": "not_found",
+      "reason": "executed 6 local EVM transactions; 0 matching oracle signals; 0 unmatched signals; predicate proof not confirmed",
+      "executed": true,
+      "found": false,
+      "observed_finding": null,
+      "finding_type": null,
+      "expected_invariant": "unauthorized mint increases attacker balance and total supply",
+      "invariant_id": "unauthorized mint increases attacker balance and total supply",
+      "selected_exploit_template": null,
+      "equivalence_class": null,
+      "synthesized_sequence": [],
+      "search_driver": null,
+      "confidence": 5,
+      "exploit_path_length": null,
+      "minimized": false,
+      "replayable": false,
+      "proof_status": null,
+      "proof": null,
+      "foundry_poc_generated": false,
+      "poc_validation_status": "not_attempted",
+      "failure_kind": "OracleDidNotTrigger",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": 6,
+      "time_to_signal_secs": null,
+      "false_positive_notes": [],
+      "artifact_path": null,
+      "matched_criteria": [],
+      "missing_criteria": [
+        "expected_finding",
+        "invariant_violation"
+      ]
+    },
+    {
+      "evidence_class": "SyntheticRegression",
+      "runtime": {
+        "schema_version": 1,
+        "fixture": "/home/pin0ccs/Desktop/RustyFuzz/benchmarks/historical/negative_controls/fixtures/erc4626-virtual-offset.json",
+        "fixture_hash": "8f6d2f16e270ecc42a42943335476466f095d59c51b6dd3a7f7d657b1b8f95c6",
+        "runtime_code_hash": "bb1bb0b7059f0ed72caa13e0a61b10ef97682aed12040b7c0dc273cce2e976d1",
+        "backend": "EvmExecutor::proof/revm-mainnet-default",
+        "transactions": [
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x7000000000000000000000000000000000000001",
+            "calldata": "0x095ea7b3000000000000000000000000620000000000000000000000000000000000020200000000000000000000000000000000000000000000000000000000000f4240",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "gas_used": 44045,
+            "coverage_edges": 137,
+            "storage_diffs": 1,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000202",
+            "calldata": "0x6e553f650000000000000000000000000000000000000000000000000000000000000001000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x00000000000000000000000000000000000000000000000000000000000f4240",
+            "gas_used": 106831,
+            "coverage_edges": 702,
+            "storage_diffs": 5,
+            "call_traces": 7
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x7000000000000000000000000000000000000001",
+            "calldata": "0xa9059cbb000000000000000000000000620000000000000000000000000000000000020200000000000000000000000000000000000000000000000000000000000003e8",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "gas_used": 32450,
+            "coverage_edges": 244,
+            "storage_diffs": 2,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "to": "0x7000000000000000000000000000000000000001",
+            "calldata": "0x095ea7b3000000000000000000000000620000000000000000000000000000000000020200000000000000000000000000000000000000000000000000000000000f4240",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "gas_used": 44045,
+            "coverage_edges": 137,
+            "storage_diffs": 1,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "to": "0x6200000000000000000000000000000000000202",
+            "calldata": "0x6e553f6500000000000000000000000000000000000000000000000000000000000003e8000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x00000000000000000000000000000000000000000000000000000000001e74e7",
+            "gas_used": 72643,
+            "coverage_edges": 702,
+            "storage_diffs": 5,
+            "call_traces": 7
+          },
+          {
+            "caller": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "to": "0x6200000000000000000000000000000000000202",
+            "calldata": "0x70a08231000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x00000000000000000000000000000000000000000000000000000000001e74e7",
+            "gas_used": 23959,
+            "coverage_edges": 105,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000202",
+            "calldata": "0xba08765200000000000000000000000000000000000000000000000000000000000f4240000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x00000000000000000000000000000000000000000000000000000000000001f5",
+            "gas_used": 45812,
+            "coverage_edges": 661,
+            "storage_diffs": 4,
+            "call_traces": 7
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x7000000000000000000000000000000000000001",
+            "calldata": "0x70a08231000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x00000000000000000000000000000000000000000000000000000000000f404c",
+            "gas_used": 23973,
+            "coverage_edges": 110,
+            "storage_diffs": 0,
+            "call_traces": 3
+          }
+        ],
+        "matching_signals": [],
+        "unmatched_signals": []
+      },
+      "benchmark_id": "negative-erc4626-virtual-offset",
+      "digests": {
+        "input_digest": "sha256:69ef57766de527b826eec68b4e56c50ccc0c786f555b2a50864ac38dced2ab08",
+        "config_digest": "sha256:1908fe4e526d3822e3128a8640af3e882016e58881d0989f5994651d0087dd62",
+        "manifest_digest": "sha256:02a91d765cfba94fe0239543e183bd16454bf146eeb9603b70aec4960179bb2c",
+        "fixture_digest": "sha256:4aae884f1dcd87edcd6cc9b8ef37a62c3ada3ed8e8b13fbcbe31501a3d9875c5",
+        "invariant_file_digest": null
+      },
+      "class": "erc4626_share_inflation",
+      "target_profile": [
+        "erc4626",
+        "accounting-heavy"
+      ],
+      "expected_exploit_shape": [],
+      "exploit_classes": [
+        "logic_accounting_error",
+        "unsafe_token_handling"
+      ],
+      "status": "not_found",
+      "reason": "executed 8 local EVM transactions; 0 matching oracle signals; 0 unmatched signals; predicate proof not configured",
+      "executed": true,
+      "found": false,
+      "observed_finding": null,
+      "finding_type": null,
+      "expected_invariant": "attacker donation changes victim share price",
+      "invariant_id": "attacker donation changes victim share price",
+      "selected_exploit_template": null,
+      "equivalence_class": null,
+      "synthesized_sequence": [],
+      "search_driver": null,
+      "confidence": 5,
+      "exploit_path_length": null,
+      "minimized": false,
+      "replayable": false,
+      "proof_status": null,
+      "proof": null,
+      "foundry_poc_generated": false,
+      "poc_validation_status": "not_attempted",
+      "failure_kind": "OracleDidNotTrigger",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": 8,
+      "time_to_signal_secs": null,
+      "false_positive_notes": [],
+      "artifact_path": null,
+      "matched_criteria": [],
+      "missing_criteria": [
+        "expected_finding",
+        "share_price_manipulation"
+      ]
+    },
+    {
+      "evidence_class": "SyntheticRegression",
+      "runtime": {
+        "schema_version": 1,
+        "fixture": "/home/pin0ccs/Desktop/RustyFuzz/benchmarks/historical/negative_controls/fixtures/erc4626-zero-donation.json",
+        "fixture_hash": "90aee092080b043af234ddb0e77d6c28f2acb1877a64637cc6c3bc3fbdcd606f",
+        "runtime_code_hash": "bb1bb0b7059f0ed72caa13e0a61b10ef97682aed12040b7c0dc273cce2e976d1",
+        "backend": "EvmExecutor::proof/revm-mainnet-default",
+        "transactions": [
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x7000000000000000000000000000000000000001",
+            "calldata": "0x095ea7b3000000000000000000000000620000000000000000000000000000000000020100000000000000000000000000000000000000000000000000000000000f4240",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "gas_used": 44045,
+            "coverage_edges": 137,
+            "storage_diffs": 1,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000201",
+            "calldata": "0x6e553f6500000000000000000000000000000000000000000000000000000000000003e8000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x000000000000000000000000000000000000000000000000000000003b9aca00",
+            "gas_used": 106843,
+            "coverage_edges": 702,
+            "storage_diffs": 5,
+            "call_traces": 7
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x7000000000000000000000000000000000000001",
+            "calldata": "0xa9059cbb00000000000000000000000062000000000000000000000000000000000002010000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "gas_used": 26826,
+            "coverage_edges": 244,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "to": "0x7000000000000000000000000000000000000001",
+            "calldata": "0x095ea7b3000000000000000000000000620000000000000000000000000000000000020100000000000000000000000000000000000000000000000000000000000f4240",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "gas_used": 44045,
+            "coverage_edges": 137,
+            "storage_diffs": 1,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "to": "0x6200000000000000000000000000000000000201",
+            "calldata": "0x6e553f6500000000000000000000000000000000000000000000000000000000000003e8000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x000000000000000000000000000000000000000000000000000000003b9aca00",
+            "gas_used": 72643,
+            "coverage_edges": 702,
+            "storage_diffs": 5,
+            "call_traces": 7
+          },
+          {
+            "caller": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "to": "0x6200000000000000000000000000000000000201",
+            "calldata": "0x70a08231000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x000000000000000000000000000000000000000000000000000000003b9aca00",
+            "gas_used": 23959,
+            "coverage_edges": 105,
+            "storage_diffs": 0,
+            "call_traces": 3
+          }
+        ],
+        "matching_signals": [],
+        "unmatched_signals": []
+      },
+      "benchmark_id": "negative-erc4626-zero-donation",
+      "digests": {
+        "input_digest": "sha256:f88217533345e4e12a31933d8e9d5e3b97612636b8070f3fc4ed27d915427bb1",
+        "config_digest": "sha256:1908fe4e526d3822e3128a8640af3e882016e58881d0989f5994651d0087dd62",
+        "manifest_digest": "sha256:4317c4782afe4195c62d7bc0d8db0094663f824518265df2c0d63ab8aaaa0395",
+        "fixture_digest": "sha256:4cc957f1d8ebbabe81c2656486a5a08795d58c8d5e90e7f8e639661ab1d16257",
+        "invariant_file_digest": null
+      },
+      "class": "erc4626_share_inflation",
+      "target_profile": [
+        "erc4626",
+        "accounting-heavy"
+      ],
+      "expected_exploit_shape": [],
+      "exploit_classes": [
+        "logic_accounting_error",
+        "unsafe_token_handling"
+      ],
+      "status": "not_found",
+      "reason": "executed 6 local EVM transactions; 0 matching oracle signals; 0 unmatched signals; predicate proof not configured",
+      "executed": true,
+      "found": false,
+      "observed_finding": null,
+      "finding_type": null,
+      "expected_invariant": "attacker donation changes victim share price",
+      "invariant_id": "attacker donation changes victim share price",
+      "selected_exploit_template": null,
+      "equivalence_class": null,
+      "synthesized_sequence": [],
+      "search_driver": null,
+      "confidence": 5,
+      "exploit_path_length": null,
+      "minimized": false,
+      "replayable": false,
+      "proof_status": null,
+      "proof": null,
+      "foundry_poc_generated": false,
+      "poc_validation_status": "not_attempted",
+      "failure_kind": "OracleDidNotTrigger",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": 6,
+      "time_to_signal_secs": null,
+      "false_positive_notes": [],
+      "artifact_path": null,
+      "matched_criteria": [],
+      "missing_criteria": [
+        "expected_finding",
+        "share_price_manipulation"
+      ]
+    },
+    {
+      "evidence_class": "SyntheticRegression",
+      "runtime": {
+        "schema_version": 1,
+        "fixture": "/home/pin0ccs/Desktop/RustyFuzz/benchmarks/historical/negative_controls/fixtures/governance-delayed-execute.json",
+        "fixture_hash": "47ff350a7a1bec9523108ce3ee4535310f44235151829c8b0313f4eaefdd64ab",
+        "runtime_code_hash": "16e7d6c9610965a007579c3284e7379cc6c65bb8cdec397ee381bb1d65f0e1c2",
+        "backend": "EvmExecutor::proof/revm-mainnet-default",
+        "transactions": [
+          {
+            "caller": "0x1111111111111111111111111111111111111111",
+            "to": "0x6200000000000000000000000000000000000501",
+            "calldata": "0xda95691a00000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000000e00000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000012000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007636f6e74726f6c00000000000000000000000000000000000000000000000000",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "gas_used": 46281,
+            "coverage_edges": 302,
+            "storage_diffs": 1,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "to": "0x6200000000000000000000000000000000000501",
+            "calldata": "0x5678138800000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000001",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000002",
+            "gas_used": 68345,
+            "coverage_edges": 164,
+            "storage_diffs": 2,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000501",
+            "calldata": "0xddf0b0090000000000000000000000000000000000000000000000000000000000000001",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x",
+            "gas_used": 47939,
+            "coverage_edges": 123,
+            "storage_diffs": 1,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000501",
+            "calldata": "0xfe0d94c10000000000000000000000000000000000000000000000000000000000000001",
+            "timestamp": 1050,
+            "status": "Revert",
+            "output": "0x08c379a00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000f74696d656c6f636b2f71756f72756d0000000000000000000000000000000000",
+            "gas_used": 28195,
+            "coverage_edges": 156,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000501",
+            "calldata": "0xfe0d94c10000000000000000000000000000000000000000000000000000000000000001",
+            "timestamp": 1100,
+            "status": "Success",
+            "output": "0x",
+            "gas_used": 33222,
+            "coverage_edges": 143,
+            "storage_diffs": 1,
+            "call_traces": 3
+          }
+        ],
+        "matching_signals": [],
+        "unmatched_signals": []
+      },
+      "benchmark_id": "negative-governance-delayed-execute",
+      "digests": {
+        "input_digest": "sha256:a57e35234313ddd82aa15c2d90f3ffb94d154cadc17b1674eb74a9ba8b9b1dc6",
+        "config_digest": "sha256:1908fe4e526d3822e3128a8640af3e882016e58881d0989f5994651d0087dd62",
+        "manifest_digest": "sha256:d8e11f3b96dae94c7ce06155caecdca55e9231132e372ab660bdb13634e4cf55",
+        "fixture_digest": "sha256:03b0666f94ff9db7d99927777ed5796b7da92e83ccaf295d1dfebb904b15c257",
+        "invariant_file_digest": null
+      },
+      "class": "governance_timelock_bypass",
+      "target_profile": [
+        "governance/timelock"
+      ],
+      "expected_exploit_shape": [],
+      "exploit_classes": [
+        "governance_timelock_failure",
+        "access_control_failure"
+      ],
+      "status": "not_found",
+      "reason": "executed 5 local EVM transactions; 0 matching oracle signals; 0 unmatched signals; predicate proof not configured",
+      "executed": true,
+      "found": false,
+      "observed_finding": null,
+      "finding_type": null,
+      "expected_invariant": "timelock delay cannot be bypassed",
+      "invariant_id": "timelock delay cannot be bypassed",
+      "selected_exploit_template": null,
+      "equivalence_class": null,
+      "synthesized_sequence": [],
+      "search_driver": null,
+      "confidence": 5,
+      "exploit_path_length": null,
+      "minimized": false,
+      "replayable": false,
+      "proof_status": null,
+      "proof": null,
+      "foundry_poc_generated": false,
+      "poc_validation_status": "not_attempted",
+      "failure_kind": "OracleDidNotTrigger",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": 5,
+      "time_to_signal_secs": null,
+      "false_positive_notes": [],
+      "artifact_path": null,
+      "matched_criteria": [],
+      "missing_criteria": [
+        "expected_finding",
+        "invariant_violation"
+      ]
+    },
+    {
+      "evidence_class": "SyntheticRegression",
+      "runtime": {
+        "schema_version": 1,
+        "fixture": "/home/pin0ccs/Desktop/RustyFuzz/benchmarks/historical/negative_controls/fixtures/governance-quorum.json",
+        "fixture_hash": "015ded44a0a893636f22f28c3f3c38ed15438b7e1213c7a484c28e2b2f3a845f",
+        "runtime_code_hash": "16e7d6c9610965a007579c3284e7379cc6c65bb8cdec397ee381bb1d65f0e1c2",
+        "backend": "EvmExecutor::proof/revm-mainnet-default",
+        "transactions": [
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000502",
+            "calldata": "0xda95691a00000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000000e00000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000012000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007636f6e74726f6c00000000000000000000000000000000000000000000000000",
+            "timestamp": 1000,
+            "status": "Revert",
+            "output": "0x08c379a00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000870726f706f736572000000000000000000000000000000000000000000000000",
+            "gas_used": 25100,
+            "coverage_edges": 295,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0x1111111111111111111111111111111111111111",
+            "to": "0x6200000000000000000000000000000000000502",
+            "calldata": "0xda95691a00000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000000e00000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000012000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007636f6e74726f6c00000000000000000000000000000000000000000000000000",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "gas_used": 46281,
+            "coverage_edges": 302,
+            "storage_diffs": 1,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000502",
+            "calldata": "0x5678138800000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000001",
+            "timestamp": 1000,
+            "status": "Revert",
+            "output": "0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000004766f746500000000000000000000000000000000000000000000000000000000",
+            "gas_used": 24019,
+            "coverage_edges": 149,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000502",
+            "calldata": "0xddf0b0090000000000000000000000000000000000000000000000000000000000000001",
+            "timestamp": 1000,
+            "status": "Revert",
+            "output": "0x08c379a00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000671756f72756d0000000000000000000000000000000000000000000000000000",
+            "gas_used": 25865,
+            "coverage_edges": 121,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000502",
+            "calldata": "0xfe0d94c10000000000000000000000000000000000000000000000000000000000000001",
+            "timestamp": 1200,
+            "status": "Revert",
+            "output": "0x08c379a00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000f74696d656c6f636b2f71756f72756d0000000000000000000000000000000000",
+            "gas_used": 25971,
+            "coverage_edges": 146,
+            "storage_diffs": 0,
+            "call_traces": 3
+          }
+        ],
+        "matching_signals": [],
+        "unmatched_signals": []
+      },
+      "benchmark_id": "negative-governance-quorum",
+      "digests": {
+        "input_digest": "sha256:32aa348b486533e0394f2168b322036a205a80b49de08f25e98a7716fed05168",
+        "config_digest": "sha256:1908fe4e526d3822e3128a8640af3e882016e58881d0989f5994651d0087dd62",
+        "manifest_digest": "sha256:4f53558658486b23a2c5e53026f2ce6fafaf314272e901f10b845e84a7f7d323",
+        "fixture_digest": "sha256:5531f386c2c642e4c51c4552ed2a768fae64cb88fafc4f772a405690b7c5630d",
+        "invariant_file_digest": null
+      },
+      "class": "governance_timelock_bypass",
+      "target_profile": [
+        "governance/timelock"
+      ],
+      "expected_exploit_shape": [],
+      "exploit_classes": [
+        "governance_timelock_failure",
+        "access_control_failure"
+      ],
+      "status": "not_found",
+      "reason": "executed 5 local EVM transactions; 0 matching oracle signals; 0 unmatched signals; predicate proof not configured",
+      "executed": true,
+      "found": false,
+      "observed_finding": null,
+      "finding_type": null,
+      "expected_invariant": "unauthorized proposal cannot execute without quorum",
+      "invariant_id": "unauthorized proposal cannot execute without quorum",
+      "selected_exploit_template": null,
+      "equivalence_class": null,
+      "synthesized_sequence": [],
+      "search_driver": null,
+      "confidence": 5,
+      "exploit_path_length": null,
+      "minimized": false,
+      "replayable": false,
+      "proof_status": null,
+      "proof": null,
+      "foundry_poc_generated": false,
+      "poc_validation_status": "not_attempted",
+      "failure_kind": "OracleDidNotTrigger",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": 5,
+      "time_to_signal_secs": null,
+      "false_positive_notes": [],
+      "artifact_path": null,
+      "matched_criteria": [],
+      "missing_criteria": [
+        "expected_finding",
+        "invariant_violation"
+      ]
+    },
+    {
+      "evidence_class": "SyntheticRegression",
+      "runtime": {
+        "schema_version": 1,
+        "fixture": "/home/pin0ccs/Desktop/RustyFuzz/benchmarks/historical/negative_controls/fixtures/lending-healthy-liquidation.json",
+        "fixture_hash": "2735d2d6dcd120c04bd42aa151e5747a31a02d2e9df4577f981cf0c1032c5040",
+        "runtime_code_hash": "fbdedaf03a7af1683cb15a1d6d7830c3a0cd8c1b749fe64171a086f4ce8773c4",
+        "backend": "EvmExecutor::proof/revm-mainnet-default",
+        "transactions": [
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000401",
+            "calldata": "0x00a718a900000000000000000000000070000000000000000000000000000000000000010000000000000000000000007000000000000000000000000000000000000001000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0000000000000000000000000000000000000000000000008ac7230489e800000000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": 1000,
+            "status": "Revert",
+            "output": "0x08c379a0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000076865616c74687900000000000000000000000000000000000000000000000000",
+            "gas_used": 29298,
+            "coverage_edges": 231,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000401",
+            "calldata": "0x0dca59c1",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000056bc75e2d63100000",
+            "gas_used": 23370,
+            "coverage_edges": 48,
+            "storage_diffs": 0,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x7000000000000000000000000000000000000001",
+            "calldata": "0x70a082310000000000000000000000006200000000000000000000000000000000000401",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000410d586a20a4c00000",
+            "gas_used": 23769,
+            "coverage_edges": 110,
+            "storage_diffs": 0,
+            "call_traces": 3
+          }
+        ],
+        "matching_signals": [],
+        "unmatched_signals": []
+      },
+      "benchmark_id": "negative-lending-healthy-liquidation",
+      "digests": {
+        "input_digest": "sha256:a55e64db0255f3189cab9784798ea71ee5f664b6501e365589998fe23caa5778",
+        "config_digest": "sha256:1908fe4e526d3822e3128a8640af3e882016e58881d0989f5994651d0087dd62",
+        "manifest_digest": "sha256:45f0a79bbf28acce8c81e3189bda8adeb87068ab7e8164fad2dd77db8f2c341b",
+        "fixture_digest": "sha256:91da19741e6f4bfa0d975054a6a8bc072e409edf90b9f25b150afef03966a8d2",
+        "invariant_file_digest": null
+      },
+      "class": "liquidation_abuse",
+      "target_profile": [
+        "lending/borrowing"
+      ],
+      "expected_exploit_shape": [],
+      "exploit_classes": [
+        "flash_loan_economic_attack",
+        "price_oracle_manipulation",
+        "logic_accounting_error"
+      ],
+      "status": "not_found",
+      "reason": "executed 3 local EVM transactions; 0 matching oracle signals; 0 unmatched signals; predicate proof not configured",
+      "executed": true,
+      "found": false,
+      "observed_finding": null,
+      "finding_type": null,
+      "expected_invariant": "healthy account cannot be liquidated for attacker profit",
+      "invariant_id": "healthy account cannot be liquidated for attacker profit",
+      "selected_exploit_template": null,
+      "equivalence_class": null,
+      "synthesized_sequence": [],
+      "search_driver": null,
+      "confidence": 5,
+      "exploit_path_length": null,
+      "minimized": false,
+      "replayable": false,
+      "proof_status": null,
+      "proof": null,
+      "foundry_poc_generated": false,
+      "poc_validation_status": "not_attempted",
+      "failure_kind": "OracleDidNotTrigger",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": 3,
+      "time_to_signal_secs": null,
+      "false_positive_notes": [],
+      "artifact_path": null,
+      "matched_criteria": [],
+      "missing_criteria": [
+        "expected_finding",
+        "invariant_violation"
+      ]
+    },
+    {
+      "evidence_class": "SyntheticRegression",
+      "runtime": {
+        "schema_version": 1,
+        "fixture": "/home/pin0ccs/Desktop/RustyFuzz/benchmarks/historical/negative_controls/fixtures/lending-repaid-borrow.json",
+        "fixture_hash": "fdd5f4cb72d1bedfbb840705843319a3503e6e7e1d2c5d7988174f2bc6c785b6",
+        "runtime_code_hash": "fbdedaf03a7af1683cb15a1d6d7830c3a0cd8c1b749fe64171a086f4ce8773c4",
+        "backend": "EvmExecutor::proof/revm-mainnet-default",
+        "transactions": [
+          {
+            "caller": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "to": "0x6200000000000000000000000000000000000402",
+            "calldata": "0xc5ebeaec0000000000000000000000000000000000000000000000056bc75e2d63100000",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x",
+            "gas_used": 64489,
+            "coverage_edges": 450,
+            "storage_diffs": 3,
+            "call_traces": 5
+          },
+          {
+            "caller": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "to": "0x7000000000000000000000000000000000000001",
+            "calldata": "0x095ea7b300000000000000000000000062000000000000000000000000000000000004020000000000000000000000000000000000000000000000056bc75e2d63100000",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "gas_used": 44093,
+            "coverage_edges": 137,
+            "storage_diffs": 1,
+            "call_traces": 3
+          },
+          {
+            "caller": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "to": "0x6200000000000000000000000000000000000402",
+            "calldata": "0x573ade8100000000000000000000000070000000000000000000000000000000000000010000000000000000000000000000000000000000000000056bc75e2d631000000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000056bc75e2d63100000",
+            "gas_used": 42191,
+            "coverage_edges": 584,
+            "storage_diffs": 4,
+            "call_traces": 5
+          },
+          {
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x7000000000000000000000000000000000000001",
+            "calldata": "0x70a082310000000000000000000000006200000000000000000000000000000000000402",
+            "timestamp": 1000,
+            "status": "Success",
+            "output": "0x0000000000000000000000000000000000000000000000410d586a20a4c00000",
+            "gas_used": 23769,
+            "coverage_edges": 110,
+            "storage_diffs": 0,
+            "call_traces": 3
+          }
+        ],
+        "matching_signals": [],
+        "unmatched_signals": [
+          {
+            "pack": "Governance",
+            "vuln": "AccountingDesync",
+            "severity": "Medium",
+            "tx_index": null,
+            "target": "0x7000000000000000000000000000000000000001",
+            "evidence": "large aggregate accounting movement across 6 storage slots | confidence=74 | reproduce=a9059cbb -> 095ea7b3 -> 095ea7b3 -> 23b872dd -> 70a08231 -> 70a08231 | caveats=large rebases, migrations, or administrative accounting updates can be legitimate"
+          }
+        ]
+      },
+      "benchmark_id": "negative-lending-repaid-borrow",
+      "digests": {
+        "input_digest": "sha256:f762f81828d1a71b046bd1abe9a3e23e56f0dbdb88959f1ee5a3734960019918",
+        "config_digest": "sha256:1908fe4e526d3822e3128a8640af3e882016e58881d0989f5994651d0087dd62",
+        "manifest_digest": "sha256:4b8485f0d1348a812abfee144a497c5bd572abfea7f17c5b62536b62c9978572",
+        "fixture_digest": "sha256:042fb306e0932ae42eae640a2a38742b3178797304b899d1fe3644adb5ae9ecd",
+        "invariant_file_digest": null
+      },
+      "class": "liquidation_abuse",
+      "target_profile": [
+        "lending/borrowing"
+      ],
+      "expected_exploit_shape": [],
+      "exploit_classes": [
+        "flash_loan_economic_attack",
+        "price_oracle_manipulation",
+        "logic_accounting_error"
+      ],
+      "status": "not_found",
+      "reason": "executed 4 local EVM transactions; 0 matching oracle signals; 1 unmatched signals; predicate proof not configured",
+      "executed": true,
+      "found": false,
+      "observed_finding": null,
+      "finding_type": null,
+      "expected_invariant": "healthy account cannot be liquidated for attacker profit",
+      "invariant_id": "healthy account cannot be liquidated for attacker profit",
+      "selected_exploit_template": null,
+      "equivalence_class": null,
+      "synthesized_sequence": [],
+      "search_driver": null,
+      "confidence": 5,
+      "exploit_path_length": null,
+      "minimized": false,
+      "replayable": false,
+      "proof_status": null,
+      "proof": null,
+      "foundry_poc_generated": false,
+      "poc_validation_status": "not_attempted",
+      "failure_kind": "OracleDidNotTrigger",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": 4,
+      "time_to_signal_secs": null,
+      "false_positive_notes": [],
+      "artifact_path": null,
+      "matched_criteria": [],
+      "missing_criteria": [
+        "expected_finding",
+        "invariant_violation"
+      ]
+    }
+  ]
+}

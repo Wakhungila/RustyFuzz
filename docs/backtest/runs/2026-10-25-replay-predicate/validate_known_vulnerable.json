@@ -1,0 +1,1465 @@
+{
+  "generated_at_unix_secs": 1792956569,
+  "summary": {
+    "total": 5,
+    "executed": 5,
+    "found": 0,
+    "not_found": 5,
+    "not_run": 0,
+    "not_run_missing_fixture": 0,
+    "not_run_missing_target": 0,
+    "not_run_missing_success_criteria": 0,
+    "not_run_unsupported_mode": 0,
+    "failed_execution": 0,
+    "skipped_by_config": 0
+  },
+  "coverage": {
+    "total_classes": 12,
+    "covered_classes": 12,
+    "benchmarked_classes": 8,
+    "confirmed_classes": 0,
+    "entries": [
+      {
+        "class": "access_control_failure",
+        "benchmark_ids": [
+          "known-uninitialized-proxy-takeover"
+        ],
+        "found": 0,
+        "executed": 1,
+        "oracles": [
+          "governance/access-control oracle"
+        ],
+        "invariants": [
+          "unauthorized privileged state mutation"
+        ],
+        "seed_templates": [
+          "access-control-sensitive selector retry"
+        ],
+        "state_machines": [
+          "access-control",
+          "governance"
+        ],
+        "gaps": [
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "price_oracle_manipulation",
+        "benchmark_ids": [
+          "known-flashloan-price-manipulation"
+        ],
+        "found": 0,
+        "executed": 1,
+        "oracles": [
+          "oracle freshness invariant"
+        ],
+        "invariants": [
+          "price dependency without freshness/bounds"
+        ],
+        "seed_templates": [
+          "oracle read -> state-changing action"
+        ],
+        "state_machines": [
+          "lending",
+          "amm"
+        ],
+        "gaps": [
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "logic_accounting_error",
+        "benchmark_ids": [
+          "known-erc20-bad-mint-inflation"
+        ],
+        "found": 0,
+        "executed": 1,
+        "oracles": [
+          "protocol invariant evaluator"
+        ],
+        "invariants": [
+          "accounting conservation failure"
+        ],
+        "seed_templates": [
+          "deposit/withdraw accounting flow"
+        ],
+        "state_machines": [
+          "vault",
+          "lending"
+        ],
+        "gaps": [
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "reentrancy",
+        "benchmark_ids": [
+          "known-read-only-reentrancy"
+        ],
+        "found": 0,
+        "executed": 1,
+        "oracles": [
+          "reentrancy oracle"
+        ],
+        "invariants": [
+          "unsafe external call state transition"
+        ],
+        "seed_templates": [
+          "callback-sensitive transfer/deposit"
+        ],
+        "state_machines": [
+          "vault",
+          "rewards"
+        ],
+        "gaps": [
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "flash_loan_economic_attack",
+        "benchmark_ids": [
+          "known-flashloan-price-manipulation"
+        ],
+        "found": 0,
+        "executed": 1,
+        "oracles": [
+          "economic delta engine"
+        ],
+        "invariants": [
+          "transient price/solvency manipulation"
+        ],
+        "seed_templates": [
+          "swap -> dependent action -> reverse swap"
+        ],
+        "state_machines": [
+          "amm",
+          "lending"
+        ],
+        "gaps": [
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "unchecked_external_call",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "call trace observer"
+        ],
+        "invariants": [
+          "unsafe external call state transition"
+        ],
+        "seed_templates": [
+          "external call around state write"
+        ],
+        "state_machines": [
+          "generic"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "governance_timelock_failure",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "governance oracle"
+        ],
+        "invariants": [
+          "queue/execute delay bypass"
+        ],
+        "seed_templates": [
+          "propose -> vote -> queue -> execute"
+        ],
+        "state_machines": [
+          "governance"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "upgradeability_proxy_error",
+        "benchmark_ids": [
+          "known-uninitialized-proxy-takeover"
+        ],
+        "found": 0,
+        "executed": 1,
+        "oracles": [
+          "access-control oracle"
+        ],
+        "invariants": [
+          "initializer or implementation mutation"
+        ],
+        "seed_templates": [
+          "initialize/reinitialize/upgradeTo"
+        ],
+        "state_machines": [
+          "access-control"
+        ],
+        "gaps": [
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "signature_replay_bug",
+        "benchmark_ids": [
+          "known-bridge-nonce-replay"
+        ],
+        "found": 0,
+        "executed": 1,
+        "oracles": [
+          "replay invariant"
+        ],
+        "invariants": [
+          "replayable message/signature reuse"
+        ],
+        "seed_templates": [
+          "permit/execute replay"
+        ],
+        "state_machines": [
+          "bridge",
+          "token"
+        ],
+        "gaps": [
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "denial_of_service_griefing",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "status/revert classifier"
+        ],
+        "invariants": [
+          "persistent liveness failure"
+        ],
+        "seed_templates": [
+          "griefable state transition"
+        ],
+        "state_machines": [
+          "generic"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "precision_rounding_loss",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "economic delta engine"
+        ],
+        "invariants": [
+          "precision or rounding loss"
+        ],
+        "seed_templates": [
+          "small amount boundary mutations"
+        ],
+        "state_machines": [
+          "vault",
+          "amm"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "unsafe_token_handling",
+        "benchmark_ids": [
+          "known-erc20-bad-mint-inflation"
+        ],
+        "found": 0,
+        "executed": 1,
+        "oracles": [
+          "erc20/accounting invariant"
+        ],
+        "invariants": [
+          "fee/rebase/return-value accounting mismatch"
+        ],
+        "seed_templates": [
+          "transfer/transferFrom around accounting"
+        ],
+        "state_machines": [
+          "token",
+          "vault"
+        ],
+        "gaps": [
+          "no confirmed replayed finding yet"
+        ]
+      }
+    ]
+  },
+  "calibration": {
+    "benchmark_count": 0,
+    "synthetic_regression_count": 5,
+    "pass_rate": 0.0,
+    "replay_success_rate": 0.0,
+    "minimized_success_rate": 0.0,
+    "poc_generation_rate": 0.0,
+    "average_time_to_signal_secs": null,
+    "average_executions_to_signal": null,
+    "useful_seed_sources": [],
+    "false_positive_budget_notes": [],
+    "threshold_recommendations": [
+      "PoC generation is not yet represented in this validation pack; require it for bounty-grade confirmations",
+      "current benchmark pack has no negative controls after confirmation; keep at least one negative/noisy fixture in larger calibration runs"
+    ]
+  },
+  "benchmarks": [
+    {
+      "evidence_class": "SyntheticRegression",
+      "benchmark_id": "known-bridge-nonce-replay",
+      "digests": {
+        "input_digest": "sha256:4cfee2639d31454037a526d7bb2bf317bc2b5071d61a0636803af79fe63dd1aa",
+        "config_digest": "sha256:0bb886abd5983b86fa5568aa20e476db12ef45bff5b04d96d58f67c5d886b600",
+        "manifest_digest": "sha256:286c7596ca5e2e12aff006e18a08bfb3f9e57c43fd4db6185a0b88803cbd839f",
+        "fixture_digest": "sha256:f640b494b10c2ebc4b89e0637c2a5d98c2ce285cb52d8421e583c314a3e87f57"
+      },
+      "class": "bridge_replay_finalization_bug",
+      "target_profile": [
+        "bridge/message-passing"
+      ],
+      "expected_exploit_shape": [
+        "finalize",
+        "finalize same nonce",
+        "release funds twice"
+      ],
+      "exploit_classes": [
+        "signature_replay_bug"
+      ],
+      "status": "not_found",
+      "reason": "matched evidence was observed but replay verification did not confirm the counterexample; matched=[ExpectedFinding, InvariantViolation, ReplayableArtifact, MinimizedPath], missing=[FoundryPocGenerated]",
+      "executed": true,
+      "found": false,
+      "observed_finding": "InvariantViolation(\"bridge replay finalize invariant\")",
+      "finding_type": "InvariantViolation(\"bridge replay finalize invariant\")",
+      "expected_invariant": "same bridge message nonce can finalize twice",
+      "invariant_id": "same bridge message nonce can finalize twice",
+      "selected_exploit_template": "bridge-nonce-replay",
+      "equivalence_class": "bridge-nonce-replay",
+      "synthesized_sequence": [
+        "#0 caller=0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa target=0x6200000000000000000000000000000000000005 value=0 input=0x92584d800000000000000000000000000000000000000000000000000000000000000000"
+      ],
+      "search_driver": null,
+      "confidence": 100,
+      "exploit_path_length": 1,
+      "minimized": true,
+      "replayable": true,
+      "proof_status": "ConcretelyReplayed",
+      "proof": {
+        "target": "0x6200000000000000000000000000000000000005",
+        "vulnerability_class": "InvariantViolation(\"bridge replay finalize invariant\")",
+        "invariant_id": "same bridge message nonce can finalize twice",
+        "violation_predicate": null,
+        "original_state_violation_verified": false,
+        "actor_roles": {},
+        "tx_sequence": [
+          {
+            "input": [
+              146,
+              88,
+              77,
+              128,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000005",
+            "value": "0x0",
+            "is_victim": false
+          }
+        ],
+        "pre_state_evidence": [
+          "preserve storage write dependencies observed in sequence"
+        ],
+        "post_state_evidence": [
+          "txs=1",
+          "storage_diffs=4",
+          "call_trace=1",
+          "finding Governance:InvariantViolation(\"bridge replay finalize invariant\") tx_index=Some(0) target=Some(0x6200000000000000000000000000000000000005)"
+        ],
+        "storage_diffs": [
+          {
+            "tx_index": 0,
+            "address": "0x6200000000000000000000000000000000000005",
+            "slot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "old_value": "0x0",
+            "new_value": "0xde0b6b3a7640000",
+            "pc": 0
+          },
+          {
+            "tx_index": 0,
+            "address": "0x6200000000000000000000000000000000000005",
+            "slot": "0x0101010101010101010101010101010101010101010101010101010101010101",
+            "old_value": "0x0",
+            "new_value": "0xde0b6b3a7640000",
+            "pc": 1
+          },
+          {
+            "tx_index": 0,
+            "address": "0x6200000000000000000000000000000000000005",
+            "slot": "0x0202020202020202020202020202020202020202020202020202020202020202",
+            "old_value": "0x0",
+            "new_value": "0xde0b6b3a7640000",
+            "pc": 2
+          },
+          {
+            "tx_index": 0,
+            "address": "0x6200000000000000000000000000000000000005",
+            "slot": "0x0303030303030303030303030303030303030303030303030303030303030303",
+            "old_value": "0x0",
+            "new_value": "0xde0b6b3a7640000",
+            "pc": 3
+          }
+        ],
+        "economic_delta": {
+          "attacker": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "victim": null,
+          "attacker_native_delta": 0,
+          "victim_native_delta": 0,
+          "token_deltas": [],
+          "semantic_deltas": [
+            {
+              "tx_index": 0,
+              "address": "0x6200000000000000000000000000000000000005",
+              "slot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+              "before": "0x0",
+              "after": "0xde0b6b3a7640000",
+              "delta": 1000000000000000000,
+              "kind": "UnknownAccounting",
+              "confidence": 25,
+              "reason": "large unclassified accounting storage movement"
+            },
+            {
+              "tx_index": 0,
+              "address": "0x6200000000000000000000000000000000000005",
+              "slot": "0x0101010101010101010101010101010101010101010101010101010101010101",
+              "before": "0x0",
+              "after": "0xde0b6b3a7640000",
+              "delta": 1000000000000000000,
+              "kind": "UnknownAccounting",
+              "confidence": 25,
+              "reason": "large unclassified accounting storage movement"
+            },
+            {
+              "tx_index": 0,
+              "address": "0x6200000000000000000000000000000000000005",
+              "slot": "0x0202020202020202020202020202020202020202020202020202020202020202",
+              "before": "0x0",
+              "after": "0xde0b6b3a7640000",
+              "delta": 1000000000000000000,
+              "kind": "UnknownAccounting",
+              "confidence": 25,
+              "reason": "large unclassified accounting storage movement"
+            },
+            {
+              "tx_index": 0,
+              "address": "0x6200000000000000000000000000000000000005",
+              "slot": "0x0303030303030303030303030303030303030303030303030303030303030303",
+              "before": "0x0",
+              "after": "0xde0b6b3a7640000",
+              "delta": 1000000000000000000,
+              "kind": "UnknownAccounting",
+              "confidence": 25,
+              "reason": "large unclassified accounting storage movement"
+            }
+          ],
+          "reserve_deltas": [],
+          "flashloan_signals": [],
+          "price_impact": null,
+          "normalized_profit": null,
+          "storage_delta_summary": [
+            {
+              "address": "0x6200000000000000000000000000000000000005",
+              "slot_count": 4,
+              "absolute_delta_score": "0x3782dace9d900000"
+            }
+          ],
+          "estimated_profit": "0x0",
+          "suspicious_value_extraction": false,
+          "accounting_anomaly": true,
+          "flashloan_pressure": false,
+          "price_impact_pressure": false,
+          "debt_or_collateral_pressure": false,
+          "share_price_pressure": false,
+          "confidence": 55,
+          "caveats": [
+            "storage-derived share/debt/reserve classifications are heuristic unless balance/ABI reads confirm them",
+            "no directly observed native/token profit; estimated profit may be a pressure signal only"
+          ]
+        },
+        "violated_condition": "same bridge message nonce can finalize twice",
+        "replay_result": "verified",
+        "minimization_result": "Minimized",
+        "confidence": 97,
+        "caveats": [
+          "preserve storage write dependencies observed in sequence"
+        ],
+        "foundry_poc_path": null,
+        "proof_status": "ConcretelyReplayed",
+        "confidence_tier": "replayed_minimized"
+      },
+      "foundry_poc_generated": false,
+      "failure_kind": "RealismProofFailure",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": 128,
+      "time_to_signal_secs": 1.2,
+      "false_positive_notes": [
+        "known-vulnerable validation fixture",
+        "fixture note: models duplicate bridge finalization for the same nonce",
+        "fixture replayable expectation: true",
+        "fixture foundry_poc expectation: true",
+        "proof tier=ReplayedMinimized, replay=Verified",
+        "replay verification did not confirm the counterexample"
+      ],
+      "artifact_path": null,
+      "matched_criteria": [
+        "expected_finding",
+        "invariant_violation",
+        "replayable_artifact",
+        "minimized_path"
+      ],
+      "missing_criteria": [
+        "foundry_poc_generated"
+      ]
+    },
+    {
+      "evidence_class": "SyntheticRegression",
+      "benchmark_id": "known-erc20-bad-mint-inflation",
+      "digests": {
+        "input_digest": "sha256:655ed2f706c8490bbb29486cebdce0cf842532a22ca5dd0058f3f6d8806e5ed5",
+        "config_digest": "sha256:0bb886abd5983b86fa5568aa20e476db12ef45bff5b04d96d58f67c5d886b600",
+        "manifest_digest": "sha256:9c5df93aaabcfb6b914542633c8bbbc9b2bfbcd6288ed64f0004684d81178da4",
+        "fixture_digest": "sha256:20766b4297323fb726d6b775b4e40e013ca979e33b0d99a74c598b5043d45ed7"
+      },
+      "class": "erc20_mint_inflation",
+      "target_profile": [
+        "erc20/token",
+        "supply-accounting"
+      ],
+      "expected_exploit_shape": [
+        "mint",
+        "balanceOf",
+        "totalSupply"
+      ],
+      "exploit_classes": [
+        "logic_accounting_error",
+        "unsafe_token_handling"
+      ],
+      "status": "not_found",
+      "reason": "matched evidence was observed but replay verification did not confirm the counterexample; matched=[ExpectedFinding, InvariantViolation, ReplayableArtifact, MinimizedPath], missing=[FoundryPocGenerated]",
+      "executed": true,
+      "found": false,
+      "observed_finding": "Other(\"erc20 mint inflation\")",
+      "finding_type": "Other(\"erc20 mint inflation\")",
+      "expected_invariant": "unauthorized mint increases attacker balance and total supply",
+      "invariant_id": "unauthorized mint increases attacker balance and total supply",
+      "selected_exploit_template": "erc20-mint-inflation",
+      "equivalence_class": "erc20-mint-inflation",
+      "synthesized_sequence": [
+        "#0 caller=0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa target=0x6200000000000000000000000000000000000001 value=0 input=0x40c10f190000000000000000000000000000000000000000000000000000000000000000"
+      ],
+      "search_driver": null,
+      "confidence": 100,
+      "exploit_path_length": 1,
+      "minimized": true,
+      "replayable": true,
+      "proof_status": "ConcretelyReplayed",
+      "proof": {
+        "target": "0x6200000000000000000000000000000000000001",
+        "vulnerability_class": "Other(\"erc20 mint inflation\")",
+        "invariant_id": "unauthorized mint increases attacker balance and total supply",
+        "violation_predicate": null,
+        "original_state_violation_verified": false,
+        "actor_roles": {},
+        "tx_sequence": [
+          {
+            "input": [
+              64,
+              193,
+              15,
+              25,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000001",
+            "value": "0x0",
+            "is_victim": false
+          }
+        ],
+        "pre_state_evidence": [
+          "preserve storage write dependencies observed in sequence"
+        ],
+        "post_state_evidence": [
+          "txs=1",
+          "storage_diffs=4",
+          "call_trace=1",
+          "finding Erc20:Other(\"erc20 mint inflation\") tx_index=Some(0) target=Some(0x6200000000000000000000000000000000000001)"
+        ],
+        "storage_diffs": [
+          {
+            "tx_index": 0,
+            "address": "0x6200000000000000000000000000000000000001",
+            "slot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "old_value": "0x0",
+            "new_value": "0xde0b6b3a7640000",
+            "pc": 0
+          },
+          {
+            "tx_index": 0,
+            "address": "0x6200000000000000000000000000000000000001",
+            "slot": "0x0101010101010101010101010101010101010101010101010101010101010101",
+            "old_value": "0x0",
+            "new_value": "0xde0b6b3a7640000",
+            "pc": 1
+          },
+          {
+            "tx_index": 0,
+            "address": "0x6200000000000000000000000000000000000001",
+            "slot": "0x0202020202020202020202020202020202020202020202020202020202020202",
+            "old_value": "0x0",
+            "new_value": "0xde0b6b3a7640000",
+            "pc": 2
+          },
+          {
+            "tx_index": 0,
+            "address": "0x6200000000000000000000000000000000000001",
+            "slot": "0x0303030303030303030303030303030303030303030303030303030303030303",
+            "old_value": "0x0",
+            "new_value": "0xde0b6b3a7640000",
+            "pc": 3
+          }
+        ],
+        "economic_delta": {
+          "attacker": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "victim": null,
+          "attacker_native_delta": 0,
+          "victim_native_delta": 0,
+          "token_deltas": [],
+          "semantic_deltas": [
+            {
+              "tx_index": 0,
+              "address": "0x6200000000000000000000000000000000000001",
+              "slot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+              "before": "0x0",
+              "after": "0xde0b6b3a7640000",
+              "delta": 1000000000000000000,
+              "kind": "UnknownAccounting",
+              "confidence": 25,
+              "reason": "large unclassified accounting storage movement"
+            },
+            {
+              "tx_index": 0,
+              "address": "0x6200000000000000000000000000000000000001",
+              "slot": "0x0101010101010101010101010101010101010101010101010101010101010101",
+              "before": "0x0",
+              "after": "0xde0b6b3a7640000",
+              "delta": 1000000000000000000,
+              "kind": "UnknownAccounting",
+              "confidence": 25,
+              "reason": "large unclassified accounting storage movement"
+            },
+            {
+              "tx_index": 0,
+              "address": "0x6200000000000000000000000000000000000001",
+              "slot": "0x0202020202020202020202020202020202020202020202020202020202020202",
+              "before": "0x0",
+              "after": "0xde0b6b3a7640000",
+              "delta": 1000000000000000000,
+              "kind": "UnknownAccounting",
+              "confidence": 25,
+              "reason": "large unclassified accounting storage movement"
+            },
+            {
+              "tx_index": 0,
+              "address": "0x6200000000000000000000000000000000000001",
+              "slot": "0x0303030303030303030303030303030303030303030303030303030303030303",
+              "before": "0x0",
+              "after": "0xde0b6b3a7640000",
+              "delta": 1000000000000000000,
+              "kind": "UnknownAccounting",
+              "confidence": 25,
+              "reason": "large unclassified accounting storage movement"
+            }
+          ],
+          "reserve_deltas": [],
+          "flashloan_signals": [],
+          "price_impact": null,
+          "normalized_profit": null,
+          "storage_delta_summary": [
+            {
+              "address": "0x6200000000000000000000000000000000000001",
+              "slot_count": 4,
+              "absolute_delta_score": "0x3782dace9d900000"
+            }
+          ],
+          "estimated_profit": "0x0",
+          "suspicious_value_extraction": false,
+          "accounting_anomaly": true,
+          "flashloan_pressure": false,
+          "price_impact_pressure": false,
+          "debt_or_collateral_pressure": false,
+          "share_price_pressure": false,
+          "confidence": 55,
+          "caveats": [
+            "storage-derived share/debt/reserve classifications are heuristic unless balance/ABI reads confirm them",
+            "no directly observed native/token profit; estimated profit may be a pressure signal only"
+          ]
+        },
+        "violated_condition": "unauthorized mint increases attacker balance and total supply",
+        "replay_result": "verified",
+        "minimization_result": "Minimized",
+        "confidence": 83,
+        "caveats": [
+          "preserve storage write dependencies observed in sequence"
+        ],
+        "foundry_poc_path": null,
+        "proof_status": "ConcretelyReplayed",
+        "confidence_tier": "replayed_minimized"
+      },
+      "foundry_poc_generated": false,
+      "failure_kind": "RealismProofFailure",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": 64,
+      "time_to_signal_secs": 0.8,
+      "false_positive_notes": [
+        "known-vulnerable validation fixture",
+        "fixture note: models unauthorized ERC20 mint and total supply inflation",
+        "fixture replayable expectation: true",
+        "fixture foundry_poc expectation: true",
+        "proof tier=ReplayedMinimized, replay=Verified",
+        "replay verification did not confirm the counterexample"
+      ],
+      "artifact_path": null,
+      "matched_criteria": [
+        "expected_finding",
+        "invariant_violation",
+        "replayable_artifact",
+        "minimized_path"
+      ],
+      "missing_criteria": [
+        "foundry_poc_generated"
+      ]
+    },
+    {
+      "evidence_class": "SyntheticRegression",
+      "benchmark_id": "known-flashloan-price-manipulation",
+      "digests": {
+        "input_digest": "sha256:3cd5dd7d65bd7c17082d370c37b853bc184c4f629847fa0bc32ccbef490a490f",
+        "config_digest": "sha256:0bb886abd5983b86fa5568aa20e476db12ef45bff5b04d96d58f67c5d886b600",
+        "manifest_digest": "sha256:59191182e24e9736b8239310b56f25ce83f2db6a3f134e7db567b783f797262c",
+        "fixture_digest": "sha256:353f87b435778d02c68008082752ac25235d8cea925a590b02afd39f94a58e1f"
+      },
+      "class": "amm_invariant_violation",
+      "target_profile": [
+        "amm/dex/pool",
+        "flash-loan"
+      ],
+      "expected_exploit_shape": [
+        "flashLoan",
+        "swap",
+        "dependent action",
+        "reverse swap",
+        "repay"
+      ],
+      "exploit_classes": [
+        "price_oracle_manipulation",
+        "flash_loan_economic_attack"
+      ],
+      "status": "not_found",
+      "reason": "matched evidence was observed but replay verification did not confirm the counterexample; matched=[ExpectedFinding, ReserveManipulation, InvariantViolation, ReplayableArtifact, MinimizedPath], missing=[FoundryPocGenerated]",
+      "executed": true,
+      "found": false,
+      "observed_finding": "UniswapV3LiquidityAsymmetry",
+      "finding_type": "UniswapV3LiquidityAsymmetry",
+      "expected_invariant": "flashloan-backed swap manipulates reserve product and leaves attacker profit after repayment",
+      "invariant_id": "flashloan-backed swap manipulates reserve product and leaves attacker profit after repayment",
+      "selected_exploit_template": "flashloan-price-manipulation",
+      "equivalence_class": "flashloan-price-manipulation",
+      "synthesized_sequence": [
+        "#0 caller=0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa target=0x6200000000000000000000000000000000000004 value=0 input=0x9ab603b90000000000000000000000000000000000000000000000000000000000000000"
+      ],
+      "search_driver": null,
+      "confidence": 100,
+      "exploit_path_length": 1,
+      "minimized": true,
+      "replayable": true,
+      "proof_status": "ConcretelyReplayed",
+      "proof": {
+        "target": "0x6200000000000000000000000000000000000004",
+        "vulnerability_class": "UniswapV3LiquidityAsymmetry",
+        "invariant_id": "flashloan-backed swap manipulates reserve product and leaves attacker profit after repayment",
+        "violation_predicate": null,
+        "original_state_violation_verified": false,
+        "actor_roles": {},
+        "tx_sequence": [
+          {
+            "input": [
+              154,
+              182,
+              3,
+              185,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000004",
+            "value": "0x0",
+            "is_victim": false
+          }
+        ],
+        "pre_state_evidence": [],
+        "post_state_evidence": [
+          "txs=1",
+          "storage_diffs=2",
+          "call_trace=1",
+          "finding Amm:UniswapV3LiquidityAsymmetry tx_index=Some(0) target=Some(0x6200000000000000000000000000000000000004)"
+        ],
+        "storage_diffs": [
+          {
+            "tx_index": 0,
+            "address": "0x6200000000000000000000000000000000000004",
+            "slot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "old_value": "0x0",
+            "new_value": "0x1",
+            "pc": 0
+          },
+          {
+            "tx_index": 0,
+            "address": "0x6200000000000000000000000000000000000004",
+            "slot": "0x0101010101010101010101010101010101010101010101010101010101010101",
+            "old_value": "0x0",
+            "new_value": "0x3e8",
+            "pc": 1
+          }
+        ],
+        "economic_delta": {
+          "attacker": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "victim": null,
+          "attacker_native_delta": 0,
+          "victim_native_delta": 0,
+          "token_deltas": [],
+          "semantic_deltas": [],
+          "reserve_deltas": [],
+          "flashloan_signals": [],
+          "price_impact": null,
+          "normalized_profit": null,
+          "storage_delta_summary": [
+            {
+              "address": "0x6200000000000000000000000000000000000004",
+              "slot_count": 2,
+              "absolute_delta_score": "0x3e9"
+            }
+          ],
+          "estimated_profit": "0x0",
+          "suspicious_value_extraction": false,
+          "accounting_anomaly": false,
+          "flashloan_pressure": false,
+          "price_impact_pressure": false,
+          "debt_or_collateral_pressure": false,
+          "share_price_pressure": false,
+          "confidence": 10,
+          "caveats": [
+            "storage-derived share/debt/reserve classifications are heuristic unless balance/ABI reads confirm them",
+            "no directly observed native/token profit; estimated profit may be a pressure signal only"
+          ]
+        },
+        "violated_condition": "flashloan-backed swap manipulates reserve product and leaves attacker profit after repayment",
+        "replay_result": "verified",
+        "minimization_result": "Minimized",
+        "confidence": 92,
+        "caveats": [],
+        "foundry_poc_path": null,
+        "proof_status": "ConcretelyReplayed",
+        "confidence_tier": "replayed_minimized"
+      },
+      "foundry_poc_generated": false,
+      "failure_kind": "RealismProofFailure",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": 160,
+      "time_to_signal_secs": 1.4,
+      "false_positive_notes": [
+        "known-vulnerable validation fixture",
+        "fixture note: models flashloan-backed AMM reserve manipulation and repayment",
+        "fixture replayable expectation: true",
+        "fixture foundry_poc expectation: true",
+        "proof tier=ReplayedMinimized, replay=Verified",
+        "replay verification did not confirm the counterexample"
+      ],
+      "artifact_path": null,
+      "matched_criteria": [
+        "expected_finding",
+        "reserve_manipulation",
+        "invariant_violation",
+        "replayable_artifact",
+        "minimized_path"
+      ],
+      "missing_criteria": [
+        "foundry_poc_generated"
+      ]
+    },
+    {
+      "evidence_class": "SyntheticRegression",
+      "benchmark_id": "known-read-only-reentrancy",
+      "digests": {
+        "input_digest": "sha256:2494a5838a1aa28665e17b2e9f39f245ebaf1cafecee0fd8d42eb06e840b2c8e",
+        "config_digest": "sha256:0bb886abd5983b86fa5568aa20e476db12ef45bff5b04d96d58f67c5d886b600",
+        "manifest_digest": "sha256:b9d8be815171194d96865494af09747e24f146f242a8833cce554cec1105c6d8",
+        "fixture_digest": "sha256:ab01f8ba3d40e49624313137d190f685ec3d09f61097b7d6905312b3726fe82e"
+      },
+      "class": "reentrancy",
+      "target_profile": [
+        "reentrancy"
+      ],
+      "expected_exploit_shape": [
+        "deposit",
+        "withdraw",
+        "fallback callback",
+        "nested view"
+      ],
+      "exploit_classes": [
+        "reentrancy"
+      ],
+      "status": "not_found",
+      "reason": "matched evidence was observed but replay verification did not confirm the counterexample; matched=[ExpectedFinding, InvariantViolation, ReplayableArtifact, MinimizedPath], missing=[FoundryPocGenerated]",
+      "executed": true,
+      "found": false,
+      "observed_finding": "Reentrancy",
+      "finding_type": "Reentrancy",
+      "expected_invariant": "read-only reentrancy observes stale accounting during callback",
+      "invariant_id": "read-only reentrancy observes stale accounting during callback",
+      "selected_exploit_template": "reentrancy-callback",
+      "equivalence_class": "reentrancy-callback",
+      "synthesized_sequence": [
+        "#0 caller=0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa target=0x6200000000000000000000000000000000000003 value=0 input=0xb6b55f250000000000000000000000000000000000000000000000000000000000000000"
+      ],
+      "search_driver": null,
+      "confidence": 100,
+      "exploit_path_length": 1,
+      "minimized": true,
+      "replayable": true,
+      "proof_status": "ConcretelyReplayed",
+      "proof": {
+        "target": "0x6200000000000000000000000000000000000003",
+        "vulnerability_class": "Reentrancy",
+        "invariant_id": "read-only reentrancy observes stale accounting during callback",
+        "violation_predicate": null,
+        "original_state_violation_verified": false,
+        "actor_roles": {},
+        "tx_sequence": [
+          {
+            "input": [
+              182,
+              181,
+              95,
+              37,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000003",
+            "value": "0x0",
+            "is_victim": false
+          }
+        ],
+        "pre_state_evidence": [
+          "preserve storage write dependencies observed in sequence"
+        ],
+        "post_state_evidence": [
+          "txs=1",
+          "storage_diffs=4",
+          "call_trace=1",
+          "finding Governance:Reentrancy tx_index=Some(0) target=Some(0x6200000000000000000000000000000000000003)"
+        ],
+        "storage_diffs": [
+          {
+            "tx_index": 0,
+            "address": "0x6200000000000000000000000000000000000003",
+            "slot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "old_value": "0x0",
+            "new_value": "0xde0b6b3a7640000",
+            "pc": 0
+          },
+          {
+            "tx_index": 0,
+            "address": "0x6200000000000000000000000000000000000003",
+            "slot": "0x0101010101010101010101010101010101010101010101010101010101010101",
+            "old_value": "0x0",
+            "new_value": "0xde0b6b3a7640000",
+            "pc": 1
+          },
+          {
+            "tx_index": 0,
+            "address": "0x6200000000000000000000000000000000000003",
+            "slot": "0x0202020202020202020202020202020202020202020202020202020202020202",
+            "old_value": "0x0",
+            "new_value": "0xde0b6b3a7640000",
+            "pc": 2
+          },
+          {
+            "tx_index": 0,
+            "address": "0x6200000000000000000000000000000000000003",
+            "slot": "0x0303030303030303030303030303030303030303030303030303030303030303",
+            "old_value": "0x0",
+            "new_value": "0xde0b6b3a7640000",
+            "pc": 3
+          }
+        ],
+        "economic_delta": {
+          "attacker": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "victim": null,
+          "attacker_native_delta": 0,
+          "victim_native_delta": 0,
+          "token_deltas": [],
+          "semantic_deltas": [
+            {
+              "tx_index": 0,
+              "address": "0x6200000000000000000000000000000000000003",
+              "slot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+              "before": "0x0",
+              "after": "0xde0b6b3a7640000",
+              "delta": 1000000000000000000,
+              "kind": "ShareBalance",
+              "confidence": 55,
+              "reason": "vault deposit/mint touched accounting storage"
+            },
+            {
+              "tx_index": 0,
+              "address": "0x6200000000000000000000000000000000000003",
+              "slot": "0x0101010101010101010101010101010101010101010101010101010101010101",
+              "before": "0x0",
+              "after": "0xde0b6b3a7640000",
+              "delta": 1000000000000000000,
+              "kind": "ShareBalance",
+              "confidence": 55,
+              "reason": "vault deposit/mint touched accounting storage"
+            },
+            {
+              "tx_index": 0,
+              "address": "0x6200000000000000000000000000000000000003",
+              "slot": "0x0202020202020202020202020202020202020202020202020202020202020202",
+              "before": "0x0",
+              "after": "0xde0b6b3a7640000",
+              "delta": 1000000000000000000,
+              "kind": "ShareBalance",
+              "confidence": 55,
+              "reason": "vault deposit/mint touched accounting storage"
+            },
+            {
+              "tx_index": 0,
+              "address": "0x6200000000000000000000000000000000000003",
+              "slot": "0x0303030303030303030303030303030303030303030303030303030303030303",
+              "before": "0x0",
+              "after": "0xde0b6b3a7640000",
+              "delta": 1000000000000000000,
+              "kind": "ShareBalance",
+              "confidence": 55,
+              "reason": "vault deposit/mint touched accounting storage"
+            }
+          ],
+          "reserve_deltas": [],
+          "flashloan_signals": [],
+          "price_impact": null,
+          "normalized_profit": null,
+          "storage_delta_summary": [
+            {
+              "address": "0x6200000000000000000000000000000000000003",
+              "slot_count": 4,
+              "absolute_delta_score": "0x3782dace9d900000"
+            }
+          ],
+          "estimated_profit": "0x0",
+          "suspicious_value_extraction": false,
+          "accounting_anomaly": true,
+          "flashloan_pressure": false,
+          "price_impact_pressure": false,
+          "debt_or_collateral_pressure": false,
+          "share_price_pressure": false,
+          "confidence": 55,
+          "caveats": [
+            "storage-derived share/debt/reserve classifications are heuristic unless balance/ABI reads confirm them",
+            "no directly observed native/token profit; estimated profit may be a pressure signal only"
+          ]
+        },
+        "violated_condition": "read-only reentrancy observes stale accounting during callback",
+        "replay_result": "verified",
+        "minimization_result": "Minimized",
+        "confidence": 83,
+        "caveats": [
+          "preserve storage write dependencies observed in sequence"
+        ],
+        "foundry_poc_path": null,
+        "proof_status": "ConcretelyReplayed",
+        "confidence_tier": "replayed_minimized"
+      },
+      "foundry_poc_generated": false,
+      "failure_kind": "RealismProofFailure",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": 112,
+      "time_to_signal_secs": 1.1,
+      "false_positive_notes": [
+        "known-vulnerable validation fixture",
+        "fixture note: models callback-driven read-only reentrancy evidence",
+        "fixture replayable expectation: true",
+        "fixture foundry_poc expectation: true",
+        "proof tier=ReplayedMinimized, replay=Verified",
+        "replay verification did not confirm the counterexample"
+      ],
+      "artifact_path": null,
+      "matched_criteria": [
+        "expected_finding",
+        "invariant_violation",
+        "replayable_artifact",
+        "minimized_path"
+      ],
+      "missing_criteria": [
+        "foundry_poc_generated"
+      ]
+    },
+    {
+      "evidence_class": "SyntheticRegression",
+      "benchmark_id": "known-uninitialized-proxy-takeover",
+      "digests": {
+        "input_digest": "sha256:5f79c405929a9d50be9d1b3dc65a0756307b921d8ab554953fd9b6879e409c42",
+        "config_digest": "sha256:0bb886abd5983b86fa5568aa20e476db12ef45bff5b04d96d58f67c5d886b600",
+        "manifest_digest": "sha256:5a4d8e40c6df50f996088f669c4ea6acf529981507da38008f7a92ca4a606616",
+        "fixture_digest": "sha256:65e5181aae6425e0f4437843df7c315da5e9583e0d7b41f3da38791d8cf246e7"
+      },
+      "class": "access_control_bypass",
+      "target_profile": [
+        "proxy/upgradeable",
+        "access-control-heavy"
+      ],
+      "expected_exploit_shape": [
+        "initialize",
+        "upgradeTo",
+        "privileged state mutation"
+      ],
+      "exploit_classes": [
+        "access_control_failure",
+        "upgradeability_proxy_error"
+      ],
+      "status": "not_found",
+      "reason": "matched evidence was observed but replay verification did not confirm the counterexample; matched=[ExpectedFinding, AccessControlBypass, InvariantViolation, ReplayableArtifact, MinimizedPath], missing=[FoundryPocGenerated]",
+      "executed": true,
+      "found": false,
+      "observed_finding": "PrivilegeEscalation",
+      "finding_type": "PrivilegeEscalation",
+      "expected_invariant": "externally callable initializer grants attacker upgrade authority",
+      "invariant_id": "externally callable initializer grants attacker upgrade authority",
+      "selected_exploit_template": "access-control-sensitive-call",
+      "equivalence_class": "access-control-sensitive-call",
+      "synthesized_sequence": [
+        "#0 caller=0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa target=0x6200000000000000000000000000000000000002 value=0 input=0xc4d66de80000000000000000000000000000000000000000000000000000000000000000"
+      ],
+      "search_driver": null,
+      "confidence": 100,
+      "exploit_path_length": 1,
+      "minimized": true,
+      "replayable": true,
+      "proof_status": "ConcretelyReplayed",
+      "proof": {
+        "target": "0x6200000000000000000000000000000000000002",
+        "vulnerability_class": "PrivilegeEscalation",
+        "invariant_id": "externally callable initializer grants attacker upgrade authority",
+        "violation_predicate": null,
+        "original_state_violation_verified": false,
+        "actor_roles": {},
+        "tx_sequence": [
+          {
+            "input": [
+              196,
+              214,
+              109,
+              232,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "to": "0x6200000000000000000000000000000000000002",
+            "value": "0x0",
+            "is_victim": false
+          }
+        ],
+        "pre_state_evidence": [
+          "retry with known non-owner and role-like callers"
+        ],
+        "post_state_evidence": [
+          "txs=1",
+          "storage_diffs=1",
+          "call_trace=1",
+          "finding Governance:PrivilegeEscalation tx_index=None target=Some(0x6200000000000000000000000000000000000002)"
+        ],
+        "storage_diffs": [
+          {
+            "tx_index": 0,
+            "address": "0x6200000000000000000000000000000000000002",
+            "slot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "old_value": "0x0",
+            "new_value": "0xde0b6b3a7640000",
+            "pc": 0
+          }
+        ],
+        "economic_delta": {
+          "attacker": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "victim": null,
+          "attacker_native_delta": 0,
+          "victim_native_delta": 0,
+          "token_deltas": [],
+          "semantic_deltas": [
+            {
+              "tx_index": 0,
+              "address": "0x6200000000000000000000000000000000000002",
+              "slot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+              "before": "0x0",
+              "after": "0xde0b6b3a7640000",
+              "delta": 1000000000000000000,
+              "kind": "UnknownAccounting",
+              "confidence": 25,
+              "reason": "large unclassified accounting storage movement"
+            }
+          ],
+          "reserve_deltas": [],
+          "flashloan_signals": [],
+          "price_impact": null,
+          "normalized_profit": null,
+          "storage_delta_summary": [
+            {
+              "address": "0x6200000000000000000000000000000000000002",
+              "slot_count": 1,
+              "absolute_delta_score": "0xde0b6b3a7640000"
+            }
+          ],
+          "estimated_profit": "0x0",
+          "suspicious_value_extraction": false,
+          "accounting_anomaly": false,
+          "flashloan_pressure": false,
+          "price_impact_pressure": false,
+          "debt_or_collateral_pressure": false,
+          "share_price_pressure": false,
+          "confidence": 35,
+          "caveats": [
+            "storage-derived share/debt/reserve classifications are heuristic unless balance/ABI reads confirm them",
+            "no directly observed native/token profit; estimated profit may be a pressure signal only"
+          ]
+        },
+        "violated_condition": "externally callable initializer grants attacker upgrade authority",
+        "replay_result": "verified",
+        "minimization_result": "Minimized",
+        "confidence": 98,
+        "caveats": [
+          "retry with known non-owner and role-like callers"
+        ],
+        "foundry_poc_path": null,
+        "proof_status": "ConcretelyReplayed",
+        "confidence_tier": "replayed_minimized"
+      },
+      "foundry_poc_generated": false,
+      "failure_kind": "RealismProofFailure",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": 96,
+      "time_to_signal_secs": 1.0,
+      "false_positive_notes": [
+        "known-vulnerable validation fixture",
+        "fixture note: models attacker initialize and privileged upgrade path",
+        "fixture replayable expectation: true",
+        "fixture foundry_poc expectation: true",
+        "proof tier=ReplayedMinimized, replay=Verified",
+        "replay verification did not confirm the counterexample"
+      ],
+      "artifact_path": null,
+      "matched_criteria": [
+        "expected_finding",
+        "access_control_bypass",
+        "invariant_violation",
+        "replayable_artifact",
+        "minimized_path"
+      ],
+      "missing_criteria": [
+        "foundry_poc_generated"
+      ]
+    }
+  ]
+}
