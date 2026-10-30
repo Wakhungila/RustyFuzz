@@ -65,7 +65,9 @@ pub enum Command {
         ///
         /// Validation happens before the campaign starts: every invalid invariant is
         /// reported at once, and a file declaring none is refused rather than silently
-        /// checking nothing.
+        /// checking nothing. Its declared target must match `--contract` or the
+        /// configured `target_contract`; an invariant file without an effective target
+        /// is rejected.
         #[arg(long)]
         invariants: Option<String>,
         #[arg(long, default_value_t = false)]

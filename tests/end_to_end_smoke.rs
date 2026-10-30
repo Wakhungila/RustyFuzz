@@ -1,6 +1,6 @@
 use revm::primitives::Address;
 use rusty_fuzz::config::HardenedDefiConfig;
-use rusty_fuzz::engine::fuzz_engine::{run_fuzz_campaign, Config};
+use rusty_fuzz::engine::fuzz_engine::{Config, run_fuzz_campaign};
 use rusty_fuzz::engine::promotion::{PromotionCampaignSummary, PromotionConfig};
 use std::fs;
 use std::str::FromStr;
@@ -48,8 +48,8 @@ async fn synthetic_abi_smoke_campaign_does_not_promote_findings() {
         target_invariant_manifest: None,
         predicate_invariants: None,
         abi_path: None,
-        max_execs: None,
-        duration_secs: Some(1),
+        max_execs: Some(4),
+        duration_secs: None,
         artifact_limit: Some(1),
         campaign_id: Some("smoke".to_string()),
         paths_are_isolated: false,
@@ -93,6 +93,10 @@ async fn synthetic_abi_smoke_campaign_does_not_promote_findings() {
         &fs::read(campaign_report_dir.join("campaign_summary.json")).expect("summary json"),
     )
     .expect("campaign summary");
+    assert!(
+        summary.total_executions > 0,
+        "smoke campaign must execute transactions before its no-finding result is meaningful"
+    );
     assert_eq!(summary.promoted_findings, 0);
     assert_eq!(summary.confirmed_findings, 0);
     assert_eq!(summary.synthetic_non_production_findings, 0);

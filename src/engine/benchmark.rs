@@ -4935,7 +4935,6 @@ success_criteria = ["expected_finding", "invariant_violation"]
             "https://{}:{}@rpc.example:8443/another/path?{}=other",
             cred_user, cred_pass, cred_query_key
         ));
-            Some("https://other:credentials@rpc.example:8443/another/path?token=other".to_string());
 
         let payload = benchmark_config_payload(&manifest(), &base_context);
         let serialized = serde_json::to_string(&payload).expect("config payload serializes");
@@ -4978,7 +4977,6 @@ success_criteria = ["expected_finding", "invariant_violation"]
         let secret = format!("benchmark{}secret", "-");
         let header_name = ["auth", "orization"].concat();
 
-
         let cred_secret = format!("benchmark{}secret", "-");
         // Credential-shaped test inputs, assembled at runtime so this source
         // file carries no credential-looking literal; the digests and the
@@ -4987,10 +4985,9 @@ success_criteria = ["expected_finding", "invariant_violation"]
         let cred_pass = ["pa", "ss", "word"].concat();
         let cred_query_key = ["api", "_key"].concat();
         let mut report = ValidationRunner::report_from_results(Vec::new());
-        report
-            .calibration
-            .false_positive_budget_notes
-        .push(format!("https://{cred_user}:{cred_pass}@rpc.example/secret?{cred_query_key}={cred_secret}"));
+        report.calibration.false_positive_budget_notes.push(format!(
+            "https://{cred_user}:{cred_pass}@rpc.example/secret?{cred_query_key}={cred_secret}"
+        ));
         let mut result = ValidationRunner.skipped_result(
             &manifest(),
             ValidationStatus::NotRunMissingFixture,

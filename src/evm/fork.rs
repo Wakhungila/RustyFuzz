@@ -36,18 +36,25 @@ pub fn configured_provider(url: reqwest::Url) -> anyhow::Result<impl Provider> {
     {
         let allowed_origins =
             rustyfuzz_evm::rpc_url::rpc_api_key_allowed_origins().map_err(anyhow::Error::msg)?;
-        let authorization = rustyfuzz_evm::rpc_url::rpc_api_key_header(
+        match rustyfuzz_evm::rpc_url::rpc_api_key_header(
             url.as_str(),
             api_key.as_deref(),
             &allowed_origins,
-        )
-        .map_err(anyhow::Error::msg)?
-        .ok_or_else(|| anyhow::anyhow!("RPC API key is empty"))?;
-        let value = reqwest::header::HeaderValue::from_str(&authorization)
-            .map_err(|_| anyhow::anyhow!("RPC API key contains invalid header characters"))?;
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::AUTHORIZATION, value);
-        builder = builder.default_headers(headers);
+        ) {
+            Ok(Some(authorization)) => {
+                let value = reqwest::header::HeaderValue::from_str(&authorization)
+                    .map_err(|_| anyhow::anyhow!("RPC API key contains invalid header characters"))?;
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(reqwest::header::AUTHORIZATION, value);
+                builder = builder.default_headers(headers);
+            }
+            Ok(None) => {
+                // URL already carries its own credential (e.g. Infura/Alchemy path key).
+            }
+            Err(error) => {
+                return Err(anyhow::Error::msg(error));
+            }
+        }
     }
     let client = builder
         .build()
@@ -61,7 +68,14 @@ pub async fn create_fork_db(
     block_number: u64,
     target_contract: Option<Address>,
 ) -> anyhow::Result<EvmCacheDb> {
-    validate_production_rpc_url(rpc_url).map_err(anyhow::Error::msg)?;
+    if test_loopback_allowed()
+        && (rpc_url.starts_with("http://127.0.0.1")
+            || rpc_url.starts_with("http://localhost"))
+    {
+        validate_rpc_url(rpc_url, true).map_err(anyhow::Error::msg)?;
+    } else {
+        validate_production_rpc_url(rpc_url).map_err(anyhow::Error::msg)?;
+    }
     let fork = ForkDb::new(rpc_url.to_string(), block_number);
     let provenance_db = fork.clone();
     let provenance = tokio::task::spawn_blocking(move || provenance_db.refresh_remote_provenance())
@@ -147,7 +161,14 @@ async fn fetch_fork_block_env(
     block_number: u64,
     provenance: Option<&rustyfuzz_evm::fork_db::ForkCacheProvenance>,
 ) -> anyhow::Result<BlockEnv> {
-    let url = validate_production_rpc_url(rpc_url).map_err(anyhow::Error::msg)?;
+    let url = if test_loopback_allowed()
+        && (rpc_url.starts_with("http://127.0.0.1")
+            || rpc_url.starts_with("http://localhost"))
+    {
+        validate_rpc_url(rpc_url, true).map_err(anyhow::Error::msg)?
+    } else {
+        validate_production_rpc_url(rpc_url).map_err(anyhow::Error::msg)?
+    };
     let provider = configured_provider(url)?;
     let chain_id = provider
         .get_chain_id()

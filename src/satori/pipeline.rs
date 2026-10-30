@@ -153,7 +153,9 @@ pub async fn run_model_audit(path: &Path, config: SatoriConfig) -> SatoriResult<
     let mut model_hypotheses = 0usize;
     for packet in &function_packets {
         let prompt = function_audit_prompt(packet, config.max_hypotheses_per_function);
-        let (response, cached) = client.complete_json(&prompt).await?;
+        let (response, cached) = client
+            .complete_json_with_fallbacks(&prompt, &config.fallback_models)
+            .await?;
         budget.record_call(&prompt, &response, cached);
         let audit: FunctionAuditResult = parse_strict_json(&response)?;
         ensure_hypothesis_count(

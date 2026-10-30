@@ -167,6 +167,21 @@ fn terminal_state_for_campaign_error(
     }
 }
 
+fn campaign_completion_status(
+    state: &str,
+    total_executions: u64,
+) -> (String, rustyfuzz_artifacts::RunTerminalState, bool) {
+    let no_executions = total_executions == 0 && state != "cancelled";
+    let effective_state = if no_executions { "failed" } else { state };
+    let terminal_state = match effective_state {
+        "cancelled" => rustyfuzz_artifacts::RunTerminalState::Cancelled,
+        "partial" => rustyfuzz_artifacts::RunTerminalState::Partial,
+        "completed" | "finalized" => rustyfuzz_artifacts::RunTerminalState::Completed,
+        _ => rustyfuzz_artifacts::RunTerminalState::Failed,
+    };
+    (effective_state.to_string(), terminal_state, no_executions)
+}
+
 type ExecutionProvenanceFields = (
     super::provenance::RpcProvenance,
     Option<String>,
@@ -1123,6 +1138,17 @@ async fn run_fuzz_campaign_with_cancellation_inner(
 
         (db, env, synthetic_fork_mode)
     };
+    let fork_setup_status = if synthetic_fork_mode {
+        "synthetic"
+    } else {
+        "rpc"
+    };
+    log::info!(
+        "Fork setup complete: status={}, target={:?}, fork_block={}",
+        fork_setup_status,
+        config.target_contract,
+        config.fork_block
+    );
 
     let fuzzer_address = Address::repeat_byte(0x13);
     // Root snapshots and artifact base caches are proof inputs. Synthetic funding
@@ -1152,6 +1178,12 @@ async fn run_fuzz_campaign_with_cancellation_inner(
     let launcher_fallback_actor_set = hardened_actor_set.clone();
     let launcher_fallback_synthetic_fork_mode = synthetic_fork_mode;
     let bytecode_analysis = discover_target_bytecode_analysis(&initial_db, config.target_contract);
+    let target_bytecode_loaded = bytecode_analysis.is_some();
+    log::info!(
+        "Target bytecode loading complete: loaded={}, target={:?}",
+        target_bytecode_loaded,
+        config.target_contract
+    );
     let bytecode_selectors = bytecode_analysis
         .as_ref()
         .map(|analysis| {
@@ -1235,6 +1267,8 @@ async fn run_fuzz_campaign_with_cancellation_inner(
             launcher_fallback_env,
             launcher_fallback_actor_set,
             launcher_fallback_synthetic_fork_mode,
+            fork_setup_status,
+            target_bytecode_loaded,
             InitialBytecode {
                 selectors: launcher_fallback_bytecode_selectors,
                 analysis: launcher_fallback_bytecode_analysis,
@@ -1655,9 +1689,14 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     update_canonical_startup_mode(&config, startup_mode)
                         .map_err(|error| libafl::Error::unknown(error.to_string()))?;
                 }
+                let initial_corpus_inputs = state.corpus().count() as u64;
+                log::info!(
+                    "Seed initialization complete: initial_corpus_inputs={}",
+                    initial_corpus_inputs
+                );
                 log_worker_corpus_sync(
                     core_id.0,
-                    state.corpus().count(),
+                    initial_corpus_inputs as usize,
                     &config.corpus_dir,
                     "brokered",
                 );
@@ -2252,6 +2291,9 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                        worker_state,
                        &promotion_stats,
                        &telemetry,
+                       fork_setup_status,
+                       target_bytecode_loaded,
+                       initial_corpus_inputs,
                    )
                   .map_err(|error| libafl::Error::unknown(error.to_string()))?;
                   Ok(())
@@ -2307,6 +2349,8 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     launcher_fallback_env,
                     launcher_fallback_actor_set,
                     launcher_fallback_synthetic_fork_mode,
+                    fork_setup_status,
+                    target_bytecode_loaded,
                     InitialBytecode {
                         selectors: launcher_fallback_bytecode_selectors,
                         analysis: launcher_fallback_bytecode_analysis,
@@ -2369,6 +2413,8 @@ async fn run_single_process_campaign(
     initial_env: revm::context::BlockEnv,
     hardened_actor_set: Option<ActorSet>,
     synthetic_fork_mode: bool,
+    fork_setup_status: &'static str,
+    target_bytecode_loaded: bool,
     bytecode: InitialBytecode,
     resume: CampaignResume,
 ) -> anyhow::Result<()> {
@@ -2778,9 +2824,14 @@ async fn run_single_process_campaign(
         );
         update_canonical_startup_mode(&config, startup_mode)?;
     }
+    let initial_corpus_inputs = state.corpus().count() as u64;
+    log::info!(
+        "Seed initialization complete: initial_corpus_inputs={}",
+        initial_corpus_inputs
+    );
     log_worker_corpus_sync(
         core_id,
-        state.corpus().count(),
+        initial_corpus_inputs as usize,
         &config.corpus_dir,
         "single",
     );
@@ -3352,7 +3403,17 @@ async fn run_single_process_campaign(
         } else {
             "finalized"
         };
-        write_final_campaign_summary(&config, &promotion_stats, &telemetry, state)?;
+        write_final_campaign_summary(
+            &config,
+            &promotion_stats,
+            &telemetry,
+            state,
+            CampaignStartupStatus {
+                fork_setup_status,
+                target_bytecode_loaded,
+                initial_corpus_inputs,
+            },
+        )?;
         if cancelled {
             return Err(CampaignCancellation {
                 reason: "fuzz campaign cancelled by watchdog",
@@ -3426,7 +3487,17 @@ async fn run_single_process_campaign(
     } else {
         "finalized"
     };
-    write_final_campaign_summary(&config, &promotion_stats, &telemetry, state)?;
+    write_final_campaign_summary(
+        &config,
+        &promotion_stats,
+        &telemetry,
+        state,
+        CampaignStartupStatus {
+            fork_setup_status,
+            target_bytecode_loaded,
+            initial_corpus_inputs,
+        },
+    )?;
     if cancelled {
         return Err(CampaignCancellation {
             reason: "fuzz campaign cancelled by watchdog",
@@ -4331,13 +4402,16 @@ fn write_worker_terminal_artifact(
     state: &str,
     promotion_stats: &PromotionCampaignStats,
     telemetry: &CampaignTelemetry,
+    fork_setup_status: &str,
+    target_bytecode_loaded: bool,
+    initial_corpus_inputs: u64,
 ) -> anyhow::Result<()> {
     let report_dir = Path::new(&config.report_dir);
     let campaign_id = config
         .campaign_id
         .as_deref()
         .expect("campaign identity is initialized before use");
-    let summary = promotion_stats.summary(
+    let mut summary = promotion_stats.summary(
         campaign_id,
         CampaignMeasurements {
             total_executions: telemetry.execution_count(),
@@ -4348,6 +4422,9 @@ fn write_worker_terminal_artifact(
             time_to_first_finding_ms: telemetry.time_to_first_finding_ms(),
         },
     );
+    summary.fork_setup_status = Some(fork_setup_status.to_string());
+    summary.target_bytecode_loaded = Some(target_bytecode_loaded);
+    summary.initial_corpus_inputs = Some(initial_corpus_inputs);
     let worker_id = worker_id.to_string();
     rustyfuzz_artifacts::fsutil::write_json_atomic(
         &worker_terminal_path(report_dir, &worker_id),
@@ -4505,6 +4582,7 @@ fn write_campaign_status_with_mirror(
             "terminal",
             "updated_at_unix",
             "integrity",
+            "reason",
             "summary",
         ] {
             if let Some(value) = object.get(key) {
@@ -4623,12 +4701,13 @@ fn write_final_campaign_summary(
     promotion_stats: &PromotionCampaignStats,
     telemetry: &CampaignTelemetry,
     state: &str,
+    startup: CampaignStartupStatus,
 ) -> anyhow::Result<()> {
     let campaign_id = config
         .campaign_id
         .as_deref()
         .expect("campaign identity is initialized before use");
-    let summary = promotion_stats.summary(
+    let mut summary = promotion_stats.summary(
         campaign_id,
         CampaignMeasurements {
             total_executions: telemetry.execution_count(),
@@ -4639,20 +4718,18 @@ fn write_final_campaign_summary(
             time_to_first_finding_ms: telemetry.time_to_first_finding_ms(),
         },
     );
+    summary.fork_setup_status = Some(startup.fork_setup_status.to_string());
+    summary.target_bytecode_loaded = Some(startup.target_bytecode_loaded);
+    summary.initial_corpus_inputs = Some(startup.initial_corpus_inputs);
     let summary_path = mirror_campaign_summary(config, &summary)?;
-    let terminal_state = match state {
-        "cancelled" => rustyfuzz_artifacts::RunTerminalState::Cancelled,
-        "partial" => rustyfuzz_artifacts::RunTerminalState::Partial,
-        "completed" | "finalized" => rustyfuzz_artifacts::RunTerminalState::Completed,
-        "failed" => rustyfuzz_artifacts::RunTerminalState::Failed,
-        _ => rustyfuzz_artifacts::RunTerminalState::Failed,
-    };
+    let (effective_state, terminal_state, no_executions) =
+        campaign_completion_status(state, telemetry.execution_count());
     write_campaign_status_with_mirror(
         config,
         &serde_json::json!({
             "schema_version": 1,
             "terminal": true,
-            "state": state,
+            "state": effective_state,
             "phase": "terminal",
             "updated_at_unix": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4660,10 +4737,22 @@ fn write_final_campaign_summary(
                 .unwrap_or_default(),
             "integrity": "unknown",
             "campaign_id": campaign_id,
+            "reason": no_executions.then_some("campaign completed without executing a transaction"),
             "summary": summary,
         }),
     )?;
-    write_run_terminal_status(config, terminal_state, Some(&summary_path))
+    write_run_terminal_status(config, terminal_state, Some(&summary_path))?;
+    if no_executions {
+        anyhow::bail!("campaign completed without executing a transaction");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CampaignStartupStatus {
+    fork_setup_status: &'static str,
+    target_bytecode_loaded: bool,
+    initial_corpus_inputs: u64,
 }
 
 fn merge_worker_summaries(
@@ -4687,6 +4776,27 @@ fn merge_worker_summaries(
         summary.total_artifacts = summary
             .total_artifacts
             .saturating_add(worker.summary.total_artifacts);
+        summary.initial_corpus_inputs = match (
+            summary.initial_corpus_inputs,
+            worker.summary.initial_corpus_inputs,
+        ) {
+            (Some(current), Some(worker_count)) => Some(current.max(worker_count)),
+            (Some(current), None) => Some(current),
+            (None, Some(worker_count)) => Some(worker_count),
+            (None, None) => None,
+        };
+        if summary.fork_setup_status.is_none() {
+            summary.fork_setup_status = worker.summary.fork_setup_status.clone();
+        }
+        summary.target_bytecode_loaded = match (
+            summary.target_bytecode_loaded,
+            worker.summary.target_bytecode_loaded,
+        ) {
+            (Some(current), Some(worker_loaded)) => Some(current && worker_loaded),
+            (Some(current), None) => Some(current),
+            (None, Some(worker_loaded)) => Some(worker_loaded),
+            (None, None) => None,
+        };
         summary.coverage_edges = summary
             .coverage_edges
             .saturating_add(worker.summary.coverage_edges);
@@ -4719,6 +4829,11 @@ fn merge_worker_summaries(
             (None, None) => None,
         };
     }
+    summary.execution_status = if summary.total_executions == 0 {
+        "no_executions".to_string()
+    } else {
+        "executed".to_string()
+    };
     summary
 }
 
@@ -4863,21 +4978,16 @@ fn finalize_brokered_campaign(
         summary.promotion_pending = promotion_summary.promotion_pending;
         summary.promotion_capped = promotion_summary.promotion_capped;
     }
-    let state = if cancelled {
+    let requested_state = if cancelled {
         "cancelled"
     } else if summary.promotion_failures > 0 || summary.promotion_pending > 0 {
         "partial"
     } else {
         "finalized"
     };
+    let (state, terminal_state, no_executions) =
+        campaign_completion_status(requested_state, summary.total_executions);
     let summary_path = mirror_campaign_summary(config, &summary)?;
-    let terminal_state = if cancelled {
-        rustyfuzz_artifacts::RunTerminalState::Cancelled
-    } else if summary.promotion_failures > 0 || summary.promotion_pending > 0 {
-        rustyfuzz_artifacts::RunTerminalState::Partial
-    } else {
-        rustyfuzz_artifacts::RunTerminalState::Completed
-    };
     write_campaign_status_with_mirror(
         config,
         &serde_json::json!({
@@ -4892,6 +5002,7 @@ fn finalize_brokered_campaign(
             "integrity": "unknown",
             "campaign_id": expected_campaign_id,
             "run_nonce": run_nonce,
+            "reason": no_executions.then_some("campaign completed without executing a transaction"),
             "summary": summary,
         }),
     )?;
@@ -4901,6 +5012,9 @@ fn finalize_brokered_campaign(
     }
     if summary.promotion_failures > 0 || summary.promotion_pending > 0 {
         anyhow::bail!("brokered campaign completed with promotion failures or pending work");
+    }
+    if no_executions {
+        anyhow::bail!("brokered campaign completed without executing a transaction");
     }
     Ok(())
 }
@@ -5600,6 +5714,106 @@ mod tests {
             terminal_state_for_campaign_error(&real_failure),
             rustyfuzz_artifacts::RunTerminalState::Failed
         );
+    }
+
+    #[test]
+    fn zero_execution_campaigns_are_failures_not_clean_runs() {
+        let (state, terminal, no_executions) = campaign_completion_status("finalized", 0);
+        assert_eq!(state, "failed");
+        assert_eq!(terminal, rustyfuzz_artifacts::RunTerminalState::Failed);
+        assert!(no_executions);
+
+        let (state, terminal, no_executions) = campaign_completion_status("finalized", 1);
+        assert_eq!(state, "finalized");
+        assert_eq!(terminal, rustyfuzz_artifacts::RunTerminalState::Completed);
+        assert!(!no_executions);
+
+        let (state, terminal, no_executions) = campaign_completion_status("cancelled", 0);
+        assert_eq!(state, "cancelled");
+        assert_eq!(terminal, rustyfuzz_artifacts::RunTerminalState::Cancelled);
+        assert!(!no_executions);
+    }
+
+    #[test]
+    fn zero_execution_finalization_persists_failure_and_returns_error() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rustyfuzz-zero-executions-{}-{nonce}",
+            std::process::id()
+        ));
+        let campaign_id = format!("zero-executions-{}-{nonce}", std::process::id());
+        fs::create_dir_all(&root).unwrap();
+        let report_dir = root.join("reports");
+        let layout = rustyfuzz_artifacts::RunLayout::new(Path::new(".rustyfuzz"), &campaign_id);
+        layout.materialize().unwrap();
+        layout.mark_incomplete(&campaign_id).unwrap();
+
+        let config = Config {
+            rpc_url: "https://rpc.example.com".to_string(),
+            fork_block: 1,
+            target_contract: Some(Address::repeat_byte(0x11)),
+            corpus_dir: root.join("corpus").display().to_string(),
+            report_dir: report_dir.display().to_string(),
+            foundry_harness: None,
+            mainnet_seed_bundle: None,
+            in_memory_bytecode: None,
+            cores: None,
+            require_seed_bundle: false,
+            require_rpc_fork: false,
+            allow_synthetic_fallback: false,
+            hardened_defi: HardenedDefiConfig::default(),
+            target_invariant_manifest: None,
+            predicate_invariants: None,
+            abi_path: None,
+            max_execs: Some(0),
+            duration_secs: None,
+            artifact_limit: None,
+            campaign_id: Some(campaign_id.clone()),
+            paths_are_isolated: true,
+            min_finding_confidence: 0,
+            promotion: PromotionConfig::default(),
+        };
+        let error = write_final_campaign_summary(
+            &config,
+            &PromotionCampaignStats::default(),
+            &CampaignTelemetry::new(),
+            "finalized",
+            CampaignStartupStatus {
+                fork_setup_status: "rpc",
+                target_bytecode_loaded: true,
+                initial_corpus_inputs: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("without executing a transaction"),
+            "{error:#}"
+        );
+
+        let status: serde_json::Value =
+            serde_json::from_slice(&fs::read(report_dir.join("campaign_status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["state"], "failed");
+        assert_eq!(
+            status["reason"],
+            "campaign completed without executing a transaction"
+        );
+        assert_eq!(status["summary"]["execution_status"], "no_executions");
+        assert_eq!(status["summary"]["fork_setup_status"], "rpc");
+        assert_eq!(status["summary"]["target_bytecode_loaded"], true);
+        assert_eq!(status["summary"]["initial_corpus_inputs"], 1);
+        assert_eq!(
+            layout.terminal_state(),
+            Some(rustyfuzz_artifacts::RunTerminalState::Failed)
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(layout.root()).unwrap();
     }
 
     #[test]

@@ -350,14 +350,15 @@ impl<'a> Resolver<'a> {
                     && record.address == binding.address
                     && record.selector == binding.slot
             }) {
-                let word = return_word_at(&record.output, binding.word_index)
-                    .ok_or_else(|| Unresolved::ReturnValueTooShort {
+                let word = return_word_at(&record.output, binding.word_index).ok_or_else(|| {
+                    Unresolved::ReturnValueTooShort {
                         address: crate::binding::hex(&binding.address),
                         selector: crate::binding::hex(&selector_from_slot(&binding.slot)),
                         word_index: binding.word_index,
                         output_bytes: record.output.len(),
-                    })?;
-                return Ok(self.extract_from(binding, &word, Provenance::CallOutput)?);
+                    }
+                })?;
+                return self.extract_from(binding, &word, Provenance::CallOutput);
             }
             if !budget.take() {
                 return Err(Unresolved::ReReadBudgetExhausted);
@@ -1034,7 +1035,10 @@ mod tests {
             .resolve(&sym("depositShares"), &mut reader, &mut budget)
             .unwrap_err();
         assert!(matches!(error, Unresolved::NoReturnValue { .. }));
-        assert!(error.is_no_signal(), "absence of a call must not be a verdict");
+        assert!(
+            error.is_no_signal(),
+            "absence of a call must not be a verdict"
+        );
     }
 
     #[test]

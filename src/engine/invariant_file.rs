@@ -34,9 +34,11 @@
 //! ```
 
 use anyhow::{anyhow, Context};
+use revm::primitives::Address;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::str::FromStr;
 
 use rustyfuzz_predicate::{BindingManifest, InvariantRegistry};
 
@@ -70,6 +72,31 @@ impl InvariantFile {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read invariant file {}", path.display()))?;
         Self::from_json(&text).with_context(|| format!("in invariant file {}", path.display()))
+    }
+
+    /// Ensures symbol bindings are scoped to the campaign's actual target.
+    pub fn validate_target(&self, expected: Option<Address>) -> anyhow::Result<()> {
+        let expected = expected.ok_or_else(|| {
+            anyhow!(
+                "an invariant file requires --contract or config target_contract so its \
+                 symbol bindings can be checked against the campaign target"
+            )
+        })?;
+        let declared = Address::from_str(&self.target).with_context(|| {
+            format!(
+                "invariant file target is not a valid address: {}",
+                self.target
+            )
+        })?;
+        if declared != expected {
+            return Err(anyhow!(
+                "invariant file target {} does not match fuzz target {}; \
+                 the symbols would bind to a different contract",
+                declared,
+                expected
+            ));
+        }
+        Ok(())
     }
 
     /// Checks the things that are cheap to check and expensive to discover later.
@@ -184,6 +211,37 @@ mod tests {
         let registry = file.build_registry().expect("builds");
         let names = registry.names();
         assert_eq!(names, vec!["supplyMatchesBalances", "supplyBounded"]);
+    }
+
+    #[test]
+    fn invariant_target_matches_the_campaign_address() {
+        let file = InvariantFile::from_json(GOOD).expect("parses");
+        let expected =
+            Address::from_str("0x00000000000000000000000000000000000000AA").expect("address");
+        file.validate_target(Some(expected))
+            .expect("case-insensitive address presentation resolves to same target");
+    }
+
+    #[test]
+    fn invariant_target_mismatch_is_rejected() {
+        let file = InvariantFile::from_json(GOOD).expect("parses");
+        let other =
+            Address::from_str("0x00000000000000000000000000000000000000bb").expect("address");
+        let error = file
+            .validate_target(Some(other))
+            .expect_err("a different target must be rejected")
+            .to_string();
+        assert!(error.contains("does not match fuzz target"), "{error}");
+    }
+
+    #[test]
+    fn invariant_file_requires_an_effective_campaign_target() {
+        let file = InvariantFile::from_json(GOOD).expect("parses");
+        let error = file
+            .validate_target(None)
+            .expect_err("cannot safely bind symbols without a campaign target")
+            .to_string();
+        assert!(error.contains("requires --contract"), "{error}");
     }
 
     #[test]

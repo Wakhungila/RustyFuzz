@@ -191,6 +191,14 @@ pub struct PromotionCampaignSummary {
     pub campaign_id: String,
     pub total_executions: u64,
     #[serde(default)]
+    pub execution_status: String,
+    #[serde(default)]
+    pub fork_setup_status: Option<String>,
+    #[serde(default)]
+    pub target_bytecode_loaded: Option<bool>,
+    #[serde(default)]
+    pub initial_corpus_inputs: Option<u64>,
+    #[serde(default)]
     pub mutated_inputs: u64,
     #[serde(default)]
     pub seed_replays: u64,
@@ -385,6 +393,14 @@ impl PromotionCampaignStats {
         PromotionCampaignSummary {
             campaign_id: campaign_id.into(),
             total_executions,
+            execution_status: if total_executions == 0 {
+                "no_executions".to_string()
+            } else {
+                "executed".to_string()
+            },
+            fork_setup_status: None,
+            target_bytecode_loaded: None,
+            initial_corpus_inputs: None,
             mutated_inputs,
             seed_replays,
             total_artifacts,
@@ -1555,9 +1571,21 @@ fn limitations_markdown(record: &FindingPromotionRecord) -> String {
 
 fn campaign_summary_markdown(summary: &PromotionCampaignSummary) -> String {
     format!(
-        "# RustyFuzz Campaign Summary\n\n- campaign_id: `{}`\n- total_executions: `{}`\n- mutated_inputs: `{}`\n- seed_replays: `{}`\n- total_artifacts: `{}`\n- coverage_edges: `{}`\n- confirmed_vulnerabilities: `{}`\n- interesting_candidates: `{}`\n- candidate_findings: `{}`\n- promoted_findings: `{}`\n- confirmed_findings: `{}`\n- rejected_candidates: `{}`\n- unproven_candidates: `{}`\n- poc_count: `{}`\n- missing_poc_for_promoted: `{}`\n- replay_failure_count: `{}`\n- synthetic_non_production_findings: `{}`\n- highest_confidence: `{}`\n- minimization_attempts: `{}`\n- minimization_reduced: `{}`\n- minimization_not_reducible: `{}`\n- promotion_capped: `{}`\n- time_to_first_finding_ms: `{}`\n\nSuccess definition: no replay-confirmed finding means no confirmed vulnerability; no passing PoC means the issue is not bounty-grade confirmed.\n",
+        "# RustyFuzz Campaign Summary\n\n- campaign_id: `{}`\n- execution_status: `{}`\n- total_executions: `{}`\n- fork_setup_status: `{}`\n- target_bytecode_loaded: `{}`\n- initial_corpus_inputs: `{}`\n- mutated_inputs: `{}`\n- seed_replays: `{}`\n- total_artifacts: `{}`\n- coverage_edges: `{}`\n- confirmed_vulnerabilities: `{}`\n- interesting_candidates: `{}`\n- candidate_findings: `{}`\n- promoted_findings: `{}`\n- confirmed_findings: `{}`\n- rejected_candidates: `{}`\n- unproven_candidates: `{}`\n- poc_count: `{}`\n- missing_poc_for_promoted: `{}`\n- replay_failure_count: `{}`\n- synthetic_non_production_findings: `{}`\n- highest_confidence: `{}`\n- minimization_attempts: `{}`\n- minimization_reduced: `{}`\n- minimization_not_reducible: `{}`\n- promotion_capped: `{}`\n- time_to_first_finding_ms: `{}`\n\nSuccess definition: a run with zero executions is not a fuzzing result. No replay-confirmed finding means no confirmed vulnerability; no passing PoC means the issue is not bounty-grade confirmed.\n",
         summary.campaign_id,
+        summary.execution_status,
         summary.total_executions,
+        summary.fork_setup_status.as_deref().unwrap_or("unknown"),
+        summary
+            .target_bytecode_loaded
+            .map(|loaded| loaded.to_string())
+            .as_deref()
+            .unwrap_or("unknown"),
+        summary
+            .initial_corpus_inputs
+            .map(|count| count.to_string())
+            .as_deref()
+            .unwrap_or("unknown"),
         summary.mutated_inputs,
         summary.seed_replays,
         summary.total_artifacts,
@@ -1643,6 +1671,23 @@ mod tests {
             !rendered.contains("- time_to_first_finding_ms: `0`"),
             "an unmeasured TTFF must not render as zero"
         );
+    }
+
+    #[test]
+    fn campaign_summary_identifies_runs_that_never_executed() {
+        let mut summary =
+            PromotionCampaignStats::default().summary("empty", CampaignMeasurements::default());
+        summary.fork_setup_status = Some("rpc".to_string());
+        summary.target_bytecode_loaded = Some(true);
+        summary.initial_corpus_inputs = Some(1);
+
+        assert_eq!(summary.execution_status, "no_executions");
+        let rendered = campaign_summary_markdown(&summary);
+        assert!(rendered.contains("- execution_status: `no_executions`"));
+        assert!(rendered.contains("- fork_setup_status: `rpc`"));
+        assert!(rendered.contains("- target_bytecode_loaded: `true`"));
+        assert!(rendered.contains("- initial_corpus_inputs: `1`"));
+        assert!(rendered.contains("zero executions is not a fuzzing result"));
     }
 
     #[test]

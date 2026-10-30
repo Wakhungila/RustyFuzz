@@ -847,16 +847,24 @@ fn rpc_on_blocking_thread(
         {
             let allowed_origins = crate::rpc_url::rpc_api_key_allowed_origins()
                 .map_err(|error| ForkDbError::Rpc(error.to_string()))?;
-            let authorization =
-                crate::rpc_url::rpc_api_key_header(&rpc_url, api_key.as_deref(), &allowed_origins)
-                    .map_err(|error| ForkDbError::Rpc(error.to_string()))?
-                    .ok_or_else(|| ForkDbError::Rpc("RPC API key is empty".to_string()))?;
-            let value = reqwest::header::HeaderValue::from_str(&authorization).map_err(|_| {
-                ForkDbError::Rpc("RPC API key contains invalid header characters".to_string())
-            })?;
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(reqwest::header::AUTHORIZATION, value);
-            client_builder = client_builder.default_headers(headers);
+            match crate::rpc_url::rpc_api_key_header(&rpc_url, api_key.as_deref(), &allowed_origins)
+            {
+                Ok(Some(authorization)) => {
+                    let value = reqwest::header::HeaderValue::from_str(&authorization).map_err(|_| {
+                        ForkDbError::Rpc("RPC API key contains invalid header characters".to_string())
+                    })?;
+                    let mut headers = reqwest::header::HeaderMap::new();
+                    headers.insert(reqwest::header::AUTHORIZATION, value);
+                    client_builder = client_builder.default_headers(headers);
+                }
+                Ok(None) => {
+                    // URL already carries its own credential (e.g. Infura/Alchemy path key);
+                    // sending a Bearer header would break the request. Proceed without one.
+                }
+                Err(error) => {
+                    return Err(ForkDbError::Rpc(error.to_string()));
+                }
+            }
         }
         let client = client_builder
             .build()

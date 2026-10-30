@@ -22,13 +22,13 @@ use rusty_fuzz::engine::fork_setup::ForkSetupDiscoverer;
 use rusty_fuzz::engine::foundry_ingest::FoundryHarnessManifest;
 use rusty_fuzz::engine::invariant_manifest::TargetInvariantManifest;
 use rusty_fuzz::engine::minimizer::Minimizer;
-use rusty_fuzz::engine::promotion::{promote_finding_artifact, PromotionConfig, PromotionRequest};
+use rusty_fuzz::engine::promotion::{PromotionConfig, PromotionRequest, promote_finding_artifact};
 use rusty_fuzz::engine::seed_intelligence::SeedIntelligence;
 use rusty_fuzz::evm::corpus::{CampaignArtifactRecord, PersistentCorpus};
 use rusty_fuzz::evm::fork::configured_provider;
 use rusty_fuzz::evm::seed_ingester::{
-    seed_abi_functions, MainnetSeed, MainnetSeedBundle, MainnetSeedConfig, SeedIngester,
-    SeedMetadata, SeedScanMode,
+    MainnetSeed, MainnetSeedBundle, MainnetSeedConfig, SeedIngester, SeedMetadata, SeedScanMode,
+    seed_abi_functions,
 };
 use rustyfuzz_evm::executor::EvmExecutor;
 use rustyfuzz_evm::fork_db::ForkDb;
@@ -162,15 +162,8 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 );
             }
 
-            // Parse the invariant file here, before any fork or campaign work, so a bad
-            // file fails in a second rather than after minutes of fuzzing. The registry
-            // is rebuilt inside the engine from the same path; this is the early,
-            // full-error report.
-            if let Some(path) = invariants.as_deref() {
-                let invariants_path = std::path::Path::new(path);
-                rusty_fuzz::engine::invariant_file::InvariantFile::load(invariants_path)
-                    .and_then(|file| file.build_registry())?;
-            }
+            // Invariant file validation (target match against --contract) happens after
+            // raw_target is resolved below; see the check after target_contract parsing.
 
             let effective_chain = chain
                 .as_deref()
@@ -199,6 +192,14 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                         raw_target.unwrap_or("")
                     )
                 })?;
+            // Validate the invariant and its target before fork or campaign work.
+            if let Some(path) = invariants.as_deref() {
+                let invariants_path = std::path::Path::new(path);
+                let file =
+                    rusty_fuzz::engine::invariant_file::InvariantFile::load(invariants_path)?;
+                file.validate_target(target_contract)?;
+                file.build_registry()?;
+            }
             println!(
                 "Starting fuzz campaign on {:?} for contract {:?}",
                 chain,
