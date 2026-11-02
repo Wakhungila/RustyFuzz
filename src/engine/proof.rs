@@ -34,6 +34,11 @@ pub struct ProofCarryingFinding {
     pub target: Option<Address>,
     pub vulnerability_class: Option<String>,
     pub invariant_id: Option<String>,
+    #[serde(default)]
+    pub violation_predicate: Option<crate::common::verifier::ViolationPredicate>,
+    /// Set only after proof-mode replay checks this predicate from original state.
+    #[serde(default)]
+    pub original_state_violation_verified: bool,
     pub actor_roles: BTreeMap<usize, ActorType>,
     pub tx_sequence: Vec<SingletonTx>,
     pub pre_state_evidence: Vec<String>,
@@ -93,6 +98,28 @@ impl ProofCarryingFinding {
                 .max_by_key(|finding| finding.severity.clone())
                 .map(|finding| finding.vuln.to_string()),
             invariant_id: candidate.violated_invariant.clone(),
+            // Preserve the authored invariant and its bindings for independent replay.
+            // Findings without that configuration can still use a DeniedMint predicate.
+            violation_predicate: candidate
+                .predicate_text
+                .as_deref()
+                .zip(candidate.predicate_manifest.as_deref())
+                .and_then(|(text, manifest)| {
+                    crate::common::verifier::ViolationPredicate::from_invariant_violation(
+                        text,
+                        manifest,
+                        candidate.predicate_tx_index.unwrap_or_default(),
+                        candidate.predicate_terms.clone(),
+                    )
+                })
+                .or_else(|| {
+                    findings.iter().find_map(|finding| {
+                        crate::common::verifier::ViolationPredicate::from_finding(
+                            finding, execution,
+                        )
+                    })
+                }),
+            original_state_violation_verified: false,
             actor_roles: candidate.actor_roles.clone(),
             tx_sequence: candidate.sequence.clone(),
             pre_state_evidence: candidate.required_preconditions.clone(),
@@ -130,11 +157,59 @@ impl ProofCarryingFinding {
         self
     }
 
+    pub fn verify_original_state(
+        &mut self,
+        base: &crate::common::types::ChainState,
+        environment: &revm::context::BlockEnv,
+        map_size: usize,
+    ) -> Option<crate::common::verifier::RealismProofReport> {
+        self.verify_original_state_with_time_warp(
+            base,
+            environment,
+            map_size,
+            rustyfuzz_evm::time_warp::TimeWarp::DEFAULT,
+        )
+    }
+
+    pub fn verify_original_state_with_time_warp(
+        &mut self,
+        base: &crate::common::types::ChainState,
+        environment: &revm::context::BlockEnv,
+        map_size: usize,
+        time_warp: rustyfuzz_evm::time_warp::TimeWarp,
+    ) -> Option<crate::common::verifier::RealismProofReport> {
+        self.original_state_violation_verified = false;
+        let predicate = self.violation_predicate.as_ref()?;
+        let input = crate::evm::fuzz::EvmInput::new(self.tx_sequence.clone(), 0);
+        let report = crate::common::verifier::RealismVerifier::with_time_warp(map_size, time_warp)
+            .prove_violation(base, environment, &input, predicate);
+        self.original_state_violation_verified =
+            report.success && report.status == crate::common::oracle::FindingStatus::Proved;
+        self.replay_result = if self.original_state_violation_verified {
+            ReplayVerificationStatus::Verified
+        } else {
+            ReplayVerificationStatus::Mismatch {
+                reason: "original-state violation replay failed".into(),
+            }
+        };
+        self.confidence_tier = self.compute_confidence_tier();
+        Some(report)
+    }
+
     pub fn verify_against(
         &self,
         execution: &SequenceExecutionResult,
         findings: &[ProtocolFinding],
     ) -> ReplayVerificationStatus {
+        if self
+            .violation_predicate
+            .as_ref()
+            .is_some_and(|predicate| !predicate.holds(execution))
+        {
+            return ReplayVerificationStatus::Mismatch {
+                reason: "original violation predicate no longer holds".into(),
+            };
+        }
         if self.tx_sequence.len() != execution.tx_results.len() {
             return ReplayVerificationStatus::Mismatch {
                 reason: format!(
@@ -185,6 +260,13 @@ impl ProofCarryingFinding {
                 ProofConfidenceTier::Heuristic
             }
             ReplayVerificationStatus::Verified => {
+                if self.violation_predicate.is_none() || !self.original_state_violation_verified {
+                    return if self.minimization_result == MinimizedSequenceStatus::Minimized {
+                        ProofConfidenceTier::ReplayedMinimized
+                    } else {
+                        ProofConfidenceTier::Replayed
+                    };
+                }
                 if self.foundry_poc_path.is_some() {
                     ProofConfidenceTier::PocGenerated
                 } else if self.proof_status == CounterexampleProofStatus::ConcretelyReplayed {
@@ -205,14 +287,7 @@ impl ProofCarryingFinding {
     }
 
     pub fn confidence_is_confirmed(&self) -> bool {
-        matches!(
-            self.confidence_tier,
-            ProofConfidenceTier::Replayed
-                | ProofConfidenceTier::ReplayedMinimized
-                | ProofConfidenceTier::ProofCarrying
-                | ProofConfidenceTier::PocGenerated
-                | ProofConfidenceTier::Confirmed
-        )
+        self.violation_predicate.is_some() && self.confidence_tier == ProofConfidenceTier::Confirmed
     }
 
     pub fn confidence_is_strictly_confirmed(&self) -> bool {
@@ -277,6 +352,10 @@ mod tests {
             actor_roles: BTreeMap::new(),
             profit_delta: Some(revm::primitives::U256::from(1)),
             violated_invariant: Some("share inflation".to_string()),
+            predicate_terms: Vec::new(),
+            predicate_text: None,
+            predicate_manifest: None,
+            predicate_tx_index: None,
             confidence: 90,
             required_preconditions: vec!["fund attacker".to_string()],
             replayability_status: ReplayabilityStatus::Replayable,
@@ -344,7 +423,7 @@ mod tests {
         )
         .with_replay_result(ReplayVerificationStatus::Verified);
 
-        assert!(proof.confidence_is_confirmed());
+        assert!(!proof.confidence_is_confirmed());
         assert!(matches!(
             proof.confidence_tier,
             ProofConfidenceTier::ProofCarrying

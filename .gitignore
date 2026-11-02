@@ -72,6 +72,18 @@ PoolFactory.json
 /benchmarks/tmp/
 /benchmarks/generated/
 
+# Local comparison harness outputs and downloaded tool binaries.
+# Keep the harness source, contracts, invariants, and checked-in fixtures.
+/benchmarks/comparison/out/
+/benchmarks/comparison/cache/
+/benchmarks/comparison/broadcast/
+/benchmarks/comparison/crytic-export/
+/benchmarks/comparison/work/
+/benchmarks/comparison/results/
+/benchmarks/comparison/abi/
+/benchmarks/comparison/bin/
+/benchmarks/comparison/deployed.json
+
 # Temporary Foundry or PoC-generation projects.
 /out/
 /broadcast/
@@ -157,3 +169,7 @@ htmlcov/
 # ─────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+
+# Foundry build artifacts (regenerable)
+/benchmarks/historical/out/
+/benchmarks/historical/cache/

@@ -1,0 +1,23 @@
+{
+  "target": "0x6200000000000000000000000000000000000301",
+  "symbols": {
+    "reserve0": {
+      "kind": "slot",
+      "slot": "0x2",
+      "offset_bits": 0,
+      "width_bits": 256
+    },
+    "reserve1": {
+      "kind": "slot",
+      "slot": "0x3",
+      "offset_bits": 0,
+      "width_bits": 256
+    }
+  },
+  "invariants": [
+    {
+      "name": "reserveProductDoesNotDecrease",
+      "predicate": "reserve0 * reserve1 >= 1000000000000"
+    }
+  ]
+}

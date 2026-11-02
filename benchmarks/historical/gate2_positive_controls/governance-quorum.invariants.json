@@ -1,0 +1,17 @@
+{
+  "target": "0x6200000000000000000000000000000000000502",
+  "symbols": {
+    "executed": {
+      "kind": "slot",
+      "slot": "0x3",
+      "offset_bits": 0,
+      "width_bits": 8
+    }
+  },
+  "invariants": [
+    {
+      "name": "ExecutionRequiresGovernancePath",
+      "predicate": "executed == 0"
+    }
+  ]
+}

@@ -6,6 +6,7 @@
 use super::commands::{Command, JobCommand};
 use super::helpers::*;
 use alloy::providers::Provider;
+use anyhow::Context;
 use libafl_bolts::core_affinity::Cores;
 
 use revm::database::CacheDB;
@@ -21,13 +22,13 @@ use rusty_fuzz::engine::fork_setup::ForkSetupDiscoverer;
 use rusty_fuzz::engine::foundry_ingest::FoundryHarnessManifest;
 use rusty_fuzz::engine::invariant_manifest::TargetInvariantManifest;
 use rusty_fuzz::engine::minimizer::Minimizer;
-use rusty_fuzz::engine::promotion::{promote_finding_artifact, PromotionConfig, PromotionRequest};
+use rusty_fuzz::engine::promotion::{PromotionConfig, PromotionRequest, promote_finding_artifact};
 use rusty_fuzz::engine::seed_intelligence::SeedIntelligence;
 use rusty_fuzz::evm::corpus::{CampaignArtifactRecord, PersistentCorpus};
 use rusty_fuzz::evm::fork::configured_provider;
 use rusty_fuzz::evm::seed_ingester::{
-    seed_abi_functions, MainnetSeed, MainnetSeedBundle, MainnetSeedConfig, SeedIngester,
-    SeedMetadata, SeedScanMode,
+    MainnetSeed, MainnetSeedBundle, MainnetSeedConfig, SeedIngester, SeedMetadata, SeedScanMode,
+    seed_abi_functions,
 };
 use rustyfuzz_evm::executor::EvmExecutor;
 use rustyfuzz_evm::fork_db::ForkDb;
@@ -44,10 +45,70 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let config = rusty_fuzz::config::Config::load("config.toml")?;
     let _config_ref = &config;
+    // `target` is the zero-config entry point. Rather than duplicating the campaign
+    // wiring below, it translates itself into the equivalent `Fuzz` command and falls
+    // through to the same code. Duplicating that arm would guarantee the two drift.
+    let command = match command {
+        Command::Target {
+            address,
+            rpc_url,
+            fork_block,
+            duration_secs,
+            max_execs,
+            rng_seed,
+            invariants,
+        } => Command::Fuzz {
+            chain: None,
+            contract: Some(address),
+            rpc_url: Some(rpc_url),
+            fork_block,
+            invariants,
+            hardened_defi: true,
+            single_process: true,
+            cores: None,
+            deterministic: true,
+            rng_seed: Some(rng_seed),
+            bounded_search: true,
+            seed_file: None,
+            require_seed_bundle: false,
+            require_rpc_fork: true,
+            allow_synthetic_fallback: false,
+            abi: None,
+            max_execs,
+            duration_secs: Some(duration_secs),
+            wall_timeout_secs: None,
+            unbounded: false,
+            artifact_limit: None,
+            campaign_id: None,
+            no_synthetic_fallback: true,
+            min_finding_confidence: 0,
+            promote_findings: true,
+            no_promote_findings: false,
+            require_replay_for_report: false,
+            require_poc_for_confirmed: false,
+            strict_proof: false,
+            no_synthetic_proof: false,
+            require_foundry_poc: false,
+            require_minimized: false,
+            reject_heuristics: false,
+            max_finding_noise: None,
+            poc_out: None,
+            promotion_limit: None,
+        },
+        other => other,
+    };
+
+    // `Target` was rewritten above, so it cannot reach here.
+    #[allow(unreachable_patterns)]
     match command {
+        // Unreachable: rewritten into `Fuzz` by the normalisation above.
+        Command::Target { .. } => unreachable!("Target is normalised before dispatch"),
         Command::Fuzz {
             chain,
             contract,
+            rpc_url,
+            fork_block,
+            invariants,
             hardened_defi,
             single_process,
             cores,
@@ -80,6 +141,30 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             poc_out,
             promotion_limit,
         } => {
+            // Apply CLI overrides before anything reads the config, so a caller cannot
+            // accidentally use the shared file's endpoint while believing it passed
+            // `--rpc-url`. `config` is shadowed rather than mutated so the intent is
+            // visible at the top of the arm.
+            let config = {
+                let mut config = config;
+                if let Some(url) = rpc_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+                    config.rpc_url = url.to_string();
+                }
+                if let Some(block) = fork_block {
+                    config.fork_block = Some(block);
+                }
+                config
+            };
+            if rpc_url.is_none() && fork_block.is_some() {
+                anyhow::bail!(
+                    "--fork-block was given without --rpc-url; the block would be pinned \
+                     against the shared config's endpoint, which is almost never intended"
+                );
+            }
+
+            // Invariant file validation (target match against --contract) happens after
+            // raw_target is resolved below; see the check after target_contract parsing.
+
             let effective_chain = chain
                 .as_deref()
                 .unwrap_or(config.chain.as_str())
@@ -107,6 +192,14 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                         raw_target.unwrap_or("")
                     )
                 })?;
+            // Validate the invariant and its target before fork or campaign work.
+            if let Some(path) = invariants.as_deref() {
+                let invariants_path = std::path::Path::new(path);
+                let file =
+                    rusty_fuzz::engine::invariant_file::InvariantFile::load(invariants_path)?;
+                file.validate_target(target_contract)?;
+                file.build_registry()?;
+            }
             println!(
                 "Starting fuzz campaign on {:?} for contract {:?}",
                 chain,
@@ -207,6 +300,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     && (config.allow_synthetic_fallback || allow_synthetic_fallback),
                 hardened_defi: hardened_defi_config,
                 target_invariant_manifest: config.target_invariant_manifest.clone(),
+                predicate_invariants: invariants.clone(),
                 abi_path: abi.or(config.target_abi.clone()),
                 max_execs,
                 duration_secs,
@@ -779,6 +873,83 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 println!("{report_json}");
             }
         }
+        Command::Capture {
+            rpc_url,
+            block,
+            fixture,
+            invariants,
+            slots,
+            mapping_slots,
+            output,
+            report,
+        } => {
+            // Validate every input before touching the network: a malformed slot or a
+            // missing fixture must fail in milliseconds, not after a multi-second fetch.
+            let fixture_path = std::path::Path::new(&fixture);
+            let accounts = rusty_fuzz::evm::fork_capture::accounts_from_fixture(fixture_path)?;
+
+            let mut slot_requests = Vec::new();
+            if let Some(path) = invariants.as_deref() {
+                slot_requests.extend(
+                    rusty_fuzz::evm::fork_capture::slot_requests_from_invariants(
+                        std::path::Path::new(path),
+                    )?,
+                );
+            }
+            for raw in &slots {
+                let (address, slot) = raw
+                    .split_once(':')
+                    .ok_or_else(|| anyhow::anyhow!("--slot {raw:?} is not `0xaddress:0xslot`"))?;
+                slot_requests.push(rusty_fuzz::evm::fork_capture::SlotRequest {
+                    address: address.to_string(),
+                    slot: slot.to_string(),
+                    source: "explicit --slot".to_string(),
+                });
+            }
+            for raw in &mapping_slots {
+                slot_requests.push(
+                    rusty_fuzz::evm::fork_capture::address_mapping_slot_request(raw)
+                        .with_context(|| format!("invalid --mapping-slot {raw:?}"))?,
+                );
+            }
+
+            let report_path = report
+                .clone()
+                .unwrap_or_else(|| format!("{output}.report.json"));
+
+            let (chain_id, fork) = rusty_fuzz::evm::fork_capture::connect(&rpc_url, block)?;
+            let (snapshot, capture_report) = rusty_fuzz::evm::fork_capture::capture(
+                &fork,
+                chain_id,
+                block,
+                &accounts,
+                &slot_requests,
+            )?;
+            rusty_fuzz::evm::fork_capture::write_snapshot(
+                &snapshot,
+                &capture_report,
+                std::path::Path::new(&output),
+                std::path::Path::new(&report_path),
+            )?;
+
+            println!(
+                "captured {} account(s), {} slot(s), {} code blob(s) at block {}",
+                capture_report.accounts,
+                capture_report.slots,
+                capture_report.codes,
+                capture_report.block_number
+            );
+            println!("snapshot: {output}");
+            println!("report:   {report_path}");
+            if !capture_report.codeless_accounts.is_empty() {
+                println!(
+                    "note: {} account(s) hold no code at this block: {}",
+                    capture_report.codeless_accounts.len(),
+                    capture_report.codeless_accounts.join(", ")
+                );
+            }
+            println!("{}", capture_report.completeness);
+        }
         Command::Invariants {
             target,
             abi_report,
@@ -894,6 +1065,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                         hardened
                     },
                     target_invariant_manifest: Some(invariant_path),
+                    predicate_invariants: None,
                     abi_path: abi.or(config.target_abi.clone()),
                     max_execs: Some(job.max_execs),
                     duration_secs: Some(job.duration_secs),
@@ -1178,6 +1350,8 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             benchmarks,
             output,
             broker_free: _,
+            rpc_url,
+            fork_block,
         } => {
             let manifests = ValidationRunner::load_manifests(&benchmarks)?;
             let runner = ValidationRunner;
@@ -1188,8 +1362,44 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                         | rusty_fuzz::engine::benchmark::BenchmarkMode::BlindRediscovery
                 )
             });
+            // Resolve the endpoint and the block for this run.
+            //
+            // `fork_block` from the CLI pins EVERY case, which is what a single-target
+            // comparison wants. Without it each manifest keeps its own `fork_block` and the
+            // context's value is only a fallback: a historical corpus pins different blocks
+            // per case, and one global value would validate the wrong state for all but one.
+            let rpc_url = rpc_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(str::to_string);
+            let effective_rpc = rpc_url.clone().unwrap_or_else(|| config.rpc_url.clone());
+            let pinned_block = fork_block.or(config.fork_block);
+            let per_manifest_blocks: Vec<Option<u64>> = manifests
+                .iter()
+                .map(|manifest| manifest.fork_block)
+                .collect();
+            let distinct_blocks: std::collections::BTreeSet<u64> =
+                per_manifest_blocks.iter().flatten().copied().collect();
+            if fork_block.is_none() && distinct_blocks.len() > 1 {
+                // The context carries a single block env, so a corpus with two pins cannot
+                // share one. Say so rather than silently validating one of them.
+                log::warn!(
+                    "case corpus pins {} distinct fork blocks ({:?}); a single block environment \
+                     is used for this run. Pass --fork-block to pin one value deliberately.",
+                    distinct_blocks.len(),
+                    distinct_blocks
+                );
+            }
             let block_env = if needs_rpc {
-                campaign_block_env(&config).await.ok()
+                match pinned_block {
+                    Some(block) => {
+                        rusty_fuzz::evm::fork::create_fork_block_env(&effective_rpc, block)
+                            .await
+                            .ok()
+                    }
+                    None => campaign_block_env(&config).await.ok(),
+                }
             } else {
                 None
             };
@@ -1199,8 +1409,8 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 .map(std::path::Path::to_path_buf)
                 .or_else(|| Some(std::path::PathBuf::from(&config.report_dir)));
             let context = rusty_fuzz::engine::benchmark::ValidationContext {
-                rpc_url: Some(config.rpc_url.clone()),
-                fork_block: config.fork_block,
+                rpc_url: Some(effective_rpc),
+                fork_block: pinned_block,
                 block_env,
                 report_dir,
             };

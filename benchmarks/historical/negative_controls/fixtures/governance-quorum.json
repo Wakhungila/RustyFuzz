@@ -102,7 +102,7 @@
       "to": "0x6200000000000000000000000000000000000502",
       "calldata": "0xfe0d94c10000000000000000000000000000000000000000000000000000000000000001",
       "value": "0x0",
-      "timestamp": 1200,
+      "timestamp": 1000,
       "expected_status": "Revert",
       "expected_output": null,
       "expected_storage": [

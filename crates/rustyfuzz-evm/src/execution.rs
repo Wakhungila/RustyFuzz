@@ -110,7 +110,10 @@ pub struct TxExecutionResult {
     pub coverage_hash: u64,
     pub coverage_edges: usize,
     pub storage_reads: Vec<StorageAccess>,
+    /// Attempted SSTORE operations, including operations in reverted frames.
     pub storage_writes: Vec<StorageAccess>,
+    /// Canonical committed changes, once per address/slot in this transaction.
+    /// Original values come from REVM state, including lazily loaded fork slots.
     pub storage_diffs: Vec<StorageDiff>,
     pub call_trace: Vec<CallObservation>,
     pub waypoints: Vec<Waypoint>,

@@ -1,0 +1,23 @@
+{
+  "case_id": "polytope-solidity-merkle-trees",
+  "source": {
+    "url": "https://github.com/polytope-labs/solidity-merkle-trees",
+    "commit": "6bbc83d5ac33f85761725cf2eba4f8700164e8ba",
+    "foundry_toml": "solc 0.8.20, src=src, test=tests/foundry, libs=[]"
+  },
+  "purpose": "one-time validation of the predicate layer against real production Solidity. NOT a vendored corpus case.",
+  "not_vendored": true,
+  "why_not_vendored": "Third-party code is not copied into this repository. Reproducibility comes from URL + commit in this manifest.",
+  "verification": {
+    "build": "forge build succeeds after npm install (forge-std is an npm dependency, remapped)",
+    "test_count": 22,
+    "test_count_method": "two independent counts: forge test summary (22 tests passed) and static grep of `function test` across tests/foundry/*.sol (12+4+6=22)",
+    "suite_breakdown": {
+      "tests/foundry/MerkleMultiProof.t.sol": 4,
+      "tests/foundry/MerkleMountainRange.t.sol": 12,
+      "tests/foundry/MerklePatricia.t.sol": 6
+    }
+  },
+  "declared_limitation": "This repository contains no stateful invariant_* functions. Its properties are universal statements over pure functions (verify(forged) == false). Validating a function-return predicate here does not exercise RustyFuzz's state-machine machinery, and is expected to find no new bug, because Foundry's own fuzzer already covers this class faster for a stateless library.",
+  "scope_decision": "Validation exercise only. 2-3 day detour to prove the predicate layer works on real code."
+}

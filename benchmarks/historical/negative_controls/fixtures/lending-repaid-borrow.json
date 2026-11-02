@@ -96,37 +96,12 @@
     },
     {
       "caller": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "to": "0x7000000000000000000000000000000000000001",
-      "calldata": "0x095ea7b300000000000000000000000062000000000000000000000000000000000004020000000000000000000000000000000000000000000000056bc75e2d63100000",
-      "value": "0x0",
-      "timestamp": 1000,
-      "expected_status": "Success",
-      "expected_output": "0x0000000000000000000000000000000000000000000000000000000000000001",
-      "expected_storage": []
-    },
-    {
-      "caller": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "to": "0x6200000000000000000000000000000000000402",
-      "calldata": "0x573ade8100000000000000000000000070000000000000000000000000000000000000010000000000000000000000000000000000000000000000056bc75e2d631000000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "calldata": "0x0dca59c1",
       "value": "0x0",
       "timestamp": 1000,
       "expected_status": "Success",
       "expected_output": "0x0000000000000000000000000000000000000000000000056bc75e2d63100000",
-      "expected_storage": [
-        {
-          "slot": "0x1",
-          "value": "0x0"
-        }
-      ]
-    },
-    {
-      "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "to": "0x7000000000000000000000000000000000000001",
-      "calldata": "0x70a082310000000000000000000000006200000000000000000000000000000000000402",
-      "value": "0x0",
-      "timestamp": 1000,
-      "expected_status": "Success",
-      "expected_output": "0x0000000000000000000000000000000000000000000000410d586a20a4c00000",
       "expected_storage": []
     }
   ],

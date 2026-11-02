@@ -9,7 +9,10 @@ use std::path::Path;
 /// v1: baseline execution provenance.
 /// v2: adds live-RPC / fork-cache provenance (Gate 4 + Gate 10).
 /// v3: adds source identity and collision-safe multi-worker execution identity.
-pub const EXECUTION_PROVENANCE_SCHEMA_VERSION: u32 = 3;
+/// v4: storage_diffs are canonical committed deltas from finalized REVM state;
+/// storage_writes/waypoints remain attempted-operation telemetry.
+/// v5: records execution environment policy and portable root replay lineage.
+pub const EXECUTION_PROVENANCE_SCHEMA_VERSION: u32 = 5;
 
 /// Live-RPC and fork-cache provenance attached to every execution record.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,6 +43,10 @@ pub struct ExecutionProvenanceRecord {
     pub budget_consumed: u64,
     pub input: EvmInput,
     pub input_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_replay_input: Option<EvmInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_policy: Option<rustyfuzz_evm::environment::EnvironmentPolicy>,
     pub execution: SequenceExecutionResult,
     pub coverage_edges: usize,
     pub state_novelty_score: u64,
@@ -77,6 +84,8 @@ pub struct PersistRequest<'a> {
     pub execution_index: u64,
     pub budget_consumed: u64,
     pub input: &'a EvmInput,
+    pub root_replay_input: &'a EvmInput,
+    pub environment_policy: rustyfuzz_evm::environment::EnvironmentPolicy,
     pub execution: &'a SequenceExecutionResult,
     pub coverage_edges: usize,
     pub state_novelty_score: u64,
@@ -108,6 +117,8 @@ pub fn persist(root: &Path, request: PersistRequest<'_>) -> anyhow::Result<()> {
         budget_consumed: request.budget_consumed,
         input: request.input.clone(),
         input_id: request.input.semantic_input_hash(),
+        root_replay_input: Some(request.root_replay_input.clone()),
+        environment_policy: Some(request.environment_policy),
         execution: request.execution.clone(),
         coverage_edges: request.coverage_edges,
         state_novelty_score: request.state_novelty_score,
@@ -187,6 +198,6 @@ mod tests {
             Some("worker"),
         )
         .is_err());
-        assert_eq!(EXECUTION_PROVENANCE_SCHEMA_VERSION, 3);
+        assert_eq!(EXECUTION_PROVENANCE_SCHEMA_VERSION, 5);
     }
 }

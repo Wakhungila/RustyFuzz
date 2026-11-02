@@ -1,0 +1,19 @@
+{
+  "target": "0x6200000000000000000000000000000000000101",
+  "symbols": {
+    "attackerBalance": {
+      "kind": "mapping",
+      "slot": "0x0",
+      "offset_bits": 0,
+      "width_bits": 256,
+      "key_type": "address",
+      "keys": ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+    }
+  },
+  "invariants": [
+    {
+      "name": "attackerBalanceRemainsZero",
+      "predicate": "sum(attackerBalance) == 0"
+    }
+  ]
+}

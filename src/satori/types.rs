@@ -15,6 +15,8 @@ pub struct SatoriRun {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SatoriConfig {
     pub model: String,
+    #[serde(default)]
+    pub fallback_models: Vec<String>,
     pub max_critical_functions: usize,
     pub max_hypotheses_per_function: usize,
     #[serde(default = "default_max_hypotheses_total")]
@@ -34,6 +36,17 @@ impl Default for SatoriConfig {
     fn default() -> Self {
         Self {
             model: crate::satori::reasoning::zen_client::DEFAULT_MODEL.to_string(),
+            fallback_models: vec![
+                "big-pickle".to_string(),
+                "beam-free".to_string(),
+                "flint-40b-free".to_string(),
+                "mimo-v2.6-flash-free".to_string(),
+                "nemotron-3.5-super-vl-free".to_string(),
+                "nemotron-3.5-lightning-free".to_string(),
+                "jev-1.13-free".to_string(),
+                "deepseek-v4.1-flash-free".to_string(),
+                "glm-5.3-flash-free".to_string(),
+            ],
             max_critical_functions: 8,
             max_hypotheses_per_function: 2,
             max_hypotheses_total: 32,

@@ -44,8 +44,12 @@ impl StrategyCounters {
     }
 }
 
+/// Sentinel for `CampaignTelemetry::first_finding`: no finding recorded yet.
+const FIRST_FINDING_UNSET: u64 = u64::MAX;
+
 pub struct CampaignTelemetry {
     start: Instant,
+    first_finding: AtomicU64,
     executions: AtomicU64,
     mutated_inputs: AtomicU64,
     seed_replays: AtomicU64,
@@ -129,6 +133,7 @@ impl CampaignTelemetry {
         let now = Instant::now();
         Self {
             start: now,
+            first_finding: AtomicU64::new(FIRST_FINDING_UNSET),
             executions: AtomicU64::new(0),
             mutated_inputs: AtomicU64::new(0),
             seed_replays: AtomicU64::new(0),
@@ -230,6 +235,31 @@ impl CampaignTelemetry {
         self.artifacts.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records the first finding of this campaign process.
+    ///
+    /// Multi-core semantics are first-writer-wins: the first `compare_exchange`
+    /// to flip the sentinel wins and later calls are no-ops, so the recorded
+    /// value is a single core's elapsed time rather than a per-core minimum.
+    pub fn record_first_finding(&self) {
+        let elapsed = self.start.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let _ = self.first_finding.compare_exchange(
+            FIRST_FINDING_UNSET,
+            elapsed,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Time from campaign start to the first recorded finding, in milliseconds.
+    ///
+    /// Returns `None` when no finding has been recorded in this process.
+    pub fn time_to_first_finding_ms(&self) -> Option<u64> {
+        match self.first_finding.load(Ordering::Relaxed) {
+            FIRST_FINDING_UNSET => None,
+            elapsed => Some(elapsed),
+        }
+    }
+
     pub fn execution_count(&self) -> u64 {
         self.executions.load(Ordering::Relaxed)
     }
@@ -256,5 +286,59 @@ impl CampaignTelemetry {
 
     pub fn artifacts(&self) -> u64 {
         self.artifacts.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_to_first_finding_is_none_until_a_finding_is_recorded() {
+        let telemetry = CampaignTelemetry::new();
+        assert_eq!(telemetry.time_to_first_finding_ms(), None);
+
+        telemetry.record_first_finding();
+        assert!(
+            telemetry.time_to_first_finding_ms().is_some(),
+            "a recorded finding must produce a measured value"
+        );
+    }
+
+    #[test]
+    fn record_first_finding_keeps_the_first_value_under_a_race() {
+        use std::sync::Arc;
+
+        // Many threads race to record; exactly one wins and the stored value is
+        // not overwritten by later callers. This is the property a plain store
+        // would violate, and the reason compare_exchange is used.
+        let telemetry = Arc::new(CampaignTelemetry::new());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let telemetry = Arc::clone(&telemetry);
+            handles.push(std::thread::spawn(move || {
+                // Spread the callers out so later ones genuinely arrive later.
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                telemetry.record_first_finding();
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("recording thread must not panic");
+        }
+
+        let first = telemetry
+            .time_to_first_finding_ms()
+            .expect("at least one caller recorded a finding");
+        // A second call cannot move the value: it is already past the sentinel.
+        let before = telemetry
+            .first_finding
+            .load(std::sync::atomic::Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        telemetry.record_first_finding();
+        let after = telemetry
+            .first_finding
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(before, after, "a later call must not overwrite the first");
+        assert_eq!(telemetry.time_to_first_finding_ms(), Some(first));
     }
 }

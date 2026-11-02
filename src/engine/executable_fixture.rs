@@ -2,6 +2,7 @@
 //! manufacture, remove, or downgrade oracle findings.
 use crate::common::oracle::ProtocolFinding;
 use crate::common::types::{ChainState, ExecutionStatus, SequenceExecutionResult, SingletonTx};
+use crate::engine::invariant_runtime::SequenceViolation;
 use anyhow::{ensure, Context, Result};
 use revm::{
     context::BlockEnv,
@@ -12,6 +13,7 @@ use revm::{
 use rustyfuzz_evm::{
     dataflow::DataflowRegistry, executor::EvmExecutor, fork_db::ForkDb, inspector::MAP_SIZE,
 };
+use rustyfuzz_predicate::{BlockContext, InvariantRegistry};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fs, path::Path};
 
@@ -116,10 +118,10 @@ impl ExecutableFixture {
             self.schema_version == 1,
             "unsupported executable fixture schema_version"
         );
-        ensure!(
-            self.environment.chain_id == 1,
-            "EvmExecutor supports mainnet chain_id=1 for fixtures"
-        );
+        // Consistent with the live path: a fixture naming a chain with no profile is
+        // refused rather than executed with mainnet semantics.
+        rustyfuzz_evm::chain_profile::ChainProfile::for_chain(self.environment.chain_id)
+            .map_err(|message| anyhow::anyhow!(message))?;
         ensure!(
             self.environment.gas_limit >= 10_000_000 && self.environment.base_fee <= 1_000_000_000,
             "invalid execution gas environment"
@@ -198,6 +200,15 @@ impl ExecutableFixture {
         Ok(())
     }
     pub fn execute(&self, path: &Path) -> Result<(SequenceExecutionResult, ExecutableEvidence)> {
+        let replay = self.execute_with_invariants(path, None)?;
+        Ok((replay.execution, replay.evidence))
+    }
+
+    pub fn execute_with_invariants(
+        &self,
+        path: &Path,
+        registry: Option<&InvariantRegistry>,
+    ) -> Result<ExecutableFixtureReplay> {
         self.validate()?;
         let mut db = CacheDB::new(ForkDb::empty());
         for account in &self.accounts {
@@ -215,6 +226,7 @@ impl ExecutableFixture {
             }
         }
         let mut state = ChainState::Evm(db);
+        let proof_base = state.clone();
         let mut env = BlockEnv {
             number: U256::from(self.environment.block_number),
             timestamp: U256::from(self.environment.timestamp),
@@ -228,6 +240,22 @@ impl ExecutableFixture {
         let mut aggregate = vec![0u8; MAP_SIZE];
         let mut results = Vec::new();
         let mut evidence = Vec::new();
+        let mut checker =
+            registry.map(|_| crate::engine::invariant_runtime::IncrementalChecker::new());
+        let initial_block_env = env.clone();
+        let input_txs = self
+            .transactions
+            .iter()
+            .map(|tx| {
+                Ok(SingletonTx {
+                    input: bytes(&tx.calldata)?,
+                    caller: tx.caller,
+                    to: tx.to,
+                    value: tx.value,
+                    is_victim: tx.caller == self.victim,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         for (index, tx) in self.transactions.iter().enumerate() {
             env.timestamp = U256::from(tx.timestamp);
             coverage.fill(0);
@@ -249,6 +277,18 @@ impl ExecutableFixture {
                     index,
                 )
                 .with_context(|| format!("execute fixture transaction {index}"))?;
+            if let (Some(registry), Some(checker)) = (registry, checker.as_mut()) {
+                checker.observe(
+                    registry,
+                    &result,
+                    &state,
+                    BlockContext {
+                        number: rustyfuzz_predicate::Int256(env.number.to_be_bytes()),
+                        timestamp: rustyfuzz_predicate::Int256(env.timestamp.to_be_bytes()),
+                    },
+                    8,
+                );
+            }
             ensure!(
                 result.status == tx.expected_status,
                 "transaction {index}: expected {:?}, got {:?}",
@@ -321,9 +361,11 @@ impl ExecutableFixture {
             .find(|a| a.address == self.target)
             .context("missing target")?
             .runtime_bytecode;
-        Ok((
+        let input = crate::evm::fuzz::EvmInput::new(input_txs, 0);
+        let invariant_violation = checker.and_then(|mut checker| checker.take_violation());
+        Ok(ExecutableFixtureReplay {
             execution,
-            ExecutableEvidence {
+            evidence: ExecutableEvidence {
                 schema_version: 1,
                 fixture: path.display().to_string(),
                 fixture_hash: format!("{:x}", keccak256(serde_json::to_vec(self)?)),
@@ -333,8 +375,21 @@ impl ExecutableFixture {
                 matching_signals: Vec::new(),
                 unmatched_signals: Vec::new(),
             },
-        ))
+            invariant_violation,
+            proof_base,
+            block_env: initial_block_env,
+            input,
+        })
     }
+}
+
+pub struct ExecutableFixtureReplay {
+    pub execution: SequenceExecutionResult,
+    pub evidence: ExecutableEvidence,
+    pub invariant_violation: Option<SequenceViolation>,
+    pub proof_base: ChainState,
+    pub block_env: BlockEnv,
+    pub input: crate::evm::fuzz::EvmInput,
 }
 
 #[cfg(test)]

@@ -1,0 +1,18 @@
+{
+  "benchmark_count": 0,
+  "synthetic_regression_count": 10,
+  "pass_rate": 0.0,
+  "replay_success_rate": 0.0,
+  "minimized_success_rate": 0.0,
+  "poc_generation_rate": 0.0,
+  "average_time_to_signal_secs": null,
+  "average_executions_to_signal": null,
+  "useful_seed_sources": [
+    "executable EVM fixture transaction sequences"
+  ],
+  "false_positive_budget_notes": [],
+  "threshold_recommendations": [
+    "PoC generation is not yet represented in this validation pack; require it for bounty-grade confirmations",
+    "current benchmark pack has no negative controls after confirmation; keep at least one negative/noisy fixture in larger calibration runs"
+  ]
+}

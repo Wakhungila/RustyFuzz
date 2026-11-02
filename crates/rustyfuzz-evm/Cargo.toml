@@ -23,3 +23,10 @@ features = ["json", "blocking"]
 version          = "43.0.3"
 default-features = false
 features         = ["std", "serde", "memory_limit", "secp256k1", "portable"]
+
+# `[[bench]]` targets are compiled with the `bench` profile (optimized + debug
+# assertions). The throughput harness needs optimized code to produce numbers
+# that mean anything, which the standard bench profile already provides.
+[[bench]]
+name = "exec_throughput"
+harness = false

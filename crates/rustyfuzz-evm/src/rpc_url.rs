@@ -89,17 +89,65 @@ pub fn rpc_api_key_allowed_origins() -> Result<Vec<String>, String> {
     parse_allowed_origins(&raw)
 }
 
+/// Whether a URL already carries its credential in the path.
+///
+/// Providers like Alchemy, Infura and Ankr embed the key as the final path segment
+/// (`/v2/<key>`). For those, sending it again as `Authorization: Bearer` is not merely
+/// redundant: Alchemy answers **HTTP 401**, so the request fails even though the URL alone
+/// works. Verified against eth-mainnet.g.alchemy.com — no header returns `0x1`, a Bearer
+/// header returns 401.
+///
+/// The test is deliberately structural rather than a provider allowlist: a hardcoded list
+/// would silently break the next provider that adopts the same scheme. A path segment of 20+
+/// characters with no separators is not a version or a method name, and treating it as a
+/// credential is the conservative reading — the failure mode of guessing wrong here is a
+/// request that works without the header and fails with it.
+fn url_carries_credential(raw_url: &str) -> bool {
+    let Ok(url) = Url::parse(raw_url) else {
+        return false;
+    };
+    url.path_segments()
+        .map(|segments| {
+            segments
+                .filter(|segment| !segment.is_empty())
+                .any(|segment| {
+                    segment.len() >= 20
+                        // Real keys contain `-` and `_` (Alchemy's do: `MWeRBkXLW6AyDjL-f6hpO`),
+                        // so excluding them was a bug that made this test fail and would have
+                        // let a header be added to exactly the endpoint that rejects it.
+                        && segment
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                })
+        })
+        .unwrap_or(false)
+}
+
 pub fn rpc_api_key_header(
     raw_url: &str,
     api_key: Option<&str>,
     allowed_origins: &[String],
 ) -> Result<Option<String>, String> {
     let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) else {
+        // The common case, and the one that used to fail confusingly: `RUSTYFUZZ_RPC_API_KEY`
+        // is set in `.env`, so `dotenvy` restores it in the process even after `unset` in the
+        // shell, and the URL already authenticates. Silently sending no header is correct
+        // here, and is what the caller needs rather than an allowlist complaint.
         return Ok(None);
     };
+    if url_carries_credential(raw_url) {
+        // Refuse to add a header that is known to break such endpoints. Importing the key
+        // from elsewhere is the caller's choice; overriding the URL's own credential is not
+        // something this function should do on the caller's behalf.
+        return Ok(None);
+    }
     let origin = request_origin(raw_url)?;
     if !allowed_origins.iter().any(|allowed| allowed == &origin) {
-        return Err("RPC API key origin is not explicitly allowlisted".to_string());
+        return Err(format!(
+            "RPC API key origin is not explicitly allowlisted: set \
+             RUSTYFUZZ_RPC_API_KEY_ALLOWED_ORIGINS={origin} (the key is present in the \
+             environment, or imported from .env, but this origin was not reviewed)"
+        ));
     }
     Ok(Some(format!("Bearer {api_key}")))
 }
@@ -352,15 +400,68 @@ mod tests {
     }
 
     #[test]
+    fn a_credential_in_the_url_path_is_recognised_across_key_shapes() {
+        // Alchemy keys contain '-', so a charset of alphanumerics only misses them and the
+        // worst case follows: a Bearer header gets added to the one endpoint that 401s on it.
+        assert!(url_carries_credential(
+            "https://eth-mainnet.g.alchemy.com/v2/MWeRBkXLW6AyDjL-f6hpO"
+        ));
+        assert!(url_carries_credential(
+            "https://mainnet.infura.io/v3/0123456789abcdef0123456789abcdef"
+        ));
+        assert!(url_carries_credential(
+            "https://rpc.ankr.com/eth_0123456789abcdef0123456789abcdef"
+        ));
+        // Not credentials: short version segments, ordinary paths, empty paths.
+        assert!(!url_carries_credential("https://rpc.example.com/v1"));
+        assert!(!url_carries_credential("https://rpc.example.com"));
+        assert!(!url_carries_credential("https://rpc.example.com/api/v2"));
+        // A long segment with separators is a path, not a key.
+        assert!(!url_carries_credential(
+            "https://rpc.example.com/some/very/long/path/segment/name"
+        ));
+        assert!(!url_carries_credential("not a url"));
+    }
+
+    #[test]
     fn rpc_api_key_requires_an_explicit_origin_allowlist() {
         let allowed = vec!["https://rpc.example.com".to_string()];
         assert_eq!(
             rpc_api_key_header("https://rpc.example.com/v1", Some("secret"), &allowed,),
             Ok(Some("Bearer secret".to_string()))
         );
+        // A URL that already carries its credential in the path must NOT get a header.
+        // Alchemy answers 401 when the key is sent both ways, so adding one turns a working
+        // request into a failure.
         assert_eq!(
-            rpc_api_key_header("https://user.example.com/v1", Some("secret"), &allowed),
-            Err("RPC API key origin is not explicitly allowlisted".to_string())
+            rpc_api_key_header(
+                "https://eth-mainnet.g.alchemy.com/v2/MWeRBkXLW6AyDjL-f6hpO",
+                Some("secret"),
+                &["https://eth-mainnet.g.alchemy.com".to_string()],
+            ),
+            Ok(None)
+        );
+        // And it needs no allowlist, because no header will be sent.
+        assert_eq!(
+            rpc_api_key_header(
+                "https://eth-mainnet.g.alchemy.com/v2/MWeRBkXLW6AyDjL-f6hpO",
+                Some("secret"),
+                &[],
+            ),
+            Ok(None)
+        );
+        // A short path segment is a version, not a credential, so the header still applies.
+        assert_eq!(
+            rpc_api_key_header("https://rpc.example.com/v2", Some("secret"), &allowed),
+            Ok(Some("Bearer secret".to_string()))
+        );
+        let rejected = rpc_api_key_header("https://user.example.com/v1", Some("secret"), &allowed)
+            .unwrap_err();
+        // The message must say what to set. "not allowlisted" alone sent a user hunting
+        // through source when the fix was one environment variable.
+        assert!(
+            rejected.contains("RUSTYFUZZ_RPC_API_KEY_ALLOWED_ORIGINS=https://user.example.com"),
+            "the error must name the exact variable and origin: {rejected}"
         );
         assert_eq!(
             rpc_api_key_header("https://rpc.example.com/v1", None, &[]),

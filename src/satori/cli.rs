@@ -23,6 +23,8 @@ pub enum SatoriCommand {
         path: PathBuf,
         #[arg(long, default_value = "big-pickle")]
         model: String,
+        #[arg(long, value_delimiter = ',')]
+        fallback_models: Vec<String>,
     },
     Hunt {
         path: PathBuf,
@@ -34,6 +36,8 @@ pub enum SatoriCommand {
         max_hypotheses_per_function: usize,
         #[arg(long, default_value_t = 0.40)]
         min_confidence: f64,
+        #[arg(long, value_delimiter = ',')]
+        fallback_models: Vec<String>,
     },
     Validate {
         run_id: String,
@@ -52,10 +56,27 @@ pub enum SatoriCommand {
         validate: bool,
         #[arg(long, default_value_t = true, action = ArgAction::Set)]
         generate_jobs: bool,
+        #[arg(long, value_delimiter = ',')]
+        fallback_models: Vec<String>,
     },
     Report {
         run_id: String,
     },
+}
+
+fn split_model_candidates(model: &str) -> (String, Vec<String>) {
+    let candidates: Vec<String> = model
+        .split(',')
+        .map(|candidate| candidate.trim().to_string())
+        .filter(|candidate| !candidate.is_empty())
+        .collect();
+    match candidates.split_first() {
+        Some((first, rest)) => (first.clone(), rest.to_vec()),
+        None => (
+            crate::satori::reasoning::zen_client::DEFAULT_MODEL.to_string(),
+            Vec::new(),
+        ),
+    }
 }
 
 pub async fn run(command: SatoriCommand) -> SatoriResult<()> {
@@ -89,10 +110,12 @@ pub async fn run(command: SatoriCommand) -> SatoriResult<()> {
                 artifacts.run.run_id, max_critical_functions
             );
         }
-        SatoriCommand::Model { path, model } => {
+        SatoriCommand::Model { path, model, .. } => {
             require_llm_feature()?;
+            let (model, fallback_models) = split_model_candidates(&model);
             let config = SatoriConfig {
                 model,
+                fallback_models,
                 validate: false,
                 generate_jobs: false,
                 ..SatoriConfig::default()
@@ -110,10 +133,13 @@ pub async fn run(command: SatoriCommand) -> SatoriResult<()> {
             max_critical_functions,
             max_hypotheses_per_function,
             min_confidence,
+            ..
         } => {
             require_llm_feature()?;
+            let (model, fallback_models) = split_model_candidates(&model);
             let config = SatoriConfig {
                 model,
+                fallback_models,
                 max_critical_functions,
                 max_hypotheses_per_function,
                 min_confidence,
@@ -138,10 +164,13 @@ pub async fn run(command: SatoriCommand) -> SatoriResult<()> {
             min_confidence,
             validate,
             generate_jobs,
+            ..
         } => {
             require_llm_feature()?;
+            let (model, fallback_models) = split_model_candidates(&model);
             let config = SatoriConfig {
                 model,
+                fallback_models,
                 max_critical_functions,
                 max_hypotheses_per_function,
                 min_confidence,

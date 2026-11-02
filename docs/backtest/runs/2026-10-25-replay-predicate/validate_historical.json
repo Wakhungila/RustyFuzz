@@ -1,0 +1,460 @@
+{
+  "generated_at_unix_secs": 1792956576,
+  "summary": {
+    "total": 2,
+    "executed": 0,
+    "found": 0,
+    "not_found": 0,
+    "not_run": 0,
+    "not_run_missing_fixture": 0,
+    "not_run_missing_target": 0,
+    "not_run_missing_success_criteria": 0,
+    "not_run_unsupported_mode": 0,
+    "failed_execution": 2,
+    "skipped_by_config": 0
+  },
+  "coverage": {
+    "total_classes": 12,
+    "covered_classes": 12,
+    "benchmarked_classes": 5,
+    "confirmed_classes": 0,
+    "entries": [
+      {
+        "class": "access_control_failure",
+        "benchmark_ids": [
+          "historical-audius-governance-reinitialization-2022"
+        ],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "governance/access-control oracle"
+        ],
+        "invariants": [
+          "unauthorized privileged state mutation"
+        ],
+        "seed_templates": [
+          "access-control-sensitive selector retry"
+        ],
+        "state_machines": [
+          "access-control",
+          "governance"
+        ],
+        "gaps": [
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "price_oracle_manipulation",
+        "benchmark_ids": [
+          "historical-euler-finance-donate-liquidation-2023"
+        ],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "oracle freshness invariant"
+        ],
+        "invariants": [
+          "price dependency without freshness/bounds"
+        ],
+        "seed_templates": [
+          "oracle read -> state-changing action"
+        ],
+        "state_machines": [
+          "lending",
+          "amm"
+        ],
+        "gaps": [
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "logic_accounting_error",
+        "benchmark_ids": [
+          "historical-euler-finance-donate-liquidation-2023"
+        ],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "protocol invariant evaluator"
+        ],
+        "invariants": [
+          "accounting conservation failure"
+        ],
+        "seed_templates": [
+          "deposit/withdraw accounting flow"
+        ],
+        "state_machines": [
+          "vault",
+          "lending"
+        ],
+        "gaps": [
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "reentrancy",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "reentrancy oracle"
+        ],
+        "invariants": [
+          "unsafe external call state transition"
+        ],
+        "seed_templates": [
+          "callback-sensitive transfer/deposit"
+        ],
+        "state_machines": [
+          "vault",
+          "rewards"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "flash_loan_economic_attack",
+        "benchmark_ids": [
+          "historical-euler-finance-donate-liquidation-2023"
+        ],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "economic delta engine"
+        ],
+        "invariants": [
+          "transient price/solvency manipulation"
+        ],
+        "seed_templates": [
+          "swap -> dependent action -> reverse swap"
+        ],
+        "state_machines": [
+          "amm",
+          "lending"
+        ],
+        "gaps": [
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "unchecked_external_call",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "call trace observer"
+        ],
+        "invariants": [
+          "unsafe external call state transition"
+        ],
+        "seed_templates": [
+          "external call around state write"
+        ],
+        "state_machines": [
+          "generic"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "governance_timelock_failure",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "governance oracle"
+        ],
+        "invariants": [
+          "queue/execute delay bypass"
+        ],
+        "seed_templates": [
+          "propose -> vote -> queue -> execute"
+        ],
+        "state_machines": [
+          "governance"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "upgradeability_proxy_error",
+        "benchmark_ids": [
+          "historical-audius-governance-reinitialization-2022"
+        ],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "access-control oracle"
+        ],
+        "invariants": [
+          "initializer or implementation mutation"
+        ],
+        "seed_templates": [
+          "initialize/reinitialize/upgradeTo"
+        ],
+        "state_machines": [
+          "access-control"
+        ],
+        "gaps": [
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "signature_replay_bug",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "replay invariant"
+        ],
+        "invariants": [
+          "replayable message/signature reuse"
+        ],
+        "seed_templates": [
+          "permit/execute replay"
+        ],
+        "state_machines": [
+          "bridge",
+          "token"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "denial_of_service_griefing",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "status/revert classifier"
+        ],
+        "invariants": [
+          "persistent liveness failure"
+        ],
+        "seed_templates": [
+          "griefable state transition"
+        ],
+        "state_machines": [
+          "generic"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "precision_rounding_loss",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "economic delta engine"
+        ],
+        "invariants": [
+          "precision or rounding loss"
+        ],
+        "seed_templates": [
+          "small amount boundary mutations"
+        ],
+        "state_machines": [
+          "vault",
+          "amm"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      },
+      {
+        "class": "unsafe_token_handling",
+        "benchmark_ids": [],
+        "found": 0,
+        "executed": 0,
+        "oracles": [
+          "erc20/accounting invariant"
+        ],
+        "invariants": [
+          "fee/rebase/return-value accounting mismatch"
+        ],
+        "seed_templates": [
+          "transfer/transferFrom around accounting"
+        ],
+        "state_machines": [
+          "token",
+          "vault"
+        ],
+        "gaps": [
+          "no benchmark manifest maps to this class",
+          "no executable benchmark coverage yet",
+          "no confirmed replayed finding yet"
+        ]
+      }
+    ]
+  },
+  "calibration": {
+    "benchmark_count": 0,
+    "synthetic_regression_count": 2,
+    "pass_rate": 0.0,
+    "replay_success_rate": 0.0,
+    "minimized_success_rate": 0.0,
+    "poc_generation_rate": 0.0,
+    "average_time_to_signal_secs": null,
+    "average_executions_to_signal": null,
+    "useful_seed_sources": [],
+    "false_positive_budget_notes": [],
+    "threshold_recommendations": [
+      "PoC generation is not yet represented in this validation pack; require it for bounty-grade confirmations",
+      "current benchmark pack has no negative controls after confirmation; keep at least one negative/noisy fixture in larger calibration runs"
+    ]
+  },
+  "benchmarks": [
+    {
+      "evidence_class": "SyntheticRegression",
+      "benchmark_id": "historical-audius-governance-reinitialization-2022",
+      "digests": {
+        "input_digest": "sha256:ea3e90c87aab283d7432573d2300c78d92057bac1dfa1281fa8f20b15aa9f67f",
+        "config_digest": "sha256:6adfcf8c5da72b979aafd1cc3b80dc1e92173352214141803c83d940232ca5bc",
+        "manifest_digest": "sha256:306683b7dfd1becb5aa11280c5bad7091435a70f1497350f617ddd563d0c5d50",
+        "fixture_digest": "sha256:7603e734e76b4e2034727ec3e0dac2eb0a95dde643a79782bf1819ae5e96301b"
+      },
+      "class": "access_control_bypass",
+      "target_profile": [
+        "governance",
+        "proxy",
+        "access-control-heavy",
+        "historical-mainnet"
+      ],
+      "expected_exploit_shape": [
+        "historical exploit contract entrypoint replays on pre-exploit fork state",
+        "unauthorized governance/proxy state mutation evidence is observed",
+        "proof-carrying replay produces a Foundry PoC"
+      ],
+      "exploit_classes": [
+        "access_control_failure",
+        "upgradeability_proxy_error"
+      ],
+      "status": "failed_execution",
+      "reason": "failed to execute live-fork benchmark `historical-audius-governance-reinitialization-2022`: provider_replay_only is unsupported: independent eth_call requests do not preserve sequence state or prove an invariant; use local EVM replay with a pinned fork/cache",
+      "executed": false,
+      "found": false,
+      "observed_finding": null,
+      "finding_type": null,
+      "expected_invariant": "access control",
+      "invariant_id": "access-control",
+      "selected_exploit_template": "reinitialize governance proxy state -> submit malicious proposal",
+      "equivalence_class": "reinitialize governance proxy state -> submit malicious proposal",
+      "synthesized_sequence": [],
+      "search_driver": null,
+      "confidence": 0,
+      "exploit_path_length": null,
+      "minimized": false,
+      "replayable": false,
+      "proof_status": null,
+      "proof": null,
+      "foundry_poc_generated": false,
+      "failure_kind": "SetupFailure",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": null,
+      "time_to_signal_secs": null,
+      "false_positive_notes": [
+        "failed to execute live-fork benchmark `historical-audius-governance-reinitialization-2022`: provider_replay_only is unsupported: independent eth_call requests do not preserve sequence state or prove an invariant; use local EVM replay with a pinned fork/cache"
+      ],
+      "artifact_path": null,
+      "matched_criteria": [],
+      "missing_criteria": [
+        "expected_finding",
+        "invariant_violation",
+        "replayable_artifact",
+        "foundry_poc_generated",
+        "minimized_path"
+      ]
+    },
+    {
+      "evidence_class": "SyntheticRegression",
+      "benchmark_id": "historical-euler-finance-donate-liquidation-2023",
+      "digests": {
+        "input_digest": "sha256:761c21c482a3ec841785ac3f22a9013d52128854092698263e6614960c2ee354",
+        "config_digest": "sha256:891b5c93a6bde165ba55e1f833585890e95fd5309c3c9eb78976ed70b268227d",
+        "manifest_digest": "sha256:c7d4473f0994c6a5119ff2e842be6114a9a8ec4e22c70e7ea7bbd9c6010f33a5",
+        "fixture_digest": "sha256:c17868e7f83fbb8f6aa5990efdcb0508d42a81c01a57df4319189802733bfcc0"
+      },
+      "class": "liquidation_abuse",
+      "target_profile": [
+        "lending",
+        "flash-loan",
+        "accounting-heavy",
+        "historical-mainnet"
+      ],
+      "expected_exploit_shape": [
+        "historical exploit contract entrypoint replays on pre-exploit fork state",
+        "Euler accounting or lending-health invariant evidence is observed",
+        "proof-carrying replay produces a Foundry PoC"
+      ],
+      "exploit_classes": [
+        "flash_loan_economic_attack",
+        "price_oracle_manipulation",
+        "logic_accounting_error"
+      ],
+      "status": "failed_execution",
+      "reason": "failed to execute live-fork benchmark `historical-euler-finance-donate-liquidation-2023`: provider_replay_only is unsupported: independent eth_call requests do not preserve sequence state or prove an invariant; use local EVM replay with a pinned fork/cache",
+      "executed": false,
+      "found": false,
+      "observed_finding": null,
+      "finding_type": null,
+      "expected_invariant": "lending health invariant",
+      "invariant_id": "lending-health",
+      "selected_exploit_template": "flash loan -> deposit/mint -> donateToReserves -> self-liquidate -> withdraw",
+      "equivalence_class": "flash loan -> deposit/mint -> donateToReserves -> self-liquidate -> withdraw",
+      "synthesized_sequence": [],
+      "search_driver": null,
+      "confidence": 0,
+      "exploit_path_length": null,
+      "minimized": false,
+      "replayable": false,
+      "proof_status": null,
+      "proof": null,
+      "foundry_poc_generated": false,
+      "failure_kind": "SetupFailure",
+      "expected_oracle": null,
+      "expected_minimum_evidence_grade": null,
+      "expected_proof_artifact": null,
+      "expected_cli_exit": null,
+      "executions_to_signal": null,
+      "time_to_signal_secs": null,
+      "false_positive_notes": [
+        "failed to execute live-fork benchmark `historical-euler-finance-donate-liquidation-2023`: provider_replay_only is unsupported: independent eth_call requests do not preserve sequence state or prove an invariant; use local EVM replay with a pinned fork/cache"
+      ],
+      "artifact_path": null,
+      "matched_criteria": [],
+      "missing_criteria": [
+        "expected_finding",
+        "invariant_violation",
+        "replayable_artifact",
+        "foundry_poc_generated",
+        "minimized_path"
+      ]
+    }
+  ]
+}

@@ -1,5 +1,5 @@
-use crate::coverage::stable_path_hash;
 use crate::dataflow::DataflowRegistry;
+use crate::environment::EnvironmentPolicy;
 use crate::execution::{
     bounded_calldata, bounded_returndata, CallKind, CallObservation, CallPhase, ChainState,
     ExecutionStatus, StorageAccess, StorageDiff, TxExecutionResult, Waypoint,
@@ -12,14 +12,16 @@ use crate::transaction::SingletonTx;
 use anyhow::Result;
 use revm::context::result::ExecutionResult;
 use revm::context::{BlockEnv, TxEnv};
-use revm::database::CacheDB;
+use revm::database::{CacheDB, DbAccount};
 use revm::primitives::{Address, TxKind, B256, U256};
-use revm::state::AccountInfo;
-use revm::{Context, InspectCommitEvm, MainBuilder, MainContext};
-use std::collections::HashSet;
+use revm::state::EvmState;
+use revm::{Context, DatabaseCommit, InspectEvm, MainBuilder, MainContext};
+use std::collections::{HashMap, HashSet};
 
-const TX_GAS_LIMIT: u64 = 10_000_000;
-const TX_GAS_PRICE_WEI: u128 = 1_000_000_000;
+/// The cache account shape, captured before an exploration-only funding step so
+/// it can be restored exactly if the transaction fails validation.
+type CachedAccount = DbAccount;
+
 const FUZZ_CALLER_BALANCE_WEI: u128 = 1_000_000_000_000_000_000_000_000_000_000;
 const MAX_FUZZ_CALL_VALUE_WEI: u128 = 100_000_000_000_000_000_000;
 
@@ -90,20 +92,35 @@ impl EvmExecutor {
         tx_idx: usize,
     ) -> Result<TxExecutionResult> {
         let ChainState::Evm(db) = chain_state;
+        // Exploration may advance blocks (time warp), so it resolves an
+        // at-or-after-pin policy. Proof requires the exact pinned block: a
+        // finding is evidence only if it reproduces on verified state.
+        let environment = match self.mode {
+            ExecutionMode::Exploration => EnvironmentPolicy::resolve_advancing(&db.db, block_env)?,
+            ExecutionMode::Proof => EnvironmentPolicy::resolve(&db.db, block_env)?,
+        };
 
+        // Start the per-transaction touched-edge log. The coverage hash below is
+        // derived from it instead of scanning the whole map, and the map itself
+        // is cleared by the caller per input, so this only resets bookkeeping.
+        crate::coverage::begin_transaction();
+
+        // Snapshot the caller's cache entry before *any* database access, because
+        // `load_account` itself populates the cache for a previously unseen
+        // account. Capturing afterwards would record the post-insertion state
+        // and leave a phantom entry behind when validation fails.
+        let caller_info_before = db.cache.accounts.get(&tx.caller).cloned();
+
+        let caller_nonce = db.load_account(tx.caller)?.info.nonce;
+
+        // Exploration funds synthetic callers so that REVM validation does not
+        // reject a fuzz-generated EOA before the target runs. Proof mode keeps
+        // the pinned database untouched. The funding is applied to the live
+        // cache and reverted below for every non-successful outcome, so a
+        // failed transaction still leaves the caller's state exactly as found.
         if self.mode == ExecutionMode::Exploration {
-            // Fuzz-generated callers are often synthetic EOAs. If they are not funded
-            // before revm validation, the transaction is rejected before target execution.
-            fund_fuzz_caller(db, tx.caller);
+            fund_fuzz_caller(db, tx.caller)?;
         }
-
-        let caller_nonce = db
-            .cache
-            .accounts
-            .get(&tx.caller)
-            .map(|account| account.info.nonce)
-            .unwrap_or_default();
-
         let executed_value = match self.mode {
             ExecutionMode::Exploration => {
                 // Prevent mutated transaction values from producing impossible payments or
@@ -115,8 +132,9 @@ impl EvmExecutor {
 
         let tx_env = TxEnv {
             caller: tx.caller,
-            gas_limit: TX_GAS_LIMIT,
-            gas_price: TX_GAS_PRICE_WEI,
+            gas_limit: environment.tx_gas_limit,
+            gas_price: environment.tx_gas_price,
+            chain_id: Some(environment.chain_id),
             value: executed_value,
             data: tx.input.clone().into(),
             kind: if tx.to == Address::ZERO {
@@ -128,31 +146,53 @@ impl EvmExecutor {
             ..Default::default()
         };
 
-        let (result, final_db, storage_diffs) = {
-            let execution_db = std::mem::replace(db, CacheDB::new(ForkDb::empty()));
-            let pre_execution_db = execution_db.clone();
-            let initialized_slots = initialized_storage_slots(&pre_execution_db);
+        // The database is borrowed rather than deep-cloned. `inspect_tx` only
+        // finalizes the journal and hands back the touched state; it does not
+        // commit. A previous implementation cloned the entire `CacheDB` per
+        // transaction to guarantee that validation errors left caller state
+        // intact; that made cost proportional to cache size (measured 86x
+        // slowdown at 50k slots) for a property that can be enforced by
+        // reverting the one account we mutated.
+        // Seed the uninitialized-read heuristic once per sequence, before the
+        // database is mutably borrowed by the EVM context. Slots written during
+        // execution are recorded by the inspector as it goes.
+        let seed_slots = if dataflow.initialized_slots.is_empty() {
+            seeded_storage_slots(db)
+        } else {
+            HashSet::new()
+        };
 
+        let outcome = {
             let ctx = Context::mainnet()
-                .with_db(execution_db)
-                .with_block(block_env.clone());
+                .with_db(&mut *db)
+                .with_cfg(environment.cfg()?)
+                .with_block(environment.block(block_env));
 
             let mut evm =
                 ctx.build_mainnet_with_inspector(CoverageInspector::with_initialized_slots(
-                    coverage,
-                    dataflow,
-                    waypoints,
-                    tx_idx,
-                    initialized_slots,
+                    coverage, dataflow, waypoints, tx_idx, seed_slots,
                 ));
 
-            let result = evm.inspect_tx_commit(tx_env)?;
-            let final_db = evm.ctx.journaled_state.database;
-            let storage_diffs =
-                storage_diffs_from_waypoints(&pre_execution_db, &final_db, waypoints, tx_idx);
-
-            (result, final_db, storage_diffs)
+            // Finalized REVM state contains original slot values and excludes
+            // writes rolled back by reverted frames. Waypoints remain attempted
+            // operation telemetry and must never define committed state.
+            evm.inspect_tx(tx_env)
         };
+
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Execution-level failure (validation, database error). Restore
+                // the caller account to its pre-transaction shape so nothing
+                // leaks into the caller's state, then propagate.
+                restore_account(db, tx.caller, caller_info_before);
+                return Err(error.into());
+            }
+        };
+
+        let storage_diffs = committed_storage_diffs(&outcome.state, waypoints, tx_idx);
+        db.commit(outcome.state);
+        let result = outcome.result;
 
         let gas_used = result.tx_gas_used();
 
@@ -167,8 +207,8 @@ impl EvmExecutor {
             .map(|bytes| canonical_execution_output(bytes))
             .unwrap_or_default();
 
-        let coverage_hash = stable_path_hash(coverage);
-        let coverage_edges = coverage.iter().filter(|&&hit| hit != 0).count();
+        let coverage_hash = crate::coverage::transaction_path_hash(coverage);
+        let coverage_edges = crate::coverage::transaction_edge_count();
         let waypoints = waypoints.clone();
         let storage_reads = storage_reads_from_waypoints(&waypoints);
         let storage_writes = storage_writes_from_waypoints(&waypoints);
@@ -185,7 +225,7 @@ impl EvmExecutor {
                 value: executed_value,
                 input: bounded_calldata(&tx.input),
                 output: bounded_returndata(&output),
-                gas_limit: TX_GAS_LIMIT,
+                gas_limit: environment.tx_gas_limit,
                 gas_used,
                 success: matches!(status, ExecutionStatus::Success),
                 kind: CallKind::Transaction,
@@ -194,8 +234,6 @@ impl EvmExecutor {
                 result: Some(format!("{status:?}")),
             },
         );
-
-        *db = final_db;
 
         Ok(TxExecutionResult {
             tx_index: tx_idx,
@@ -223,22 +261,16 @@ fn canonical_execution_output(bytes: &[u8]) -> Vec<u8> {
     bytes.to_vec()
 }
 
-fn fund_fuzz_caller(db: &mut CacheDB<ForkDb>, caller: Address) {
+fn fund_fuzz_caller(db: &mut CacheDB<ForkDb>, caller: Address) -> Result<()> {
     let balance = U256::from(FUZZ_CALLER_BALANCE_WEI);
-
-    if let Some(account) = db.cache.accounts.get_mut(&caller) {
-        if account.info.balance < balance {
-            account.info.balance = balance;
-        }
-    } else {
-        db.insert_account_info(
-            caller,
-            AccountInfo {
-                balance,
-                ..AccountInfo::default()
-            },
-        );
+    let mut info = db.load_account(caller)?.info.clone();
+    if info.balance < balance {
+        info.balance = balance;
+        // Inserting also marks a previously absent account as existing; merely
+        // changing its balance would leave CacheDB::basic returning None.
+        db.insert_account_info(caller, info);
     }
+    Ok(())
 }
 
 fn bounded_tx_value(value: U256) -> U256 {
@@ -251,7 +283,15 @@ fn bounded_tx_value(value: U256) -> U256 {
     }
 }
 
-fn initialized_storage_slots(db: &CacheDB<ForkDb>) -> HashSet<(Address, B256)> {
+/// Storage slots that the pinned fork database already holds for accounts in the
+/// cache.
+///
+/// This is the per-sequence seed for the uninitialized-read heuristic. It is
+/// computed from the cache's account list once per sequence instead of once per
+/// transaction. Slot *presence* is what the heuristic reads, so cached zero
+/// values are included exactly as the previous per-transaction scan included
+/// them; only the timing of the scan changed.
+fn seeded_storage_slots(db: &CacheDB<ForkDb>) -> HashSet<(Address, B256)> {
     let mut slots = HashSet::new();
     for (address, account) in &db.cache.accounts {
         for slot in account.storage.keys() {
@@ -259,6 +299,26 @@ fn initialized_storage_slots(db: &CacheDB<ForkDb>) -> HashSet<(Address, B256)> {
         }
     }
     slots
+}
+
+/// Undo the exploration-only caller funding after a failed transaction.
+///
+/// `fund_fuzz_caller` only ever raises the balance of an account that already
+/// failed validation, and `inspect_tx` does not commit on error, so the cache
+/// entry is restored to its exact previous shape (including absence from the
+/// cache) to keep failed transactions observationally invisible.
+fn restore_account(db: &mut CacheDB<ForkDb>, caller: Address, previous: Option<CachedAccount>) {
+    match previous {
+        Some(account) => {
+            db.cache.accounts.insert(caller, account);
+        }
+        None => {
+            // The caller was absent from the cache before funding. Removing the
+            // entry restores that observation instead of leaving a phantom
+            // funded account behind.
+            db.cache.accounts.remove(&caller);
+        }
+    }
 }
 
 fn storage_reads_from_waypoints(waypoints: &[Waypoint]) -> Vec<StorageAccess> {
@@ -307,35 +367,39 @@ fn storage_writes_from_waypoints(waypoints: &[Waypoint]) -> Vec<StorageAccess> {
         .collect()
 }
 
-fn storage_diffs_from_waypoints(
-    before: &CacheDB<ForkDb>,
-    after: &CacheDB<ForkDb>,
+fn committed_storage_diffs(
+    state: &EvmState,
     waypoints: &[Waypoint],
     tx_index: usize,
 ) -> Vec<StorageDiff> {
-    storage_writes_from_waypoints(waypoints)
+    let write_pcs: HashMap<_, _> = storage_writes_from_waypoints(waypoints)
         .into_iter()
-        .map(|write| StorageDiff {
-            old_value: cached_storage_value(before, write.address, write.slot),
-            new_value: write
-                .value
-                .unwrap_or_else(|| cached_storage_value(after, write.address, write.slot)),
-            tx_index,
-            address: write.address,
-            slot: write.slot,
-            pc: write.pc,
-        })
-        .filter(|diff| diff.old_value != diff.new_value)
-        .collect()
-}
-
-fn cached_storage_value(db: &CacheDB<ForkDb>, address: Address, slot: B256) -> U256 {
-    db.cache
-        .accounts
-        .get(&address)
-        .and_then(|account| account.storage.get(&U256::from_be_slice(slot.as_slice())))
-        .copied()
-        .unwrap_or_default()
+        .filter(|write| write.tx_index == tx_index)
+        .map(|write| ((write.address, write.slot, write.value), write.pc))
+        .collect();
+    let mut diffs = Vec::new();
+    for (address, account) in state {
+        if !account.is_touched() || account.is_selfdestructed() {
+            continue;
+        }
+        for (slot, value) in account.changed_storage_slots() {
+            let slot = B256::from(*slot);
+            diffs.push(StorageDiff {
+                tx_index,
+                address: *address,
+                slot,
+                old_value: value.original_value(),
+                new_value: value.present_value(),
+                // PC is best-effort telemetry: bounded waypoints can omit it.
+                pc: write_pcs
+                    .get(&(*address, slot, Some(value.present_value())))
+                    .copied()
+                    .unwrap_or_default(),
+            });
+        }
+    }
+    diffs.sort_by_key(|diff| (diff.address, diff.slot));
+    diffs
 }
 
 fn call_trace_from_waypoints(waypoints: &[Waypoint], max_entries: usize) -> Vec<CallObservation> {

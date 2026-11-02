@@ -2424,10 +2424,19 @@ fn executable_matching_signal_is_found_without_a_proof() {
     manifest.fixture = Some(path.file_name().unwrap().to_string_lossy().into_owned());
     manifest.manifest_root = Some(path.parent().unwrap().to_path_buf());
     manifest.resolved_fixture = None;
+    // The probe lives outside the repo tree, so the source control's invariant file
+    // (repo-relative) can no longer resolve; this test is about the matching signal
+    // without a proof, which is orthogonal to authored predicates.
+    manifest.invariant_file = None;
     let report = ValidationRunner.run_manifests(&[manifest]);
     std::fs::remove_file(path).unwrap();
     let result = &report.benchmarks[0];
-    assert_eq!(result.status, ValidationStatus::Found);
+    assert_eq!(
+        result.status,
+        ValidationStatus::Found,
+        "reason: {}",
+        result.reason
+    );
     assert!(result.found);
     assert!(!result.runtime.as_ref().unwrap().matching_signals.is_empty());
     assert!(
@@ -2459,11 +2468,206 @@ fn gate2_vulnerable_counterparts_trigger_each_protected_class() {
         if !result.executed || !result.found {
             missed.push(result.benchmark_id.clone());
         }
-        assert!(result.proof.is_none() && result.proof_status.is_none());
+        // Every gate2 control now carries an authored invariant file, and every
+        // vulnerable counterpart must produce a confirmed, replay-verified proof —
+        // storage-slot predicates and return-value predicates alike.
+        let proof = result
+            .proof
+            .as_ref()
+            .expect("every gate2 vulnerable counterpart should produce a proof");
+        {
+            assert_eq!(
+                proof.confidence_tier,
+                rusty_fuzz::engine::proof::ProofConfidenceTier::Confirmed
+            );
+            assert!(proof.original_state_violation_verified);
+            assert_eq!(
+                proof.replay_result,
+                rusty_fuzz::engine::proof::ReplayVerificationStatus::Verified
+            );
+            assert!(proof.violation_predicate.is_some());
+            assert_eq!(
+                result.poc_validation_status,
+                rusty_fuzz::engine::benchmark::PocValidationStatus::NotAttempted
+            );
+            assert!(!result.foundry_poc_generated);
+            assert_eq!(
+                result.evidence_class,
+                rusty_fuzz::engine::benchmark::BenchmarkEvidenceClass::SyntheticRegression
+            );
+            assert!(result.digests.invariant_file_digest.is_some());
+        }
     }
     assert!(
         missed.is_empty(),
         "real vulnerable counterparts missed: {missed:?}"
+    );
+}
+
+#[test]
+fn authored_erc20_predicate_confirms_only_the_vulnerable_replay() {
+    use rusty_fuzz::engine::benchmark::{
+        BenchmarkEvidenceClass, PocValidationStatus, ValidationRunner, ValidationStatus,
+    };
+    use rusty_fuzz::engine::proof::{ProofConfidenceTier, ReplayVerificationStatus};
+    let positive = ValidationRunner::load_manifests(
+        "benchmarks/historical/gate2_positive_controls/erc20-owner-mint.toml",
+    )
+    .unwrap();
+    let negative = ValidationRunner::load_manifests(
+        "benchmarks/historical/negative_controls/erc20-owner-mint.toml",
+    )
+    .unwrap();
+    let fixture_path = std::path::Path::new(positive[0].fixture.as_ref().unwrap());
+    let fixture =
+        rusty_fuzz::engine::executable_fixture::ExecutableFixture::load(fixture_path).unwrap();
+    let invariant_file = rusty_fuzz::engine::invariant_file::InvariantFile::load(
+        std::path::Path::new("benchmarks/historical/erc20-owner-mint.invariants.json"),
+    )
+    .unwrap();
+    let registry = invariant_file.build_registry().unwrap();
+    let observed = fixture
+        .execute_with_invariants(fixture_path, Some(&registry))
+        .unwrap();
+    assert!(
+        observed.invariant_violation.is_some(),
+        "the shared storage binding did not expose the vulnerable write: {:?}",
+        observed.execution.storage_diffs
+    );
+    let report = ValidationRunner.run_manifests(&[positive[0].clone(), negative[0].clone()]);
+    let vulnerable = report
+        .benchmarks
+        .iter()
+        .find(|result| result.benchmark_id == "positive-erc20-owner-mint")
+        .unwrap();
+    let safe = report
+        .benchmarks
+        .iter()
+        .find(|result| result.benchmark_id == "negative-erc20-owner-mint")
+        .unwrap();
+
+    assert_eq!(vulnerable.status, ValidationStatus::Found);
+    assert!(vulnerable.found);
+    assert_eq!(
+        vulnerable.evidence_class,
+        BenchmarkEvidenceClass::SyntheticRegression
+    );
+    let proof = vulnerable
+        .proof
+        .as_ref()
+        .expect("confirmed predicate proof");
+    assert_eq!(proof.confidence_tier, ProofConfidenceTier::Confirmed);
+    assert!(proof.original_state_violation_verified);
+    assert_eq!(proof.replay_result, ReplayVerificationStatus::Verified);
+    assert!(proof.violation_predicate.is_some());
+    assert!(proof.storage_diffs.iter().any(|diff| {
+        diff.address == vulnerable.runtime.as_ref().unwrap().transactions[1].to
+            && diff.new_value > diff.old_value
+    }));
+    assert_eq!(
+        vulnerable.poc_validation_status,
+        PocValidationStatus::NotAttempted
+    );
+    assert!(!vulnerable.foundry_poc_generated);
+
+    assert_eq!(safe.status, ValidationStatus::NotFound);
+    assert!(!safe.found);
+    assert!(safe.proof.is_none());
+    assert!(safe.runtime.as_ref().unwrap().matching_signals.is_empty());
+    assert_eq!(
+        safe.poc_validation_status,
+        PocValidationStatus::NotAttempted
+    );
+}
+
+#[test]
+fn fresh_replay_rejects_a_stale_authored_predicate_violation() {
+    use rusty_fuzz::engine::benchmark::ValidationRunner;
+    use rusty_fuzz::engine::confirmation::{FindingConfirmationConfig, FindingConfirmationGate};
+    use rusty_fuzz::engine::proof::{ProofConfidenceTier, ReplayVerificationStatus};
+    use rusty_fuzz::engine::scoring::CampaignScore;
+    let manifest = ValidationRunner::load_manifests(
+        "benchmarks/historical/gate2_positive_controls/erc20-owner-mint.toml",
+    )
+    .unwrap()
+    .remove(0);
+    let fixture_path = std::path::Path::new(manifest.fixture.as_ref().unwrap());
+    let fixture =
+        rusty_fuzz::engine::executable_fixture::ExecutableFixture::load(fixture_path).unwrap();
+    let invariant_file = rusty_fuzz::engine::invariant_file::InvariantFile::load(
+        std::path::Path::new("benchmarks/historical/erc20-owner-mint.invariants.json"),
+    )
+    .unwrap();
+    let registry = invariant_file.build_registry().unwrap();
+    let observed = fixture
+        .execute_with_invariants(fixture_path, Some(&registry))
+        .unwrap();
+    let violation = observed.invariant_violation.as_ref().unwrap();
+    let mut findings = ProtocolOraclePack::default().evaluate(&observed.execution);
+    findings.push(ProtocolFinding {
+        pack: rusty_fuzz::common::oracle::ProtocolOraclePackKind::Erc20,
+        vuln: VulnType::InvariantViolation(violation.predicate.clone()),
+        severity: ProtocolSeverity::High,
+        tx_index: Some(violation.tx_index),
+        target: Some(fixture.target),
+        evidence: "authored invariant violation".to_string(),
+    });
+    let mut candidate = rusty_fuzz::engine::exploit_path::ExploitPathBuilder::from_execution(
+        &observed.input,
+        &observed.execution,
+        &findings,
+        &CampaignScore::default(),
+    )
+    .unwrap();
+    violation.attach_to(&mut candidate, &observed.execution, &findings);
+    let mut proof = candidate.proof.unwrap();
+
+    let mut balance_of = vec![0x70, 0xa0, 0x82, 0x31];
+    balance_of.extend([0; 12]);
+    balance_of.extend(fixture.attacker.into_array());
+    proof.tx_sequence[1].input = balance_of;
+    let replay = proof
+        .verify_original_state_with_time_warp(
+            &observed.proof_base,
+            &observed.block_env,
+            rustyfuzz_evm::inspector::MAP_SIZE,
+            rustyfuzz_evm::time_warp::TimeWarp::NONE,
+        )
+        .unwrap();
+
+    assert!(!replay.success);
+    assert_eq!(
+        replay.status,
+        rusty_fuzz::common::oracle::FindingStatus::Rejected
+    );
+    assert_eq!(
+        replay.rejection_reasons,
+        vec![rusty_fuzz::common::oracle::RejectionReason::OracleWeakness]
+    );
+    assert!(!proof.violation_predicate.as_ref().unwrap().holds(
+        replay
+            .execution
+            .as_ref()
+            .expect("deterministic fresh replay")
+    ));
+    assert!(!proof.original_state_violation_verified);
+    assert_eq!(
+        proof.replay_result,
+        ReplayVerificationStatus::Mismatch {
+            reason: "original-state violation replay failed".to_string()
+        }
+    );
+    assert_ne!(proof.confidence_tier, ProofConfidenceTier::Confirmed);
+    let gate = FindingConfirmationGate::new(FindingConfirmationConfig {
+        require_minimized: false,
+        require_actor_labels: false,
+        require_protocol_assertion: false,
+        ..FindingConfirmationConfig::default()
+    });
+    assert!(
+        !gate
+            .evaluate(Some(&proof), &findings, &CampaignScore::default())
+            .confirmed
     );
 }
 

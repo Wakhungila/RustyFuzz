@@ -10,6 +10,14 @@ pub struct DataflowRegistry {
     pub influenced_slots: HashMap<Address, HashSet<B256>>,
     pub storage_taints: HashMap<(Address, B256), TaintSource>,
     pub storage_expressions: HashMap<(Address, B256), SymbolicExpression>,
+    /// Storage slots known to have been written during this sequence.
+    ///
+    /// Used by the uninitialized-read heuristic: a slot read before any write
+    /// in the campaign's lifetime may indicate a missing initializer. The set
+    /// is carried by the registry (which is per-sequence) instead of being
+    /// re-derived by walking the whole cache on every transaction, because each
+    /// rescan was O(cache size) and dominated the cost of execution.
+    pub initialized_slots: HashSet<(Address, B256)>,
 }
 
 impl DataflowRegistry {
@@ -51,5 +59,19 @@ impl DataflowRegistry {
 
     pub fn storage_expression(&self, address: Address, slot: B256) -> Option<SymbolicExpression> {
         self.storage_expressions.get(&(address, slot)).cloned()
+    }
+
+    /// Records that `slot` was seeded with a non-zero value in the base state,
+    /// so reads of it are not reported as uninitialized.
+    pub fn seed_initialized_slot(&mut self, address: Address, slot: B256) {
+        self.initialized_slots.insert((address, slot));
+    }
+
+    pub fn is_initialized_slot(&self, address: Address, slot: B256) -> bool {
+        self.initialized_slots.contains(&(address, slot))
+    }
+
+    pub fn mark_initialized_slot(&mut self, address: Address, slot: B256) {
+        self.initialized_slots.insert((address, slot));
     }
 }

@@ -230,6 +230,18 @@ impl ForkDbCacheSnapshot {
     }
 }
 
+/// Parses a `0x`-prefixed quantity.
+///
+/// Refuses a bare decimal on purpose: "10" is ambiguous between decimal ten and hex ten,
+/// and a silently wrong chain id or block number is worse than a parse failure.
+fn parse_quantity_u64(text: &str) -> Option<u64> {
+    let hex = text
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| text.trim().strip_prefix("0X"))?;
+    u64::from_str_radix(hex, 16).ok()
+}
+
 fn parse_block_tag_number(tag: &str) -> Option<u64> {
     let t = tag.trim();
     if t == "latest" || t == "safe" || t == "finalized" || t == "pending" || t == "earliest" {
@@ -690,6 +702,63 @@ impl ForkDb {
         }
     }
 
+    /// Reads `eth_chainId` and records it in this database's provenance.
+    ///
+    /// Exposed because the capture path needs the chain id to produce a replayable
+    /// snapshot, and the offline replay path rejects a snapshot without one. Going through
+    /// this method rather than a fresh HTTP client keeps URL validation, the SSRF guard and
+    /// the API-key handling in one place.
+    pub fn fetch_chain_id(&self) -> Result<u64, ForkDbError> {
+        let value: String = self.rpc("eth_chainId", json!([]))?;
+        let chain_id = parse_quantity_u64(&value)
+            .ok_or_else(|| ForkDbError::Rpc("eth_chainId was not a quantity".to_string()))?;
+        self.set_provenance_chain_id(chain_id);
+        Ok(chain_id)
+    }
+
+    /// Records the chain id and recomputes the cache id, keeping them consistent.
+    fn set_provenance_chain_id(&self, chain_id: u64) {
+        let mut provenance = self.inner.provenance.lock();
+        provenance.chain_id = Some(chain_id);
+        provenance.cache_id = Some(compute_cache_id(
+            provenance.provider_sanitized.as_str(),
+            Some(chain_id),
+            provenance.block_number,
+        ));
+    }
+
+    /// Reads the hash of the pinned block, recording it as provenance.
+    ///
+    /// A snapshot without a block hash is rejected by the offline path, so a capture that
+    /// skipped this would produce an unusable artifact.
+    pub fn fetch_pinned_block_hash(&self) -> Result<B256, ForkDbError> {
+        let block: Value =
+            self.rpc("eth_getBlockByNumber", json!([self.inner.block_tag, false]))?;
+        let hash = block
+            .get("hash")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                ForkDbError::Rpc("pinned block has no hash (is it pending?)".to_string())
+            })?;
+        let hash: B256 = hash
+            .parse()
+            .map_err(|_| ForkDbError::Rpc("block hash is not 32 bytes".to_string()))?;
+        let number = block
+            .get("number")
+            .and_then(|value| value.as_str())
+            .and_then(parse_quantity_u64);
+        if let Some(number) = number {
+            self.inner
+                .provenance
+                .lock()
+                .block_number
+                .get_or_insert(number);
+            self.cache_block_hash(number, hash);
+        }
+        self.inner.provenance.lock().block_hash = Some(format!("{hash:#x}"));
+        Ok(hash)
+    }
+
     pub fn with_thread_rpc_budget<T>(budget: Option<usize>, f: impl FnOnce() -> T) -> T {
         struct BudgetGuard(Option<usize>);
         impl Drop for BudgetGuard {
@@ -778,16 +847,24 @@ fn rpc_on_blocking_thread(
         {
             let allowed_origins = crate::rpc_url::rpc_api_key_allowed_origins()
                 .map_err(|error| ForkDbError::Rpc(error.to_string()))?;
-            let authorization =
-                crate::rpc_url::rpc_api_key_header(&rpc_url, api_key.as_deref(), &allowed_origins)
-                    .map_err(|error| ForkDbError::Rpc(error.to_string()))?
-                    .ok_or_else(|| ForkDbError::Rpc("RPC API key is empty".to_string()))?;
-            let value = reqwest::header::HeaderValue::from_str(&authorization).map_err(|_| {
-                ForkDbError::Rpc("RPC API key contains invalid header characters".to_string())
-            })?;
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(reqwest::header::AUTHORIZATION, value);
-            client_builder = client_builder.default_headers(headers);
+            match crate::rpc_url::rpc_api_key_header(&rpc_url, api_key.as_deref(), &allowed_origins)
+            {
+                Ok(Some(authorization)) => {
+                    let value = reqwest::header::HeaderValue::from_str(&authorization).map_err(|_| {
+                        ForkDbError::Rpc("RPC API key contains invalid header characters".to_string())
+                    })?;
+                    let mut headers = reqwest::header::HeaderMap::new();
+                    headers.insert(reqwest::header::AUTHORIZATION, value);
+                    client_builder = client_builder.default_headers(headers);
+                }
+                Ok(None) => {
+                    // URL already carries its own credential (e.g. Infura/Alchemy path key);
+                    // sending a Bearer header would break the request. Proceed without one.
+                }
+                Err(error) => {
+                    return Err(ForkDbError::Rpc(error.to_string()));
+                }
+            }
         }
         let client = client_builder
             .build()

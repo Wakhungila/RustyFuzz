@@ -354,6 +354,7 @@ pub async fn execute_bounded_job(
         allow_synthetic_fallback: false,
         hardened_defi: hardened,
         target_invariant_manifest: None,
+        predicate_invariants: None,
         abi_path: None,
         max_execs: Some(job.max_execs),
         duration_secs: Some(job.duration_secs),

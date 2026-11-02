@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "measurement_date": "2026-10-25",
+  "timezone": "Africa/Nairobi",
+  "runtime_commit": "39b25e6346e88fc5efb6588eae98d1ef524c021e",
+  "runtime_binary_sha256": "e94a2493b024643ea5f877b1c93450c97364e229dab9ace37020a3c25c376409",
+  "runtime_source_state": "tracked source clean at measurement; untracked docs/CODEX_HANDOFF.md",
+  "rpc_host": "eth-mainnet.g.alchemy.com",
+  "chain_id": 1,
+  "context_fork_block": 15201793,
+  "context_fork_block_hash": "0xc3cb5c89144fdb25b7563a5ecc888314253080248d89512035512b396a821239",
+  "rpc_checks": [
+    "eth_chainId returned 0x1",
+    "eth_blockNumber returned 0x190e028",
+    "eth_getBlockByNumber confirmed block 15201793"
+  ],
+  "configuration": "Temporary copy of repository config.toml with context fork_block replaced by verified Ethereum block 15201793; repository config untouched.",
+  "environment": {
+    "RUSTYFUZZ_RPC_API_KEY": "unset",
+    "RUSTYFUZZ_RPC_API_KEY_ALLOWED_ORIGINS": "https://eth-mainnet.g.alchemy.com",
+    "RUSTYFUZZ_RUN_FORGE_TESTS": "1"
+  },
+  "commands": [
+    "rusty-fuzz validate --benchmarks <repo>/benchmarks/historical/known_vulnerable --output <run>/validate_known_vulnerable.json",
+    "rusty-fuzz validate --benchmarks <repo>/benchmarks/historical --output <run>/validate_historical.json"
+  ],
+  "reports": {
+    "validate_known_vulnerable.json": "aaa3eefcad9c51f36429a3085487b15439f970e9c1e963ee7c9ffdb74646d891",
+    "validate_historical.json": "ce4a91169ac0b325a31d2ec43244a7724bcf80430436ddf939f18623ca7ddb0a"
+  },
+  "fixture_hashes": {
+    "benchmarks/historical/audius-governance-reinitialization-2022.toml": "84eba772a2bed39feb2fe0387851eb14ec153da972f46331687c0e6da200e8b7",
+    "benchmarks/historical/euler-finance-donate-liquidation-2023.toml": "45f5220fa848be9a92ad0519fc2932f6052e4bb1fa62212a8cb03e45aad35ed1",
+    "benchmarks/historical/fixtures/audius-governance-reinitialization-2022.json": "7603e734e76b4e2034727ec3e0dac2eb0a95dde643a79782bf1819ae5e96301b",
+    "benchmarks/historical/fixtures/euler-finance-donate-liquidation-2023.json": "c17868e7f83fbb8f6aa5990efdcb0508d42a81c01a57df4319189802733bfcc0",
+    "benchmarks/historical/known_vulnerable/fixtures/known-bridge-nonce-replay.json": "f640b494b10c2ebc4b89e0637c2a5d98c2ce285cb52d8421e583c314a3e87f57",
+    "benchmarks/historical/known_vulnerable/fixtures/known-erc20-bad-mint-inflation.json": "20766b4297323fb726d6b775b4e40e013ca979e33b0d99a74c598b5043d45ed7",
+    "benchmarks/historical/known_vulnerable/fixtures/known-flashloan-price-manipulation.json": "353f87b435778d02c68008082752ac25235d8cea925a590b02afd39f94a58e1f",
+    "benchmarks/historical/known_vulnerable/fixtures/known-read-only-reentrancy.json": "ab01f8ba3d40e49624313137d190f685ec3d09f61097b7d6905312b3726fe82e",
+    "benchmarks/historical/known_vulnerable/fixtures/known-uninitialized-proxy-takeover.json": "65e5181aae6425e0f4437843df7c315da5e9583e0d7b41f3da38791d8cf246e7",
+    "benchmarks/historical/known_vulnerable/known-bridge-nonce-replay.toml": "c964b74f5be8148a760e8e55532a637b437acc81c5e58578c07611d564daa27d",
+    "benchmarks/historical/known_vulnerable/known-erc20-bad-mint-inflation.toml": "6b72f5a8bb13f6b0c785602c4a4c002cbb768e2049e7170f35ef686cc3387776",
+    "benchmarks/historical/known_vulnerable/known-flashloan-price-manipulation.toml": "c6e5cc2791d1308d911c9def99243be8b072756b89134981c8274d17fdeafe5f",
+    "benchmarks/historical/known_vulnerable/known-read-only-reentrancy.toml": "45ab89108a249c242b53f0425ce2b7f33d2a24a3efc7ae82a30a7fe090057fc6",
+    "benchmarks/historical/known_vulnerable/known-uninitialized-proxy-takeover.toml": "11d65cb1185794795a6cf03437438034bad55575ab03e4adc86bf1f61725855d"
+  }
+}

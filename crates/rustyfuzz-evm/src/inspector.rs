@@ -44,7 +44,6 @@ pub struct CoverageInspector<'a> {
     pub memory_taint_budget_remaining: usize,
     pub waypoints_inserted: usize,
     pub call_traces_inserted: usize,
-    pub known_initialized_slots: HashSet<(Address, B256)>, // Track slots written in current or previous TXs
     pub call_depth: usize,
     pending_sload: Option<PendingStorageRead>,
 }
@@ -75,6 +74,10 @@ impl<'a> CoverageInspector<'a> {
         )
     }
 
+    /// `initial_slots` seeds the uninitialized-read heuristic with slots that
+    /// are already written in the base state. Slots written during execution are
+    /// recorded directly in the [`DataflowRegistry`], which outlives a single
+    /// transaction, so the set grows without a per-transaction cache scan.
     pub fn with_initialized_slots(
         coverage: &'a mut [u8],
         dataflow: &'a mut DataflowRegistry,
@@ -82,6 +85,7 @@ impl<'a> CoverageInspector<'a> {
         current_tx_idx: usize,
         initial_slots: HashSet<(Address, B256)>,
     ) -> Self {
+        dataflow.initialized_slots.extend(initial_slots);
         Self {
             coverage,
             dataflow,
@@ -102,7 +106,6 @@ impl<'a> CoverageInspector<'a> {
             memory_taint_budget_remaining: MAX_MEMORY_TAINT_TRACKING_BYTES,
             waypoints_inserted: 0,
             call_traces_inserted: 0,
-            known_initialized_slots: initial_slots,
             call_depth: 0,
             pending_sload: None,
         }
@@ -466,11 +469,9 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
             } // Remove taint for popped item
             0x54 => {
                 if let Ok(slot_val) = interp.stack.peek(0) {
-                    let addr = interp
-                        .input
-                        .bytecode_address()
-                        .copied()
-                        .unwrap_or(Address::ZERO);
+                    // DELEGATECALL executes another account's code using the
+                    // current account's storage, just as REVM's SLOAD does.
+                    let addr = interp.input.target_address();
                     let slot = B256::from(slot_val);
 
                     // If this slot was written by a previous transaction in the sequence
@@ -512,11 +513,7 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
             }
             0x5C => {
                 if let Ok(slot_val) = interp.stack.peek(0) {
-                    let addr = interp
-                        .input
-                        .bytecode_address()
-                        .copied()
-                        .unwrap_or(Address::ZERO);
+                    let addr = interp.input.target_address();
                     let slot = B256::from(slot_val);
 
                     if let Some(ts) = self.transient_taint_map.get(&(addr, slot)).cloned() {
@@ -542,13 +539,25 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
 
         // Precision Edge Hashing: mimicking hardware-level branch tracking
         if !self.coverage.is_empty() {
-            let edge_hash =
-                (pc ^ self.last_pc.rotate_left(1) ^ ((opcode as usize) << 1)) % self.coverage.len();
-            self.coverage[edge_hash] = self.coverage[edge_hash].saturating_add(1);
+            // `self.coverage.len()` is a runtime power of two (MAP_SIZE), so mask
+            // instead of dividing: a division per opcode is measurable. Indices
+            // are also reported to the touched log so the path signature costs
+            // O(edges touched) rather than O(map size) per transaction.
+            let mask = self.coverage.len() - 1;
+            let edge_hash = (pc ^ self.last_pc.rotate_left(1) ^ ((opcode as usize) << 1)) & mask;
+            let slot = &mut self.coverage[edge_hash];
+            if *slot == 0 {
+                crate::coverage::record_touched(edge_hash);
+            }
+            *slot = slot.saturating_add(1);
 
             if matches!(opcode, 0xF1 | 0xF2 | 0xF4 | 0xFA) {
-                let call_edge = (edge_hash ^ 0x9e37) % self.coverage.len();
-                self.coverage[call_edge] = self.coverage[call_edge].saturating_add(1);
+                let call_edge = (edge_hash ^ 0x9e37) & mask;
+                let slot = &mut self.coverage[call_edge];
+                if *slot == 0 {
+                    crate::coverage::record_touched(call_edge);
+                }
+                *slot = slot.saturating_add(1);
             }
         }
 
@@ -559,11 +568,7 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
         // Causal Tracking: Monitor SLOAD (0x54) and SSTORE (0x55)
         if opcode == 0x54 || opcode == 0x55 {
             if let Ok(slot_val) = interp.stack.peek(0) {
-                let addr = interp
-                    .input
-                    .bytecode_address()
-                    .copied()
-                    .unwrap_or(Address::ZERO);
+                let addr = interp.input.target_address();
                 let slot = B256::from(slot_val);
 
                 if opcode == 0x54 && self.pending_sload.is_none() {
@@ -580,7 +585,7 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                 // Logic Sanitizer: Detect Uninitialized Storage Reads
                 // If a slot is read before being written to in the protocol lifecycle,
                 // it might indicate a missing initializer or an uninitialized state bug.
-                if !self.known_initialized_slots.contains(&(addr, slot)) {
+                if !self.dataflow.is_initialized_slot(addr, slot) {
                     // Log a high-severity waypoint for uninitialized access
                     self.push_waypoint(Waypoint::Dataflow {
                         address: addr,
@@ -609,16 +614,12 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
 
                 // Slot is the first item on the stack for SSTORE
                 if let Ok(slot_val) = interp.stack.peek(0) {
-                    let address = interp
-                        .input
-                        .bytecode_address()
-                        .copied()
-                        .unwrap_or(Address::ZERO);
+                    let address = interp.input.target_address();
                     let slot = B256::from(slot_val);
 
                     self.dataflow.mark_influenced(address, slot);
                     // Mark this slot as initialized for the logic sanitizer
-                    self.known_initialized_slots.insert((address, slot));
+                    self.dataflow.mark_initialized_slot(address, slot);
 
                     // If the value being stored is tainted, convert its source to a
                     // persistent Storage source so subsequent reads know which TX produced it.
@@ -636,6 +637,19 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
                     }
                     if let Some(expr) = value_expression.clone() {
                         self.storage_expression_map.insert((address, slot), expr);
+                    }
+                    // A slot whose value flows from calldata, msg.sender or
+                    // msg.value is an *influenced* slot. This is the signal the
+                    // access-control oracle uses to recognise ownership slots
+                    // stored outside the EIP-1967 layout. Without it that check
+                    // can never fire, because nothing else ever emitted an
+                    // influenced dataflow waypoint.
+                    if persistent_taint_for_value.is_some() {
+                        self.push_waypoint(Waypoint::Dataflow {
+                            address,
+                            slot: slot.to_vec(),
+                            influenced: true,
+                        });
                     }
                     self.dataflow.mark_storage_symbolic(
                         address,
@@ -662,11 +676,7 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
         if opcode == 0x5D {
             let value_taint_source = stack_taint(&self.taint_stack, 1);
             if let Ok(slot_val) = interp.stack.peek(0) {
-                let address = interp
-                    .input
-                    .bytecode_address()
-                    .copied()
-                    .unwrap_or(Address::ZERO);
+                let address = interp.input.target_address();
                 let slot = B256::from(slot_val);
 
                 if let Some(ts) = value_taint_source {

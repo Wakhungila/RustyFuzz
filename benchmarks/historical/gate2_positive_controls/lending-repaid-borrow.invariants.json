@@ -1,0 +1,17 @@
+{
+  "target": "0x6200000000000000000000000000000000000402",
+  "symbols": {
+    "debt": {
+      "kind": "slot",
+      "slot": "0x1",
+      "offset_bits": 0,
+      "width_bits": 256
+    }
+  },
+  "invariants": [
+    {
+      "name": "BorrowIsRecordedAsDebt",
+      "predicate": "debt >= 100000000000000000000"
+    }
+  ]
+}

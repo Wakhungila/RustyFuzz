@@ -1,0 +1,177 @@
+{
+  "schema_version": 1,
+  "measurement": "measurement.json",
+  "cases": [
+    {
+      "case_id": "known-bridge-nonce-replay",
+      "source": "validate_known_vulnerable.json",
+      "scope": "expectation_only_fixture",
+      "validator_status": "not_found",
+      "validator_executed": true,
+      "evm_sequence_executed": false,
+      "reason": "matched evidence was observed but replay verification did not confirm the counterexample; matched=[ExpectedFinding, InvariantViolation, ReplayableArtifact, MinimizedPath], missing=[FoundryPocGenerated]",
+      "predicate_available": false,
+      "original_state_violation_verified": false,
+      "original_state_verification_attempted": false,
+      "confirmation_tier": "replayed_minimized",
+      "confirmed": false,
+      "recorded_replay_result": "verified",
+      "poc_generated": false,
+      "poc_validation": "not_attempted",
+      "first_blocker": "predicate_unavailable",
+      "missing_criteria": [
+        "foundry_poc_generated"
+      ]
+    },
+    {
+      "case_id": "known-erc20-bad-mint-inflation",
+      "source": "validate_known_vulnerable.json",
+      "scope": "expectation_only_fixture",
+      "validator_status": "not_found",
+      "validator_executed": true,
+      "evm_sequence_executed": false,
+      "reason": "matched evidence was observed but replay verification did not confirm the counterexample; matched=[ExpectedFinding, InvariantViolation, ReplayableArtifact, MinimizedPath], missing=[FoundryPocGenerated]",
+      "predicate_available": false,
+      "original_state_violation_verified": false,
+      "original_state_verification_attempted": false,
+      "confirmation_tier": "replayed_minimized",
+      "confirmed": false,
+      "recorded_replay_result": "verified",
+      "poc_generated": false,
+      "poc_validation": "not_attempted",
+      "first_blocker": "predicate_unavailable",
+      "missing_criteria": [
+        "foundry_poc_generated"
+      ]
+    },
+    {
+      "case_id": "known-flashloan-price-manipulation",
+      "source": "validate_known_vulnerable.json",
+      "scope": "expectation_only_fixture",
+      "validator_status": "not_found",
+      "validator_executed": true,
+      "evm_sequence_executed": false,
+      "reason": "matched evidence was observed but replay verification did not confirm the counterexample; matched=[ExpectedFinding, ReserveManipulation, InvariantViolation, ReplayableArtifact, MinimizedPath], missing=[FoundryPocGenerated]",
+      "predicate_available": false,
+      "original_state_violation_verified": false,
+      "original_state_verification_attempted": false,
+      "confirmation_tier": "replayed_minimized",
+      "confirmed": false,
+      "recorded_replay_result": "verified",
+      "poc_generated": false,
+      "poc_validation": "not_attempted",
+      "first_blocker": "predicate_unavailable",
+      "missing_criteria": [
+        "foundry_poc_generated"
+      ]
+    },
+    {
+      "case_id": "known-read-only-reentrancy",
+      "source": "validate_known_vulnerable.json",
+      "scope": "expectation_only_fixture",
+      "validator_status": "not_found",
+      "validator_executed": true,
+      "evm_sequence_executed": false,
+      "reason": "matched evidence was observed but replay verification did not confirm the counterexample; matched=[ExpectedFinding, InvariantViolation, ReplayableArtifact, MinimizedPath], missing=[FoundryPocGenerated]",
+      "predicate_available": false,
+      "original_state_violation_verified": false,
+      "original_state_verification_attempted": false,
+      "confirmation_tier": "replayed_minimized",
+      "confirmed": false,
+      "recorded_replay_result": "verified",
+      "poc_generated": false,
+      "poc_validation": "not_attempted",
+      "first_blocker": "predicate_unavailable",
+      "missing_criteria": [
+        "foundry_poc_generated"
+      ]
+    },
+    {
+      "case_id": "known-uninitialized-proxy-takeover",
+      "source": "validate_known_vulnerable.json",
+      "scope": "expectation_only_fixture",
+      "validator_status": "not_found",
+      "validator_executed": true,
+      "evm_sequence_executed": false,
+      "reason": "matched evidence was observed but replay verification did not confirm the counterexample; matched=[ExpectedFinding, AccessControlBypass, InvariantViolation, ReplayableArtifact, MinimizedPath], missing=[FoundryPocGenerated]",
+      "predicate_available": false,
+      "original_state_violation_verified": false,
+      "original_state_verification_attempted": false,
+      "confirmation_tier": "replayed_minimized",
+      "confirmed": false,
+      "recorded_replay_result": "verified",
+      "poc_generated": false,
+      "poc_validation": "not_attempted",
+      "first_blocker": "predicate_unavailable",
+      "missing_criteria": [
+        "foundry_poc_generated"
+      ]
+    },
+    {
+      "case_id": "historical-audius-governance-reinitialization-2022",
+      "source": "validate_historical.json",
+      "scope": "historical_replay_blocked",
+      "validator_status": "failed_execution",
+      "validator_executed": false,
+      "evm_sequence_executed": false,
+      "reason": "failed to execute live-fork benchmark `historical-audius-governance-reinitialization-2022`: provider_replay_only is unsupported: independent eth_call requests do not preserve sequence state or prove an invariant; use local EVM replay with a pinned fork/cache",
+      "predicate_available": null,
+      "original_state_violation_verified": null,
+      "original_state_verification_attempted": false,
+      "confirmation_tier": null,
+      "confirmed": null,
+      "recorded_replay_result": null,
+      "poc_generated": false,
+      "poc_validation": "not_attempted",
+      "first_blocker": "unsupported_provider_replay_only",
+      "missing_criteria": [
+        "expected_finding",
+        "invariant_violation",
+        "replayable_artifact",
+        "foundry_poc_generated",
+        "minimized_path"
+      ]
+    },
+    {
+      "case_id": "historical-euler-finance-donate-liquidation-2023",
+      "source": "validate_historical.json",
+      "scope": "historical_replay_blocked",
+      "validator_status": "failed_execution",
+      "validator_executed": false,
+      "evm_sequence_executed": false,
+      "reason": "failed to execute live-fork benchmark `historical-euler-finance-donate-liquidation-2023`: provider_replay_only is unsupported: independent eth_call requests do not preserve sequence state or prove an invariant; use local EVM replay with a pinned fork/cache",
+      "predicate_available": null,
+      "original_state_violation_verified": null,
+      "original_state_verification_attempted": false,
+      "confirmation_tier": null,
+      "confirmed": null,
+      "recorded_replay_result": null,
+      "poc_generated": false,
+      "poc_validation": "not_attempted",
+      "first_blocker": "unsupported_provider_replay_only",
+      "missing_criteria": [
+        "expected_finding",
+        "invariant_violation",
+        "replayable_artifact",
+        "foundry_poc_generated",
+        "minimized_path"
+      ]
+    }
+  ],
+  "decision": {
+    "priority": "benchmark_proof_path",
+    "reason": "All five fixture proofs lack predicates; neither historical EVM replay executes. No original-state predicate replay was attempted, so neither search quality nor PoC compatibility was measured.",
+    "next_implementation": "Connect authored predicates and binding manifests to stateful executable benchmark replay, preserve their evidence on candidates, and run original-state verification before confirmation. Supply verified replay material for historical fixtures; keep legacy expectation fixtures explicitly synthetic.",
+    "acceptance": [
+      "An existing executable vulnerable control reaches predicate evaluation and original-state replay; its safe counterpart does not confirm.",
+      "Recorded violating terms with a satisfied fresh replay are rejected.",
+      "Confirmation tier is assigned from actual gate evaluation, never from a fixture expectation.",
+      "PoC generation and validation are reported separately, with not-attempted distinct from failure."
+    ],
+    "deferred": [
+      "action grammar until executable search is measured",
+      "target-suite PoCs until proof confirmation is reached",
+      "Z3 pending explicit owner approval"
+    ]
+  }
+}

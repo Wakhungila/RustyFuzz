@@ -64,6 +64,21 @@ pub struct HardenedDefiConfig {
     pub min_persist_confidence: f64,
     #[serde(default)]
     pub require_confirmation_for_poc: bool,
+    /// Seconds `block.timestamp` advances per transaction within a sequence.
+    ///
+    /// Time-dependent logic (vesting, TWAP, interest accrual, timelocks,
+    /// auctions) is unreachable if every transaction in a sequence sees the same
+    /// block. The advance is a pure function of the transaction index, so replay
+    /// reproduces the same block environments exactly. `0` disables it.
+    ///
+    /// Default: 3600 (one hour per transaction), so a short sequence spans a
+    /// realistic window instead of a single instant.
+    #[serde(default = "default_time_warp_seconds")]
+    pub time_warp_seconds: u64,
+    /// Blocks `block.number` advances per transaction within a sequence.
+    /// Default: 1, matching one mined block per transaction.
+    #[serde(default = "default_time_warp_blocks")]
+    pub time_warp_blocks: u64,
 }
 
 impl Default for HardenedDefiConfig {
@@ -85,8 +100,18 @@ impl Default for HardenedDefiConfig {
             enable_exploit_templates: true,
             min_persist_confidence: default_min_persist_confidence(),
             require_confirmation_for_poc: true,
+            time_warp_seconds: default_time_warp_seconds(),
+            time_warp_blocks: default_time_warp_blocks(),
         }
     }
+}
+
+fn default_time_warp_seconds() -> u64 {
+    3_600
+}
+
+fn default_time_warp_blocks() -> u64 {
+    1
 }
 
 fn default_true() -> bool {

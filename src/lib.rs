@@ -1,5 +1,8 @@
 #[cfg(feature = "evm")]
 pub mod chain;
+// The allocator is library-level so every binary target (the fuzzer and the
+// benchmark harness) gets the same allocation behaviour.
+pub mod allocator;
 #[cfg(feature = "evm")]
 pub mod common;
 #[cfg(feature = "evm")]
@@ -33,3 +36,8 @@ pub use evm::*;
 
 #[cfg(feature = "evm")]
 pub use common::types::*;
+
+/// Test-only helpers shared by the library and the binary target.
+#[cfg(test)]
+#[path = "test_support.rs"]
+pub mod test_support;

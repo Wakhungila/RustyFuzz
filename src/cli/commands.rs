@@ -10,11 +10,66 @@ pub struct Args {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum Command {
+    /// Zero-config campaign: an address, a chain and a block, nothing else.
+    ///
+    /// Deliberately a thin alias over `fuzz` rather than a second code path. Its job is
+    /// to remove the three things that stopped a fresh user: writing a harness, editing
+    /// `config.toml`, and knowing which flags the real entry point needs. Everything it
+    /// does is the same work `fuzz` does, with sensible defaults filled in.
+    Target {
+        /// Address to fuzz.
+        address: String,
+        /// RPC endpoint to fork from. Required: there is no default worth guessing.
+        #[arg(long)]
+        rpc_url: String,
+        /// Block to pin the fork at. Defaults to the endpoint's latest block.
+        #[arg(long)]
+        fork_block: Option<u64>,
+        /// Wall-clock budget in seconds.
+        #[arg(long, default_value_t = 300)]
+        duration_secs: u64,
+        /// Execution budget, if a caller prefers a count to a duration.
+        #[arg(long)]
+        max_execs: Option<u64>,
+        /// Deterministic RNG seed, for a reproducible first run.
+        #[arg(long, default_value_t = 1)]
+        rng_seed: u64,
+        /// JSON file of invariants to check after every transaction.
+        #[arg(long)]
+        invariants: Option<String>,
+    },
     Fuzz {
         #[arg(long)]
         chain: Option<String>,
         #[arg(long)]
         contract: Option<String>,
+        /// RPC endpoint to fork from, overriding `config.toml`.
+        ///
+        /// Exists because pointing at any chain other than the one in the shared config
+        /// previously required editing `config.toml`, which is a usability cliff: the
+        /// file is not meant to be rewritten per test run, and it is shared.
+        #[arg(long)]
+        rpc_url: Option<String>,
+        /// Block number to pin the fork at, overriding `config.toml`.
+        ///
+        /// Must be paired with `--rpc-url` in practice; an unreachable pin makes every
+        /// benchmark skip, which is what happened when the shared config's block was not
+        /// available on the endpoint.
+        #[arg(long)]
+        fork_block: Option<u64>,
+        /// JSON file of invariants to check after every transaction.
+        ///
+        /// Kept as a flag rather than a `config.toml` table so a campaign's invariants
+        /// travel with the invocation, not with a file shared between runs -- the same
+        /// reasoning as `--rpc-url`. See `src/engine/invariant_file.rs` for the format.
+        ///
+        /// Validation happens before the campaign starts: every invalid invariant is
+        /// reported at once, and a file declaring none is refused rather than silently
+        /// checking nothing. Its declared target must match `--contract` or the
+        /// configured `target_contract`; an invariant file without an effective target
+        /// is rejected.
+        #[arg(long)]
+        invariants: Option<String>,
         #[arg(long, default_value_t = false)]
         hardened_defi: bool,
         #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = false)]
@@ -171,6 +226,48 @@ pub enum Command {
         #[arg(long)]
         output: Option<String>,
     },
+    /// Capture a real fork snapshot for offline historical replay.
+    ///
+    /// The offline replay path accepts only a `ForkDbCacheSnapshot` with a matching digest
+    /// and pinned provenance, and nothing else in the tool could produce one. This is that
+    /// producer.
+    ///
+    /// Only the slots you name are captured. Every other slot is ABSENT from the snapshot,
+    /// so a replay that reads one reports Unknown rather than a fabricated zero — which is
+    /// the only honest option, since a mapping cannot be enumerated over JSON-RPC.
+    Capture {
+        /// RPC endpoint to capture from. Must be an archive node for a historical block.
+        #[arg(long)]
+        rpc_url: String,
+        /// State block to capture. For historical replay, use the pre-transaction
+        /// block (normally the exploit transaction's block number minus one).
+        #[arg(long)]
+        block: u64,
+        /// Historical fixture whose target and transaction parties are captured.
+        #[arg(long)]
+        fixture: String,
+        /// Invariants file whose plain storage bindings are also captured.
+        ///
+        /// Mappings and return values are skipped: a mapping needs a key we do not have,
+        /// and a return value is not storage.
+        #[arg(long)]
+        invariants: Option<String>,
+        /// Extra slot to capture, as `0xaddress:0xslot`. Repeatable.
+        #[arg(long = "slot", num_args = 1)]
+        slots: Vec<String>,
+        /// Address-mapping storage entry, as `0xcontract:0xbase-slot:0xkey-address`.
+        ///
+        /// Use only when the contract's storage layout establishes the base slot.
+        /// Repeatable.
+        #[arg(long = "mapping-slot", num_args = 1)]
+        mapping_slots: Vec<String>,
+        /// Where to write the snapshot.
+        #[arg(long)]
+        output: String,
+        /// Where to write the capture report. Defaults to `<output>.report.json`.
+        #[arg(long)]
+        report: Option<String>,
+    },
     Job {
         #[command(subcommand)]
         command: JobCommand,
@@ -288,6 +385,17 @@ pub enum Command {
         output: Option<String>,
         #[arg(long, default_value_t = true)]
         broker_free: bool,
+        /// RPC endpoint for mainnet_fork cases, overriding `config.toml`.
+        #[arg(long)]
+        rpc_url: Option<String>,
+        /// Fork block for every mainnet_fork case, overriding both `config.toml` and each
+        /// manifest.
+        ///
+        /// Without an override each manifest uses its own `fork_block`, which is what a
+        /// historical corpus needs: the cases pin different blocks, and one global value
+        /// would silently validate the wrong state for all but one of them.
+        #[arg(long)]
+        fork_block: Option<u64>,
     },
     Satori {
         #[command(subcommand)]

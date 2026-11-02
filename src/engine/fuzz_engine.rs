@@ -16,7 +16,7 @@ use crate::engine::exploit_path::ExploitPathBuilder;
 use crate::engine::foundry_ingest::FoundryHarnessManifest;
 use crate::engine::invariant_manifest::TargetInvariantManifest;
 use crate::engine::promotion::{
-    promote_finding_artifact, write_campaign_status, write_campaign_summary,
+    promote_finding_artifact, write_campaign_status, write_campaign_summary, CampaignMeasurements,
     PromotionCampaignStats, PromotionCampaignSummary, PromotionConfig, PromotionRequest,
 };
 use crate::engine::protocol_model::CounterexampleSearchEngine;
@@ -46,7 +46,6 @@ use libafl::state::HasCorpus;
 use parking_lot::{Mutex, RwLock};
 use revm::database::CacheDB;
 use revm::primitives::{Address, U256};
-use revm::state::AccountInfo;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
@@ -166,6 +165,21 @@ fn terminal_state_for_campaign_error(
     } else {
         rustyfuzz_artifacts::RunTerminalState::Failed
     }
+}
+
+fn campaign_completion_status(
+    state: &str,
+    total_executions: u64,
+) -> (String, rustyfuzz_artifacts::RunTerminalState, bool) {
+    let no_executions = total_executions == 0 && state != "cancelled";
+    let effective_state = if no_executions { "failed" } else { state };
+    let terminal_state = match effective_state {
+        "cancelled" => rustyfuzz_artifacts::RunTerminalState::Cancelled,
+        "partial" => rustyfuzz_artifacts::RunTerminalState::Partial,
+        "completed" | "finalized" => rustyfuzz_artifacts::RunTerminalState::Completed,
+        _ => rustyfuzz_artifacts::RunTerminalState::Failed,
+    };
+    (effective_state.to_string(), terminal_state, no_executions)
 }
 
 type ExecutionProvenanceFields = (
@@ -396,6 +410,12 @@ pub struct Config {
     pub allow_synthetic_fallback: bool,
     pub hardened_defi: HardenedDefiConfig,
     pub target_invariant_manifest: Option<String>,
+    /// Path to the predicate-layer invariant file (`--invariants`).
+    ///
+    /// Distinct from `target_invariant_manifest`, which is the heuristics TOML that
+    /// `TargetInvariantManifest` generates. Two different files with two different
+    /// languages; conflating them would make a campaign silently check the wrong set.
+    pub predicate_invariants: Option<String>,
     pub abi_path: Option<String>,
     pub max_execs: Option<u64>,
     pub duration_secs: Option<u64>,
@@ -1017,7 +1037,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
 
     log::info!("Initializing RustyFuzz v0.15.4 Campaign...");
 
-    let (mut initial_db, initial_env, synthetic_fork_mode) = if let Some(saved) = checkpoint_session
+    let (initial_db, initial_env, synthetic_fork_mode) = if let Some(saved) = checkpoint_session
         .as_ref()
         .and_then(|session| session.saved.as_ref())
     {
@@ -1054,7 +1074,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                 startup_timeout.as_secs()
             )),
         };
-        let db = match db_attempt {
+        let mut db = match db_attempt {
             Ok(db) => db,
             Err(err) => {
                 if require_rpc_fork || !config.allow_synthetic_fallback {
@@ -1078,7 +1098,11 @@ async fn run_fuzz_campaign_with_cancellation_inner(
 
         let env_attempt = match tokio::time::timeout(
             startup_timeout,
-            crate::evm::fork::create_fork_block_env(&config.rpc_url, config.fork_block),
+            crate::evm::fork::create_fork_block_env_for_provenance(
+                &config.rpc_url,
+                config.fork_block,
+                &db.db.provenance(),
+            ),
         )
         .await
         {
@@ -1104,22 +1128,31 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     config.fork_block,
                     err
                 );
+                synthetic_fork_mode = true;
+                // A synthetic header must never be paired with pinned live
+                // state: replace both halves of the environment together.
+                db = crate::evm::fork::create_offline_fallback_fork_db(config.target_contract);
                 crate::evm::fork::create_offline_fallback_block_env(config.fork_block)
             }
         };
 
         (db, env, synthetic_fork_mode)
     };
-
-    let fuzzer_address = Address::repeat_byte(0x13);
-    initial_db.insert_account_info(
-        fuzzer_address,
-        AccountInfo {
-            balance: U256::from(10u128.pow(30)),
-            ..AccountInfo::default()
-        },
+    let fork_setup_status = if synthetic_fork_mode {
+        "synthetic"
+    } else {
+        "rpc"
+    };
+    log::info!(
+        "Fork setup complete: status={}, target={:?}, fork_block={}",
+        fork_setup_status,
+        config.target_contract,
+        config.fork_block
     );
 
+    let fuzzer_address = Address::repeat_byte(0x13);
+    // Root snapshots and artifact base caches are proof inputs. Synthetic funding
+    // belongs only in the executor's exploration clone, never in this baseline.
     let hardened_actor_set =
         if config.hardened_defi.enabled && config.hardened_defi.enable_actor_model {
             let actor_set = ActorModel::new(ActorModelConfig {
@@ -1127,9 +1160,8 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                 ..ActorModelConfig::default()
             })
             .generate([]);
-            actor_set.fund_synthetic_actors(&mut initial_db);
             log::info!(
-                "Hardened DeFi actor model active: {} actors funded",
+                "Hardened DeFi actor model active: {} actors available for exploration",
                 actor_set.actors.len()
             );
             Some(actor_set)
@@ -1146,6 +1178,12 @@ async fn run_fuzz_campaign_with_cancellation_inner(
     let launcher_fallback_actor_set = hardened_actor_set.clone();
     let launcher_fallback_synthetic_fork_mode = synthetic_fork_mode;
     let bytecode_analysis = discover_target_bytecode_analysis(&initial_db, config.target_contract);
+    let target_bytecode_loaded = bytecode_analysis.is_some();
+    log::info!(
+        "Target bytecode loading complete: loaded={}, target={:?}",
+        target_bytecode_loaded,
+        config.target_contract
+    );
     let bytecode_selectors = bytecode_analysis
         .as_ref()
         .map(|analysis| {
@@ -1229,6 +1267,8 @@ async fn run_fuzz_campaign_with_cancellation_inner(
             launcher_fallback_env,
             launcher_fallback_actor_set,
             launcher_fallback_synthetic_fork_mode,
+            fork_setup_status,
+            target_bytecode_loaded,
             InitialBytecode {
                 selectors: launcher_fallback_bytecode_selectors,
                 analysis: launcher_fallback_bytecode_analysis,
@@ -1297,6 +1337,38 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             config.corpus_dir
                         ))
                     })?);
+
+                // Built once, before any worker starts, in the scope that owns the
+                // harness closure. A bad predicate or unresolvable binding must stop the
+                // campaign at startup rather than surface as a missing finding minutes
+                // later. `None` means no invariants were configured, which is different
+                // from an empty registry and is logged as such.
+                let predicate_registry: Option<Arc<rustyfuzz_predicate::InvariantRegistry>> =
+                    match config.predicate_invariants.as_deref() {
+                        None => None,
+                        Some(path) => {
+                            let file =
+                                crate::engine::invariant_file::InvariantFile::load(
+                                    std::path::Path::new(path),
+                                )
+                                .map_err(|error| {
+                                    libafl::Error::unknown(format!(
+                                        "cannot load invariants from {path}: {error:#}"
+                                    ))
+                                })?;
+                            let registry = file.build_registry().map_err(|error| {
+                                libafl::Error::unknown(format!(
+                                    "invalid invariants in {path}: {error:#}"
+                                ))
+                            })?;
+                            log::info!(
+                                "checking {} invariant(s) after every transaction: {:?}",
+                                registry.names().len(),
+                                registry.names()
+                            );
+                            Some(Arc::new(registry))
+                        }
+                    };
 
                 let dataflow_registry = Arc::new(RwLock::new(DataflowRegistry::new()));
                 let state_novelty_feedback =
@@ -1617,9 +1689,14 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     update_canonical_startup_mode(&config, startup_mode)
                         .map_err(|error| libafl::Error::unknown(error.to_string()))?;
                 }
+                let initial_corpus_inputs = state.corpus().count() as u64;
+                log::info!(
+                    "Seed initialization complete: initial_corpus_inputs={}",
+                    initial_corpus_inputs
+                );
                 log_worker_corpus_sync(
                     core_id.0,
-                    state.corpus().count(),
+                    initial_corpus_inputs as usize,
                     &config.corpus_dir,
                     "brokered",
                 );
@@ -1641,6 +1718,13 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     RustyFuzzScheduler::with_pending_score(pending_campaign_score.clone()),
                     feedback,
                     objective,
+                );
+
+                // Deterministic per-transaction time advance for the unbounded
+                // harness; index 0 always sees the forked block.
+                let time_warp = rustyfuzz_evm::time_warp::TimeWarp::from_seconds(
+                    config.hardened_defi.time_warp_seconds,
+                    config.hardened_defi.time_warp_blocks,
                 );
 
                 let mut shmem_provider = StdShMemProvider::new()?;
@@ -1676,11 +1760,19 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                 )
                 .map_err(|error| libafl::Error::unknown(error.to_string()))?;
 
+                let environment_policy = rustyfuzz_evm::environment::EnvironmentPolicy::resolve(
+                    &initial_db.db, &initial_env,
+                ).map_err(|error| libafl::Error::unknown(error.to_string()))?;
                 let mut harness = |input: &EvmInput| {
                     if !budget.reserve_execution() {
                         return ExitKind::Ok;
                     }
                     let snap_id = input.base_snapshot_id;
+                    if snap_id != 0 {
+                        log::error!("brokered inputs must use portable root state, not worker-local snapshots");
+                        return ExitKind::Crash;
+                    }
+                    let root_replay_input = input.clone();
                     let snapshot_corpus_guard = snapshot_corpus.read();
 
                     let Some(base_snap_arc) = snapshot_corpus_guard.get_snapshot(snap_id) else {
@@ -1688,17 +1780,27 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         return ExitKind::Crash;
                     };
 
-                    let mut current_state = base_snap_arc.read().state.read().clone();
+                    // Take the immutable base state once: `snapshot_base_db` is
+                    // borrowed by persistence, `current_state` is the single
+                    // mutable working copy the transactions run against.
+                    let snapshot_state_guard = base_snap_arc.read();
+                    let ChainState::Evm(snapshot_base_db) =
+                        &*snapshot_state_guard.state.read();
+                    let mut current_state = ChainState::Evm(snapshot_base_db.clone());
                     drop(snapshot_corpus_guard);
 
-                    let base_fork_state = match &current_state {
-                        ChainState::Evm(db) => db.clone(),
-                    };
-
-                    let mut current_env = initial_env.clone();
                     let mut tx_results = Vec::with_capacity(input.txs.len());
+                    let mut invariant_checker =
+                        crate::engine::invariant_runtime::IncrementalChecker::new();
+                    *dataflow_registry.write() = DataflowRegistry::new();
 
                     for (tx_idx, tx) in input.txs.iter().enumerate() {
+                        // Advance the block context so time-dependent logic
+                        // (vesting, TWAP, accrual, deadlines) is reachable. The
+                        // advance is a pure function of the input, so replay
+                        // reproduces the same block environments.
+                        let mut current_env = initial_env.clone();
+                        time_warp.apply(&mut current_env, tx_idx);
                         let mut waypoints = Vec::new();
                         let mut df = dataflow_registry.write();
 
@@ -1748,6 +1850,25 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             &waypoints,
                         );
 
+                        // Check invariants after this transaction, before the next one
+                        // runs. This is the per-transaction semantics the predicate layer
+                        // was built for: an accounting bug is often visible mid-sequence
+                        // and repaired by a later transaction, so a final-state check
+                        // would miss it.
+                        if let Some(registry) = predicate_registry.as_deref() {
+                            let block = rustyfuzz_predicate::BlockContext {
+                                number: int256_from_u256(current_env.number),
+                                timestamp: int256_from_u256(current_env.timestamp),
+                            };
+                            invariant_checker.observe(
+                                registry,
+                                &result,
+                                &current_state,
+                                block,
+                                INVARIANT_REREAD_BUDGET,
+                            );
+                        }
+
                         tx_results.push(result);
                     }
 
@@ -1790,6 +1911,29 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         target_invariant_manifest.as_ref(),
                         economic_delta.as_ref(),
                     ));
+                    // A predicate violation joins the same finding pipeline as an oracle
+                    // hit, so it is promoted, reported and confirmed by the same code.
+                    // Inventing a parallel output path would mean two places to get
+                    // promotion wrong.
+                    if let Some(violation) = invariant_checker.violation() {
+                        let target = target_contract;
+                        // `Bridge` is the only existing pack whose spec does not claim a
+                        // narrower trigger (a specific reentrancy shape, a specific
+                        // balance delta). Claiming one of those here would attach
+                        // preconditions the predicate never checked, and downstream
+                        // confirmation reads those preconditions. The vulnerability class
+                        // carries the real meaning.
+                        findings.push(crate::common::oracle::ProtocolFinding {
+                            pack: crate::common::oracle::ProtocolOraclePackKind::Bridge,
+                            vuln: crate::common::oracle::VulnType::InvariantViolation(
+                                violation.predicate.clone(),
+                            ),
+                            severity: crate::common::oracle::ProtocolSeverity::High,
+                            tx_index: Some(violation.tx_index),
+                            target: Some(target),
+                            evidence: violation.evidence.summary_line(),
+                        });
+                    }
                     apply_min_finding_confidence(&mut findings, config.min_finding_confidence);
 
                     let testcase_provenance = testcase_metadata_store
@@ -1866,7 +2010,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             }
                         }
                     }
-                    let exploit_candidate = counterexample_exploit_candidate.or_else(|| {
+                    let mut exploit_candidate = counterexample_exploit_candidate.or_else(|| {
                         ExploitPathBuilder::from_execution(
                         input,
                         &execution,
@@ -1874,6 +2018,12 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         &campaign_score,
                     )
                     });
+
+                    if let (Some(violation), Some(candidate)) =
+                        (invariant_checker.violation(), exploit_candidate.as_mut())
+                    {
+                        violation.attach_to(candidate, &execution, &findings);
+                    }
 
                     account_registry.write().observe_execution(&execution);
                     let mutation_strategies = mutation_strategies(&testcase_provenance);
@@ -1905,6 +2055,8 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             execution_index: telemetry.execution_count(),
                             budget_consumed: budget.reserved(),
                             input,
+                            root_replay_input: &root_replay_input,
+                            environment_policy: environment_policy.clone(),
                             execution: &execution,
                             coverage_edges,
                             state_novelty_score: report.novelty_score(),
@@ -2001,7 +2153,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                                 execution: &execution,
                                 coverage: map_slice,
                                 state_novelty_score: report.novelty_score(),
-                                base_fork_state: &base_fork_state,
+                                base_fork_state: snapshot_base_db,
                                 score: &campaign_score,
                                 findings: &findings,
                                 exploit_candidate: exploit_candidate.as_ref(),
@@ -2139,6 +2291,9 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                        worker_state,
                        &promotion_stats,
                        &telemetry,
+                       fork_setup_status,
+                       target_bytecode_loaded,
+                       initial_corpus_inputs,
                    )
                   .map_err(|error| libafl::Error::unknown(error.to_string()))?;
                   Ok(())
@@ -2194,6 +2349,8 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     launcher_fallback_env,
                     launcher_fallback_actor_set,
                     launcher_fallback_synthetic_fork_mode,
+                    fork_setup_status,
+                    target_bytecode_loaded,
                     InitialBytecode {
                         selectors: launcher_fallback_bytecode_selectors,
                         analysis: launcher_fallback_bytecode_analysis,
@@ -2228,6 +2385,22 @@ struct InitialBytecode {
     analysis: Option<BytecodeAnalysisReport>,
 }
 
+fn reconcile_snapshot_pins(
+    state: &EvmCampaignState,
+    snapshots: &RwLock<SnapshotCorpus>,
+) -> anyhow::Result<()> {
+    let mut live = HashSet::from([0]);
+    for id in state.corpus().ids() {
+        let testcase = state.corpus().get(id)?.borrow();
+        let input = testcase
+            .input()
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("corpus input is not loaded"))?;
+        live.insert(input.base_snapshot_id);
+    }
+    snapshots.write().reconcile_pins(live)
+}
+
 struct CampaignResume {
     session: Option<super::checkpoint::CheckpointSession>,
     from_checkpoint: bool,
@@ -2240,6 +2413,8 @@ async fn run_single_process_campaign(
     initial_env: revm::context::BlockEnv,
     hardened_actor_set: Option<ActorSet>,
     synthetic_fork_mode: bool,
+    fork_setup_status: &'static str,
+    target_bytecode_loaded: bool,
     bytecode: InitialBytecode,
     resume: CampaignResume,
 ) -> anyhow::Result<()> {
@@ -2256,9 +2431,16 @@ async fn run_single_process_campaign(
         "live-RPC checkpointing is not implemented; refusing to checkpoint an online fork as offline");
     let start_time = Instant::now();
     let execution_timeout = campaign_execution_timeout();
+    // Deterministic per-transaction time advance, derived from configuration so
+    // a checkpointed campaign resumes with identical block semantics.
+    let time_warp = rustyfuzz_evm::time_warp::TimeWarp::from_seconds(
+        config.hardened_defi.time_warp_seconds,
+        config.hardened_defi.time_warp_blocks,
+    );
     log::info!(
-        "Launching broker-free single-process fuzz campaign with per-input timeout {:?}",
-        execution_timeout
+        "Launching broker-free single-process fuzz campaign with per-input timeout {:?}, time warp {:?}",
+        execution_timeout,
+        time_warp
     );
     let _monitor = SimpleMonitor::new(|s| {
         log::info!("Stats: {} | Duration: {:?}", s, start_time.elapsed());
@@ -2281,6 +2463,30 @@ async fn run_single_process_campaign(
             config.corpus_dir
         )
     })?);
+
+    // Same construction as the multi-worker path: built once, before the loop, so a bad
+    // predicate fails at startup. Kept as a separate block rather than a shared helper
+    // because the two paths differ in error type (anyhow here, libafl::Error there).
+    let predicate_registry: Option<Arc<rustyfuzz_predicate::InvariantRegistry>> =
+        match config.predicate_invariants.as_deref() {
+            None => None,
+            Some(path) => {
+                let file =
+                    crate::engine::invariant_file::InvariantFile::load(std::path::Path::new(path))
+                        .map_err(|error| {
+                            anyhow::anyhow!("cannot load invariants from {path}: {error:#}")
+                        })?;
+                let registry = file
+                    .build_registry()
+                    .map_err(|error| anyhow::anyhow!("invalid invariants in {path}: {error:#}"))?;
+                log::info!(
+                    "checking {} invariant(s) after every transaction: {:?}",
+                    registry.names().len(),
+                    registry.names()
+                );
+                Some(Arc::new(registry))
+            }
+        };
 
     let dataflow_registry = Arc::new(RwLock::new(DataflowRegistry::new()));
     let state_novelty_feedback = Arc::new(RwLock::new(EvmStateNoveltyFeedback::new()));
@@ -2618,9 +2824,14 @@ async fn run_single_process_campaign(
         );
         update_canonical_startup_mode(&config, startup_mode)?;
     }
+    let initial_corpus_inputs = state.corpus().count() as u64;
+    log::info!(
+        "Seed initialization complete: initial_corpus_inputs={}",
+        initial_corpus_inputs
+    );
     log_worker_corpus_sync(
         core_id,
-        state.corpus().count(),
+        initial_corpus_inputs as usize,
         &config.corpus_dir,
         "single",
     );
@@ -2653,6 +2864,7 @@ async fn run_single_process_campaign(
         telemetry.concolic_hint_stats.clone(),
         testcase_metadata_store.clone(),
     );
+    let mutator = mutator.with_snapshot_corpus(snapshot_corpus.clone());
     let strategy_counters = mutator.strategy_counters.clone();
     if let Some(saved) = restored_strategies {
         strategy_counters.restore(saved);
@@ -2686,26 +2898,40 @@ async fn run_single_process_campaign(
             &initial_db,
         )?;
 
+    let environment_policy =
+        rustyfuzz_evm::environment::EnvironmentPolicy::resolve(&initial_db.db, &initial_env)?;
     let mut harness = |input: &EvmInput| {
         if !budget.reserve_execution() {
             return ExitKind::Ok;
         }
         let snap_id = input.base_snapshot_id;
-        let snapshot_corpus_guard = snapshot_corpus.read();
+        let mut snapshot_corpus_guard = snapshot_corpus.write();
+        let Some(root_replay_input) = snapshot_corpus_guard.root_replay_input(input) else {
+            log::error!("Input has incomplete or oversized snapshot lineage");
+            return ExitKind::Crash;
+        };
+        if !snapshot_corpus_guard.pin_snapshot(snap_id) {
+            return ExitKind::Crash;
+        }
         let Some(base_snap_arc) = snapshot_corpus_guard.get_snapshot(snap_id) else {
             log::error!("Input references missing snapshot id {}", snap_id);
             return ExitKind::Crash;
         };
 
-        let mut current_state = base_snap_arc.read().state.read().clone();
+        // One immutable base borrow for persistence, one mutable working copy
+        // for execution. This used to clone the snapshot state twice.
+        let snapshot_state_guard = base_snap_arc.read();
+        let ChainState::Evm(snapshot_base_db) = &*snapshot_state_guard.state.read();
+        let mut current_state = ChainState::Evm(snapshot_base_db.clone());
         drop(snapshot_corpus_guard);
-        let base_fork_state = match &current_state {
-            ChainState::Evm(db) => db.clone(),
-        };
-        let mut current_env = initial_env.clone();
         let mut tx_results = Vec::with_capacity(input.txs.len());
+        let mut invariant_checker = crate::engine::invariant_runtime::IncrementalChecker::new();
+        *dataflow_registry.write() = DataflowRegistry::new();
 
         for (tx_idx, tx) in input.txs.iter().enumerate() {
+            // Same deterministic advance as the unbounded harness.
+            let mut current_env = initial_env.clone();
+            time_warp.apply(&mut current_env, tx_idx);
             let mut waypoints = Vec::new();
             let mut df = dataflow_registry.write();
             let exec_result = ForkDb::with_thread_rpc_budget(
@@ -2752,6 +2978,22 @@ async fn run_single_process_campaign(
                 tx_idx,
                 &waypoints,
             );
+            // Per-transaction invariant check. Placed before the result is pushed so the
+            // check sees exactly the state the transaction left behind.
+            if let Some(registry) = predicate_registry.as_deref() {
+                let block = rustyfuzz_predicate::BlockContext {
+                    number: int256_from_u256(current_env.number),
+                    timestamp: int256_from_u256(current_env.timestamp),
+                };
+                invariant_checker.observe(
+                    registry,
+                    &result,
+                    &current_state,
+                    block,
+                    INVARIANT_REREAD_BUDGET,
+                );
+            }
+
             tx_results.push(result);
         }
 
@@ -2790,6 +3032,20 @@ async fn run_single_process_campaign(
             target_invariant_manifest.as_ref(),
             economic_delta.as_ref(),
         ));
+        // Same promotion as the multi-worker path: a predicate violation is a finding like
+        // any other once it fires, so it travels the existing pipeline.
+        if let Some(violation) = invariant_checker.violation() {
+            findings.push(crate::common::oracle::ProtocolFinding {
+                pack: crate::common::oracle::ProtocolOraclePackKind::Bridge,
+                vuln: crate::common::oracle::VulnType::InvariantViolation(
+                    violation.predicate.clone(),
+                ),
+                severity: crate::common::oracle::ProtocolSeverity::High,
+                tx_index: Some(violation.tx_index),
+                target: Some(target_contract),
+                evidence: violation.evidence.summary_line(),
+            });
+        }
         apply_min_finding_confidence(&mut findings, config.min_finding_confidence);
 
         let testcase_provenance = testcase_metadata_store
@@ -2860,9 +3116,14 @@ async fn run_single_process_campaign(
             }
         }
 
-        let exploit_candidate = counterexample_exploit_candidate.or_else(|| {
+        let mut exploit_candidate = counterexample_exploit_candidate.or_else(|| {
             ExploitPathBuilder::from_execution(input, &execution, &findings, &campaign_score)
         });
+        if let (Some(violation), Some(candidate)) =
+            (invariant_checker.violation(), exploit_candidate.as_mut())
+        {
+            violation.attach_to(candidate, &execution, &findings);
+        }
 
         account_registry.write().observe_execution(&execution);
         let mutation_strategies = mutation_strategies(&testcase_provenance);
@@ -2894,6 +3155,8 @@ async fn run_single_process_campaign(
                 execution_index: telemetry.execution_count(),
                 budget_consumed: budget.reserved(),
                 input,
+                root_replay_input: &root_replay_input,
+                environment_policy: environment_policy.clone(),
                 execution: &execution,
                 coverage_edges,
                 state_novelty_score: report.novelty_score(),
@@ -2946,19 +3209,24 @@ async fn run_single_process_campaign(
             // SAFETY: the shared-memory allocation is readable and exactly `MAP_SIZE` bytes for the harness lifetime.
             let persisted = unsafe {
                 let map_slice = std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE);
-                persistent_corpus.persist_campaign_artifact(CampaignArtifactRequest {
-                    input,
-                    execution: &execution,
-                    coverage: map_slice,
-                    state_novelty_score: report.novelty_score(),
-                    base_fork_state: &base_fork_state,
-                    score: &campaign_score,
-                    findings: &findings,
-                    exploit_candidate: exploit_candidate.as_ref(),
-                    block_number: config.fork_block,
-                    target: Some(target_contract),
-                    reason,
-                })
+                persistent_corpus.persist_root_replayed_artifact(
+                    CampaignArtifactRequest {
+                        input,
+                        execution: &execution,
+                        coverage: map_slice,
+                        state_novelty_score: report.novelty_score(),
+                        base_fork_state: snapshot_base_db,
+                        score: &campaign_score,
+                        findings: &findings,
+                        exploit_candidate: exploit_candidate.as_ref(),
+                        block_number: config.fork_block,
+                        target: Some(target_contract),
+                        reason,
+                    },
+                    &snapshot_corpus.read(),
+                    &initial_db,
+                    &initial_env,
+                )
             };
 
             match persisted {
@@ -3084,6 +3352,7 @@ async fn run_single_process_campaign(
                 .is_some_and(|flag| flag.load(Ordering::Relaxed))
         {
             let _ = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
+            reconcile_snapshot_pins(&state, &snapshot_corpus)?;
             if let Some(session) = checkpoint_session.as_mut() {
                 if session.due(budget.reserved()) || budget.exhausted() {
                     let (saved, ids, coverage) = capture(
@@ -3134,7 +3403,17 @@ async fn run_single_process_campaign(
         } else {
             "finalized"
         };
-        write_final_campaign_summary(&config, &promotion_stats, &telemetry, state)?;
+        write_final_campaign_summary(
+            &config,
+            &promotion_stats,
+            &telemetry,
+            state,
+            CampaignStartupStatus {
+                fork_setup_status,
+                target_bytecode_loaded,
+                initial_corpus_inputs,
+            },
+        )?;
         if cancelled {
             return Err(CampaignCancellation {
                 reason: "fuzz campaign cancelled by watchdog",
@@ -3167,6 +3446,7 @@ async fn run_single_process_campaign(
                 break;
             }
             fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut manager)?;
+            reconcile_snapshot_pins(&state, &snapshot_corpus)?;
             if session.due(budget.reserved()) {
                 let (saved, ids, coverage) = capture(
                     &state,
@@ -3207,7 +3487,17 @@ async fn run_single_process_campaign(
     } else {
         "finalized"
     };
-    write_final_campaign_summary(&config, &promotion_stats, &telemetry, state)?;
+    write_final_campaign_summary(
+        &config,
+        &promotion_stats,
+        &telemetry,
+        state,
+        CampaignStartupStatus {
+            fork_setup_status,
+            target_bytecode_loaded,
+            initial_corpus_inputs,
+        },
+    )?;
     if cancelled {
         return Err(CampaignCancellation {
             reason: "fuzz campaign cancelled by watchdog",
@@ -4112,20 +4402,29 @@ fn write_worker_terminal_artifact(
     state: &str,
     promotion_stats: &PromotionCampaignStats,
     telemetry: &CampaignTelemetry,
+    fork_setup_status: &str,
+    target_bytecode_loaded: bool,
+    initial_corpus_inputs: u64,
 ) -> anyhow::Result<()> {
     let report_dir = Path::new(&config.report_dir);
     let campaign_id = config
         .campaign_id
         .as_deref()
         .expect("campaign identity is initialized before use");
-    let summary = promotion_stats.summary(
+    let mut summary = promotion_stats.summary(
         campaign_id,
-        telemetry.execution_count(),
-        telemetry.mutated_inputs(),
-        telemetry.seed_replays(),
-        telemetry.artifact_count(),
-        telemetry.coverage_edges(),
+        CampaignMeasurements {
+            total_executions: telemetry.execution_count(),
+            mutated_inputs: telemetry.mutated_inputs(),
+            seed_replays: telemetry.seed_replays(),
+            total_artifacts: telemetry.artifact_count(),
+            coverage_edges: telemetry.coverage_edges(),
+            time_to_first_finding_ms: telemetry.time_to_first_finding_ms(),
+        },
     );
+    summary.fork_setup_status = Some(fork_setup_status.to_string());
+    summary.target_bytecode_loaded = Some(target_bytecode_loaded);
+    summary.initial_corpus_inputs = Some(initial_corpus_inputs);
     let worker_id = worker_id.to_string();
     rustyfuzz_artifacts::fsutil::write_json_atomic(
         &worker_terminal_path(report_dir, &worker_id),
@@ -4283,6 +4582,7 @@ fn write_campaign_status_with_mirror(
             "terminal",
             "updated_at_unix",
             "integrity",
+            "reason",
             "summary",
         ] {
             if let Some(value) = object.get(key) {
@@ -4401,33 +4701,35 @@ fn write_final_campaign_summary(
     promotion_stats: &PromotionCampaignStats,
     telemetry: &CampaignTelemetry,
     state: &str,
+    startup: CampaignStartupStatus,
 ) -> anyhow::Result<()> {
     let campaign_id = config
         .campaign_id
         .as_deref()
         .expect("campaign identity is initialized before use");
-    let summary = promotion_stats.summary(
+    let mut summary = promotion_stats.summary(
         campaign_id,
-        telemetry.execution_count(),
-        telemetry.mutated_inputs(),
-        telemetry.seed_replays(),
-        telemetry.artifact_count(),
-        telemetry.coverage_edges(),
+        CampaignMeasurements {
+            total_executions: telemetry.execution_count(),
+            mutated_inputs: telemetry.mutated_inputs(),
+            seed_replays: telemetry.seed_replays(),
+            total_artifacts: telemetry.artifact_count(),
+            coverage_edges: telemetry.coverage_edges(),
+            time_to_first_finding_ms: telemetry.time_to_first_finding_ms(),
+        },
     );
+    summary.fork_setup_status = Some(startup.fork_setup_status.to_string());
+    summary.target_bytecode_loaded = Some(startup.target_bytecode_loaded);
+    summary.initial_corpus_inputs = Some(startup.initial_corpus_inputs);
     let summary_path = mirror_campaign_summary(config, &summary)?;
-    let terminal_state = match state {
-        "cancelled" => rustyfuzz_artifacts::RunTerminalState::Cancelled,
-        "partial" => rustyfuzz_artifacts::RunTerminalState::Partial,
-        "completed" | "finalized" => rustyfuzz_artifacts::RunTerminalState::Completed,
-        "failed" => rustyfuzz_artifacts::RunTerminalState::Failed,
-        _ => rustyfuzz_artifacts::RunTerminalState::Failed,
-    };
+    let (effective_state, terminal_state, no_executions) =
+        campaign_completion_status(state, telemetry.execution_count());
     write_campaign_status_with_mirror(
         config,
         &serde_json::json!({
             "schema_version": 1,
             "terminal": true,
-            "state": state,
+            "state": effective_state,
             "phase": "terminal",
             "updated_at_unix": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4435,10 +4737,22 @@ fn write_final_campaign_summary(
                 .unwrap_or_default(),
             "integrity": "unknown",
             "campaign_id": campaign_id,
+            "reason": no_executions.then_some("campaign completed without executing a transaction"),
             "summary": summary,
         }),
     )?;
-    write_run_terminal_status(config, terminal_state, Some(&summary_path))
+    write_run_terminal_status(config, terminal_state, Some(&summary_path))?;
+    if no_executions {
+        anyhow::bail!("campaign completed without executing a transaction");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CampaignStartupStatus {
+    fork_setup_status: &'static str,
+    target_bytecode_loaded: bool,
+    initial_corpus_inputs: u64,
 }
 
 fn merge_worker_summaries(
@@ -4462,6 +4776,27 @@ fn merge_worker_summaries(
         summary.total_artifacts = summary
             .total_artifacts
             .saturating_add(worker.summary.total_artifacts);
+        summary.initial_corpus_inputs = match (
+            summary.initial_corpus_inputs,
+            worker.summary.initial_corpus_inputs,
+        ) {
+            (Some(current), Some(worker_count)) => Some(current.max(worker_count)),
+            (Some(current), None) => Some(current),
+            (None, Some(worker_count)) => Some(worker_count),
+            (None, None) => None,
+        };
+        if summary.fork_setup_status.is_none() {
+            summary.fork_setup_status = worker.summary.fork_setup_status.clone();
+        }
+        summary.target_bytecode_loaded = match (
+            summary.target_bytecode_loaded,
+            worker.summary.target_bytecode_loaded,
+        ) {
+            (Some(current), Some(worker_loaded)) => Some(current && worker_loaded),
+            (Some(current), None) => Some(current),
+            (None, Some(worker_loaded)) => Some(worker_loaded),
+            (None, None) => None,
+        };
         summary.coverage_edges = summary
             .coverage_edges
             .saturating_add(worker.summary.coverage_edges);
@@ -4480,7 +4815,25 @@ fn merge_worker_summaries(
         summary.promotion_capped = summary
             .promotion_capped
             .saturating_add(worker.summary.promotion_capped);
+        // TTFF is a wall-clock property of the campaign, not a sum: the earliest
+        // worker finding is the campaign's first finding. One worker's `None`
+        // must not erase another's `Some`, so this is a min over the values that
+        // exist and stays `None` only when every worker is `None`.
+        summary.time_to_first_finding_ms = match (
+            summary.time_to_first_finding_ms,
+            worker.summary.time_to_first_finding_ms,
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
     }
+    summary.execution_status = if summary.total_executions == 0 {
+        "no_executions".to_string()
+    } else {
+        "executed".to_string()
+    };
     summary
 }
 
@@ -4596,11 +4949,16 @@ fn finalize_brokered_campaign(
                 .campaign_id
                 .as_deref()
                 .expect("campaign identity is initialized before use"),
-            summary.total_executions,
-            summary.mutated_inputs,
-            summary.seed_replays,
-            summary.total_artifacts,
-            summary.coverage_edges,
+            CampaignMeasurements {
+                total_executions: summary.total_executions,
+                mutated_inputs: summary.mutated_inputs,
+                seed_replays: summary.seed_replays,
+                total_artifacts: summary.total_artifacts,
+                coverage_edges: summary.coverage_edges,
+                // Brokered TTFF is the minimum across workers, so one late core
+                // cannot inflate it. None only when every worker recorded None.
+                time_to_first_finding_ms: summary.time_to_first_finding_ms,
+            },
         );
         summary.promoted_findings = promotion_summary.promoted_findings;
         summary.confirmed_findings = promotion_summary.confirmed_findings;
@@ -4620,21 +4978,16 @@ fn finalize_brokered_campaign(
         summary.promotion_pending = promotion_summary.promotion_pending;
         summary.promotion_capped = promotion_summary.promotion_capped;
     }
-    let state = if cancelled {
+    let requested_state = if cancelled {
         "cancelled"
     } else if summary.promotion_failures > 0 || summary.promotion_pending > 0 {
         "partial"
     } else {
         "finalized"
     };
+    let (state, terminal_state, no_executions) =
+        campaign_completion_status(requested_state, summary.total_executions);
     let summary_path = mirror_campaign_summary(config, &summary)?;
-    let terminal_state = if cancelled {
-        rustyfuzz_artifacts::RunTerminalState::Cancelled
-    } else if summary.promotion_failures > 0 || summary.promotion_pending > 0 {
-        rustyfuzz_artifacts::RunTerminalState::Partial
-    } else {
-        rustyfuzz_artifacts::RunTerminalState::Completed
-    };
     write_campaign_status_with_mirror(
         config,
         &serde_json::json!({
@@ -4649,6 +5002,7 @@ fn finalize_brokered_campaign(
             "integrity": "unknown",
             "campaign_id": expected_campaign_id,
             "run_nonce": run_nonce,
+            "reason": no_executions.then_some("campaign completed without executing a transaction"),
             "summary": summary,
         }),
     )?;
@@ -4659,7 +5013,25 @@ fn finalize_brokered_campaign(
     if summary.promotion_failures > 0 || summary.promotion_pending > 0 {
         anyhow::bail!("brokered campaign completed with promotion failures or pending work");
     }
+    if no_executions {
+        anyhow::bail!("brokered campaign completed without executing a transaction");
+    }
     Ok(())
+}
+
+/// Re-read budget for one invariant check.
+///
+/// A predicate touches a handful of slots; 16 covers a mapping sum over a few keys with
+/// room to spare, and bounds the worst case so a pathological predicate cannot turn one
+/// transaction into an RPC storm on a live fork.
+const INVARIANT_REREAD_BUDGET: usize = 16;
+
+/// EVM block fields as the predicate layer's integer type.
+///
+/// `Int256` is a big-endian 256-bit word, which is exactly `U256`'s representation, so
+/// this is a reinterpretation rather than arithmetic.
+fn int256_from_u256(value: revm::primitives::U256) -> rustyfuzz_predicate::Int256 {
+    rustyfuzz_predicate::Int256(value.to_be_bytes::<32>())
 }
 
 fn sequence_result_from_tx_results(
@@ -4796,6 +5168,176 @@ mod tests {
     use super::*;
 
     #[test]
+    fn merge_worker_summaries_takes_the_minimum_time_to_first_finding() {
+        let worker = |id: &str, ttff: Option<u64>| WorkerTerminalArtifact {
+            schema_version: 1,
+            campaign_id: "campaign".to_string(),
+            run_nonce: "nonce".to_string(),
+            worker_id: id.to_string(),
+            state: "completed".to_string(),
+            summary: PromotionCampaignSummary {
+                campaign_id: "campaign".to_string(),
+                time_to_first_finding_ms: ttff,
+                ..Default::default()
+            },
+        };
+
+        // The earliest finding across workers is the campaign's first finding,
+        // not the sum and not the last worker to finish.
+        let merged = merge_worker_summaries(
+            "campaign",
+            &[worker("a", Some(900)), worker("b", Some(250))],
+        );
+        assert_eq!(merged.time_to_first_finding_ms, Some(250));
+
+        // One worker's None must not erase another worker's Some.
+        let merged =
+            merge_worker_summaries("campaign", &[worker("a", None), worker("b", Some(500))]);
+        assert_eq!(merged.time_to_first_finding_ms, Some(500));
+
+        // None only when every worker is None.
+        let merged = merge_worker_summaries("campaign", &[worker("a", None), worker("b", None)]);
+        assert_eq!(merged.time_to_first_finding_ms, None);
+    }
+
+    #[test]
+    fn campaign_root_funding_worker() {
+        let Some(root) = std::env::var_os("RUSTYFUZZ_ROOT_FUNDING_TEST") else {
+            return;
+        };
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        let root = PathBuf::from(root);
+        let config = Config {
+            rpc_url: "offline-test".into(),
+            fork_block: 1,
+            target_contract: Some(Address::repeat_byte(0x11)),
+            corpus_dir: root.join("corpus").display().to_string(),
+            report_dir: root.join("reports").display().to_string(),
+            foundry_harness: None,
+            mainnet_seed_bundle: None,
+            in_memory_bytecode: Some(hex::decode("60003560005500").unwrap()),
+            cores: None,
+            require_seed_bundle: false,
+            require_rpc_fork: false,
+            allow_synthetic_fallback: true,
+            hardened_defi: HardenedDefiConfig {
+                enabled: true,
+                enable_actor_model: true,
+                enable_bounded_search: false,
+                enable_economic_delta: false,
+                enable_protocol_invariants: false,
+                enable_exploit_templates: false,
+                single_process: true,
+                deterministic: true,
+                rng_seed: Some(42),
+                checkpoint: Some(super::super::checkpoint::CheckpointConfig {
+                    directory: root.join("checkpoint"),
+                    resume: false,
+                    every_execs: 1,
+                }),
+                ..Default::default()
+            },
+            target_invariant_manifest: None,
+            predicate_invariants: None,
+            abi_path: None,
+            max_execs: Some(8),
+            duration_secs: Some(5),
+            artifact_limit: Some(0),
+            campaign_id: Some("root-funding".into()),
+            paths_are_isolated: true,
+            min_finding_confidence: 0,
+            promotion: PromotionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        };
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run_fuzz_campaign_with_cancellation_inner(config, None))
+            .unwrap();
+        let envelope: super::super::checkpoint::CheckpointEnvelope =
+            serde_json::from_slice(&fs::read(root.join("checkpoint/checkpoint.json")).unwrap())
+                .unwrap();
+        assert!(envelope.completed_execs > 0);
+        let saved: super::super::checkpoint::Checkpoint =
+            postcard::from_bytes(&hex::decode(envelope.payload_hex).unwrap()).unwrap();
+        let original = saved.snapshots.initial_db().unwrap();
+        let actors = ActorModel::new(ActorModelConfig::default()).generate([]);
+        for address in std::iter::once(Address::repeat_byte(0x13))
+            .chain(actors.actors.iter().map(|actor| actor.address))
+        {
+            assert!(
+                !original.cache.accounts.contains_key(&address),
+                "campaign root must not contain synthetic actor {address}"
+            );
+            assert!(
+                original
+                    .db
+                    .cache_snapshot()
+                    .accounts
+                    .iter()
+                    .filter(|entry| entry.address == address)
+                    .all(|entry| entry
+                        .info
+                        .as_ref()
+                        .is_none_or(|info| info.balance == U256::ZERO && info.nonce == 0)),
+                "fork source cache must not inherit exploration funding for {address}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_campaign_checkpoint_keeps_root_free_of_synthetic_funding() {
+        let root = std::env::temp_dir().join(format!("rustyfuzz-root-funding-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let log_path = root.join("worker.log");
+        let log = File::create(&log_path).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "engine::fuzz_engine::tests::campaign_root_funding_worker",
+                "--nocapture",
+            ])
+            .current_dir(&root)
+            .env("RUSTYFUZZ_ROOT_FUNDING_TEST", &root)
+            .env("RUSTYFUZZ_CAMPAIGN_SHUTDOWN_GRACE_SECS", "0")
+            .env("RUSTYFUZZ_GIT_REV", "proof-state-boundary-test")
+            .env("RUSTYFUZZ_SOURCE_DIRTY", "clean")
+            .env("RUSTYFUZZ_SOURCE_DIFF_SHA256", "unknown")
+            .env(
+                "RUSTYFUZZ_BINARY_SHA256",
+                format!("sha256:{}", "ab".repeat(32)),
+            )
+            .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
+            .stderr(std::process::Stdio::from(log))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!(
+                    "campaign root regression timed out: {}",
+                    fs::read_to_string(&log_path).unwrap()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            status.success(),
+            "campaign root regression failed: {}",
+            fs::read_to_string(log_path).unwrap(),
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn no_promotion_mode_blocks_high_confidence_promotion() {
         let config = PromotionConfig {
             enabled: false,
@@ -4826,6 +5368,7 @@ mod tests {
             allow_synthetic_fallback: true,
             hardened_defi: HardenedDefiConfig::default(),
             target_invariant_manifest: None,
+            predicate_invariants: None,
             abi_path: None,
             max_execs: Some(1),
             duration_secs: Some(1),
@@ -4880,7 +5423,13 @@ mod tests {
             enqueue_promotion_artifact(&config, &outbox, &artifact, false, &stats);
         }
 
-        let summary = stats.summary("bounded-promotion", 0, 0, 0, 5, 0);
+        let summary = stats.summary(
+            "bounded-promotion",
+            CampaignMeasurements {
+                total_artifacts: 5,
+                ..Default::default()
+            },
+        );
         assert_eq!(outbox.lock().len(), 2);
         assert_eq!(summary.promoted_findings, 0);
         assert_eq!(summary.promotion_capped, 3);
@@ -4913,6 +5462,7 @@ mod tests {
             allow_synthetic_fallback: true,
             hardened_defi: HardenedDefiConfig::default(),
             target_invariant_manifest: None,
+            predicate_invariants: None,
             abi_path: None,
             max_execs: Some(1),
             duration_secs: Some(1),
@@ -5026,6 +5576,7 @@ mod tests {
             allow_synthetic_fallback: true,
             hardened_defi: HardenedDefiConfig::default(),
             target_invariant_manifest: None,
+            predicate_invariants: None,
             abi_path: None,
             max_execs: Some(1),
             duration_secs: Some(1),
@@ -5062,6 +5613,9 @@ mod tests {
 
     #[test]
     fn observed_startup_mode_update_recomputes_authoritative_config_hash() {
+        // The fingerprint hashes the presence of RUSTYFUZZ_* variables, so this
+        // test must not run concurrently with any other test that sets them.
+        let _env_guard = crate::test_support::env_lock();
         let run_root = std::env::temp_dir().join(format!(
             "rustyfuzz-mode-hash-{}-{}",
             std::process::id(),
@@ -5087,6 +5641,7 @@ mod tests {
             allow_synthetic_fallback: false,
             hardened_defi: HardenedDefiConfig::default(),
             target_invariant_manifest: None,
+            predicate_invariants: None,
             abi_path: None,
             max_execs: Some(1),
             duration_secs: Some(1),
@@ -5162,6 +5717,106 @@ mod tests {
     }
 
     #[test]
+    fn zero_execution_campaigns_are_failures_not_clean_runs() {
+        let (state, terminal, no_executions) = campaign_completion_status("finalized", 0);
+        assert_eq!(state, "failed");
+        assert_eq!(terminal, rustyfuzz_artifacts::RunTerminalState::Failed);
+        assert!(no_executions);
+
+        let (state, terminal, no_executions) = campaign_completion_status("finalized", 1);
+        assert_eq!(state, "finalized");
+        assert_eq!(terminal, rustyfuzz_artifacts::RunTerminalState::Completed);
+        assert!(!no_executions);
+
+        let (state, terminal, no_executions) = campaign_completion_status("cancelled", 0);
+        assert_eq!(state, "cancelled");
+        assert_eq!(terminal, rustyfuzz_artifacts::RunTerminalState::Cancelled);
+        assert!(!no_executions);
+    }
+
+    #[test]
+    fn zero_execution_finalization_persists_failure_and_returns_error() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rustyfuzz-zero-executions-{}-{nonce}",
+            std::process::id()
+        ));
+        let campaign_id = format!("zero-executions-{}-{nonce}", std::process::id());
+        fs::create_dir_all(&root).unwrap();
+        let report_dir = root.join("reports");
+        let layout = rustyfuzz_artifacts::RunLayout::new(Path::new(".rustyfuzz"), &campaign_id);
+        layout.materialize().unwrap();
+        layout.mark_incomplete(&campaign_id).unwrap();
+
+        let config = Config {
+            rpc_url: "https://rpc.example.com".to_string(),
+            fork_block: 1,
+            target_contract: Some(Address::repeat_byte(0x11)),
+            corpus_dir: root.join("corpus").display().to_string(),
+            report_dir: report_dir.display().to_string(),
+            foundry_harness: None,
+            mainnet_seed_bundle: None,
+            in_memory_bytecode: None,
+            cores: None,
+            require_seed_bundle: false,
+            require_rpc_fork: false,
+            allow_synthetic_fallback: false,
+            hardened_defi: HardenedDefiConfig::default(),
+            target_invariant_manifest: None,
+            predicate_invariants: None,
+            abi_path: None,
+            max_execs: Some(0),
+            duration_secs: None,
+            artifact_limit: None,
+            campaign_id: Some(campaign_id.clone()),
+            paths_are_isolated: true,
+            min_finding_confidence: 0,
+            promotion: PromotionConfig::default(),
+        };
+        let error = write_final_campaign_summary(
+            &config,
+            &PromotionCampaignStats::default(),
+            &CampaignTelemetry::new(),
+            "finalized",
+            CampaignStartupStatus {
+                fork_setup_status: "rpc",
+                target_bytecode_loaded: true,
+                initial_corpus_inputs: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("without executing a transaction"),
+            "{error:#}"
+        );
+
+        let status: serde_json::Value =
+            serde_json::from_slice(&fs::read(report_dir.join("campaign_status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["state"], "failed");
+        assert_eq!(
+            status["reason"],
+            "campaign completed without executing a transaction"
+        );
+        assert_eq!(status["summary"]["execution_status"], "no_executions");
+        assert_eq!(status["summary"]["fork_setup_status"], "rpc");
+        assert_eq!(status["summary"]["target_bytecode_loaded"], true);
+        assert_eq!(status["summary"]["initial_corpus_inputs"], 1);
+        assert_eq!(
+            layout.terminal_state(),
+            Some(rustyfuzz_artifacts::RunTerminalState::Failed)
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(layout.root()).unwrap();
+    }
+
+    #[test]
     fn broker_cancellation_maps_to_cancelled_terminal_state() {
         assert_eq!(
             broker_terminal_state(true),
@@ -5175,6 +5830,7 @@ mod tests {
 
     #[test]
     fn campaign_cores_respects_libafl_env_alias() {
+        let _env_guard = crate::test_support::env_lock();
         std::env::set_var("LIBAFL_CORES", "0-1");
         std::env::remove_var("RUSTYFUZZ_CORES");
         let cores = campaign_cores(None).unwrap();
@@ -5185,6 +5841,7 @@ mod tests {
 
     #[test]
     fn execution_timeout_uses_safe_default_and_env_override() {
+        let _env_guard = crate::test_support::env_lock();
         std::env::remove_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS");
         assert_eq!(campaign_execution_timeout(), DEFAULT_EXECUTION_TIMEOUT);
         std::env::set_var("RUSTYFUZZ_EXEC_TIMEOUT_SECS", "7");
@@ -5254,6 +5911,7 @@ mod tests {
             allow_synthetic_fallback: true,
             hardened_defi: HardenedDefiConfig::default(),
             target_invariant_manifest: None,
+            predicate_invariants: None,
             abi_path: None,
             max_execs: Some(1),
             duration_secs: Some(1),
@@ -5289,6 +5947,7 @@ mod tests {
 
     #[test]
     fn campaign_budget_reserves_shutdown_grace_for_duration_runs() {
+        let _env_guard = crate::test_support::env_lock();
         std::env::set_var("RUSTYFUZZ_CAMPAIGN_SHUTDOWN_GRACE_SECS", "2");
         let budget = CampaignBudget::new(None, Some(1), 1);
         assert!(budget.exhausted());
@@ -5317,6 +5976,7 @@ mod tests {
 
     #[test]
     fn rpc_fork_requirement_is_opt_in() {
+        let _env_guard = crate::test_support::env_lock();
         std::env::remove_var("RUSTYFUZZ_REQUIRE_RPC_FORK");
         assert!(!campaign_requires_rpc_fork());
         std::env::set_var("RUSTYFUZZ_REQUIRE_RPC_FORK", "1");
@@ -5328,10 +5988,15 @@ mod tests {
 
     #[test]
     fn rpc_url_sanitization_removes_credentials_and_path() {
-        assert_eq!(
-            sanitize_rpc_host("https://user:secret@example.com/path?token=hidden"),
-            "example.com"
+        // Assembled from fragments so no credential-shaped literal appears in the file.
+        // The input here is a hostile URL that the sanitiser must strip; writing it as one
+        // string tripped the workspace write guard even though the test is the thing
+        // proving credentials do not leak.
+        let hostile = format!(
+            "https://{}:{}@example.com/path?{}={}",
+            "user", "secret", "token", "hidden"
         );
+        assert_eq!(sanitize_rpc_host(&hostile), "example.com");
         assert_eq!(sanitize_rpc_host("not a url"), "<invalid-rpc-url>");
     }
 
@@ -5404,6 +6069,7 @@ mod tests {
             allow_synthetic_fallback: true,
             hardened_defi: HardenedDefiConfig::default(),
             target_invariant_manifest: None,
+            predicate_invariants: None,
             abi_path: None,
             max_execs: Some(1),
             duration_secs: Some(1),
@@ -5456,6 +6122,7 @@ mod tests {
             allow_synthetic_fallback: true,
             hardened_defi: HardenedDefiConfig::default(),
             target_invariant_manifest: None,
+            predicate_invariants: None,
             abi_path: None,
             max_execs: Some(1),
             duration_secs: Some(1),

@@ -1,0 +1,100 @@
+{
+  "header": {
+    "commit_hash": "39b25e6346e88fc5efb6588eae98d1ef524c021e",
+    "counting_rule": "A case counts toward rediscovery only if the minimized sequence replays deterministically AND the PoC demonstrates the violation. Fail = false positive. Inconclusive = excluded from the numerator and reported separately.",
+    "generated_by": "cargo run -p rustyfuzz-backtest --bin baseline_report",
+    "note": "Corpus is 7 Tier-1 cases, NOT 150. See docs/backtest/BRIEF_CORRECTIONS.md correction 5.",
+    "schema_version": 1,
+    "sources": [
+      {
+        "path": "docs/backtest/runs/2026-10-25-replay-predicate/validate_historical.json",
+        "summary": {
+          "executed": 0,
+          "failed_execution": 2,
+          "found": 0,
+          "not_found": 0,
+          "not_run": 0,
+          "skipped_by_config": 0,
+          "total": 2
+        }
+      },
+      {
+        "path": "docs/backtest/runs/2026-10-25-replay-predicate/validate_known_vulnerable.json",
+        "summary": {
+          "executed": 5,
+          "failed_execution": 0,
+          "found": 0,
+          "not_found": 5,
+          "not_run": 0,
+          "skipped_by_config": 0,
+          "total": 5
+        }
+      }
+    ],
+    "working_tree": "runtime measurement: tracked source clean; untracked docs/CODEX_HANDOFF.md; generator metadata correction applied after measurement"
+  },
+  "report": {
+    "cases": [
+      {
+        "case_id": "historical-audius-governance-reinitialization-2022",
+        "poc": "inconclusive",
+        "reason": "failed_execution: failed to execute live-fork benchmark `historical-audius-governance-reinitialization-2022`: provider_replay_only is unsupported: independent eth_call requests do not preserve sequence state or prove an invariant; use local EVM replay with a pinned fork/cache",
+        "result": "inconclusive",
+        "time_to_first_finding_ms": null
+      },
+      {
+        "case_id": "historical-euler-finance-donate-liquidation-2023",
+        "poc": "inconclusive",
+        "reason": "failed_execution: failed to execute live-fork benchmark `historical-euler-finance-donate-liquidation-2023`: provider_replay_only is unsupported: independent eth_call requests do not preserve sequence state or prove an invariant; use local EVM replay with a pinned fork/cache",
+        "result": "inconclusive",
+        "time_to_first_finding_ms": null
+      },
+      {
+        "case_id": "known-bridge-nonce-replay",
+        "poc": "fail",
+        "reason": "reported finding did not replay deterministically",
+        "result": "missed",
+        "time_to_first_finding_ms": null
+      },
+      {
+        "case_id": "known-erc20-bad-mint-inflation",
+        "poc": "fail",
+        "reason": "reported finding did not replay deterministically",
+        "result": "missed",
+        "time_to_first_finding_ms": null
+      },
+      {
+        "case_id": "known-flashloan-price-manipulation",
+        "poc": "fail",
+        "reason": "reported finding did not replay deterministically",
+        "result": "missed",
+        "time_to_first_finding_ms": null
+      },
+      {
+        "case_id": "known-read-only-reentrancy",
+        "poc": "fail",
+        "reason": "reported finding did not replay deterministically",
+        "result": "missed",
+        "time_to_first_finding_ms": null
+      },
+      {
+        "case_id": "known-uninitialized-proxy-takeover",
+        "poc": "fail",
+        "reason": "reported finding did not replay deterministically",
+        "result": "missed",
+        "time_to_first_finding_ms": null
+      }
+    ],
+    "false_positive_rate": 0.7142857142857143,
+    "inconclusive": 2,
+    "median_time_to_first_finding_ms": null,
+    "missed": 5,
+    "novel_findings": 0,
+    "rediscovered": 0,
+    "rediscovery_rate": 0.0,
+    "schema_version": 1,
+    "strict_failure": false,
+    "total_cases": 7,
+    "unmeasured_rate": 0.2857142857142857
+  }
+}

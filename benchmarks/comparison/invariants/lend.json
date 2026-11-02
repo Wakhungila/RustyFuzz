@@ -1,0 +1,23 @@
+{
+ "target": "0xdc64a140aa3e981100a9beca4e685f962f0cf6c9",
+ "symbols": {
+  "debt": {
+   "kind": "slot",
+   "slot": "0x1",
+   "offset_bits": 0,
+   "width_bits": 256
+  },
+  "collateral": {
+   "kind": "slot",
+   "slot": "0x2",
+   "offset_bits": 0,
+   "width_bits": 256
+  }
+ },
+ "invariants": [
+  {
+   "name": "debtWithinCollateral",
+   "predicate": "debt * 4 <= collateral * 3"
+  }
+ ]
+}

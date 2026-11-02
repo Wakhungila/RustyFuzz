@@ -246,6 +246,7 @@ async fn run_benchmark_contract(
         allow_synthetic_fallback: true,
         hardened_defi,
         target_invariant_manifest: None,
+        predicate_invariants: None,
         abi_path: abi_path.as_ref().map(|path| path.display().to_string()),
         max_execs: Some(args.max_execs),
         duration_secs: None,

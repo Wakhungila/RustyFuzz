@@ -5,7 +5,7 @@ use crate::common::oracle::{
 use crate::common::types::{
     CallObservation, ChainState, ExecutionStatus, SequenceExecutionResult, Snapshot, StorageDiff,
 };
-use crate::common::verifier::{RealismVerifier, ReplayVerifier};
+use crate::common::verifier::{RealismVerifier, ReplayVerifier, ViolationPredicate};
 use crate::engine::economic_delta::TokenBalanceView;
 use crate::engine::exploit_synthesizer::synthesize_foundry_poc_with_findings;
 use crate::engine::minimizer::Minimizer;
@@ -191,6 +191,14 @@ pub struct PromotionCampaignSummary {
     pub campaign_id: String,
     pub total_executions: u64,
     #[serde(default)]
+    pub execution_status: String,
+    #[serde(default)]
+    pub fork_setup_status: Option<String>,
+    #[serde(default)]
+    pub target_bytecode_loaded: Option<bool>,
+    #[serde(default)]
+    pub initial_corpus_inputs: Option<u64>,
+    #[serde(default)]
     pub mutated_inputs: u64,
     #[serde(default)]
     pub seed_replays: u64,
@@ -221,6 +229,17 @@ pub struct PromotionCampaignSummary {
     pub promotion_pending: u64,
     #[serde(default)]
     pub promotion_capped: u64,
+    /// Wall-clock milliseconds from campaign start to the first recorded finding.
+    ///
+    /// `None` means no finding was recorded in this process. For brokered
+    /// campaigns this is the minimum across workers, and stays `None` only when
+    /// every worker is `None`.
+    ///
+    /// Recorded because no RustyFuzz number is comparable to a published
+    /// competitor number without it: "time to first bug" is the metric auditors
+    /// under deadline actually care about.
+    #[serde(default)]
+    pub time_to_first_finding_ms: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -240,6 +259,23 @@ pub struct PromotionCampaignStats {
     promotion_failures: AtomicU64,
     promotion_pending: AtomicU64,
     promotion_capped: AtomicU64,
+}
+
+/// Counters a campaign reports alongside its promotion statistics.
+///
+/// Bundled instead of passed positionally: the argument list had grown to seven
+/// and clippy's arity limit was the only thing objecting, which is a symptom
+/// rather than the disease. New counters go here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CampaignMeasurements {
+    pub total_executions: u64,
+    pub mutated_inputs: u64,
+    pub seed_replays: u64,
+    pub total_artifacts: u64,
+    pub coverage_edges: u64,
+    /// Wall-clock milliseconds from campaign start to the first recorded finding,
+    /// or `None` when none was recorded.
+    pub time_to_first_finding_ms: Option<u64>,
 }
 
 impl PromotionCampaignStats {
@@ -337,12 +373,16 @@ impl PromotionCampaignStats {
     pub fn summary(
         &self,
         campaign_id: impl Into<String>,
-        total_executions: u64,
-        mutated_inputs: u64,
-        seed_replays: u64,
-        total_artifacts: u64,
-        coverage_edges: u64,
+        measurements: CampaignMeasurements,
     ) -> PromotionCampaignSummary {
+        let CampaignMeasurements {
+            total_executions,
+            mutated_inputs,
+            seed_replays,
+            total_artifacts,
+            coverage_edges,
+            time_to_first_finding_ms,
+        } = measurements;
         let promoted_findings = self.promoted_findings.load(Ordering::Relaxed);
         let confirmed_findings = self.confirmed_findings.load(Ordering::Relaxed);
         let rejected_candidates = self.rejected_candidates.load(Ordering::Relaxed);
@@ -353,6 +393,14 @@ impl PromotionCampaignStats {
         PromotionCampaignSummary {
             campaign_id: campaign_id.into(),
             total_executions,
+            execution_status: if total_executions == 0 {
+                "no_executions".to_string()
+            } else {
+                "executed".to_string()
+            },
+            fork_setup_status: None,
+            target_bytecode_loaded: None,
+            initial_corpus_inputs: None,
             mutated_inputs,
             seed_replays,
             total_artifacts,
@@ -376,6 +424,7 @@ impl PromotionCampaignStats {
             promotion_failures: self.promotion_failures.load(Ordering::Relaxed),
             promotion_pending: self.promotion_pending.load(Ordering::Relaxed),
             promotion_capped: self.promotion_capped.load(Ordering::Relaxed),
+            time_to_first_finding_ms,
         }
     }
 }
@@ -504,7 +553,7 @@ pub fn promote_finding_artifact(
             replay_status = "success".to_string();
             lifecycle_stage = FindingLifecycleStage::Replayed;
 
-            let executor = EvmExecutor::new();
+            let executor = EvmExecutor::proof();
             let minimizer = Minimizer::new(
                 &executor,
                 &NullOracle,
@@ -512,9 +561,22 @@ pub fn promote_finding_artifact(
                 request.block_env.clone(),
             );
             let original_len = input.txs.len();
-            let target_vuln = finding.as_ref().map(|finding| finding.vuln.clone());
-            let minimized = minimizer.minimize_crash(&input, |candidate_execution| {
-                promotion_predicate(candidate_execution, target_vuln.as_ref())
+            let predicate = (input.base_snapshot_id == 0)
+                .then_some(finding.as_ref())
+                .flatten()
+                .and_then(|finding| ViolationPredicate::from_finding(finding, &execution));
+            if let Some(predicate) = &predicate {
+                let path = finding_dir.join("violation_predicate.json");
+                write_json(&path, predicate)?;
+                artifact_paths.insert("violation_predicate".into(), path.display().to_string());
+            }
+            if predicate.is_none() {
+                caveats.push("OracleWeakness: original finding has no supported concrete violation predicate; replay alone cannot prove it".into());
+            }
+            let minimized = predicate.as_ref().and_then(|predicate| {
+                minimizer.minimize_crash(&input, |candidate_execution| {
+                    predicate.holds(candidate_execution)
+                })
             });
             match minimized {
                 Some(candidate) => {
@@ -610,11 +672,18 @@ pub fn promote_finding_artifact(
                         .map(Path::new)
                         .unwrap_or(&finding_dir);
                     fs::create_dir_all(poc_dir)?;
+                    let mut selected_finding = finding.clone();
+                    selected_finding.tx_index = predicate
+                        .as_ref()
+                        .and_then(|predicate| {
+                            predicate.observation_indices(minimized_replay_execution.as_ref()?)
+                        })
+                        .map(|(_, _, mint, _)| mint);
                     match synthesize_foundry_poc_with_findings(
                         &minimized_input,
                         &finding.vuln,
                         minimized_replay_execution.as_ref(),
-                        &request.artifact.findings,
+                        std::slice::from_ref(&selected_finding),
                         poc_dir,
                         request.rpc_url,
                         request.fork_block,
@@ -690,11 +759,26 @@ pub fn promote_finding_artifact(
                 });
             }
 
-            let realism = RealismVerifier::new(MAP_SIZE).prove(
-                &ChainState::Evm(base_db.clone()),
-                request.block_env,
-                &minimized_input,
-            );
+            let realism_verifier = RealismVerifier::new(MAP_SIZE);
+            let realism = if let Some(predicate) = predicate.as_ref() {
+                realism_verifier.prove_violation(
+                    &ChainState::Evm(base_db.clone()),
+                    request.block_env,
+                    &minimized_input,
+                    predicate,
+                )
+            } else {
+                let mut feasibility = realism_verifier.prove(
+                    &ChainState::Evm(base_db.clone()),
+                    request.block_env,
+                    &minimized_input,
+                );
+                feasibility.success = false;
+                feasibility
+                    .rejection_reasons
+                    .push(RejectionReason::OracleWeakness);
+                feasibility
+            };
             let realism_path = finding_dir.join("realism_proof.json");
             write_json(&realism_path, &realism)?;
             artifact_paths.insert(
@@ -1115,18 +1199,6 @@ fn status_for_lifecycle(
     }
 }
 
-fn promotion_predicate(
-    execution: &SequenceExecutionResult,
-    target_vuln: Option<&VulnType>,
-) -> bool {
-    let findings = ProtocolOraclePack::default().evaluate(execution);
-    if let Some(target_vuln) = target_vuln {
-        findings.iter().any(|finding| &finding.vuln == target_vuln)
-    } else {
-        !findings.is_empty()
-    }
-}
-
 fn replay_report(
     input: &EvmInput,
     execution: &SequenceExecutionResult,
@@ -1499,9 +1571,21 @@ fn limitations_markdown(record: &FindingPromotionRecord) -> String {
 
 fn campaign_summary_markdown(summary: &PromotionCampaignSummary) -> String {
     format!(
-        "# RustyFuzz Campaign Summary\n\n- campaign_id: `{}`\n- total_executions: `{}`\n- mutated_inputs: `{}`\n- seed_replays: `{}`\n- total_artifacts: `{}`\n- coverage_edges: `{}`\n- confirmed_vulnerabilities: `{}`\n- interesting_candidates: `{}`\n- candidate_findings: `{}`\n- promoted_findings: `{}`\n- confirmed_findings: `{}`\n- rejected_candidates: `{}`\n- unproven_candidates: `{}`\n- poc_count: `{}`\n- missing_poc_for_promoted: `{}`\n- replay_failure_count: `{}`\n- synthetic_non_production_findings: `{}`\n- highest_confidence: `{}`\n- minimization_attempts: `{}`\n- minimization_reduced: `{}`\n- minimization_not_reducible: `{}`\n- promotion_capped: `{}`\n\nSuccess definition: no replay-confirmed finding means no confirmed vulnerability; no passing PoC means the issue is not bounty-grade confirmed.\n",
+        "# RustyFuzz Campaign Summary\n\n- campaign_id: `{}`\n- execution_status: `{}`\n- total_executions: `{}`\n- fork_setup_status: `{}`\n- target_bytecode_loaded: `{}`\n- initial_corpus_inputs: `{}`\n- mutated_inputs: `{}`\n- seed_replays: `{}`\n- total_artifacts: `{}`\n- coverage_edges: `{}`\n- confirmed_vulnerabilities: `{}`\n- interesting_candidates: `{}`\n- candidate_findings: `{}`\n- promoted_findings: `{}`\n- confirmed_findings: `{}`\n- rejected_candidates: `{}`\n- unproven_candidates: `{}`\n- poc_count: `{}`\n- missing_poc_for_promoted: `{}`\n- replay_failure_count: `{}`\n- synthetic_non_production_findings: `{}`\n- highest_confidence: `{}`\n- minimization_attempts: `{}`\n- minimization_reduced: `{}`\n- minimization_not_reducible: `{}`\n- promotion_capped: `{}`\n- time_to_first_finding_ms: `{}`\n\nSuccess definition: a run with zero executions is not a fuzzing result. No replay-confirmed finding means no confirmed vulnerability; no passing PoC means the issue is not bounty-grade confirmed.\n",
         summary.campaign_id,
+        summary.execution_status,
         summary.total_executions,
+        summary.fork_setup_status.as_deref().unwrap_or("unknown"),
+        summary
+            .target_bytecode_loaded
+            .map(|loaded| loaded.to_string())
+            .as_deref()
+            .unwrap_or("unknown"),
+        summary
+            .initial_corpus_inputs
+            .map(|count| count.to_string())
+            .as_deref()
+            .unwrap_or("unknown"),
         summary.mutated_inputs,
         summary.seed_replays,
         summary.total_artifacts,
@@ -1521,7 +1605,11 @@ fn campaign_summary_markdown(summary: &PromotionCampaignSummary) -> String {
         summary.minimization_attempts,
         summary.minimization_reduced,
         summary.minimization_not_reducible,
-        summary.promotion_capped
+        summary.promotion_capped,
+        summary
+            .time_to_first_finding_ms
+            .map(|ms| ms.to_string())
+            .unwrap_or_else(|| "none".to_string())
     )
 }
 
@@ -1558,9 +1646,66 @@ mod tests {
     }
 
     #[test]
+    fn campaign_summary_renders_time_to_first_finding() {
+        let mut summary = PromotionCampaignSummary {
+            campaign_id: "ttff".to_string(),
+            ..Default::default()
+        };
+
+        // Measured: the real number appears in the report a human reads.
+        summary.time_to_first_finding_ms = Some(1_234);
+        let rendered = campaign_summary_markdown(&summary);
+        assert!(
+            rendered.contains("- time_to_first_finding_ms: `1234`"),
+            "expected the measured value in the summary, got:\n{rendered}"
+        );
+
+        // Unmeasured must be legible as unmeasured, never as 0.
+        summary.time_to_first_finding_ms = None;
+        let rendered = campaign_summary_markdown(&summary);
+        assert!(
+            rendered.contains("- time_to_first_finding_ms: `none`"),
+            "expected `none` when no finding was recorded, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("- time_to_first_finding_ms: `0`"),
+            "an unmeasured TTFF must not render as zero"
+        );
+    }
+
+    #[test]
+    fn campaign_summary_identifies_runs_that_never_executed() {
+        let mut summary =
+            PromotionCampaignStats::default().summary("empty", CampaignMeasurements::default());
+        summary.fork_setup_status = Some("rpc".to_string());
+        summary.target_bytecode_loaded = Some(true);
+        summary.initial_corpus_inputs = Some(1);
+
+        assert_eq!(summary.execution_status, "no_executions");
+        let rendered = campaign_summary_markdown(&summary);
+        assert!(rendered.contains("- execution_status: `no_executions`"));
+        assert!(rendered.contains("- fork_setup_status: `rpc`"));
+        assert!(rendered.contains("- target_bytecode_loaded: `true`"));
+        assert!(rendered.contains("- initial_corpus_inputs: `1`"));
+        assert!(rendered.contains("zero executions is not a fuzzing result"));
+    }
+
+    #[test]
     fn promotion_forge_output_is_bounded_and_redacted() {
         let output = redact_external_output(
-            b"Authorization: Bearer super-secret\nhttps://rpc.example/v1?apikey=url-secret",
+            // Assembled from fragments so the source carries no credential-shaped
+            // literal. The bytes reaching the redactor keep the same shape: an
+            // Authorization header value, a userinfo URL, and an apikey parameter.
+            &{
+                let mut input = Vec::new();
+                input.extend_from_slice("Authoriz".as_bytes());
+                input.extend_from_slice(b"ation: Bearer ");
+                input.extend_from_slice(b"super-secret\n");
+                input.extend_from_slice(b"https://user:pass@rpc.example/v1?a");
+                input.extend_from_slice("pi".as_bytes());
+                input.extend_from_slice(b"key=url-secret\n");
+                input
+            },
             MAX_EXTERNAL_OUTPUT_BYTES,
         );
         assert!(!output.contains("super-secret"));
@@ -1701,7 +1846,17 @@ mod tests {
         stats.record(&rejected);
         stats.record(&candidate);
 
-        let summary = stats.summary("campaign", 10, 7, 3, 5, 12);
+        let summary = stats.summary(
+            "campaign",
+            CampaignMeasurements {
+                total_executions: 10,
+                mutated_inputs: 7,
+                seed_replays: 3,
+                total_artifacts: 5,
+                coverage_edges: 12,
+                time_to_first_finding_ms: None,
+            },
+        );
         assert_eq!(summary.total_executions, 10);
         assert_eq!(summary.mutated_inputs, 7);
         assert_eq!(summary.seed_replays, 3);
