@@ -22,13 +22,13 @@ use rusty_fuzz::engine::fork_setup::ForkSetupDiscoverer;
 use rusty_fuzz::engine::foundry_ingest::FoundryHarnessManifest;
 use rusty_fuzz::engine::invariant_manifest::TargetInvariantManifest;
 use rusty_fuzz::engine::minimizer::Minimizer;
-use rusty_fuzz::engine::promotion::{PromotionConfig, PromotionRequest, promote_finding_artifact};
+use rusty_fuzz::engine::promotion::{promote_finding_artifact, PromotionConfig, PromotionRequest};
 use rusty_fuzz::engine::seed_intelligence::SeedIntelligence;
 use rusty_fuzz::evm::corpus::{CampaignArtifactRecord, PersistentCorpus};
 use rusty_fuzz::evm::fork::configured_provider;
 use rusty_fuzz::evm::seed_ingester::{
-    MainnetSeed, MainnetSeedBundle, MainnetSeedConfig, SeedIngester, SeedMetadata, SeedScanMode,
-    seed_abi_functions,
+    seed_abi_functions, MainnetSeed, MainnetSeedBundle, MainnetSeedConfig, SeedIngester,
+    SeedMetadata, SeedScanMode,
 };
 use rustyfuzz_evm::executor::EvmExecutor;
 use rustyfuzz_evm::fork_db::ForkDb;

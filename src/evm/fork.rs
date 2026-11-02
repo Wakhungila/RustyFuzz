@@ -42,8 +42,10 @@ pub fn configured_provider(url: reqwest::Url) -> anyhow::Result<impl Provider> {
             &allowed_origins,
         ) {
             Ok(Some(authorization)) => {
-                let value = reqwest::header::HeaderValue::from_str(&authorization)
-                    .map_err(|_| anyhow::anyhow!("RPC API key contains invalid header characters"))?;
+                let value =
+                    reqwest::header::HeaderValue::from_str(&authorization).map_err(|_| {
+                        anyhow::anyhow!("RPC API key contains invalid header characters")
+                    })?;
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert(reqwest::header::AUTHORIZATION, value);
                 builder = builder.default_headers(headers);
@@ -69,8 +71,7 @@ pub async fn create_fork_db(
     target_contract: Option<Address>,
 ) -> anyhow::Result<EvmCacheDb> {
     if test_loopback_allowed()
-        && (rpc_url.starts_with("http://127.0.0.1")
-            || rpc_url.starts_with("http://localhost"))
+        && (rpc_url.starts_with("http://127.0.0.1") || rpc_url.starts_with("http://localhost"))
     {
         validate_rpc_url(rpc_url, true).map_err(anyhow::Error::msg)?;
     } else {
@@ -162,8 +163,7 @@ async fn fetch_fork_block_env(
     provenance: Option<&rustyfuzz_evm::fork_db::ForkCacheProvenance>,
 ) -> anyhow::Result<BlockEnv> {
     let url = if test_loopback_allowed()
-        && (rpc_url.starts_with("http://127.0.0.1")
-            || rpc_url.starts_with("http://localhost"))
+        && (rpc_url.starts_with("http://127.0.0.1") || rpc_url.starts_with("http://localhost"))
     {
         validate_rpc_url(rpc_url, true).map_err(anyhow::Error::msg)?
     } else {

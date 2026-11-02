@@ -850,9 +850,12 @@ fn rpc_on_blocking_thread(
             match crate::rpc_url::rpc_api_key_header(&rpc_url, api_key.as_deref(), &allowed_origins)
             {
                 Ok(Some(authorization)) => {
-                    let value = reqwest::header::HeaderValue::from_str(&authorization).map_err(|_| {
-                        ForkDbError::Rpc("RPC API key contains invalid header characters".to_string())
-                    })?;
+                    let value =
+                        reqwest::header::HeaderValue::from_str(&authorization).map_err(|_| {
+                            ForkDbError::Rpc(
+                                "RPC API key contains invalid header characters".to_string(),
+                            )
+                        })?;
                     let mut headers = reqwest::header::HeaderMap::new();
                     headers.insert(reqwest::header::AUTHORIZATION, value);
                     client_builder = client_builder.default_headers(headers);

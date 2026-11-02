@@ -1,6 +1,6 @@
 use revm::primitives::Address;
 use rusty_fuzz::config::HardenedDefiConfig;
-use rusty_fuzz::engine::fuzz_engine::{Config, run_fuzz_campaign};
+use rusty_fuzz::engine::fuzz_engine::{run_fuzz_campaign, Config};
 use rusty_fuzz::engine::promotion::{PromotionCampaignSummary, PromotionConfig};
 use std::fs;
 use std::str::FromStr;

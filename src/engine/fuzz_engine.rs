@@ -1,7 +1,5 @@
 use crate::common::oracle::ProtocolOraclePack;
-use crate::common::types::{
-    ChainState, EvmInput, ExecutionStatus, SequenceExecutionResult, SingletonTx,
-};
+use crate::common::types::{ChainState, EvmInput, SequenceExecutionResult, SingletonTx};
 use crate::config::HardenedDefiConfig;
 use crate::engine::abi_ingest::{ingest_abi_file, merge_abi_registry, AbiIngestReport};
 use crate::engine::actors::{ActorModel, ActorModelConfig, ActorSet};
@@ -2137,8 +2135,6 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         );
                     } else if let Some(reason) = campaign_artifact_reason(
                         synthetic_fork_mode,
-                        &execution,
-                        &report,
                         &campaign_score,
                         &findings,
                         exploit_candidate.as_ref(),
@@ -2407,6 +2403,9 @@ struct CampaignResume {
     cancellation: Option<Arc<AtomicBool>>,
 }
 
+// Internal-only orchestration signature; both campaign entry points call this
+// directly. Mirrors the precedent in crates/rustyfuzz-evm/src/executor.rs.
+#[allow(clippy::too_many_arguments)]
 async fn run_single_process_campaign(
     config: Config,
     initial_db: CacheDB<ForkDb>,
@@ -3200,8 +3199,6 @@ async fn run_single_process_campaign(
             );
         } else if let Some(reason) = campaign_artifact_reason(
             synthetic_fork_mode,
-            &execution,
-            &report,
             &campaign_score,
             &findings,
             exploit_candidate.as_ref(),
@@ -3755,8 +3752,6 @@ fn log_seed_bundle_status(
 
 fn campaign_artifact_reason(
     synthetic_fork_mode: bool,
-    execution: &SequenceExecutionResult,
-    state_report: &StateNoveltyReport,
     campaign_score: &CampaignScore,
     findings: &[crate::common::oracle::ProtocolFinding],
     exploit_candidate: Option<&crate::engine::exploit_path::ExploitPathCandidate>,
@@ -3766,10 +3761,9 @@ fn campaign_artifact_reason(
         return None;
     }
 
-    const MIN_NON_SUCCESS_ARTIFACT_SCORE: u64 = 500;
-    const MIN_ECONOMIC_OR_INVARIANT_SCORE: u64 = 250;
-    const MIN_STATE_NOVELTY_ARTIFACT_SCORE: u64 = 150;
-
+    // Only persist artifacts with oracle findings or confirmed exploit proof.
+    // Score-only artifacts cannot be promoted (promotion requires non-empty findings)
+    // and only create corpus noise.
     if exploit_candidate.is_some_and(|candidate| {
         candidate
             .proof
@@ -3779,45 +3773,8 @@ fn campaign_artifact_reason(
         return Some("replayable-minimized-path");
     }
 
-    // Confirmed oracle evidence is always worth persisting, even if the
-    // sequence includes a revert/halt before or after the meaningful action.
     if !findings.is_empty() {
         return Some("protocol-oracle-finding");
-    }
-
-    if campaign_score
-        .explanation
-        .iter()
-        .any(|reason| reason.contains("exploit-directed"))
-        && campaign_score.total >= MIN_ECONOMIC_OR_INVARIANT_SCORE
-    {
-        return Some("exploit-path-candidate");
-    }
-
-    let has_non_success_tx = execution
-        .tx_results
-        .iter()
-        .any(|result| !matches!(result.status, ExecutionStatus::Success));
-
-    // Reverts and halts are normal fuzzing outcomes. Persist only high-signal
-    // non-success paths; otherwise the corpus gets flooded with low-value files.
-    if has_non_success_tx {
-        return (campaign_score.total >= MIN_NON_SUCCESS_ARTIFACT_SCORE)
-            .then_some("high-score-non-success-status");
-    }
-
-    // Economic/invariant pressure is useful, but low-score pressure is usually
-    // weak signal. Persist only when the full campaign score is meaningful.
-    if (campaign_score.economic_pressure > 0 || campaign_score.invariant_pressure > 0)
-        && campaign_score.total >= MIN_ECONOMIC_OR_INVARIANT_SCORE
-    {
-        return Some("economic-or-invariant-pressure");
-    }
-
-    // State novelty should be persisted only when backed by a non-trivial
-    // campaign score. Otherwise minor storage/call deltas create artifact noise.
-    if state_report.interesting && campaign_score.total >= MIN_STATE_NOVELTY_ARTIFACT_SCORE {
-        return Some("state-novelty");
     }
 
     None
@@ -4395,6 +4352,7 @@ fn sha256_bounded_regular_file(path: &Path, max_bytes: u64) -> anyhow::Result<St
     Ok(format!("sha256:{}", hex::encode(digest.finalize())))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_worker_terminal_artifact(
     config: &Config,
     run_nonce: &str,

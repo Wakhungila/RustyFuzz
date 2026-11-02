@@ -20,6 +20,7 @@ pub const FREE_CHAT_MODELS: &[&str] = &[
     "jev-1.13-free",
     "deepseek-v4.1-flash-free",
     "glm-5.3-flash-free",
+    "iceman-contributor-free",
 ];
 
 #[derive(Debug, Clone)]
@@ -109,7 +110,9 @@ impl ZenClient {
                 Err(error) => last_error = Some(error),
             }
         }
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Satori Zen: no available model candidate for completion")))
+        Err(last_error.unwrap_or_else(|| {
+            anyhow::anyhow!("Satori Zen: no available model candidate for completion")
+        }))
     }
 }
 
