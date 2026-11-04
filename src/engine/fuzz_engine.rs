@@ -1422,7 +1422,16 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         harness.target_selectors.len(),
                         harness.handler_contracts.len()
                     );
-
+                    for invariant in &harness.invariant_functions {
+                        log::debug!(
+                            "Foundry invariant: {} (contract={:?}, selector={:#010x}, file={}:{})",
+                            invariant.name,
+                            invariant.contract,
+                            u32::from_be_bytes(invariant.selector),
+                            invariant.file.display(),
+                            invariant.line
+                        );
+                    }
                     populate_abi_from_foundry_harness(harness, &mut initial_abi);
                 }
 
@@ -2534,6 +2543,16 @@ async fn run_single_process_campaign(
             harness.target_selectors.len(),
             harness.handler_contracts.len()
         );
+        for invariant in &harness.invariant_functions {
+            log::debug!(
+                "Foundry invariant: {} (contract={:?}, selector={:#010x}, file={}:{})",
+                invariant.name,
+                invariant.contract,
+                u32::from_be_bytes(invariant.selector),
+                invariant.file.display(),
+                invariant.line
+            );
+        }
         populate_abi_from_foundry_harness(harness, &mut initial_abi);
     }
 
