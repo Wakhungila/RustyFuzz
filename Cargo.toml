@@ -62,7 +62,7 @@ required-features = ["evm"]
 # Build with notifications:   cargo build --release --features "evm,notifier"
 # ─────────────────────────────────────────────────────────────────────────────
 [features]
-default  = ["evm", "mimalloc-allocator"]
+default  = ["evm"]
 evm      = [
     "dep:revm",
     "dep:alloy",
@@ -77,9 +77,6 @@ llm      = ["dep:reqwest"]
 live-tests = []
 notifier = ["dep:reqwest"]
 sgx      = []
-# Allocation-heavy workload (journal, per-tx account copies, inspector
-# temporaries). Enabled by default; disable with --no-default-features for
-# platforms without a mimalloc port, or to compare allocators.
 mimalloc-allocator = ["dep:mimalloc"]
 
 # ─────────────────────────────────────────────────────────────────────────────
