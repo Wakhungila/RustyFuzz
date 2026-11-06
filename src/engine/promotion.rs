@@ -463,7 +463,12 @@ pub fn promote_finding_artifact(
         !request.config.no_promotion,
         "refusing promotion while no-promotion mode is active"
     );
-    rustyfuzz_evm::rpc_url::validate_production_rpc_url(request.rpc_url)
+    // The promotion replays against the same endpoint the campaign forked
+    // from, so it must accept exactly what the fork path accepts. Using the
+    // stricter production-only rule here made a campaign that could fork a
+    // local `anvil` endpoint fail to promote the artifact it had already
+    // found.
+    rustyfuzz_evm::rpc_url::validate_rpc_url_for_process(request.rpc_url)
         .map_err(|error| anyhow::anyhow!("invalid promotion RPC URL: {error}"))?;
     anyhow::ensure!(
         !request.synthetic_mode,
@@ -1055,6 +1060,12 @@ fn validate_foundry_poc(
         .arg(project_root.join("cache"))
         .current_dir(project_root)
         .env("RUSTYFUZZ_SATORI_WRITABLE_ROOT", project_root);
+    // The sandbox has no network, so a build that needs a compiler must use
+    // one the operator already installed. Forwarding the selection keeps the
+    // PoC stage usable offline.
+    if let Some(solc) = std::env::var_os("FOUNDRY_SOLC") {
+        command.env("FOUNDRY_SOLC", solc);
+    }
     match run_bounded_external_command(&mut command, MAX_EXTERNAL_COMMAND_TIMEOUT) {
         Ok(output) => PocValidationReport {
             success: output.status.success() && !output.timed_out,

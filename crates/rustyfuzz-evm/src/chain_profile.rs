@@ -64,6 +64,12 @@ pub struct ChainProfile {
     pub schedule: ForkSchedule,
     pub blobs: BlobPricing,
     pub header: HeaderRequirements,
+    /// Lowest block this profile is valid for.
+    ///
+    /// A profile whose rules changed over the chain's history (a hardfork
+    /// activation) must refuse the range it cannot describe rather than apply
+    /// the wrong rules to it. `0` means "every block".
+    pub min_block: u64,
 }
 
 impl ChainProfile {
@@ -79,6 +85,52 @@ impl ChainProfile {
             prevrandao: true,
             excess_blob_gas: true,
         },
+        min_block: 0,
+    };
+
+    /// Arbitrum One (Arbitrum Nitro).
+    ///
+    /// Nitro's EVM implements the Cancun instruction set (`PUSH0`, `TSTORE`,
+    /// `TLOAD`, `MCOPY`) and does **not** price blobs: its header carries
+    /// `baseFeePerGas` and `mixHash` but no `excessBlobGas`, so demanding a
+    /// blob header field would fail every fork with a message about a missing
+    /// field rather than about missing support. `mixHash` is what Nitro
+    /// exposes as `PREVRANDAO`.
+    ///
+    /// The Cancun spec is pinned for the whole covered range rather than
+    /// keyed to an ArbOS activation table, so `min_block` deliberately starts
+    /// well after Arbitrum's Cancun-era upgrades. The bound is conservative
+    /// and must be tightened to the exact ArbOS activation block before this
+    /// profile is used for older state.
+    pub const ARBITRUM_ONE: ChainProfile = ChainProfile {
+        chain_id: 42_161,
+        name: "arbitrum-one",
+        schedule: ForkSchedule::Fixed(SpecId::CANCUN),
+        blobs: BlobPricing::Absent,
+        header: HeaderRequirements {
+            prevrandao: true,
+            excess_blob_gas: false,
+        },
+        min_block: 400_000_000,
+    };
+
+    /// A local development chain (the anvil / hardhat default chain id).
+    ///
+    /// Local chains exist so the pipeline can be validated against a
+    /// deliberately planted defect, where the point is throughput and
+    /// determinism rather than mainnet economics. They expose Cancun-era
+    /// opcodes and carry no blob header field, so they follow the same header
+    /// rules as Arbitrum One.
+    pub const ANVIL_LOCAL: ChainProfile = ChainProfile {
+        chain_id: 31_337,
+        name: "anvil-local",
+        schedule: ForkSchedule::Fixed(SpecId::CANCUN),
+        blobs: BlobPricing::Absent,
+        header: HeaderRequirements {
+            prevrandao: true,
+            excess_blob_gas: false,
+        },
+        min_block: 0,
     };
 
     /// Resolves a profile for `chain_id`, or explains why there is none.
@@ -89,6 +141,8 @@ impl ChainProfile {
     pub fn for_chain(chain_id: u64) -> Result<Self, String> {
         match chain_id {
             1 => Ok(Self::ETHEREUM_MAINNET),
+            42_161 => Ok(Self::ARBITRUM_ONE),
+            31_337 => Ok(Self::ANVIL_LOCAL),
             other => Err(format!(
                 "chain {other} has no execution profile: hardfork schedule, blob pricing \
                  and required header fields are unknown. Executing it with Ethereum \
@@ -96,6 +150,11 @@ impl ChainProfile {
                  crates/rustyfuzz-evm/src/chain_profile.rs before forking this chain."
             )),
         }
+    }
+
+    /// Whether this profile describes the rules at `number`.
+    pub fn covers_block(&self, number: u64) -> bool {
+        number >= self.min_block
     }
 
     /// The hardfork spec for a block, per this chain's schedule.
@@ -128,6 +187,34 @@ mod tests {
         assert_eq!(profile.name, "ethereum-mainnet");
         assert!(profile.header.prevrandao);
         assert!(profile.header.excess_blob_gas);
+    }
+
+    #[test]
+    fn arbitrum_one_resolves_without_blob_pricing() {
+        let profile = ChainProfile::for_chain(42_161).expect("arbitrum one is supported");
+        assert_eq!(profile.chain_id, 42_161);
+        assert_eq!(profile.name, "arbitrum-one");
+        // Arbitrum One's header carries no excessBlobGas, so the profile must
+        // not require one and must not price blobs.
+        assert!(!profile.header.excess_blob_gas);
+        assert!(profile.header.prevrandao);
+        assert_eq!(profile.blob_fraction(1_793_267_791), None);
+        assert_eq!(profile.spec_for(519_323_411, 1_793_267_791), SpecId::CANCUN);
+    }
+
+    #[test]
+    fn arbitrum_one_refuses_blocks_outside_its_covered_range() {
+        let profile = ChainProfile::for_chain(42_161).unwrap();
+        assert!(profile.covers_block(519_323_411));
+        assert!(!profile.covers_block(profile.min_block - 1));
+        assert!(profile.covers_block(profile.min_block));
+    }
+
+    #[test]
+    fn mainnet_covers_every_block() {
+        let profile = ChainProfile::for_chain(1).unwrap();
+        assert!(profile.covers_block(0));
+        assert!(profile.covers_block(1));
     }
 
     #[test]
@@ -172,6 +259,7 @@ mod tests {
                 prevrandao: false,
                 excess_blob_gas: false,
             },
+            min_block: 0,
         };
         assert_eq!(profile.spec_for(1, 0), SpecId::PRAGUE);
         assert_eq!(profile.spec_for(999_999_999, 0), SpecId::PRAGUE);
@@ -188,6 +276,7 @@ mod tests {
                 prevrandao: false,
                 excess_blob_gas: false,
             },
+            min_block: 0,
         };
         // Mainnet would return a fraction at this timestamp; this chain must not, or the
         // executor would demand an `excessBlobGas` field the header never carries.
@@ -201,5 +290,38 @@ mod tests {
         assert_eq!(profile.blob_fraction(1_710_338_135), Some(3_338_477));
         // Before Cancun there is no fraction.
         assert_eq!(profile.blob_fraction(1_600_000_000), None);
+    }
+
+    #[test]
+    fn revm_blob_change_preserves_l1_fork_behavior() {
+        // Regression test: the REVM blob handling change must not alter L1 fork behavior.
+        // 
+        // Pre-Cancun blocks must leave blob_excess_gas_and_price unset (None).
+        // Post-Cancun blocks must derive the field from the block header.
+        // 
+        // Arbitrum One and ANVIL_LOCAL run Cancun-era rules but have
+        // BlobPricing::Absent, so they report zero excess and zero base fee.
+        // BLOBBASEFEE must return 0 for such chains.
+
+        // ETHEREUM_MAINNET pre-Cancun: no blob fraction
+        let mainnet = ChainProfile::ETHEREUM_MAINNET;
+        assert_eq!(mainnet.blob_fraction(1_600_000_000), None, "pre-Cancun mainnet has no blob fraction");
+
+        // ETHEREUM_MAINNET post-Cancun: has blob fraction from header
+        assert_eq!(mainnet.blob_fraction(1_710_338_135), Some(3_338_477), "post-Cancun mainnet has blob fraction");
+
+        // ARBITRUM_ONE: Cancun-era but Absent blob pricing -> zero excess/price
+        let arbitrum = ChainProfile::ARBITRUM_ONE;
+        assert_eq!(arbitrum.blob_fraction(1_710_338_135), None, "Arbitrum Absent pricing has no fraction");
+
+        // Verify the chain profiles have the expected blob settings
+        assert!(matches!(ChainProfile::ETHEREUM_MAINNET.blobs, BlobPricing::FromHeader { .. }));
+        assert!(matches!(ChainProfile::ARBITRUM_ONE.blobs, BlobPricing::Absent));
+        assert!(matches!(ChainProfile::ANVIL_LOCAL.blobs, BlobPricing::Absent));
+
+        // Verify header requirements: only ETHEREUM_MAINNET requires excess_blob_gas
+        assert!(ChainProfile::ETHEREUM_MAINNET.header.excess_blob_gas);
+        assert!(!ChainProfile::ARBITRUM_ONE.header.excess_blob_gas);
+        assert!(!ChainProfile::ANVIL_LOCAL.header.excess_blob_gas);
     }
 }

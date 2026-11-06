@@ -60,8 +60,8 @@ impl EnvironmentPolicy {
         // Offline cache imports retaining a chain identity are historical forks,
         // too. Only fixtures without chain identity receive synthetic semantics.
         let synthetic = provenance.chain_id.is_none() && provenance.provider_sanitized.is_empty();
-        let (chain_id, spec, fraction) = if synthetic {
-            (1, SpecId::OSAKA, Some(5_007_716))
+        let (chain_id, spec, fraction, source) = if synthetic {
+            (1, SpecId::OSAKA, Some(5_007_716), "synthetic-osaka".to_string())
         } else {
             let chain_id = provenance
                 .chain_id
@@ -125,7 +125,7 @@ impl EnvironmentPolicy {
                     "post-Cancun header is missing excess blob gas"
                 );
             }
-            (chain_id, spec, profile.blob_fraction(timestamp))
+            (chain_id, spec, profile.blob_fraction(timestamp), format!("pinned-{}", profile.name))
         };
         ensure!(
             block.gas_limit >= 21_000,
@@ -133,12 +133,7 @@ impl EnvironmentPolicy {
         );
         Ok(Self {
             version: ENVIRONMENT_POLICY_VERSION,
-            source: if synthetic {
-                "synthetic-osaka"
-            } else {
-                "pinned-ethereum-mainnet"
-            }
-            .into(),
+            source,
             chain_id,
             spec_id: spec.to_string(),
             tx_gas_limit: 10_000_000.min(block.gas_limit),

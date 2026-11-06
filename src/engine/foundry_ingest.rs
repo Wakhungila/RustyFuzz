@@ -24,6 +24,15 @@ pub struct FoundryInvariantFunction {
     pub name: String,
     pub visibility: Option<String>,
     pub line: usize,
+    /// Four-byte selector of the zero-argument invariant function
+    /// (`keccak256("name()")[:4]`), e.g. `invariant_totalAssetsCoverShares()`.
+    /// Populated at ingestion so campaigns can surface selector-level metadata
+    /// without compiling Solidity. Per-transaction invocation against the
+    /// deployed test contract requires forge-artifact address resolution
+    /// (not captured by this source scan) and is intentionally not wired here:
+    /// calling the selector on `target_contract` would false-positive, since the
+    /// function is declared on the test contract, not the system under test.
+    pub selector: [u8; 4],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -140,12 +149,14 @@ impl FoundryHarnessManifest {
 
             if let Some(function) = parse_function_signature(trimmed) {
                 if is_invariant_function(&function.name) {
+                    let selector = invariant_selector(&function.name);
                     self.invariant_functions.push(FoundryInvariantFunction {
                         file: rel.clone(),
                         contract: current_contract.clone(),
                         name: function.name,
                         visibility: function.visibility,
                         line: line_no,
+                        selector,
                     });
                 }
             }
@@ -529,6 +540,17 @@ fn is_invariant_function(name: &str) -> bool {
         || name.starts_with("property_")
 }
 
+/// Four-byte selector of a zero-argument invariant function:
+/// `keccak256("name()")[:4]`. Foundry invariant / echidna / statefulFuzz /
+/// property functions take no arguments, so the selector is fully determined by
+/// the name and needs no ABI.
+pub fn invariant_selector(name: &str) -> [u8; 4] {
+    let signature = format!("{name}()");
+    revm::primitives::keccak256(signature.as_bytes())[..4]
+        .try_into()
+        .expect("keccak256 output is always 32 bytes; first 4 are a valid selector")
+}
+
 fn extract_call_arguments(line: &str, name: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut rest = line;
@@ -711,6 +733,14 @@ contract VaultInvariantTest {
         assert_eq!(
             manifest.invariant_functions[0].name,
             "invariant_totalAssetsCoverShares"
+        );
+        let expected_selector: [u8; 4] =
+            revm::primitives::keccak256("invariant_totalAssetsCoverShares()".as_bytes())[..4]
+                .try_into()
+                .unwrap();
+        assert_eq!(
+            manifest.invariant_functions[0].selector, expected_selector,
+            "the zero-argument invariant's selector is derived from its name"
         );
         assert_eq!(manifest.handler_contracts.len(), 1);
         assert_eq!(manifest.handler_contracts[0].contract, "VaultHandler");
@@ -928,5 +958,22 @@ contract VaultInvariantTest {
             .try_into()
             .unwrap();
         assert_eq!(selector, expected);
+    }
+
+    #[test]
+    fn invariant_selector_is_deterministic_and_name_derived() {
+        let a = invariant_selector("invariant_totalAssetsCoverShares");
+        let b = invariant_selector("invariant_totalAssetsCoverShares");
+        assert_eq!(a, b, "the same invariant name yields the same selector");
+        let expected: [u8; 4] =
+            revm::primitives::keccak256("invariant_totalAssetsCoverShares()".as_bytes())[..4]
+                .try_into()
+                .unwrap();
+        assert_eq!(a, expected);
+        let c = invariant_selector("echidna_balanceNeverDecreases");
+        assert_ne!(a, c, "different invariant names yield different selectors");
+        let d = invariant_selector("statefulFuzz_totalSupply");
+        assert_ne!(a, d);
+        assert_ne!(c, d);
     }
 }

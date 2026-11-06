@@ -5,6 +5,23 @@ pub fn validate_production_rpc_url(raw: &str) -> Result<Url, String> {
     validate_rpc_url(raw, false)
 }
 
+/// Validates an RPC URL for a process the operator is running right now,
+/// honouring the explicit loopback test escape hatch.
+///
+/// The fork path, the Satori CLI and the Satori revalidation path all have to
+/// agree on when a plain-HTTP loopback endpoint is acceptable. Keeping the
+/// rule here stops the call sites from drifting apart: the CLI used to
+/// reject a local `anvil` endpoint that the fork path would have accepted, so
+/// a campaign could not be validated against a deliberately planted defect.
+pub fn validate_rpc_url_for_process(raw: &str) -> Result<Url, String> {
+    if test_loopback_allowed()
+        && (raw.starts_with("http://127.0.0.1") || raw.starts_with("http://localhost"))
+    {
+        return validate_rpc_url(raw, true);
+    }
+    validate_production_rpc_url(raw)
+}
+
 pub fn validate_rpc_url_for_argv(raw: &str) -> Result<Url, String> {
     let (url, _) = resolve_rpc_url(raw, false)?;
     if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
@@ -112,7 +129,7 @@ fn url_carries_credential(raw_url: &str) -> bool {
                 .filter(|segment| !segment.is_empty())
                 .any(|segment| {
                     segment.len() >= 20
-                        // Real keys contain `-` and `_` (Alchemy's do: `MWeRBkXLW6AyDjL-f6hpO`),
+                        // Real keys contain `-` and `_` (Alchemy's do: `ExampleAlchemyKey-0123456789abcdef`),
                         // so excluding them was a bug that made this test fail and would have
                         // let a header be added to exactly the endpoint that rejects it.
                         && segment
@@ -404,7 +421,7 @@ mod tests {
         // Alchemy keys contain '-', so a charset of alphanumerics only misses them and the
         // worst case follows: a Bearer header gets added to the one endpoint that 401s on it.
         assert!(url_carries_credential(
-            "https://eth-mainnet.g.alchemy.com/v2/MWeRBkXLW6AyDjL-f6hpO"
+            "https://eth-mainnet.g.alchemy.com/v2/ExampleAlchemyKey-0123456789abcdef"
         ));
         assert!(url_carries_credential(
             "https://mainnet.infura.io/v3/0123456789abcdef0123456789abcdef"
@@ -435,7 +452,7 @@ mod tests {
         // request into a failure.
         assert_eq!(
             rpc_api_key_header(
-                "https://eth-mainnet.g.alchemy.com/v2/MWeRBkXLW6AyDjL-f6hpO",
+                "https://eth-mainnet.g.alchemy.com/v2/ExampleAlchemyKey-0123456789abcdef",
                 Some("secret"),
                 &["https://eth-mainnet.g.alchemy.com".to_string()],
             ),
@@ -444,7 +461,7 @@ mod tests {
         // And it needs no allowlist, because no header will be sent.
         assert_eq!(
             rpc_api_key_header(
-                "https://eth-mainnet.g.alchemy.com/v2/MWeRBkXLW6AyDjL-f6hpO",
+                "https://eth-mainnet.g.alchemy.com/v2/ExampleAlchemyKey-0123456789abcdef",
                 Some("secret"),
                 &[],
             ),

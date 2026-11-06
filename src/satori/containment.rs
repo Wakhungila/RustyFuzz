@@ -15,6 +15,15 @@ use std::os::unix::process::CommandExt;
 pub(crate) const EXTERNAL_MEMORY_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(crate) const EXTERNAL_MAX_PROCESSES: u64 = 256;
 
+/// Virtual address-space ceiling for a sandboxed external analyzer.
+///
+/// The resident-memory ceiling lives in the cgroup; this is a second, looser
+/// guard against a process reserving unbounded address space. A compiler
+/// reserves a large virtual address space while keeping a small resident
+/// footprint, so a tight address-space limit makes `solc` fail with
+/// "memory allocation failed" before it compiles anything at all.
+pub(crate) const EXTERNAL_ADDRESS_SPACE_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ExternalContainmentLimits {
     pub(crate) memory_bytes: u64,
@@ -132,6 +141,66 @@ fn is_bwrap(path: &Path) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some("bwrap")
 }
 
+/// Resolves an external program to an absolute path on the host, using the
+/// same `PATH` the command would have used.
+///
+/// The sandbox resolves the program *inside* its own root, where the host's
+/// `PATH` entries may not exist. Resolving on the host first is what makes
+/// a tool installed outside the bound directories reachable.
+fn resolve_program_on_host(program: &std::ffi::OsStr) -> Option<PathBuf> {
+    let candidate = PathBuf::from(program);
+    if candidate.components().count() > 1 {
+        return std::fs::canonicalize(candidate).ok();
+    }
+    let path_env = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_env)
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file())
+        .and_then(|candidate| std::fs::canonicalize(candidate).ok())
+}
+
+/// Whether a directory is already visible inside the sandbox.
+fn is_already_bound(
+    directory: &Path,
+    current_dir: Option<&Path>,
+    writable_root: Option<&Path>,
+) -> bool {
+    if directory.starts_with("/usr") || directory.starts_with("/etc") {
+        return true;
+    }
+    current_dir
+        .map(|current| directory.starts_with(current))
+        .unwrap_or(false)
+        || writable_root
+            .map(|root| directory.starts_with(root))
+            .unwrap_or(false)
+}
+
+/// Toolchain directories the operator names explicitly, for the parts of a
+/// build toolchain that live outside the bound system directories (a solc
+/// installation, a package cache).
+///
+/// The value is a `PATH`-style list of absolute directories. Only existing
+/// directories are bound, and each is bound read-only.
+fn toolchain_roots() -> Vec<PathBuf> {
+    std::env::var_os("RUSTYFUZZ_SATORI_TOOLCHAIN_ROOTS")
+        .map(|value| {
+            std::env::split_paths(&value)
+                .filter(|path| path.is_absolute() && path.is_dir())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolves a path against a base directory unless it is already absolute.
+fn absolutize_against(path: &Path, base: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
 fn validate_launcher(path: PathBuf) -> io::Result<PathBuf> {
     if !path.is_absolute() {
         return Err(io::Error::other(
@@ -224,6 +293,34 @@ fn wrap_with_bwrap(
         .map(|(key, value)| (key.to_os_string(), value.map(std::ffi::OsStr::to_os_string)))
         .collect();
 
+    // Resolve every path the sandbox binds to an absolute one.
+    //
+    // A relative source is ambiguous inside the sandbox: `bwrap` resolves it
+    // against its own root, not against the directory the command would have
+    // run in. The analyzer then failed with "Can't find source path" even
+    // though the directory existed on the host.
+    let process_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let current_dir = current_dir.map(|dir| absolutize_against(&dir, &process_cwd));
+    let writable_root = writable_root.map(|dir| absolutize_against(&dir, &process_cwd));
+
+    // The analyzer itself must be reachable inside the sandbox. The default
+    // Foundry install lives under `$HOME`, which the sandbox deliberately
+    // does not bind, so `forge` failed to spawn even on a host where it was
+    // installed correctly. Binding the directory that holds the resolved
+    // binary — plus any toolchain roots the operator names explicitly —
+    // keeps the sandbox tight while making the tool usable.
+    let mut extra_read_only_binds = Vec::new();
+    if let Some(resolved) = resolve_program_on_host(&program) {
+        if let Some(parent) = resolved.parent() {
+            if !is_already_bound(parent, current_dir.as_deref(), writable_root.as_deref()) {
+                extra_read_only_binds.push(parent.to_path_buf());
+            }
+        }
+    }
+    extra_read_only_binds.extend(toolchain_roots());
+    extra_read_only_binds.sort();
+    extra_read_only_binds.dedup();
+
     let mut wrapped = Command::new(launcher);
     wrapped
         .arg("--die-with-parent")
@@ -288,6 +385,9 @@ fn wrap_with_bwrap(
         .arg("/proc")
         .arg("--dev")
         .arg("/dev");
+    for directory in &extra_read_only_binds {
+        wrapped.arg("--ro-bind").arg(directory).arg(directory);
+    }
     if let Some(current_dir) = current_dir.as_ref() {
         wrapped.arg("--ro-bind").arg(current_dir).arg(current_dir);
         if let Some(writable_root) = writable_root.as_ref() {
@@ -303,7 +403,7 @@ fn wrap_with_bwrap(
     wrapped
         .arg("--")
         .arg("/usr/bin/prlimit")
-        .arg(format!("--as={}", limits.memory_bytes))
+        .arg(format!("--as={}", EXTERNAL_ADDRESS_SPACE_LIMIT_BYTES))
         .arg(format!("--nproc={}", limits.max_processes))
         .arg(format!("--fsize={}", limits.output_bytes))
         .arg("--")

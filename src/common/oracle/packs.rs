@@ -709,18 +709,25 @@ impl ProtocolOraclePack {
                 continue;
             }
             let code = U256::from_be_slice(&tx.output[4..36]).to::<u64>();
+            // The severity describes the *lead*, not the impact. A panic is an
+            // atomic revert, so it never by itself proves that funds were
+            // stuck or accounting corrupted; the codes that can only be
+            // Solidity's own input guards are rated lower because they say
+            // the contract behaved correctly.
+            let severity = if crate::common::oracle::panic_code_can_indicate_defect(code) {
+                ProtocolSeverity::Medium
+            } else {
+                ProtocolSeverity::Low
+            };
             findings.push(ProtocolFinding {
                 pack: ProtocolOraclePackKind::RuntimePanic,
                 vuln: VulnType::UnintendedPanic(code),
-                severity: if code == 0x01 {
-                    ProtocolSeverity::High
-                } else {
-                    ProtocolSeverity::Medium
-                },
+                severity,
                 tx_index: Some(tx.tx_index),
                 target: tx.call_trace.first().map(|call| call.target),
                 evidence: format!(
-                    "transaction reverted with Solidity Panic(0x{code:x}); code 0x01 is an assert/invariant failure"
+                    "transaction reverted with Solidity Panic(0x{code:x}) ({}); the revert is atomic, so it shows the call was rejected rather than that state was corrupted",
+                    crate::common::oracle::describe_panic_code(code)
                 ),
             });
         }

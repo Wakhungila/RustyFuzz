@@ -28,6 +28,20 @@ pub struct SatoriConfig {
     pub generate_jobs: bool,
     pub run_forge_tests: bool,
     pub run_slither: bool,
+    /// Deployed contract the generated jobs must target.
+    ///
+    /// When set, it overrides the model-supplied `affected_contracts` entry so
+    /// validation runs against the address the operator declared.
+    #[serde(default)]
+    pub target_contract: Option<String>,
+    /// Live fork RPC endpoint applied to generated jobs.
+    ///
+    /// Redacted on disk (`<rpc-url>`); the live value is only held in memory.
+    #[serde(default)]
+    pub fork_rpc_url: Option<String>,
+    /// Fork block applied to generated jobs.
+    #[serde(default)]
+    pub fork_block: Option<u64>,
     pub cache_dir: PathBuf,
     pub memory_path: PathBuf,
 }
@@ -56,6 +70,9 @@ impl Default for SatoriConfig {
             generate_jobs: true,
             run_forge_tests: false,
             run_slither: false,
+            target_contract: None,
+            fork_rpc_url: None,
+            fork_block: None,
             cache_dir: PathBuf::from("satori/cache"),
             memory_path: PathBuf::from("satori/memory/events.jsonl"),
         }
