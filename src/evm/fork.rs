@@ -5,14 +5,16 @@ use alloy::rpc::types::eth::BlockNumberOrTag;
 
 use anyhow::Context;
 use revm::context::BlockEnv;
+use revm::context_interface::block::BlobExcessGasAndPrice;
 use revm::database::CacheDB;
+use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
 
 use rustyfuzz_evm::fork_db::{EvmCacheDb, ForkDb};
 use rustyfuzz_evm::rpc_url::{
-    resolve_rpc_url_for_current_process, test_loopback_allowed, validate_production_rpc_url,
-    validate_rpc_url,
+    resolve_rpc_url_for_current_process, test_loopback_allowed, validate_rpc_url,
+    validate_rpc_url_for_process,
 };
 
 #[cfg(feature = "evm")]
@@ -70,13 +72,7 @@ pub async fn create_fork_db(
     block_number: u64,
     target_contract: Option<Address>,
 ) -> anyhow::Result<EvmCacheDb> {
-    if test_loopback_allowed()
-        && (rpc_url.starts_with("http://127.0.0.1") || rpc_url.starts_with("http://localhost"))
-    {
-        validate_rpc_url(rpc_url, true).map_err(anyhow::Error::msg)?;
-    } else {
-        validate_production_rpc_url(rpc_url).map_err(anyhow::Error::msg)?;
-    }
+    validate_rpc_url_for_process(rpc_url).map_err(anyhow::Error::msg)?;
     let fork = ForkDb::new(rpc_url.to_string(), block_number);
     let provenance_db = fork.clone();
     let provenance = tokio::task::spawn_blocking(move || provenance_db.refresh_remote_provenance())
@@ -91,10 +87,20 @@ pub async fn create_fork_db(
         provenance.chain_id.is_some(),
         "live fork provenance is missing a chain id"
     );
+    // The chain profile is the single place that decides which chains are
+    // executable and which block range its rules describe. A chain without a
+    // profile — or a block outside the profile's covered range — is refused
+    // here, before any state is read.
+    let profile = rustyfuzz_evm::chain_profile::ChainProfile::for_chain(
+        provenance.chain_id.expect("chain id presence was checked above"),
+    )
+    .map_err(|message| anyhow::anyhow!(message))?;
     anyhow::ensure!(
-        provenance.chain_id == Some(1),
-        "unsupported chain {:?}: chain-specific execution semantics are required",
-        provenance.chain_id
+        profile.covers_block(block_number),
+        "chain {} profile covers blocks from {} onwards; block {} is outside that range",
+        profile.name,
+        profile.min_block,
+        block_number
     );
     anyhow::ensure!(
         provenance.block_number == Some(block_number),
@@ -162,13 +168,7 @@ async fn fetch_fork_block_env(
     block_number: u64,
     provenance: Option<&rustyfuzz_evm::fork_db::ForkCacheProvenance>,
 ) -> anyhow::Result<BlockEnv> {
-    let url = if test_loopback_allowed()
-        && (rpc_url.starts_with("http://127.0.0.1") || rpc_url.starts_with("http://localhost"))
-    {
-        validate_rpc_url(rpc_url, true).map_err(anyhow::Error::msg)?
-    } else {
-        validate_production_rpc_url(rpc_url).map_err(anyhow::Error::msg)?
-    };
+    let url = validate_rpc_url_for_process(rpc_url).map_err(anyhow::Error::msg)?;
     let provider = configured_provider(url)?;
     let chain_id = provider
         .get_chain_id()
@@ -177,8 +177,15 @@ async fn fetch_fork_block_env(
     // One gate, one message: the profile is the single place that decides which chains
     // are executable. Failing here rather than later means an unsupported chain never
     // reaches a fork, let alone a campaign.
-    rustyfuzz_evm::chain_profile::ChainProfile::for_chain(chain_id)
+    let profile = rustyfuzz_evm::chain_profile::ChainProfile::for_chain(chain_id)
         .map_err(|message| anyhow::anyhow!(message))?;
+    anyhow::ensure!(
+        profile.covers_block(block_number),
+        "chain {} profile covers blocks from {} onwards; block {} is outside that range",
+        profile.name,
+        profile.min_block,
+        block_number
+    );
 
     let block = provider
         .get_block_by_number(BlockNumberOrTag::Number(block_number))
@@ -233,12 +240,30 @@ async fn fetch_fork_block_env(
         slot_num: 0,
     };
 
-    let fraction = rustyfuzz_evm::environment::mainnet_blob_fraction(header.timestamp);
-    if let Some(fraction) = fraction {
-        let excess = header
-            .excess_blob_gas
-            .context("post-Cancun header is missing excess blob gas")?;
-        block_env.set_blob_excess_gas_and_price(excess, fraction);
+    // Blob pricing follows the chain profile, not the Ethereum mainnet table:
+    // a chain that does not price blobs (Arbitrum One) has no `excessBlobGas`
+    // in its header at all.
+    //
+    // REVM still requires the field for any post-Cancun spec, so a chain that
+    // runs Cancun-era rules without blob transactions reports a zero excess
+    // and a zero blob base fee — which is what such a chain's `BLOBBASEFEE`
+    // returns anyway. A pre-Cancun block leaves it unset, because no rule
+    // reads it there.
+    let spec = profile.spec_for(header.number, header.timestamp);
+    match profile.blob_fraction(header.timestamp) {
+        Some(fraction) => {
+            let excess = header
+                .excess_blob_gas
+                .context("post-Cancun header is missing excess blob gas")?;
+            block_env.set_blob_excess_gas_and_price(excess, fraction);
+        }
+        None if spec >= SpecId::CANCUN => {
+            block_env.blob_excess_gas_and_price = Some(BlobExcessGasAndPrice {
+                excess_blob_gas: 0,
+                blob_gasprice: 0,
+            });
+        }
+        None => {}
     }
 
     Ok(block_env)

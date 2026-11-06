@@ -124,6 +124,84 @@ pub fn write_json_atomic_under<T: serde::Serialize>(
     write_atomic_under(root, path, bytes)
 }
 
+/// Copies a directory tree into `destination`.
+///
+/// Security hardening:
+/// - Symlinks are refused at every level: a tree copied into a campaign
+///   directory must not be able to redirect a later write outside it.
+/// - `..` components and absolute paths are rejected in source and destination.
+/// Only regular files and directories are copied; anything else (sockets, devices,
+/// fifos) is an error rather than a silent skip.
+pub fn copy_directory_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    // Reject `..` components and absolute paths in source
+    if source.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_))) {
+        return Err(format!(
+            "source path contains traversal or absolute components: {}",
+            source.display()
+        ));
+    }
+    
+    // Reject `..` components in destination
+    if destination.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!(
+            "destination path contains traversal components: {}",
+            destination.display()
+        ));
+    }
+    
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| format!("cannot inspect {}: {error}", source.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to copy symlinked directory {}",
+            source.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!("{} is not a directory", source.display()));
+    }
+    fs::create_dir_all(destination)
+        .map_err(|error| format!("cannot create {}: {error}", destination.display()))?;
+    
+    let entries = fs::read_dir(source)
+        .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot read directory entry: {error}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect directory entry: {error}"))?;
+        let target = destination.join(entry.file_name());
+        
+        // Validate target doesn't escape (check for .. in the filename)
+        if target.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err(format!(
+                "target path would escape destination: {}",
+                target.display()
+            ));
+        }
+        
+        if file_type.is_symlink() {
+            return Err(format!(
+                "refusing to copy symlinked entry {}",
+                entry.path().display()
+            ));
+        }
+        if file_type.is_dir() {
+            copy_directory_tree(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), &target).map_err(|error| {
+                format!("cannot copy {}: {error}", entry.path().display())
+            })?;
+        } else {
+            return Err(format!(
+                "refusing to copy unsupported file type {}",
+                entry.path().display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +241,74 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("link")).expect("symlink");
         let path = root.join("link").join("file.json");
         assert!(contained_path(&root, &path).is_err());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn copy_directory_tree_copies_files_and_refuses_symlinks() {
+        let temp = std::env::temp_dir().join(format!(
+            "rustyfuzz-copy-tree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let source = temp.join("source");
+        let destination = temp.join("destination");
+        fs::create_dir_all(source.join("inputs")).expect("source");
+        fs::write(source.join("manifest.json"), b"{}").expect("manifest");
+        fs::write(source.join("inputs").join("seed.json"), b"[]").expect("seed");
+
+        copy_directory_tree(&source, &destination).expect("copy must succeed");
+        assert_eq!(
+            fs::read(destination.join("manifest.json")).expect("copied manifest"),
+            b"{}"
+        );
+        assert_eq!(
+            fs::read(destination.join("inputs").join("seed.json")).expect("copied seed"),
+            b"[]"
+        );
+
+        #[cfg(unix)]
+        {
+            let outside = temp.join("outside");
+            fs::create_dir_all(&outside).expect("outside");
+            std::os::unix::fs::symlink(&outside, source.join("escape")).expect("symlink");
+            let error = copy_directory_tree(&source, &temp.join("second"))
+                .expect_err("a symlinked entry must be refused");
+            assert!(error.contains("symlinked"), "{error}");
+        }
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn copy_directory_tree_rejects_parent_dir_components() {
+        let temp = std::env::temp_dir().join(format!(
+            "rustyfuzz-copy-tree-parent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        
+        // Test source with .. component
+        let source = temp.join("source").join("subdir").join("..").join("source");
+        let dest = temp.join("destination");
+        let error = copy_directory_tree(&source, &dest)
+            .expect_err("source with .. must be refused");
+        assert!(error.contains("traversal") || error.contains(".."), "{error}");
+        
+        // Test destination with .. component
+        let good_source = temp.join("good_source");
+        fs::create_dir_all(&good_source).expect("source");
+        let bad_dest = temp.join("dest").join("..").join("escape");
+        let error = copy_directory_tree(&good_source, &bad_dest)
+            .expect_err("destination with .. must be refused");
+        assert!(error.contains("traversal"), "{error}");
+        
         let _ = fs::remove_dir_all(temp);
     }
 }

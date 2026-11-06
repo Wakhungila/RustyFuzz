@@ -1,0 +1,21 @@
+{
+  "id": "chatcmpl-test-123",
+  "object": "chat.completion",
+  "created": 1234567890,
+  "model": "nvidia/nemotron-3.5-lightning-30b-a3b",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\n  \"function_id\": \"Vault::deposit()\",\n  \"hypotheses\": [\n    {\n      \"id\": \"hyp-001\",\n      \"title\": \"Missing input validation on deposit amount\",\n      \"bug_class\": \"ERC4626-share-inflation-via-donation\",\n      \"root_cause\": \"The deposit function does not validate that amount > 0\",\n      \"affected_contracts\": [\"Vault\"],\n      \"affected_functions\": [\"Vault::deposit()\"],\n      \"attack_sequence\": [\n        {\"action\": \"deposit\", \"preconditions\": [\"amount=0\"], \"mutation\": [\"deposit(0)\"]},\n        {\"action\": \"observe\", \"preconditions\": [], \"mutation\": []}\n      ],\n      \"confidence_before_validation\": 0.7,\n      \"mitigations\": [\"Add require(amount > 0)\"],\n      \"evidence\": \"The function accepts zero-amount deposits\"\n    }\n  ],\n  \"candidate_invariants\": [\"Deposits of zero amount should revert\"],\n  \"rejected_notes\": []\n}"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 500,
+    "completion_tokens": 300,
+    "total_tokens": 800
+  }
+}

@@ -514,11 +514,21 @@ fn build_candidate_template(
         template_inputs.push((input.clone(), Default::default()));
     }
 
-    let (mut selected, selected_metadata) = template_inputs
+    let (proposal, proposal_metadata) = template_inputs
         .into_iter()
         .max_by_key(|(candidate, _)| candidate.txs.len())?;
+
+    // The candidate's recorded path must be the path that was executed.
+    //
+    // The generated flow template is a *proposal* for what to try next — a
+    // shape the search believes might exploit the inferred protocol. It was
+    // never executed, so recording it as the proof path persisted a
+    // transaction sequence that never ran and attached this execution's
+    // replay verdict to it. The proposal still describes what the search
+    // believes, so it stays in the evidence and in the extension hints.
+    let selected = input.clone();
     let actor_roles = if let Some(set) = actor_set {
-        set.apply_roles_to_sequence(&mut selected.txs)
+        set.assign_roles(selected.txs.len())
     } else {
         default_role_map(selected.txs.len())
     };
@@ -533,11 +543,10 @@ fn build_candidate_template(
     } else {
         ReplayabilityStatus::NeedsForkState
     };
-    let minimized_sequence_status = if selected.txs.len() <= input.txs.len() {
-        MinimizedSequenceStatus::Minimized
-    } else {
-        MinimizedSequenceStatus::NeedsMinimization
-    };
+    // The candidate is the raw executed input, so it has not been minimized.
+    // Claiming otherwise would let the confirmation ladder treat an
+    // unminimized path as a minimized one.
+    let minimized_sequence_status = MinimizedSequenceStatus::NeedsMinimization;
     let proof_status = if best_invariant.is_some()
         && (model.confidence >= 70
             || matches!(replayability_status, ReplayabilityStatus::Replayable))
@@ -561,8 +570,8 @@ fn build_candidate_template(
     let mut evidence = vec![
         format!("formal-model confidence={}", model.confidence),
         format!(
-            "dependency-score={}",
-            dependency_sequence_score(&selected, &selected_metadata.mutation_provenance)
+            "template dependency-score={}",
+            dependency_sequence_score(&proposal, &proposal_metadata.mutation_provenance)
         ),
     ];
     if let Some(hypothesis) = best_invariant {
@@ -1032,5 +1041,103 @@ mod tests {
         let candidate = result.candidate.unwrap();
         assert!(!candidate.replay_checks.is_empty());
         assert!(!candidate.evidence.is_empty());
+    }
+
+    #[test]
+    fn counterexample_candidate_records_the_executed_path_not_a_generated_template() {
+        // The counterexample search proposes a multi-transaction flow template
+        // built from the inferred protocol type. That template is a proposal,
+        // not an execution: recording it as the candidate's path would persist
+        // a transaction sequence that never ran and attach this execution's
+        // replay verdict to it.
+        let executed_selector = function_selector("vaultAction(uint256)");
+        let input = EvmInput {
+            txs: vec![SingletonTx {
+                input: executed_selector.to_vec(),
+                caller: Address::repeat_byte(0xaa),
+                to: target(),
+                value: U256::ZERO,
+                is_victim: false,
+            }],
+            base_snapshot_id: 0,
+        };
+        let execution = execution_with_selectors(&["vaultAction(uint256)", "latestAnswer()"]);
+        let findings = vec![ProtocolFinding {
+            pack: crate::common::oracle::ProtocolOraclePackKind::Erc4626,
+            vuln: VulnType::VaultInflation,
+            severity: ProtocolSeverity::High,
+            tx_index: Some(0),
+            target: Some(target()),
+            evidence: "share inflation".to_string(),
+        }];
+
+        let result =
+            CounterexampleSearchEngine::default().search(&input, &execution, &findings, None, None);
+        let candidate = result.candidate.expect("candidate");
+        assert_eq!(
+            candidate.input.txs.len(),
+            input.txs.len(),
+            "the candidate must record the executed transaction count"
+        );
+        assert_eq!(
+            candidate.input.txs[0].input, executed_selector.to_vec(),
+            "the candidate must record the executed calldata, not a generated template"
+        );
+        assert_eq!(
+            candidate.minimized_sequence_status,
+            MinimizedSequenceStatus::NeedsMinimization,
+            "the raw executed input has not been minimized"
+        );
+    }
+
+    #[test]
+    fn counterexample_candidate_keeps_the_executed_callers() {
+        // The recorded proof path has to describe the replay that produced it.
+        // Rewriting the callers to the actor set's addresses would leave the
+        // policy observation coming from a different account than the
+        // privileged call, so the violation predicate would no longer hold.
+        let executed_caller = Address::repeat_byte(0xaa);
+        let input = EvmInput {
+            txs: vec![SingletonTx {
+                input: function_selector("vaultAction(uint256)").to_vec(),
+                caller: executed_caller,
+                to: target(),
+                value: U256::ZERO,
+                is_victim: false,
+            }],
+            base_snapshot_id: 0,
+        };
+        let execution = execution_with_selectors(&["vaultAction(uint256)", "latestAnswer()"]);
+        let findings = vec![ProtocolFinding {
+            pack: crate::common::oracle::ProtocolOraclePackKind::Erc4626,
+            vuln: VulnType::VaultInflation,
+            severity: ProtocolSeverity::High,
+            tx_index: Some(0),
+            target: Some(target()),
+            evidence: "share inflation".to_string(),
+        }];
+        let actor_set = crate::engine::actors::ActorSet {
+            actors: vec![crate::engine::actors::Actor {
+                role: ActorType::Attacker,
+                address: Address::repeat_byte(0x11),
+                initial_balance: U256::ZERO,
+                synthetic: true,
+                explanation: "test actor".to_string(),
+            }],
+            observed_callers: Vec::new(),
+        };
+
+        let result = CounterexampleSearchEngine::default().search(
+            &input,
+            &execution,
+            &findings,
+            None,
+            Some(&actor_set),
+        );
+        let candidate = result.candidate.expect("candidate");
+        assert_eq!(
+            candidate.input.txs[0].caller, executed_caller,
+            "the recorded path must keep the account that actually ran"
+        );
     }
 }

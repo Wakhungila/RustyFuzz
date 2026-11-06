@@ -1,0 +1,22 @@
+{
+  "id": "chatcmpl-test-789",
+  "object": "chat.completion",
+  "created": 1234567890,
+  "model": "nvidia/llama-3.1-nemotron-70b-instruct",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "reasoning_content": "Let me think about this step by step. The user provided a function packet. I need to generate hypotheses about potential vulnerabilities. Let me analyze the function signature and context to find security issues related to token transfers, access control, and oracle manipulation. After evaluating the attack surface, I'll produce JSON output matching the required schema.",
+        "content": "Here is the FunctionAuditResult JSON:\n```json\n{\n  \"function_id\": \"Oracle::setPrice(uint256)\",\n  \"hypotheses\": [\n    {\n      \"id\": \"hyp-002\",\n      \"title\": \"Oracle price manipulation via unguarded setter\",\n      \"bug_class\": \"stale-oracle-accepted\",\n      \"root_cause\": \"The price setter does not check msg.sender against an authorized role\",\n      \"affected_contracts\": [\"Oracle\"],\n      \"affected_functions\": [\"Oracle::setPrice()\"],\n      \"attack_sequence\": [\n        {\"action\": \"impersonate\", \"preconditions\": [], \"mutation\": [\"sign with attacker key\"]},\n        {\"action\": \"set_price\", \"preconditions\": [], \"mutation\": [\"setPrice(999999)\"]},\n        {\"action\": \"observe\", \"preconditions\": [\"price set\"], \"mutation\": []}\n      ],\n      \"confidence_before_validation\": 0.85,\n      \"mitigations\": [\"Add onlyOwner modifier to setPrice function\"],\n      \"evidence\": \"No access control check found on setPrice function\"}\n  ],\n  \"candidate_invariants\": [\"Only authorized contracts can set oracle prices\"],\n  \"rejected_notes\": [\"No rejected hypotheses for this function\"]\n}\n```"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 500,
+    "completion_tokens": 400,
+    "total_tokens": 900
+  }
+}

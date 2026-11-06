@@ -69,6 +69,14 @@ pub struct RealismProofReport {
     pub evidence_grade: EvidenceGrade,
     pub rejection_reasons: Vec<RejectionReason>,
     pub execution: Option<SequenceExecutionResult>,
+    /// Why the replay failed, when it did.
+    ///
+    /// Without it a rejected replay is indistinguishable from a rejected
+    /// predicate: both end up as a bare `ReplayFailed` reason, and the
+    /// operator cannot tell a missing fork state from a transaction the
+    /// executor refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_detail: Option<String>,
 }
 
 impl ReplayVerifier {
@@ -566,11 +574,22 @@ impl RealismVerifier {
         Self {
             executor: EvmExecutor::proof(),
             map_size,
-            time_warp: rustyfuzz_evm::time_warp::TimeWarp::DEFAULT,
+            // A proof replay must reproduce the finding on the state that was
+            // actually verified, so every transaction runs at the pinned
+            // block. Advancing the block here would not just change the
+            // observation: the proof executor resolves the environment with
+            // the exactly-pinned policy and refuses anything else, so the
+            // replay could never succeed. It would also disagree with the
+            // generated Foundry PoC, which forks at the pinned block and
+            // replays the sequence there.
+            time_warp: rustyfuzz_evm::time_warp::TimeWarp::NONE,
         }
     }
 
     /// Builds a proof verifier that replays under an explicit time-warp policy.
+    ///
+    /// Only usable where the execution environment accepts a block number
+    /// other than the pinned one; the proof executor does not.
     pub fn with_time_warp(map_size: usize, time_warp: rustyfuzz_evm::time_warp::TimeWarp) -> Self {
         Self {
             executor: EvmExecutor::proof(),
@@ -595,6 +614,7 @@ impl RealismVerifier {
                 evidence_grade: EvidenceGrade::Heuristic,
                 rejection_reasons,
                 execution: None,
+                failure_detail: None,
             };
         }
 
@@ -607,6 +627,7 @@ impl RealismVerifier {
                 evidence_grade: EvidenceGrade::DeterministicReplay,
                 rejection_reasons: Vec::new(),
                 execution: Some(first),
+                failure_detail: None,
             },
             (Ok(_), Ok(_)) => RealismProofReport {
                 success: false,
@@ -614,13 +635,17 @@ impl RealismVerifier {
                 evidence_grade: EvidenceGrade::DeterministicReplay,
                 rejection_reasons: vec![RejectionReason::NonDeterministic],
                 execution: None,
+                failure_detail: Some(
+                    "two replays of the same sequence produced different results".to_string(),
+                ),
             },
-            (Err(_), _) | (_, Err(_)) => RealismProofReport {
+            (Err(first), _) | (_, Err(first)) => RealismProofReport {
                 success: false,
                 status: FindingStatus::Rejected,
                 evidence_grade: EvidenceGrade::Heuristic,
                 rejection_reasons: vec![RejectionReason::ReplayFailed],
                 execution: None,
+                failure_detail: Some(format!("{first:#}")),
             },
         }
     }

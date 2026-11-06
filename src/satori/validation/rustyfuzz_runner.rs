@@ -15,7 +15,7 @@ use crate::satori::fsutil::{
 use crate::satori::types::{ProofStatus, RustyFuzzJobSpec, ValidationStatus, ValidationVerdict};
 use revm::primitives::{Address, U256};
 use rustyfuzz_evm::fork_db::ForkDbCacheSnapshot;
-use rustyfuzz_evm::rpc_url::validate_production_rpc_url;
+use rustyfuzz_evm::rpc_url::validate_rpc_url_for_process;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -241,6 +241,24 @@ fn persist_required_seed_bundle(
     Ok(())
 }
 
+/// Copies the canonical campaign reports into the Satori run directory.
+///
+/// The engine owns the canonical campaign layout and relocates the reports
+/// into it, so without this snapshot the Satori verdict would reference
+/// evidence that lives outside its own run directory. The canonical layout
+/// remains the authority; this is a copy of what the campaign produced.
+fn snapshot_campaign_reports(
+    layout: &rustyfuzz_artifacts::RunLayout,
+    report_dir: &Path,
+) -> anyhow::Result<()> {
+    let canonical_reports = layout.reports_dir();
+    if !canonical_reports.is_dir() {
+        return Ok(());
+    }
+    crate::common::fs_security::copy_directory_tree(&canonical_reports, report_dir)
+        .map_err(|message| anyhow::anyhow!("cannot snapshot campaign reports: {message}"))
+}
+
 fn required_seed_replay_verified(run_dir: &Path, marker_path: &Path, sequence_hash: &str) -> bool {
     let Ok(relative) = marker_path.strip_prefix(run_dir) else {
         return false;
@@ -396,6 +414,11 @@ pub async fn execute_bounded_job(
             confidence_after_validation: 0.0,
         });
     }
+    // The engine relocates the campaign reports into the canonical layout, so
+    // the Satori run takes a snapshot of them. The verdict has to reference
+    // evidence that lives inside its own run directory, and the canonical
+    // layout stays the authority for the campaign itself.
+    snapshot_campaign_reports(&fuzz_engine::canonical_layout(&campaign_id), &report_dir)?;
     let replay_marker_path = report_dir.join("required_seed_replay.json");
     if !required_seed_replay_verified(&run_dir, &replay_marker_path, &sequence_hash) {
         return Ok(ValidationVerdict {
@@ -410,8 +433,13 @@ pub async fn execute_bounded_job(
         });
     }
 
-    let persisted_sequence_id =
-        PersistentCorpus::new(&corpus_dir)?.resolve_input_id(&required_sequence)?;
+    // Finding records reference corpus input ids, so the required sequence has
+    // to exist as a corpus entry before its id can be resolved. A corpus id is
+    // derived from the input's semantic hash, so the id resolved here is the
+    // same one the campaign's canonical corpus uses for that input.
+    let corpus = PersistentCorpus::new(&corpus_dir)?;
+    corpus.persist_input(&required_sequence, &[], 0)?;
+    let persisted_sequence_id = corpus.resolve_input_id(&required_sequence)?;
     let summary_path = report_dir.join("campaign_summary.json");
     let summary: PromotionCampaignSummary = match read_json_in_run(
         &run_dir,
@@ -492,7 +520,7 @@ fn bounded_verdict_classification(
         return (
             ValidationStatus::PlausibleUnvalidated,
             ProofStatus::HeuristicOnly,
-            "bounded execution completed without a matching finding or persisted required-sequence artifact; unrelated campaign signals do not invalidate the hypothesis"
+            "bounded execution replayed the required sequence and completed without a finding tied to it; unrelated campaign signals do not invalidate the hypothesis"
                 .to_string(),
             0.0,
         );
@@ -613,7 +641,7 @@ fn validate_job_limits(job: &RustyFuzzJobSpec) -> SatoriResult<()> {
         .map_err(anyhow::Error::msg)?;
     validate_identifier(&job.job_id)?;
     if let Some(rpc_url) = job.fork_rpc_url.as_deref() {
-        validate_production_rpc_url(rpc_url).map_err(anyhow::Error::msg)?;
+        validate_rpc_url_for_process(rpc_url).map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }
@@ -641,7 +669,21 @@ fn bug_classes_match(job_class: &str, finding_type: &str) -> bool {
     let finding_type = crate::satori::memory::bug_class::normalize_bug_class(finding_type);
     let matches = |expected: &[&str]| expected.iter().any(|value| finding_type.contains(value));
     match job_class.as_str() {
-        "access_control" => matches(&["privilege_escalation"]),
+        // An access-control hypothesis is confirmed by the oracle's
+        // finer-grained authorization finding: the model labels the class
+        // (`access-control-bypass`), the oracle reports the concrete rule it
+        // broke (`mint authorization policy violation`). Matching only the
+        // privilege-escalation wording dropped a confirmed mint-policy
+        // finding on the floor.
+        "access_control"
+        | "access_control_bypass"
+        | "missing_access_control"
+        | "unauthorized_mint"
+        | "unauthorized_minting" => matches(&[
+            "privilege_escalation",
+            "mint_authorization_policy_violation",
+            "mint_policy_violation",
+        ]),
         "erc4626_share_inflation" | "share_inflation" | "vault_inflation" => {
             matches(&["vault_inflation", "share_inflation"])
         }
@@ -675,6 +717,45 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn campaign_reports_are_snapshotted_into_the_satori_run_directory() {
+        let temp = std::env::temp_dir().join(format!(
+            "satori-report-snapshot-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let layout = rustyfuzz_artifacts::RunLayout::new(&temp.join("canonical"), "campaign-snapshot");
+        layout.materialize_new().expect("canonical layout");
+        std::fs::write(
+            layout.reports_dir().join("required_seed_replay.json"),
+            br#"{"completed":true}"#,
+        )
+        .expect("replay marker");
+        std::fs::create_dir_all(layout.reports_dir().join("findings").join("f1")).expect("findings");
+        std::fs::write(
+            layout.reports_dir().join("findings").join("f1").join("finding.json"),
+            b"{}",
+        )
+        .expect("finding");
+
+        let report_dir = temp.join("run").join("reports");
+        snapshot_campaign_reports(&layout, &report_dir).expect("snapshot must succeed");
+
+        assert!(report_dir.join("required_seed_replay.json").is_file());
+        assert!(report_dir.join("findings").join("f1").join("finding.json").is_file());
+        assert_eq!(
+            std::fs::read(report_dir.join("required_seed_replay.json")).expect("marker"),
+            br#"{"completed":true}"#
+        );
+
+        // A campaign that never produced a canonical report tree is not an
+        // error: the verdict simply has no evidence to point at.
+        let empty = rustyfuzz_artifacts::RunLayout::new(&temp.join("empty"), "campaign-empty");
+        snapshot_campaign_reports(&empty, &temp.join("empty-report")).expect("empty snapshot");
+
+        let _ = std::fs::remove_dir_all(temp);
+    }
 
     #[test]
     fn no_matching_required_sequence_is_unvalidated_even_with_unrelated_rejections() {

@@ -94,7 +94,15 @@ pub fn canonical_run_dir(run_id: &str) -> SatoriResult<PathBuf> {
 
 pub fn canonical_run_dir_path(run_dir: &Path) -> SatoriResult<PathBuf> {
     let root = canonical_run_root()?;
-    let run_dir = contained_path(&root, run_dir).map_err(anyhow::Error::msg)?;
+    // The run_dir may be relative (e.g., loaded from run.json as
+    // "satori/runs/satori-..." for older runs). First canonicalize it if
+    // relative, then verify it is contained within the canonical root.
+    let run_dir = if run_dir.is_absolute() {
+        contained_path(&root, run_dir).map_err(anyhow::Error::msg)?
+    } else {
+        let canonical = fs::canonicalize(run_dir)?;
+        contained_path(&root, &canonical).map_err(anyhow::Error::msg)?
+    };
     let metadata = fs::symlink_metadata(&run_dir)?;
     anyhow::ensure!(
         metadata.is_dir() && !metadata.file_type().is_symlink(),
@@ -550,6 +558,9 @@ fn collect_files_inner(
             continue;
         }
         if metadata.is_dir() {
+            if is_top_level_dependency_dir(root, &entry_path) {
+                continue;
+            }
             collect_files_inner(root, &entry_path, depth + 1, files, total_bytes)?;
         } else {
             anyhow::ensure!(
@@ -1052,6 +1063,38 @@ pub fn should_ignore(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Directories that hold vendored dependencies rather than project source.
+///
+/// Foundry installs dependencies into `lib/` and honours `libs` in
+/// `foundry.toml`; other Solidity tooling uses `vendor/`, `dependencies/` or
+/// `deps/`. Ingesting them as project source does two kinds of damage: it
+/// floods the model's context with third-party code, and — worse — a
+/// dependency's function overload can shadow the target contract's own, so
+/// the generated call carries a selector the target does not implement and
+/// every replay reverts on an unknown selector.
+///
+/// Only the top level is excluded: a project's own `src/lib/` is still
+/// project source.
+pub const DEPENDENCY_DIR_NAMES: &[&str] = &[
+    "lib",
+    "libs",
+    "vendor",
+    "vendors",
+    "dependencies",
+    "deps",
+];
+
+/// Whether `path` is a vendored dependency directory directly under `root`.
+pub fn is_top_level_dependency_dir(root: &Path, path: &Path) -> bool {
+    if path.parent() != Some(root) {
+        return false;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| DEPENDENCY_DIR_NAMES.contains(&name))
+        .unwrap_or(false)
+}
+
 pub const MAX_EVIDENCE_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn read_evidence_file(root: &Path, path: &Path) -> SatoriResult<Vec<u8>> {
@@ -1116,6 +1159,62 @@ pub fn verify_source_file_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vendored_dependency_directories_are_not_ingested_as_project_source() -> SatoriResult<()> {
+        let root = std::env::temp_dir().join(format!(
+            "rustyfuzz-satori-deps-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+
+        // Project source, a nested `lib` that is genuinely the project's own,
+        // and a vendored dependency directory.
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/Token.sol"), b"contract Token {}")?;
+        fs::create_dir_all(root.join("src/lib"))?;
+        fs::write(root.join("src/lib/Helper.sol"), b"contract Helper {}")?;
+        fs::create_dir_all(root.join("lib/forge-std/src"))?;
+        fs::write(root.join("lib/forge-std/src/Test.sol"), b"contract Test {}")?;
+        fs::create_dir_all(root.join("vendor"))?;
+        fs::write(root.join("vendor/Dep.sol"), b"contract Dep {}")?;
+
+        let collected = collect_files(&root)?;
+        let names: Vec<String> = collected
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        assert!(
+            names.contains(&"src/Token.sol".to_string()),
+            "project source must be ingested: {names:?}"
+        );
+        assert!(
+            names.contains(&"src/lib/Helper.sol".to_string()),
+            "a nested lib directory is still project source: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.starts_with("lib/")),
+            "vendored dependencies must not be ingested: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.starts_with("vendor/")),
+            "vendored dependencies must not be ingested: {names:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
 
     #[test]
     fn evidence_reader_rejects_escape_symlink_and_oversized_files() -> SatoriResult<()> {

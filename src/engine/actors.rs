@@ -72,6 +72,19 @@ impl ActorSet {
         }
         assigned
     }
+
+    /// Assigns a role to each transaction *without* rewriting the callers.
+    ///
+    /// An executed sequence's callers are the accounts that actually ran.
+    /// Rewriting them to the actor set's addresses would make the recorded
+    /// proof path disagree with the replay it describes — the policy
+    /// observation would no longer come from the account that performed the
+    /// privileged call, and the violation predicate would not hold.
+    pub fn assign_roles(&self, len: usize) -> BTreeMap<usize, ActorType> {
+        (0..len)
+            .map(|idx| (idx, role_for_position(idx, len)))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]

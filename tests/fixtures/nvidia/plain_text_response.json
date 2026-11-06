@@ -1,0 +1,21 @@
+{
+  "id": "chatcmpl-test-101",
+  "object": "chat.completion",
+  "created": 1234567890,
+  "model": "nvidia/nemotron-3.5-lightning-30b-a3b",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "I need to analyze this function packet for vulnerabilities. Let me look at the token transfer mechanism and check for any reentrancy vectors or access control issues. Based on my analysis, here's what I found:\n\nThe primary finding is that the function lacks proper access control on the token minting operation, which could allow unrestricted token creation by attackers. The invariant that should hold is that only authorized accounts can mint tokens, but the current implementation does not enforce this constraint during the critical mint path.\n\nAdditionally, there's a potential stale oracle issue where the price feed could become outdated if the update mechanism is not triggered frequently enough during high volatility periods.\n\nFor the specific function under review, I'll construct the hypothesis objects now."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 500,
+    "completion_tokens": 200,
+    "total_tokens": 700
+  }
+}

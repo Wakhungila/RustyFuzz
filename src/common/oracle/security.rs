@@ -80,13 +80,21 @@ impl VulnerabilityOracle for ReentrancyOracle {
 
 /// PanicOracle: Monitors for EVM Panic errors (0x4e487b71).
 pub struct PanicOracle;
-
 impl VulnerabilityOracle for PanicOracle {
     fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
         for waypoint in &after.waypoints {
             if let Waypoint::StaticCall { output, .. } = waypoint {
                 if output.len() >= 36 && output[0..4] == [0x4e, 0x48, 0x7b, 0x71] {
                     let code = U256::from_be_slice(&output[4..36]).to::<u64>();
+                    // 0x01 is excluded because an assertion is a guard the
+                    // author wrote on purpose: tripping it is the contract
+                    // refusing a call, not the contract misbehaving. Every
+                    // other code is reported so that a logic defect which
+                    // happens to surface as an overflow or an out-of-bounds
+                    // index is not silently dropped. The severity the finding
+                    // carries comes from the shared panic table, so this
+                    // oracle and the runtime-panic pack agree on how serious a
+                    // given code is.
                     if code != 0x01 {
                         return Some(VulnType::UnintendedPanic(code));
                     }

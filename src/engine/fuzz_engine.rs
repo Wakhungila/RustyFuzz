@@ -68,6 +68,23 @@ const MAX_CANONICAL_EVIDENCE_DEPTH: usize = 64;
 const MAX_CANONICAL_SUMMARY_BYTES: usize = 12 * 1024 * 1024;
 const REQUIRED_SEED_PROVENANCE_PREFIX: &str = "rustyfuzz:required-seed";
 
+/// Root directory for canonical campaign artifacts, relative to the process
+/// working directory.
+///
+/// The canonical layout is the authority for a campaign's evidence: the engine
+/// relocates the corpus and the reports into it, so a caller that wants to
+/// read a campaign's summary, findings, or replay marker back has to look
+/// here rather than at the paths it passed in.
+pub const CANONICAL_ARTIFACTS_ROOT: &str = ".rustyfuzz";
+
+/// The canonical artifact layout for a campaign id.
+///
+/// Consumers that drive a campaign and then read its evidence use this to
+/// find the same directory the engine wrote to.
+pub fn canonical_layout(campaign_id: &str) -> rustyfuzz_artifacts::RunLayout {
+    rustyfuzz_artifacts::RunLayout::new(Path::new(CANONICAL_ARTIFACTS_ROOT), campaign_id)
+}
+
 fn required_seed_inputs(bundle: &MainnetSeedBundle) -> anyhow::Result<Vec<EvmInput>> {
     let inputs = bundle
         .seeds
@@ -843,12 +860,50 @@ pub fn effective_config_fingerprint(
     })
 }
 
+/// Moves a caller-staged seed bundle into the canonical run layout.
+///
+/// The engine relocates the corpus into `.rustyfuzz/runs/<campaign>/inputs`,
+/// so a bundle the caller wrote before the campaign started (the Satori
+/// validator stages the required sequence there) would otherwise be invisible
+/// to the campaign that has to consume it, and the campaign would fail with
+/// "seed bundle missing" instead of running.
+///
+/// An existing destination is left alone: the canonical layout is the
+/// authority once a campaign has started, and overwriting it could replace
+/// seeds the campaign already consumed.
+fn migrate_required_seed_bundle(
+    caller_corpus_dir: &Path,
+    inputs_dir: &Path,
+    bundle_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(bundle_id) = bundle_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return Ok(());
+    };
+    if bundle_id == "." || bundle_id == ".." || bundle_id.contains('/') || bundle_id.contains('\\') {
+        anyhow::bail!("seed bundle id contains unsupported path characters");
+    }
+    let source = caller_corpus_dir.join("mainnet_seeds").join(bundle_id);
+    if !source.exists() {
+        return Ok(());
+    }
+    let destination = inputs_dir.join("mainnet_seeds").join(bundle_id);
+    if destination.exists() {
+        return Ok(());
+    }
+    crate::common::fs_security::copy_directory_tree(&source, &destination)
+        .map_err(|message| anyhow::anyhow!("cannot migrate required seed bundle: {message}"))
+}
+
 fn prepare_canonical_run_lifecycle_at(
     config: Config,
     artifacts_root: &Path,
     owner: Option<rustyfuzz_artifacts::CampaignLock>,
 ) -> anyhow::Result<(Config, rustyfuzz_artifacts::CampaignLock)> {
     dotenvy::dotenv().ok();
+    // The caller may have staged a required seed bundle in its own corpus
+    // directory before the campaign started. The canonical layout owns the
+    // corpus from here on, so the bundle has to travel with it.
+    let caller_corpus_dir = PathBuf::from(&config.corpus_dir);
     let mut config = config.with_isolated_paths();
     let campaign_id = config
         .campaign_id
@@ -886,6 +941,11 @@ fn prepare_canonical_run_lifecycle_at(
         }
         Err(error) => return Err(error.into()),
     };
+    migrate_required_seed_bundle(
+        &caller_corpus_dir,
+        &layout.inputs_dir(),
+        config.mainnet_seed_bundle.as_deref(),
+    )?;
     let terminal = layout
         .read_terminal_status()
         .map_err(|error| anyhow::anyhow!("cannot read canonical terminal state: {error}"))?;
@@ -984,7 +1044,7 @@ pub async fn run_fuzz_campaign_with_cancellation(
     cancellation: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<()> {
     let (terminal_config, owner) =
-        prepare_canonical_run_lifecycle_at(config, Path::new(".rustyfuzz"), None)?;
+        prepare_canonical_run_lifecycle_at(config, Path::new(CANONICAL_ARTIFACTS_ROOT), None)?;
     run_fuzz_campaign_owned(terminal_config, cancellation, owner).await
 }
 
@@ -994,7 +1054,7 @@ pub async fn run_fuzz_campaign_with_cancellation_locked(
     owner: rustyfuzz_artifacts::CampaignLock,
 ) -> anyhow::Result<()> {
     let (terminal_config, owner) =
-        prepare_canonical_run_lifecycle_at(config, Path::new(".rustyfuzz"), Some(owner))?;
+        prepare_canonical_run_lifecycle_at(config, Path::new(CANONICAL_ARTIFACTS_ROOT), Some(owner))?;
     run_fuzz_campaign_owned(terminal_config, cancellation, owner).await
 }
 
@@ -4504,9 +4564,10 @@ fn load_canonical_run_manifest(
 }
 
 fn canonical_run_layout(config: &Config) -> Option<rustyfuzz_artifacts::RunLayout> {
-    config.campaign_id.as_deref().map(|campaign_id| {
-        rustyfuzz_artifacts::RunLayout::new(Path::new(".rustyfuzz"), campaign_id)
-    })
+    config
+        .campaign_id
+        .as_deref()
+        .map(canonical_layout)
 }
 
 fn write_run_terminal_status(
@@ -5143,6 +5204,46 @@ fn seed_input(target_contract: Address, fuzzer_address: Address) -> EvmInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_seed_bundle_is_migrated_into_the_canonical_layout() {
+        let temp = std::env::temp_dir().join(format!(
+            "rustyfuzz-seed-migration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let caller = temp.join("caller-corpus");
+        let inputs = temp.join("canonical").join("inputs");
+        std::fs::create_dir_all(caller.join("mainnet_seeds").join("satori-sequence").join("inputs"))
+            .expect("caller bundle");
+        std::fs::write(
+            caller.join("mainnet_seeds").join("satori-sequence").join("manifest.json"),
+            b"{\"bundle\":true}",
+        )
+        .expect("manifest");
+        std::fs::create_dir_all(&inputs).expect("inputs");
+
+        migrate_required_seed_bundle(&caller, &inputs, Some("satori-sequence"))
+            .expect("bundle must migrate");
+        let migrated = inputs.join("mainnet_seeds").join("satori-sequence").join("manifest.json");
+        assert_eq!(
+            std::fs::read(&migrated).expect("migrated manifest"),
+            b"{\"bundle\":true}"
+        );
+
+        // A missing source is not an error: the campaign simply has no staged
+        // bundle to carry over.
+        migrate_required_seed_bundle(&temp.join("empty"), &inputs, Some("satori-sequence"))
+            .expect("missing source must be tolerated");
+
+        // A bundle id that tries to escape the corpus is refused.
+        assert!(migrate_required_seed_bundle(&caller, &inputs, Some("../escape")).is_err());
+
+        let _ = std::fs::remove_dir_all(temp);
+    }
 
     #[test]
     fn merge_worker_summaries_takes_the_minimum_time_to_first_finding() {
@@ -6213,5 +6314,64 @@ mod tests {
         assert!(merged
             .recommended_invariant_families
             .contains(&"access-control".to_string()));
+    }
+
+    #[test]
+    fn campaign_artifact_reason_returns_none_for_score_only() {
+        let score = CampaignScore {
+            total: 900,
+            economic_pressure: 0,
+            invariant_pressure: 0,
+            counterexample_pressure: 0,
+            oracle_pressure: 0,
+            state_pressure: 100,
+            exploration_pressure: 800,
+            explanation: vec!["high anomaly".to_string()],
+        };
+        let result = campaign_artifact_reason(false, &score, &[], None);
+        assert!(result.is_none(), "score-only should not produce artifact reason");
+    }
+
+    #[test]
+    fn campaign_artifact_reason_returns_reason_for_oracle_finding() {
+        use crate::common::oracle::{ProtocolFinding, ProtocolOraclePackKind, ProtocolSeverity, VulnType};
+
+        let finding = ProtocolFinding {
+            pack: ProtocolOraclePackKind::Erc20,
+            vuln: VulnType::PriceOracleManipulation,
+            severity: ProtocolSeverity::Critical,
+            tx_index: None,
+            target: None,
+            evidence: "oracle price manipulation detected".to_string(),
+        };
+        let score = CampaignScore {
+            total: 1000,
+            economic_pressure: 0,
+            invariant_pressure: 850,
+            counterexample_pressure: 0,
+            oracle_pressure: 150,
+            state_pressure: 0,
+            exploration_pressure: 0,
+            explanation: vec!["oracle finding detected".to_string()],
+        };
+        let result = campaign_artifact_reason(false, &score, &[finding], None);
+        assert_eq!(result, Some("protocol-oracle-finding"));
+    }
+
+    #[test]
+    fn campaign_artifact_reason_returns_none_in_synthetic_fork_mode() {
+        let score = CampaignScore {
+            total: 1000,
+            economic_pressure: 1000,
+            invariant_pressure: 0,
+            counterexample_pressure: 0,
+            oracle_pressure: 0,
+            state_pressure: 0,
+            exploration_pressure: 0,
+            explanation: vec!["synthetic fork".to_string()],
+        };
+        // Synthetic fork mode should always return None regardless of other conditions
+        let result = campaign_artifact_reason(true, &score, &[], None);
+        assert!(result.is_none(), "synthetic fork mode should suppress artifacts");
     }
 }

@@ -15,19 +15,29 @@ use crate::satori::jobs::job_from_hypothesis;
 use crate::satori::memory::false_positive::has_minimum_evidence;
 use crate::satori::memory::MemoryStore;
 use crate::satori::packets::{build_function_packets, build_repo_packet};
+use crate::satori::reasoning::normalize::normalize_function_audit;
 use crate::satori::reasoning::parser::parse_strict_json;
 use crate::satori::reasoning::prompts::load_prompt;
+use crate::satori::reasoning::schemas::FUNCTION_AUDIT_JSON_SCHEMA;
 use crate::satori::reasoning::zen_client::ZenClient;
 use crate::satori::report::write_reports;
 use crate::satori::types::{
-    FunctionAuditResult, FunctionPacket, ProjectModel, ProtocolModel, RustyFuzzJobSpec,
-    SatoriConfig, SatoriReport, SatoriRun, StaticAnalysisBundle, VulnerabilityHypothesis,
+    AttackStep, FunctionAuditResult, FunctionPacket, FunctionSummary, ProjectModel, ProtocolModel,
+    RustyFuzzJobSpec, SatoriConfig, SatoriReport, SatoriRun, StaticAnalysisBundle,
+    VulnerabilityHypothesis,
+};
+use crate::satori::validation::sequence_resolver::{
+    authorization_probe_step, balance_probe_step, default_attacker, is_mint_action,
+    mint_recipient, policy_probe_for_preconditions, resolve_attack_sequence_with_hints,
+    step_caller, ResolverContext, ERC20_BALANCE_OF_SIGNATURE,
 };
 use crate::satori::validation::validate_jobs_async;
 use chrono::Utc;
+use revm::primitives::Address;
 use serde::de::DeserializeOwned;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::str::FromStr;
 
 pub struct PipelineArtifacts {
     pub run: SatoriRun,
@@ -150,14 +160,23 @@ pub async fn run_model_audit(path: &Path, config: SatoriConfig) -> SatoriResult<
     let mut budget = BudgetTracker::default();
     let mut hypotheses = Vec::new();
     let mut rejected = Vec::new();
+    let mut used_hypothesis_ids: BTreeSet<String> = BTreeSet::new();
     let mut model_hypotheses = 0usize;
     for packet in &function_packets {
         let prompt = function_audit_prompt(packet, config.max_hypotheses_per_function);
+        let func_id = &packet.target_function.id;
         let (response, cached) = client
             .complete_json_with_fallbacks(&prompt, &config.fallback_models)
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!("Model call failed for {}: {}", func_id, e))?;
         budget.record_call(&prompt, &response, cached);
-        let audit: FunctionAuditResult = parse_strict_json(&response)?;
+        let audit: FunctionAuditResult = parse_function_audit(&response, &packet.target_function.id)
+            .map_err(|e| {
+            anyhow::anyhow!("Failed to parse response for {}: {}\nResponse was: {}", 
+                func_id, e, 
+                response.chars().take(200).collect::<String>()
+            )
+        })?;
         ensure_hypothesis_count(
             audit.hypotheses.len(),
             config.max_hypotheses_per_function,
@@ -169,7 +188,11 @@ pub async fn run_model_audit(path: &Path, config: SatoriConfig) -> SatoriResult<
                 .ok_or_else(|| anyhow::anyhow!("Satori hypothesis count overflow"))?;
             ensure_hypothesis_count(model_hypotheses, config.max_hypotheses_total, "global")?;
             match reject_hypothesis(&hypothesis, &config) {
-                None => hypotheses.push(hypothesis),
+                None => {
+                    let mut hypothesis = hypothesis;
+                    assign_hypothesis_id(&mut hypothesis, func_id, &mut used_hypothesis_ids);
+                    hypotheses.push(hypothesis);
+                }
                 Some(reason) => rejected.push(format!("{}: {reason}", hypothesis.id)),
             }
         }
@@ -183,7 +206,56 @@ pub async fn run_model_audit(path: &Path, config: SatoriConfig) -> SatoriResult<
     let jobs = if config.generate_jobs {
         hypotheses
             .iter()
-            .map(job_from_hypothesis)
+            .map(|hypothesis| {
+                let mut job = job_from_hypothesis(hypothesis);
+                // The operator-declared target wins over the model's
+                // `affected_contracts` guess, and the live fork settings turn
+                // the job into an executable campaign against that chain.
+                if let Some(target) = &config.target_contract {
+                    job.target_contract = Some(target.clone());
+                }
+                job.fork_rpc_url = config.fork_rpc_url.clone();
+                job.fork_block = config.fork_block;
+                // Models describe attacks in prose; resolve them into explicit
+                // transactions the runner can execute. A sequence that cannot
+                // be resolved stays prose and the runner reports the missing
+                // context instead of fuzzing something unexplained.
+                if let Some(target) = &config.target_contract {
+                    if let Ok(address) = Address::from_str(target) {
+                        let context = ResolverContext {
+                            target: address,
+                            functions: &artifacts.analysis.functions,
+                            attacker: default_attacker(),
+                        };
+                        if let Some(steps) = resolve_attack_sequence_with_hints(
+                            &job.sequence_template,
+                            &hypothesis.affected_functions,
+                            &context,
+                        ) {
+                            let steps = with_authorization_probe(
+                                hypothesis,
+                                steps,
+                                &artifacts.analysis.functions,
+                                &context,
+                            );
+                            job.actors = steps
+                                .iter()
+                                .map(|step| step.actor.clone())
+                                .collect::<BTreeSet<_>>()
+                                .into_iter()
+                                .collect();
+                            // The depth budget has to cover the sequence as it
+                            // now stands: the authorization probe adds a
+                            // transaction, and a budget of one would make the
+                            // runner reject the very sequence that
+                            // establishes the precondition.
+                            job.max_depth = job.max_depth.max(steps.len());
+                            job.sequence_template = steps;
+                        }
+                    }
+                }
+                job
+            })
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -255,6 +327,95 @@ pub async fn run_model_audit(path: &Path, config: SatoriConfig) -> SatoriResult<
     };
     write_reports(&artifacts.run.run_dir, &report)?;
     Ok(report)
+}
+
+/// Prepends the probe that establishes the hypothesis' authorization
+/// precondition, when the hypothesis states one the target can answer.
+///
+/// Without the probe the campaign only shows that a privileged call
+/// succeeded. The protocol oracle needs to see the policy *refuse* the same
+/// account first, and the replayable predicate needs that refusal in the
+/// transaction immediately before the privileged call, so the probe is
+/// inserted directly in front of the mint it authorises.
+///
+/// The probe is only added when the hypothesis itself names the policy, so a
+/// sequence is never padded with calls the analyst did not ask for.
+fn with_authorization_probe(
+    hypothesis: &VulnerabilityHypothesis,
+    mut steps: Vec<AttackStep>,
+    functions: &[FunctionSummary],
+    context: &ResolverContext<'_>,
+) -> Vec<AttackStep> {
+    let mut preconditions = hypothesis.required_conditions.clone();
+    preconditions.extend(hypothesis.false_positive_checks.iter().cloned());
+    let Some(policy) = policy_probe_for_preconditions(&preconditions, functions) else {
+        return steps;
+    };
+    let Some(selector) = policy.selector.as_deref() else {
+        return steps;
+    };
+    let selector = selector.to_ascii_lowercase();
+    // The probe belongs immediately before the privileged call, so the oracle
+    // and the predicate see it in the transaction right before the mint.
+    let Some(position) = steps.iter().position(|step| is_mint_action(&step.action)) else {
+        return steps;
+    };
+    // Do not add a second probe when the sequence already contains one.
+    if steps.iter().any(|step| {
+        step.calldata_hint
+            .as_deref()
+            .is_some_and(|hint| hint.to_ascii_lowercase().starts_with(&selector))
+    }) {
+        return steps;
+    }
+    // Every observation in the ladder must come from the same account as the
+    // privileged call: the predicate compares the policy's address argument
+    // and the balance's subject against the mint's caller.
+    let caller = steps
+        .get(position)
+        .and_then(step_caller)
+        .unwrap_or(context.attacker);
+    let Some(probe) = authorization_probe_step(policy, caller, context) else {
+        return steps;
+    };
+    // The ladder proves the violation by comparing the recipient's balance
+    // before and after the privileged call, with the policy denial in
+    // between. All three observations have to come from the same account as
+    // the privileged call, so the sequence reads:
+    //
+    //   balanceOf(recipient) -> canMint(caller) -> mint(recipient, amount)
+    //   -> balanceOf(recipient)
+    //
+    // Without the trailing observation the replay cannot show the balance
+    // grew, and the finding stays heuristic no matter how well it replayed.
+    let balance_of = functions
+        .iter()
+        .find(|function| function.signature == ERC20_BALANCE_OF_SIGNATURE);
+    let recipient = steps.get(position).and_then(mint_recipient);
+    if let (Some(balance_of), Some(recipient)) = (balance_of, recipient) {
+        let before = balance_probe_step(
+            balance_of,
+            recipient,
+            caller,
+            "record the balance before the mint",
+            context,
+        );
+        let after = balance_probe_step(
+            balance_of,
+            recipient,
+            caller,
+            "record the balance after the mint",
+            context,
+        );
+        if let (Some(before), Some(after)) = (before, after) {
+            steps.insert(position, before);
+            steps.insert(position + 1, probe);
+            steps.insert(position + 3, after);
+            return steps;
+        }
+    }
+    steps.insert(position, probe);
+    steps
 }
 
 pub async fn revalidate_existing_run(run_id: &str) -> SatoriResult<SatoriReport> {
@@ -443,16 +604,53 @@ fn load_function_packets(run_dir: &Path) -> SatoriResult<Vec<FunctionPacket>> {
 fn function_audit_prompt(packet: &FunctionPacket, max_hypotheses: usize) -> String {
     let packet_json = serde_json::to_string_pretty(packet).unwrap_or_default();
     format!(
-        "{}\n\n{}\n\nReturn at most {} hypotheses as FunctionAuditResult JSON.\n\nPACKET:\n{}",
+        "{}\n\n{}\n\nRespond with a single JSON object that conforms to the JSON Schema below.\n\
+         The schema is authoritative: every property listed in \"required\" MUST be present, \
+         with exactly the declared types. Use [] for an empty array and \"\" for an empty string. \
+         Do not add properties that are not in the schema.\n\n\
+         JSON Schema:\n{}\n\n\
+         Return at most {} hypotheses.\n\nPACKET:\n{}",
         load_prompt("system"),
         load_prompt("function_audit"),
+        FUNCTION_AUDIT_JSON_SCHEMA,
         max_hypotheses,
         redact_source_text(&packet_json)
     )
 }
 
-fn ensure_hypothesis_count(count: usize, cap: usize, scope: &str) -> SatoriResult<()> {
-    anyhow::ensure!(
+/// Parses a model response into a `FunctionAuditResult`.
+///
+/// Models routinely emit near-correct shapes (an invariant as a bare string, a
+/// hypothesis missing `evidence_from_context`). The payload is normalized into
+/// the canonical form before deserialization so a single sloppy field does not
+/// discard the whole analysis. A missing `function_id` is backfilled from the
+/// packet; a missing confidence stays `0.0` and therefore fails the confidence
+/// gate instead of being promoted.
+fn parse_function_audit(
+    response: &str,
+    expected_function_id: &str,
+) -> SatoriResult<FunctionAuditResult> {
+    let mut value: serde_json::Value = serde_json::from_str(response.trim())
+        .map_err(|_| anyhow::anyhow!("model output is not strict JSON"))?;
+    normalize_function_audit(&mut value);
+    if let Some(map) = value.as_object_mut() {
+        let function_id = map
+            .get("function_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if function_id.is_empty() {
+            map.insert(
+                "function_id".to_string(),
+                serde_json::Value::String(expected_function_id.to_string()),
+            );
+        }
+    }
+    parse_strict_json(&value.to_string())
+}
+
+fn ensure_hypothesis_count(count: usize, cap: usize, scope: &str) -> SatoriResult<()> {    anyhow::ensure!(
         count <= cap,
         "Satori model returned {count} hypotheses, exceeding the {scope} cap of {cap}"
     );
@@ -475,6 +673,77 @@ fn ensure_job_count(count: usize, cap: usize) -> SatoriResult<()> {
         "Satori generated {count} jobs, exceeding the job cap of {cap}"
     );
     Ok(())
+}
+
+/// Assigns a run-unique, filesystem-safe identifier to a model hypothesis.
+///
+/// Models routinely number hypotheses per function (`H1`, `H2`), so two
+/// functions in one project produce the same ID and the pipeline used to abort
+/// the entire run on that collision. A colliding ID is suffixed with a short,
+/// deterministic digest of the function it came from: reproducible across runs,
+/// safe to embed in artifact filenames, and unique within the run.
+fn assign_hypothesis_id(
+    hypothesis: &mut VulnerabilityHypothesis,
+    function_id: &str,
+    used: &mut BTreeSet<String>,
+) {
+    let base = sanitize_identifier_fragment(&hypothesis.id, "hypothesis");
+    if used.insert(base.clone()) {
+        hypothesis.id = base;
+        return;
+    }
+    let digest = crate::satori::fsutil::sha256_hex(function_id.as_bytes());
+    let digest = &digest[..8];
+    let mut candidate = format!("{base}-{digest}");
+    let mut counter = 2usize;
+    while !used.insert(candidate.clone()) {
+        candidate = format!("{base}-{digest}-{counter}");
+        counter += 1;
+    }
+    hypothesis.id = candidate;
+}
+
+/// Reduces an arbitrary model-supplied label to a single safe path segment.
+///
+/// Hypothesis IDs become artifact filenames, so they must satisfy
+/// `validate_filesystem_identifier`: ASCII alphanumerics plus `-`, `_` and `.`,
+/// no path separators, and no dot paths.
+fn sanitize_identifier_fragment(value: &str, fallback: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut previous_dash = false;
+    for character in value.trim().chars() {
+        let mapped = if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+            character
+        } else {
+            '-'
+        };
+        if mapped == '-' {
+            if previous_dash {
+                continue;
+            }
+            previous_dash = true;
+        } else {
+            previous_dash = false;
+        }
+        out.push(mapped);
+    }
+    // A leading dot would produce a hidden path segment, and a trailing dot is
+    // ambiguous across filesystems.
+    let trimmed = out.trim_matches('.').to_string();
+    let mut trimmed = if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed
+    };
+    if trimmed.len() > crate::common::fs_security::MAX_FILESYSTEM_IDENTIFIER_LENGTH {
+        trimmed.truncate(crate::common::fs_security::MAX_FILESYSTEM_IDENTIFIER_LENGTH);
+        trimmed = trimmed.trim_matches('.').to_string();
+    }
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed
+    }
 }
 
 fn ensure_unique_hypotheses(hypotheses: &[VulnerabilityHypothesis]) -> SatoriResult<()> {
@@ -528,6 +797,84 @@ fn reject_hypothesis(
 mod tests {
     use super::*;
     use crate::satori::types::FunctionSummary;
+
+    fn hypothesis_with_id(id: &str) -> VulnerabilityHypothesis {
+        VulnerabilityHypothesis {
+            id: id.to_string(),
+            title: "t".to_string(),
+            bug_class: "access_control".to_string(),
+            root_cause: "r".to_string(),
+            affected_contracts: vec!["C".to_string()],
+            affected_functions: vec!["C::f()".to_string()],
+            evidence_from_context: Vec::new(),
+            required_conditions: Vec::new(),
+            attack_sequence: Vec::new(),
+            false_positive_checks: Vec::new(),
+            validation_plan: Vec::new(),
+            suggested_invariants: Vec::new(),
+            rustyfuzz_objective: "o".to_string(),
+            confidence_before_validation: 0.5,
+        }
+    }
+
+    #[test]
+    fn duplicate_hypothesis_ids_are_disambiguated_per_function() {
+        let mut used = BTreeSet::new();
+        let mut first = hypothesis_with_id("H1");
+        let mut second = hypothesis_with_id("H1");
+        assign_hypothesis_id(&mut first, "Vault::deposit()", &mut used);
+        assign_hypothesis_id(&mut second, "Vault::withdraw()", &mut used);
+        assert_eq!(first.id, "H1");
+        assert_ne!(second.id, first.id);
+        assert!(second.id.starts_with("H1-"));
+        // Deterministic: the same function always produces the same suffix.
+        let mut third = hypothesis_with_id("H1");
+        assign_hypothesis_id(&mut third, "Vault::withdraw()", &mut used);
+        assert_ne!(third.id, second.id);
+    }
+
+    #[test]
+    fn hypothesis_ids_are_reduced_to_safe_path_segments() {
+        let mut used = BTreeSet::new();
+        let mut hypothesis = hypothesis_with_id("H1: uninitialized proxy / takeover");
+        assign_hypothesis_id(&mut hypothesis, "Vault::initialize()", &mut used);
+        assert!(hypothesis
+            .id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | '.')));
+        assert!(crate::satori::fsutil::validate_identifier(&hypothesis.id).is_ok());
+        assert!(!hypothesis.id.starts_with('.'));
+        assert!(!hypothesis.id.ends_with('.'));
+    }
+
+    #[test]
+    fn empty_hypothesis_id_falls_back_to_a_placeholder() {
+        let mut used = BTreeSet::new();
+        let mut hypothesis = hypothesis_with_id("   ");
+        assign_hypothesis_id(&mut hypothesis, "Vault::f()", &mut used);
+        assert_eq!(hypothesis.id, "hypothesis");
+    }
+
+    #[test]
+    fn function_audit_json_is_normalized_before_parsing() {
+        let audit = parse_function_audit(
+            r#"{"function_id":"","hypotheses":[{"id":"H1","title":"t","bug_class":"access_control","root_cause":"r","evidence":["line 3"],"candidate_invariants":["x"]}],"candidate_invariants":["keep balance"],"rejected_notes":[]}"#,
+            "Vault::f()",
+        )
+        .expect("near-correct model output must still parse");
+        assert_eq!(audit.function_id, "Vault::f()");
+        assert_eq!(audit.hypotheses[0].evidence_from_context, vec!["line 3"]);
+        assert_eq!(audit.candidate_invariants[0].description, "keep balance");
+        // A missing confidence stays at zero so the hypothesis cannot be
+        // promoted by a default.
+        assert_eq!(audit.hypotheses[0].confidence_before_validation, 0.0);
+    }
+
+    #[test]
+    fn malformed_model_output_is_rejected() {
+        assert!(parse_function_audit("not json", "Vault::f()").is_err());
+    }
 
     #[test]
     fn function_audit_prompt_redacts_source_secrets() {

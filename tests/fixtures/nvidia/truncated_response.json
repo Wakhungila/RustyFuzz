@@ -1,0 +1,21 @@
+{
+  "id": "chatcmpl-test-456",
+  "object": "chat.completion",
+  "created": 1234567890,
+  "model": "nvidia/nemotron-3.5-lightning-30b-a3b",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null
+      },
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 500,
+    "completion_tokens": 8192,
+    "total_tokens": 8692
+  }
+}
