@@ -25,7 +25,7 @@ use revm::context::BlockEnv;
 use revm::primitives::U256;
 
 /// Per-transaction time advance derived from an input sequence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TimeWarp {
     /// Seconds added per transaction.
     pub seconds_per_tx: u64,

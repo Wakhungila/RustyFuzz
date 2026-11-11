@@ -131,6 +131,28 @@ pub struct SequenceExecutionResult {
     pub oracle_observations: Vec<OracleObservation>,
 }
 
+impl SequenceExecutionResult {
+    /// Canonical aggregation for campaigns, replay, minimization and proof.
+    /// The ordered transaction signatures are independent of the observer map's
+    /// size and of scheduler-only reward slots.
+    pub fn from_tx_results(tx_results: Vec<TxExecutionResult>) -> Self {
+        let final_coverage_hash = tx_results.iter()
+            .flat_map(|result| result.coverage_hash.to_be_bytes())
+            .fold(0xcbf29ce484222325u64, |hash, byte|
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
+        Self {
+            total_gas_used: tx_results.iter().map(|result| result.gas_used).sum(),
+            final_coverage_hash,
+            storage_reads: tx_results.iter().flat_map(|result| result.storage_reads.clone()).collect(),
+            storage_writes: tx_results.iter().flat_map(|result| result.storage_writes.clone()).collect(),
+            storage_diffs: tx_results.iter().flat_map(|result| result.storage_diffs.clone()).collect(),
+            call_trace: tx_results.iter().flat_map(|result| result.call_trace.clone()).collect(),
+            oracle_observations: Vec::new(),
+            tx_results,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct StorageAccess {
     pub tx_index: usize,

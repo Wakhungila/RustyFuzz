@@ -893,6 +893,8 @@ mod tests {
         assert_eq!(corpus.resolve_input_id(&input).unwrap(), metadata.id);
         assert_eq!(corpus.load_input(&metadata.id).unwrap(), input);
         let mut record = FindingPromotionRecord {
+            replay_context: None,
+            violation_predicate: None,
             finding_id: "f1".to_string(),
             campaign_id: "campaign".to_string(),
             input_id: metadata.id.clone(),
@@ -986,6 +988,8 @@ mod tests {
             }
         }
         let record = FindingPromotionRecord {
+            replay_context: None,
+            violation_predicate: None,
             finding_id: "finding".to_string(),
             campaign_id: "campaign".to_string(),
             input_id: "input".to_string(),

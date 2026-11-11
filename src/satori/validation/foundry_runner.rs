@@ -229,42 +229,50 @@ pub fn maybe_run_forge_test(
         .unwrap_or(&test_path)
         .display()
         .to_string();
-    if rpc_url.is_some_and(|value| !value.trim().is_empty()) && !cfg!(test) {
-        return Ok(ToolRun {
-            tool: "forge".to_string(),
-            command: forge_display_command(Path::new(&match_path), rpc_url),
-            available: false,
-            success: false,
-            exit_code: None,
-            stdout_snippet: String::new(),
-            stderr_snippet: "RPC-backed Foundry validation is disabled under the network-isolated analyzer sandbox".to_string(),
-            artifact: Some(match_path.into()),
-        });
-    }
-    let rpc_endpoint = match rpc_url.filter(|value| !value.trim().is_empty()) {
-        Some(raw) => match prepare_forge_rpc(raw) {
-            Ok(endpoint) => Some(endpoint),
-            Err(error) => {
-                return Ok(ToolRun {
-                    tool: "forge".to_string(),
-                    command: forge_display_command(Path::new(&match_path), None),
-                    available: false,
-                    success: false,
-                    exit_code: None,
-                    stdout_snippet: String::new(),
-                    stderr_snippet: redact_external_output(
-                        error.to_string().as_bytes(),
-                        MAX_EXTERNAL_OUTPUT_BYTES,
-                    ),
-                    artifact: Some(match_path.into()),
-                });
+
+    // Determine RPC endpoint setup strategy:
+    // - In test mode: no RPC proxy (tests control it independently via FAKE_ env vars)
+    // - Outside sandbox with RPC: direct access via environment variable to forge
+    // - Inside sandbox: RPC via proxy for network isolation
+    let has_sandbox_launcher = std::env::var_os("RUSTYFUZZ_SATORI_SANDBOX_LAUNCHER").is_some();
+    let rpc_endpoint: Option<ForgeRpcEndpoint> = match rpc_url.filter(|value| !value.trim().is_empty()) {
+        Some(raw) => {
+            if has_sandbox_launcher {
+                // Inside sandbox (either real or simulated): set up proxy for network access
+                match prepare_forge_rpc(raw) {
+                    Ok(endpoint) => Some(endpoint),
+                    Err(error) => {
+                        return Ok(ToolRun {
+                            tool: "forge".to_string(),
+                            command: forge_display_command(Path::new(&match_path), None),
+                            available: false,
+                            success: false,
+                            exit_code: None,
+                            stdout_snippet: String::new(),
+                            stderr_snippet: redact_external_output(
+                                error.to_string().as_bytes(),
+                                MAX_EXTERNAL_OUTPUT_BYTES,
+                            ),
+                            artifact: Some(match_path.into()),
+                        });
+                    }
+                }
+            } else {
+                // Outside sandbox: rpc_endpoint is None, forge will read RUSTYFUZZ_RPC_URL from env
+                None
             }
-        },
+        }
         None => None,
     };
     let command = forge_display_command(Path::new(&match_path), rpc_url);
     let mut version_command = Command::new("forge");
     version_command.arg("--version").current_dir(&project_root);
+    // Set RPC URL for non-sandbox forge execution (needed for version check if it requires network)
+    if let Some(raw) = rpc_url {
+        if !raw.trim().is_empty() && !has_sandbox_launcher {
+            version_command.env("RUSTYFUZZ_RPC_URL", raw);
+        }
+    }
     let version = run_bounded_external_command(&mut version_command, MAX_EXTERNAL_COMMAND_TIMEOUT);
     if forge_version_is_unavailable(&version) {
         let stderr_snippet = match &version {
@@ -320,6 +328,11 @@ pub fn maybe_run_forge_test(
                     .current_dir(&project_root);
                 if let Some(rpc_endpoint) = rpc_endpoint.as_ref() {
                     configure_forge_rpc(&mut command_builder, rpc_endpoint);
+                } else if let Some(rpc_url) = rpc_url {
+                    // Outside sandbox: pass RPC URL directly to forge process
+                    if !rpc_url.trim().is_empty() {
+                        command_builder.env("RUSTYFUZZ_RPC_URL", rpc_url);
+                    }
                 }
                 command_builder.env("RUSTYFUZZ_SATORI_WRITABLE_ROOT", &stage_dir);
                 match run_bounded_external_command(

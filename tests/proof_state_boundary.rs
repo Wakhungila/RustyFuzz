@@ -69,6 +69,7 @@ fn artifact_base_cache_preserves_original_caller_and_rejects_exploration_funding
     let corpus = PersistentCorpus::new(&root).unwrap();
     let artifact = corpus
         .persist_campaign_artifact(CampaignArtifactRequest {
+            replay_context: None,
             input: &input,
             execution: &execution,
             coverage: &coverage,

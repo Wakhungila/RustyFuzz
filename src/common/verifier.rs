@@ -4,7 +4,6 @@ use crate::common::oracle::{
 use crate::common::types::{ChainState, OracleObservation, SequenceExecutionResult, Snapshot};
 use crate::evm::corpus::PersistentCorpus;
 use crate::evm::economic_views::{snapshot_economic_views, EconomicViewProbePlan};
-use crate::evm::feedback::EvmCoverageFeedback;
 use crate::evm::fuzz::EvmInput;
 use crate::satori::fsutil::{
     redact_external_output, run_bounded_external_command_with_output_limit,
@@ -115,7 +114,19 @@ impl ReplayVerifier {
         block_env: &BlockEnv,
         input: &EvmInput,
     ) -> Result<(SequenceExecutionResult, Vec<u8>)> {
+        let (execution, coverage, _, _) = self.replay_state(base_state, block_env, input)?;
+        Ok((execution, coverage))
+    }
+
+    fn replay_state(
+        &self,
+        base_state: &ChainState,
+        block_env: &BlockEnv,
+        input: &EvmInput,
+    ) -> Result<(SequenceExecutionResult, Vec<u8>, ChainState, BlockEnv)> {
+        anyhow::ensure!(input.validate(), "invalid replay input");
         let mut state = base_state.clone();
+        let mut final_env = block_env.clone();
         let mut coverage = vec![0u8; self.map_size];
         let mut dataflow = DataflowRegistry::new();
         let mut tx_results = Vec::with_capacity(input.txs.len());
@@ -136,31 +147,11 @@ impl ReplayVerifier {
                 tx_idx,
             )?;
             tx_results.push(result);
+            final_env = env;
         }
 
-        let execution = SequenceExecutionResult {
-            total_gas_used: tx_results.iter().map(|result| result.gas_used).sum(),
-            final_coverage_hash: EvmCoverageFeedback::stable_path_hash(&coverage),
-            storage_reads: tx_results
-                .iter()
-                .flat_map(|result| result.storage_reads.clone())
-                .collect(),
-            storage_writes: tx_results
-                .iter()
-                .flat_map(|result| result.storage_writes.clone())
-                .collect(),
-            storage_diffs: tx_results
-                .iter()
-                .flat_map(|result| result.storage_diffs.clone())
-                .collect(),
-            call_trace: tx_results
-                .iter()
-                .flat_map(|result| result.call_trace.clone())
-                .collect(),
-            oracle_observations: Vec::new(),
-            tx_results,
-        };
-        Ok((execution, coverage))
+        let execution = SequenceExecutionResult::from_tx_results(tx_results);
+        Ok((execution, coverage, state, final_env))
     }
 
     pub fn replay_with_economic_views(
@@ -172,24 +163,7 @@ impl ReplayVerifier {
     ) -> Result<ReplayEconomicResult> {
         let plan = EconomicViewProbePlan::from_sequence(input, target);
         let before = snapshot_economic_views(base_state, block_env, &plan, 0);
-        let execution = self.replay(base_state, block_env, input)?;
-
-        let mut state = base_state.clone();
-        let mut env = block_env.clone();
-        let mut coverage = vec![0u8; self.map_size];
-        let mut dataflow = DataflowRegistry::new();
-        for (tx_idx, tx) in input.txs.iter().enumerate() {
-            let mut waypoints = Vec::new();
-            self.executor.execute_with_result(
-                &mut state,
-                &mut env,
-                tx,
-                &mut coverage,
-                &mut dataflow,
-                &mut waypoints,
-                tx_idx,
-            )?;
-        }
+        let (execution, _, state, env) = self.replay_state(base_state, block_env, input)?;
 
         let after = snapshot_economic_views(&state, &env, &plan, input.txs.len());
         let delta = crate::engine::economic_delta::economic_view_delta(&before, &after);
@@ -394,6 +368,38 @@ impl ViolationPredicate {
 
     pub fn holds(&self, execution: &SequenceExecutionResult) -> bool {
         self.holds_with_block(execution, None)
+    }
+
+    pub fn holds_in_context(
+        &self,
+        execution: &SequenceExecutionResult,
+        context: &crate::engine::replay_context::ReplayContext,
+    ) -> bool {
+        let index = match self {
+            Self::InvariantViolated { tx_index, .. } => *tx_index,
+            Self::DeniedMint { .. } => 0,
+        };
+        let block = context.block_at(index);
+        self.holds_with_block(execution, Some(rustyfuzz_predicate::BlockContext {
+            number: rustyfuzz_predicate::Int256(block.number.to_be_bytes()),
+            timestamp: rustyfuzz_predicate::Int256(block.timestamp.to_be_bytes()),
+        }))
+    }
+
+    /// Keep the same witnessed transaction when minimization removes a prefix.
+    /// Removing the witness itself is forbidden; a different violation is not
+    /// evidence that this finding survived reduction.
+    pub fn after_removing_transaction(&self, removed: usize) -> Option<Self> {
+        let mut predicate = self.clone();
+        if let Self::InvariantViolated { tx_index, .. } = &mut predicate {
+            if removed == *tx_index {
+                return None;
+            }
+            if removed < *tx_index {
+                *tx_index -= 1;
+            }
+        }
+        Some(predicate)
     }
 
     fn holds_with_block(
@@ -717,28 +723,7 @@ impl RealismVerifier {
             tx_results.push(result);
         }
 
-        Ok(SequenceExecutionResult {
-            total_gas_used: tx_results.iter().map(|result| result.gas_used).sum(),
-            final_coverage_hash: EvmCoverageFeedback::stable_path_hash(&coverage),
-            storage_reads: tx_results
-                .iter()
-                .flat_map(|result| result.storage_reads.clone())
-                .collect(),
-            storage_writes: tx_results
-                .iter()
-                .flat_map(|result| result.storage_writes.clone())
-                .collect(),
-            storage_diffs: tx_results
-                .iter()
-                .flat_map(|result| result.storage_diffs.clone())
-                .collect(),
-            call_trace: tx_results
-                .iter()
-                .flat_map(|result| result.call_trace.clone())
-                .collect(),
-            oracle_observations: Vec::new(),
-            tx_results,
-        })
+        Ok(SequenceExecutionResult::from_tx_results(tx_results))
     }
 }
 

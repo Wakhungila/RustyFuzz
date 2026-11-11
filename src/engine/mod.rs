@@ -32,6 +32,7 @@ pub mod promotion;
 pub mod proof;
 pub mod protocol_model;
 pub mod provenance;
+pub mod replay_context;
 pub mod scheduler;
 pub mod scoring;
 pub mod seed_intelligence;

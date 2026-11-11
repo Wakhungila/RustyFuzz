@@ -245,8 +245,7 @@ fn attach_to_cgroup(command: &mut Command, cgroup: &CgroupGuard) -> io::Result<(
             let mut start = digits.len();
             loop {
                 start -= 1;
-                digits[start] = u8::try_from(pid % 10)
-                    .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+                digits[start] = (pid % 10) as u8 + b'0';
                 pid /= 10;
                 if pid == 0 {
                     break;
@@ -559,11 +558,15 @@ impl CgroupGuard {
         let events = self.path.join("cgroup.events");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         loop {
-            if fs::read_to_string(&events)
-                .map(|events| has_word(&events, "populated 0"))
-                .unwrap_or(true)
-            {
-                break;
+            // cgroup.events format: "populated 0\n" where 0 means no processes
+            // We need to check both words exist and 0 follows "populated"
+            if let Ok(content) = fs::read_to_string(&events) {
+                let words: Vec<&str> = content.split_ascii_whitespace().collect();
+                if words.get(0) == Some(&"populated") && words.get(1) == Some(&"0") {
+                    break;
+                }
+            } else {
+                // If we can't read the file, treat as still populated
             }
             if std::time::Instant::now() >= deadline {
                 return Err(io::Error::other(

@@ -12,7 +12,8 @@ use std::path::Path;
 /// v4: storage_diffs are canonical committed deltas from finalized REVM state;
 /// storage_writes/waypoints remain attempted-operation telemetry.
 /// v5: records execution environment policy and portable root replay lineage.
-pub const EXECUTION_PROVENANCE_SCHEMA_VERSION: u32 = 5;
+/// v6: records the initial block and time policy required by independent replay.
+pub const EXECUTION_PROVENANCE_SCHEMA_VERSION: u32 = 6;
 
 /// Live-RPC and fork-cache provenance attached to every execution record.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,6 +48,8 @@ pub struct ExecutionProvenanceRecord {
     pub root_replay_input: Option<EvmInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_policy: Option<rustyfuzz_evm::environment::EnvironmentPolicy>,
+    #[serde(default)]
+    pub replay_context: Option<super::replay_context::ReplayContext>,
     pub execution: SequenceExecutionResult,
     pub coverage_edges: usize,
     pub state_novelty_score: u64,
@@ -81,6 +84,7 @@ pub struct ExecutionProvenanceRecord {
 }
 
 pub struct PersistRequest<'a> {
+    pub replay_context: &'a super::replay_context::ReplayContext,
     pub execution_index: u64,
     pub budget_consumed: u64,
     pub input: &'a EvmInput,
@@ -112,6 +116,7 @@ pub fn persist(root: &Path, request: PersistRequest<'_>) -> anyhow::Result<()> {
         request.worker_id.as_deref(),
     )?;
     let record = ExecutionProvenanceRecord {
+        replay_context: Some(request.replay_context.clone()),
         schema_version: EXECUTION_PROVENANCE_SCHEMA_VERSION,
         execution_index: request.execution_index,
         budget_consumed: request.budget_consumed,
@@ -198,6 +203,6 @@ mod tests {
             Some("worker"),
         )
         .is_err());
-        assert_eq!(EXECUTION_PROVENANCE_SCHEMA_VERSION, 5);
+        assert_eq!(EXECUTION_PROVENANCE_SCHEMA_VERSION, 6);
     }
 }

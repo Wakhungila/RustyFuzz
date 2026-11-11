@@ -6,6 +6,7 @@ use crate::common::types::{
 use crate::engine::confirmation::{FindingConfirmation, FindingConfirmationGate};
 use crate::engine::exploit_path::ExploitPathCandidate;
 use crate::engine::proof::{ProofCarryingFinding, ProofConfidenceTier};
+use crate::engine::replay_context::ReplayContext;
 use crate::engine::scoring::CampaignScore;
 use crate::evm::feedback::EvmCoverageFeedback;
 use crate::evm::fuzz::{EvmInput, EvmTestcaseMetadata};
@@ -140,9 +141,26 @@ pub struct CampaignArtifactRecord {
     pub findings: Vec<ProtocolFinding>,
     #[serde(default)]
     pub proof: Option<ProofCarryingFinding>,
+    #[serde(default)]
+    pub replay_context: Option<ReplayContext>,
+    #[serde(default)]
+    pub discovery_execution_hash: Option<String>,
     pub metadata: CorpusEntryMetadata,
     #[serde(default)]
     pub triage: CampaignArtifactTriageSummary,
+}
+
+impl CampaignArtifactRecord {
+    pub fn recorded_context(&self) -> anyhow::Result<&ReplayContext> {
+        self.replay_context.as_ref().context("artifact has no recorded replay context; regenerate it before validation")
+    }
+
+    pub fn verify_replay(&self, input: &EvmInput, execution: &SequenceExecutionResult) -> anyhow::Result<()> {
+        anyhow::ensure!(self.metadata.input_hash == input.semantic_input_hash(), "replay input differs from discovery");
+        anyhow::ensure!(self.discovery_execution_hash.as_deref() == Some(execution_hash(execution)?.as_str()),
+            "replay differs from recorded discovery execution");
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -172,6 +190,7 @@ pub struct CampaignArtifactTriageSummary {
 }
 
 pub struct CampaignArtifactRequest<'a> {
+    pub replay_context: Option<&'a ReplayContext>,
     pub input: &'a EvmInput,
     pub execution: &'a SequenceExecutionResult,
     pub coverage: &'a [u8],
@@ -188,6 +207,10 @@ pub struct CampaignArtifactRequest<'a> {
 pub struct PersistentCorpus {
     root: PathBuf,
     global_root: Option<PathBuf>,
+}
+
+pub fn execution_hash(execution: &SequenceExecutionResult) -> anyhow::Result<String> {
+    Ok(format!("keccak256:{}", hex::encode(revm::primitives::keccak256(serde_json::to_vec(execution)?))))
 }
 
 fn safe_corpus_path(
@@ -656,14 +679,40 @@ impl PersistentCorpus {
         let input = snapshots.root_replay_input(request.input).ok_or_else(|| {
             anyhow::anyhow!("snapshot lineage is missing, cyclic, or exceeds input limits")
         })?;
-        let verifier = crate::common::verifier::ReplayVerifier::new(MAP_SIZE);
+        let context = request.replay_context.context("snapshot replay requires recorded execution context")?;
+        context.validate(&original.db)?;
+        anyhow::ensure!(context.initial_block == *environment, "snapshot replay block context mismatch");
+        let verifier = crate::common::verifier::ReplayVerifier::with_time_warp(MAP_SIZE, context.time_warp);
         let base = ChainState::Evm(original.clone());
         let (execution, coverage) = verifier.replay_with_coverage(&base, environment, &input)?;
         anyhow::ensure!(
             execution == verifier.replay(&base, environment, &input)?,
             "complete root replay is nondeterministic"
         );
-        let findings = crate::common::oracle::ProtocolOraclePack::default().evaluate(&execution);
+        let mut findings = crate::common::oracle::ProtocolOraclePack::default().evaluate(&execution);
+        let prefix_len = input.txs.len() - request.input.txs.len();
+        let mut candidate = request.exploit_candidate.cloned();
+        if let Some(candidate) = candidate.as_mut() {
+            candidate.sequence = input.txs.clone();
+            candidate.proof = None;
+            candidate.predicate_tx_index = candidate.predicate_tx_index.map(|index| index + prefix_len);
+            for term in &mut candidate.predicate_terms {
+                term.tx_index += prefix_len;
+            }
+            if candidate.predicate_text.is_some() {
+                let proof = ProofCarryingFinding::from_candidate(candidate, &execution, &findings);
+                let predicate = proof.violation_predicate.as_ref().context("snapshot invariant has no replayable predicate")?;
+                anyhow::ensure!(predicate.holds_in_context(&execution, context),
+                    "snapshot invariant did not survive root replay");
+                findings.extend(request.findings.iter().filter(|finding| {
+                    matches!(&finding.vuln, crate::common::oracle::VulnType::InvariantViolation(text)
+                        if Some(text) == candidate.predicate_text.as_ref())
+                }).cloned().map(|mut finding| {
+                    finding.tx_index = finding.tx_index.map(|index| index + prefix_len);
+                    finding
+                }));
+            }
+        }
         anyhow::ensure!(
             request.findings.iter().all(|expected| findings
                 .iter()
@@ -678,8 +727,7 @@ impl PersistentCorpus {
             coverage: &coverage,
             base_fork_state: original,
             findings: &findings,
-            // Suffix-only hypotheses cannot be relabeled as full-path proof.
-            exploit_candidate: None,
+            exploit_candidate: candidate.as_ref(),
             ..request
         })
     }
@@ -688,6 +736,9 @@ impl PersistentCorpus {
         &self,
         request: CampaignArtifactRequest<'_>,
     ) -> anyhow::Result<CampaignArtifactOutcome> {
+        if let Some(context) = request.replay_context {
+            context.validate(&request.base_fork_state.db)?;
+        }
         let artifact_key = artifact_equivalence_key(&request)?;
         validate_filesystem_identifier(&artifact_key).map_err(anyhow::Error::msg)?;
         let index_path = safe_corpus_path(
@@ -816,6 +867,8 @@ impl PersistentCorpus {
         );
 
         let record = CampaignArtifactRecord {
+            replay_context: request.replay_context.cloned(),
+            discovery_execution_hash: Some(execution_hash(request.execution)?),
             input_id: metadata.id.clone(),
             fork_cache_id,
             artifact_key: artifact_key.clone(),
@@ -854,6 +907,30 @@ impl PersistentCorpus {
             record,
             created_new: true,
         })
+    }
+
+    pub fn load_campaign_artifact(&self, input_id: &str) -> anyhow::Result<CampaignArtifactRecord> {
+        let path = safe_corpus_path(&self.root, "campaign_artifacts", input_id, ".json")?;
+        let bytes = read_regular_file_under(&self.root, &path, "campaign artifact record")?;
+        let record: CampaignArtifactRecord = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(record.input_id == input_id, "campaign artifact input identity mismatch");
+        Ok(record)
+    }
+
+    pub fn replay_campaign_artifact(
+        &self,
+        input_id: &str,
+        fork_cache_id: Option<&str>,
+    ) -> anyhow::Result<(CampaignArtifactRecord, EvmInput, SequenceExecutionResult)> {
+        let artifact = self.load_campaign_artifact(input_id)?;
+        let context = artifact.recorded_context()?;
+        let input = self.load_input(input_id)?;
+        let fork = self.load_offline_fork_db(fork_cache_id.unwrap_or(&artifact.fork_cache_id))?;
+        context.validate(&fork)?;
+        let execution = crate::common::verifier::ReplayVerifier::with_time_warp(MAP_SIZE, context.time_warp)
+            .verify_deterministic(&ChainState::Evm(EvmCacheDb::new(fork)), &context.initial_block, &input)?;
+        artifact.verify_replay(&input, &execution)?;
+        Ok((artifact, input, execution))
     }
 
     pub fn list_campaign_artifacts(&self) -> anyhow::Result<Vec<CampaignArtifactRecord>> {
@@ -1314,7 +1391,11 @@ fn artifact_equivalence_key(request: &CampaignArtifactRequest<'_>) -> anyhow::Re
         request.target,
         request.reason,
     )?;
-    let encoded = serde_json::to_vec(&components)?;
+    let encoded = serde_json::to_vec(&(
+        components,
+        request.replay_context,
+        request.exploit_candidate.and_then(|candidate| candidate.predicate_manifest.as_deref()),
+    ))?;
     Ok(hex::encode(revm::primitives::keccak256(encoded)))
 }
 
@@ -2573,6 +2654,7 @@ mod artifact_tests {
         fs::write(&fork_cache, b"blocked").unwrap();
         assert!(corpus
             .persist_campaign_artifact(CampaignArtifactRequest {
+                replay_context: None,
                 input: &input,
                 execution: &execution,
                 coverage: &coverage,
@@ -2598,6 +2680,7 @@ mod artifact_tests {
 
         let first = corpus
             .persist_campaign_artifact(CampaignArtifactRequest {
+                replay_context: None,
                 input: &input,
                 execution: &execution,
                 coverage: &coverage,
@@ -2613,6 +2696,7 @@ mod artifact_tests {
             .expect("first artifact");
         let second = corpus
             .persist_campaign_artifact(CampaignArtifactRequest {
+                replay_context: None,
                 input: &input,
                 execution: &execution,
                 coverage: &coverage,
@@ -2684,6 +2768,7 @@ mod artifact_tests {
         let base = EvmCacheDb::new(ForkDb::empty());
         let record = corpus
             .persist_campaign_artifact(CampaignArtifactRequest {
+                replay_context: None,
                 input: &input,
                 execution: &execution,
                 coverage: &[1],

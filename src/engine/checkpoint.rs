@@ -46,7 +46,8 @@ fn default_interval() -> u64 {
 // v4 started from an unfunded root with committed storage observations.
 // Older snapshots can contain exploration funding and cannot be resumed safely
 // under these execution semantics without reconstructing the original fork.
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 5;
+// v6 continues transaction time across snapshot lineage and records replay context.
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 6;
 pub const CHECKPOINT_CONFIG_IDENTITY_SCHEMA_VERSION: u32 = 2;
 const LEGACY_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 const MAX_CHECKPOINT_IDENTITY_INPUT_BYTES: u64 = 16 * 1024 * 1024;
@@ -636,7 +637,7 @@ mod tests {
         .unwrap();
         assert!(error
             .to_string()
-            .contains("unsupported checkpoint schema 4; expected 5"));
+            .contains("unsupported checkpoint schema 4; expected 6"));
         let _ = std::fs::remove_dir_all(directory);
     }
 

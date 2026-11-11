@@ -142,6 +142,10 @@ pub struct FindingPromotionRecord {
     pub evidence_hash: Option<String>,
     #[serde(default)]
     pub evidence_hashes: Option<PromotionEvidenceHashes>,
+    #[serde(default)]
+    pub replay_context: Option<super::replay_context::ReplayContext>,
+    #[serde(default)]
+    pub violation_predicate: Option<ViolationPredicate>,
     pub synthetic_mode: bool,
     pub caveats: Vec<String>,
     pub artifact_paths: BTreeMap<String, String>,
@@ -456,6 +460,35 @@ pub struct PromotionRequest<'a> {
     pub config: &'a PromotionConfig,
 }
 
+/// Select the original property, never a different signal found during replay.
+pub fn select_original_predicate(
+    artifact: &CampaignArtifactRecord,
+    input: &EvmInput,
+    execution: &SequenceExecutionResult,
+) -> anyhow::Result<(Option<ProtocolFinding>, Option<ViolationPredicate>)> {
+    anyhow::ensure!(input.base_snapshot_id == 0, "validation requires complete root lineage");
+    if let Some(proof) = artifact.proof.as_ref() {
+        if let Some(predicate) = proof.violation_predicate.as_ref() {
+            anyhow::ensure!(proof.tx_sequence == input.txs, "predicate is bound to a different input sequence");
+            let finding = artifact.findings.iter().find(|finding| match predicate {
+                ViolationPredicate::InvariantViolated { predicate, tx_index, .. } =>
+                    finding.vuln == VulnType::InvariantViolation(predicate.clone())
+                        && finding.tx_index == Some(*tx_index),
+                ViolationPredicate::DeniedMint { target, .. } =>
+                    finding.target == Some(*target)
+                        && finding.vuln == VulnType::Other("mint authorization policy violation".into()),
+            }).ok_or_else(|| anyhow::anyhow!("recorded predicate does not match its discovery finding"))?;
+            return Ok((Some(finding.clone()), Some(predicate.clone())));
+        }
+    }
+    for finding in &artifact.findings {
+        if let Some(predicate) = ViolationPredicate::from_finding(finding, execution) {
+            return Ok((Some(finding.clone()), Some(predicate)));
+        }
+    }
+    Ok((artifact.findings.first().cloned(), None))
+}
+
 pub fn promote_finding_artifact(
     request: PromotionRequest<'_>,
 ) -> anyhow::Result<FindingPromotionRecord> {
@@ -479,11 +512,16 @@ pub fn promote_finding_artifact(
         "refusing to promote score-only artifact input_id={} without oracle/protocol finding evidence",
         request.artifact.input_id
     );
-    let finding = request.artifact.findings.first().cloned();
+    let context = request.artifact.recorded_context()?;
+    anyhow::ensure!(context.initial_block == *request.block_env,
+        "promotion block environment differs from discovery");
+    anyhow::ensure!(request.artifact.block_number == request.fork_block,
+        "promotion fork block differs from discovery");
     let cached_fork = request
         .corpus
         .load_fork_cache(&request.artifact.fork_cache_id)?;
     validate_promotion_provenance(&cached_fork.provenance, request.fork_block)?;
+    context.validate(&ForkDb::from_cache_snapshot(cached_fork.clone()))?;
     let finding_id = finding_id(request.campaign_id, &request.artifact.input_id);
     let finding_dir = request.report_dir.join("findings").join(&finding_id);
     fs::create_dir_all(&finding_dir)?;
@@ -515,14 +553,21 @@ pub fn promote_finding_artifact(
         )?
     };
     let base_db: EvmCacheDb = CacheDB::new(fork_db.clone());
-    let verifier = ReplayVerifier::new(MAP_SIZE);
+    context.validate(&fork_db)?;
+    let verifier = ReplayVerifier::with_time_warp(MAP_SIZE, context.time_warp);
     let replay_result = verifier.verify_deterministic(
         &ChainState::Evm(CacheDB::new(fork_db)),
         request.block_env,
         &input,
-    );
+    ).and_then(|execution| {
+        request.artifact.verify_replay(&input, &execution)?;
+        Ok(execution)
+    });
 
     let mut artifact_paths = BTreeMap::new();
+    let context_path = finding_dir.join("replay_context.json");
+    write_json(&context_path, context)?;
+    artifact_paths.insert("replay_context".into(), context_path.display().to_string());
     let mut lifecycle_stage: FindingLifecycleStage;
     let replay_status: String;
     let mut minimize_status = "not_run".to_string();
@@ -535,9 +580,14 @@ pub fn promote_finding_artifact(
     let mut generated_poc_hash = None;
     let mut realism_proof = None;
     let mut policy_rejections = Vec::new();
+    let mut finding = request.artifact.findings.first().cloned();
+    let mut validation_predicate = request.artifact.proof.as_ref()
+        .and_then(|proof| proof.violation_predicate.clone());
 
     match replay_result {
         Ok(execution) => {
+            let (selected, predicate) = select_original_predicate(request.artifact, &input, &execution)?;
+            finding = selected;
             let final_balances = verifier
                 .replay_with_economic_views(
                     &ChainState::Evm(base_db.clone()),
@@ -564,12 +614,8 @@ pub fn promote_finding_artifact(
                 &NullOracle,
                 base_db.clone(),
                 request.block_env.clone(),
-            );
+            ).with_replay_context(context)?;
             let original_len = input.txs.len();
-            let predicate = (input.base_snapshot_id == 0)
-                .then_some(finding.as_ref())
-                .flatten()
-                .and_then(|finding| ViolationPredicate::from_finding(finding, &execution));
             if let Some(predicate) = &predicate {
                 let path = finding_dir.join("violation_predicate.json");
                 write_json(&path, predicate)?;
@@ -578,14 +624,23 @@ pub fn promote_finding_artifact(
             if predicate.is_none() {
                 caveats.push("OracleWeakness: original finding has no supported concrete violation predicate; replay alone cannot prove it".into());
             }
+            validation_predicate = predicate.clone();
             let minimized = predicate.as_ref().and_then(|predicate| {
-                minimizer.minimize_crash(&input, |candidate_execution| {
-                    predicate.holds(candidate_execution)
-                })
+                match minimizer.minimize_violation(&input, predicate, context) {
+                    Ok(result) => Some(result),
+                    Err(error) => {
+                        caveats.push(format!("predicate-preserving minimization failed: {error:#}"));
+                        None
+                    }
+                }
             });
             match minimized {
-                Some(candidate) => {
+                Some((candidate, minimized_predicate)) => {
                     minimized_input = candidate;
+                    validation_predicate = Some(minimized_predicate);
+                    let predicate_path = finding_dir.join("minimized_violation_predicate.json");
+                    write_json(&predicate_path, &validation_predicate)?;
+                    artifact_paths.insert("minimized_violation_predicate".into(), predicate_path.display().to_string());
                     let minimized_len = minimized_input.txs.len();
                     minimize_status = if minimized_len < original_len {
                         "reduced".to_string()
@@ -632,6 +687,9 @@ pub fn promote_finding_artifact(
                 );
                 match minimized_replay {
                     Ok(execution) => {
+                        anyhow::ensure!(validation_predicate.as_ref().is_some_and(|predicate|
+                            predicate.holds_in_context(&execution, context)),
+                            "minimized replay lost the original violation");
                         let minimized_findings = ProtocolOraclePack::default().evaluate(&execution);
                         let minimized_report = replay_report(
                             &minimized_input,
@@ -668,6 +726,8 @@ pub fn promote_finding_artifact(
 
             if (minimize_status == "reduced" || minimize_status == "not_reducible")
                 && minimized_replay_execution.is_some()
+                && context.time_warp.is_noop()
+                && matches!(validation_predicate, Some(ViolationPredicate::DeniedMint { .. }))
             {
                 if let Some(finding) = finding.as_ref() {
                     let poc_dir = request
@@ -678,12 +738,14 @@ pub fn promote_finding_artifact(
                         .unwrap_or(&finding_dir);
                     fs::create_dir_all(poc_dir)?;
                     let mut selected_finding = finding.clone();
-                    selected_finding.tx_index = predicate
+                    if let Some((_before, _policy, mint_idx, _after)) = validation_predicate
                         .as_ref()
                         .and_then(|predicate| {
                             predicate.observation_indices(minimized_replay_execution.as_ref()?)
                         })
-                        .map(|(_, _, mint, _)| mint);
+                    {
+                        selected_finding.tx_index = Some(mint_idx);
+                    }
                     match synthesize_foundry_poc_with_findings(
                         &minimized_input,
                         &finding.vuln,
@@ -698,7 +760,7 @@ pub fn promote_finding_artifact(
                             let validation = if request.config.external_foundry_opt_in {
                                 validate_foundry_poc(
                                     Path::new(&path),
-                                    &request.artifact.findings,
+                            std::slice::from_ref(&selected_finding),
                                     request.report_dir,
                                 )
                             } else {
@@ -748,6 +810,13 @@ pub fn promote_finding_artifact(
                 }
             }
 
+            if (minimize_status == "reduced" || minimize_status == "not_reducible")
+                && poc_status == "not_run"
+            {
+                poc_status = "unsupported_context_or_predicate".to_string();
+                caveats.push("Foundry export cannot preserve this predicate or time policy; no PoC validation or confirmation is claimed".into());
+            }
+
             if let (Some(original_replay), Some(minimized_replay), Some(generated_poc)) = (
                 evidence_hash.clone(),
                 minimized_replay_hash,
@@ -764,8 +833,8 @@ pub fn promote_finding_artifact(
                 });
             }
 
-            let realism_verifier = RealismVerifier::new(MAP_SIZE);
-            let realism = if let Some(predicate) = predicate.as_ref() {
+            let realism_verifier = RealismVerifier::with_time_warp(MAP_SIZE, context.time_warp);
+            let realism = if let Some(predicate) = validation_predicate.as_ref() {
                 realism_verifier.prove_violation(
                     &ChainState::Evm(base_db.clone()),
                     request.block_env,
@@ -834,7 +903,7 @@ pub fn promote_finding_artifact(
     let reject_heuristics = request.config.reject_heuristics || strict_proof;
     let minimized = minimize_status == "reduced" || minimize_status == "not_reducible";
     let realism_success = realism_proof.as_ref().is_some_and(|proof| proof.success);
-    for finding in &request.artifact.findings {
+    for finding in finding.iter() {
         let oracle_rejections = oracle_rejection_reasons_for_finding(finding);
         if !oracle_rejections.is_empty() && (strict_proof || reject_heuristics) {
             policy_rejections.extend(oracle_rejections);
@@ -909,6 +978,8 @@ pub fn promote_finding_artifact(
     require_replay_for_report(request.config, &replay_status)?;
 
     let record = FindingPromotionRecord {
+        replay_context: Some(context.clone()),
+        violation_predicate: validation_predicate,
         finding_id: finding_id.clone(),
         campaign_id: request.campaign_id.to_string(),
         input_id: request.artifact.input_id.clone(),
@@ -1819,6 +1890,8 @@ mod tests {
     fn campaign_summary_counts_candidates_confirmed_and_rejected_separately() {
         let stats = PromotionCampaignStats::default();
         let confirmed = FindingPromotionRecord {
+            replay_context: None,
+            violation_predicate: None,
             finding_id: "confirmed".to_string(),
             campaign_id: "campaign".to_string(),
             input_id: "input-1".to_string(),
@@ -1898,6 +1971,8 @@ mod tests {
     #[test]
     fn finding_markdown_labels_unconfirmed_severity_and_evidence_hash() {
         let record = FindingPromotionRecord {
+            replay_context: None,
+            violation_predicate: None,
             finding_id: "candidate".to_string(),
             campaign_id: "campaign".to_string(),
             input_id: "input-1".to_string(),

@@ -14,7 +14,6 @@ use revm::database_interface::DatabaseRef;
 use revm::primitives::Address;
 use rusty_fuzz::common::fs_security::{validate_filesystem_identifier, validate_job_bounds};
 use rusty_fuzz::common::oracle::{ProtocolOraclePack, ReentrancyOracle, VulnType};
-use rusty_fuzz::common::verifier::ReplayVerifier;
 use rusty_fuzz::engine::abi_ingest::{ingest_abi_file, write_abi_cache};
 use rusty_fuzz::engine::benchmark::ValidationRunner;
 use rusty_fuzz::engine::bytecode_analysis::analyze_bytecode;
@@ -32,7 +31,6 @@ use rusty_fuzz::evm::seed_ingester::{
 };
 use rustyfuzz_evm::executor::EvmExecutor;
 use rustyfuzz_evm::fork_db::ForkDb;
-use rustyfuzz_evm::inspector::MAP_SIZE;
 use rustyfuzz_evm::rpc_url::validate_production_rpc_url;
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -1094,54 +1092,16 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             }
         },
         Command::Replay {
-            input,
+            input: input_id,
             fork_cache_id,
-            live,
+            live: _,
         } => {
             ensure_evm_chain(&config)?;
-            let fork_cache_id = fork_cache_id.unwrap_or_else(|| input.clone());
             let corpus = PersistentCorpus::new(&config.corpus_dir)?;
-            let block_env = campaign_block_env(&config).await?;
-            let verifier = ReplayVerifier::new(MAP_SIZE);
-            let execution = if live {
-                let input = load_replay_input(&corpus, &input)?;
-                let fork_block = config
-                    .fork_block
-                    .ok_or_else(|| anyhow::anyhow!("live replay requires --fork-block"))?;
-                let live_fork = ForkDb::new(config.rpc_url.clone(), fork_block);
-                let observed = live_fork.refresh_remote_provenance()?;
-                let chain_id = observed
-                    .chain_id
-                    .ok_or_else(|| anyhow::anyhow!("live replay provenance is missing chain id"))?;
-                let block_hash = observed.block_hash.ok_or_else(|| {
-                    anyhow::anyhow!("live replay provenance is missing block hash")
-                })?;
-                let cached_fork = corpus.load_online_fork_db(
-                    &fork_cache_id,
-                    fork_block,
-                    &observed.provider_sanitized,
-                    chain_id,
-                    &block_hash,
-                )?;
-                let (execution, report) =
-                    verifier.compare_cached_vs_live(cached_fork, live_fork, &block_env, &input)?;
-                println!("Differential replay report: {report:?}");
-                anyhow::ensure!(report.equivalent, "cached-vs-live replay mismatch");
-                execution
-            } else if std::path::Path::new(&input).exists() {
-                anyhow::ensure!(
-                    fork_cache_id != input,
-                    "replaying a raw JSON input path requires --fork-cache-id"
-                );
-                let input = load_json_replay_input(&input)?;
-                verifier.verify_deterministic(
-                    &replay_base_state(&corpus, &fork_cache_id)?,
-                    &block_env,
-                    &input,
-                )?
-            } else {
-                verifier.verify_persisted_input(&corpus, &input, &fork_cache_id, &block_env)?
-            };
+            let (_artifact, _input, execution) = corpus.replay_campaign_artifact(
+                &input_id,
+                fork_cache_id.as_deref(),
+            )?;
             println!(
                 "Replay ok: txs={}, gas={}, coverage_hash={}",
                 execution.tx_results.len(),
@@ -1158,8 +1118,9 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             let fork_cache_id = fork_cache_id.unwrap_or_else(|| input_id.clone());
             let corpus = PersistentCorpus::new(&config.corpus_dir)?;
             let input = corpus.load_input(&input_id)?;
+            let db = corpus.load_offline_fork_db(&fork_cache_id)?;
             let block_env = campaign_block_env(&config).await?;
-            let db = CacheDB::new(corpus.load_offline_fork_db(&fork_cache_id)?);
+            let db = CacheDB::new(db);
             let executor = EvmExecutor::new();
             let oracle = ReentrancyOracle;
             let minimizer = Minimizer::new(&executor, &oracle, db, block_env);
@@ -1195,15 +1156,10 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             reason,
         } => {
             ensure_evm_chain(&config)?;
-            let fork_cache_id = fork_cache_id.unwrap_or_else(|| input_id.clone());
             let corpus = PersistentCorpus::new(&config.corpus_dir)?;
-            let input = corpus.load_input(&input_id)?;
-            let block_env = campaign_block_env(&config).await?;
-            let execution = ReplayVerifier::new(MAP_SIZE).verify_persisted_input(
-                &corpus,
+            let (_artifact, input, execution) = corpus.replay_campaign_artifact(
                 &input_id,
-                &fork_cache_id,
-                &block_env,
+                fork_cache_id.as_deref(),
             )?;
             let metadata = corpus.persist_execution_input(
                 &input,

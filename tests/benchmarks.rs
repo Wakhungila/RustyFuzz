@@ -689,6 +689,7 @@ fn persistent_corpus_writes_campaign_artifact_with_fork_cache() {
 
     let record = corpus
         .persist_campaign_artifact(CampaignArtifactRequest {
+            replay_context: None,
             input: &input,
             execution: &execution,
             coverage: &[1, 0, 2, 0],

@@ -29,34 +29,8 @@ use std::sync::{
 use std::time::Duration;
 use uuid::Uuid;
 
-pub fn load_replay_input(
-    corpus: &PersistentCorpus,
-    input: &str,
-) -> anyhow::Result<rusty_fuzz::evm::fuzz::EvmInput> {
-    if std::path::Path::new(input).exists() {
-        load_json_replay_input(input)
-    } else {
-        corpus.load_input(input)
-    }
-}
-
-pub fn load_json_replay_input(path: &str) -> anyhow::Result<rusty_fuzz::evm::fuzz::EvmInput> {
-    let raw = std::fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&raw)?)
-}
-
 pub fn read_json_file<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T> {
     Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
-}
-
-pub fn replay_base_state(
-    corpus: &PersistentCorpus,
-    fork_cache_id: &str,
-) -> anyhow::Result<rusty_fuzz::common::types::ChainState> {
-    let fork_db = corpus.load_offline_fork_db(fork_cache_id)?;
-    Ok(rusty_fuzz::common::types::ChainState::Evm(
-        revm::database::CacheDB::new(fork_db),
-    ))
 }
 
 pub fn ensure_evm_chain(config: &Config) -> anyhow::Result<()> {

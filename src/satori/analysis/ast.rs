@@ -63,16 +63,19 @@ fn extract_contract_names(text: &str) -> Vec<String> {
 
 fn extract_functions(file: &SourceFile, text: &str, contracts: &[String]) -> Vec<FunctionSummary> {
     let mut result = Vec::new();
-    let lines = text.lines().collect::<Vec<_>>();
-    let contract = contracts
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "UnknownContract".to_string());
+    let lines: Vec<&str> = text.lines().collect();
+    
+    // For each function line, find which contract it belongs to
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
         if !trimmed.starts_with("function ") && !trimmed.starts_with("constructor(") {
             continue;
         }
+        
+        // Find the contract this function belongs to by looking backwards
+        // for the most recent contract that hasn't been closed
+        let contract = find_contract_for_function(&lines[..=idx], contracts);
+        
         let raw_snippet = lines[idx..lines.len().min(idx + 18)].join("\n");
         let snippet = redact_source_text(&raw_snippet);
         // A parameter list may span several lines; keep joining until the
@@ -110,6 +113,53 @@ fn extract_functions(file: &SourceFile, text: &str, contracts: &[String]) -> Vec
         result.push(summary);
     }
     result
+}
+
+/// Find which contract a function belongs to by analyzing brace balance.
+fn find_contract_for_function(lines: &[&str], _all_contracts: &[String]) -> String {
+    let mut brace_depths: Vec<(usize, i32, Option<String>)> = Vec::new();
+    let mut current_depth: i32 = 0;
+    let mut current_contract: Option<String> = None;
+    
+    for (line_idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        
+        // Check for contract/interface/library keywords
+        for keyword in ["contract ", "abstract contract ", "interface ", "library "] {
+            if let Some(rest) = trimmed.strip_prefix(keyword) {
+                let name = rest
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if !name.is_empty() {
+                    current_contract = Some(name);
+                }
+            }
+        }
+        
+        // Track brace changes
+        let open_count = line.chars().filter(|&c| c == '{').count() as i32;
+        let close_count = line.chars().filter(|&c| c == '}').count() as i32;
+        let prev_depth = current_depth;
+        current_depth += open_count - close_count;
+        
+        // If we're entering a new scope from depth 0, remember the contract
+        if prev_depth == 0 && current_depth > 0 && current_contract.is_some() {
+            brace_depths.push((line_idx, current_depth, current_contract.clone()));
+        }
+        // If we're closing back to depth 0, clear current_contract for nested contracts
+        if current_depth == 0 {
+            current_contract = None;
+        }
+    }
+    
+    // Find the contract at the deepest enclosing brace depth
+    if let Some((_, _, Some(contract))) = brace_depths.last() {
+        contract.clone()
+    } else {
+        "UnknownContract".to_string()
+    }
 }
 
 fn detect_in_snippet(

@@ -8,6 +8,8 @@ use crate::evm::corpus::{CorpusEntryMetadata, CrashRecord, PersistentCorpus};
 use crate::evm::feedback::EvmStateNoveltyFeedback;
 use crate::evm::fuzz::EvmInput;
 use crate::evm::snapshot::new_evm_snapshot;
+use crate::common::verifier::ViolationPredicate;
+use crate::engine::replay_context::ReplayContext;
 use bitvec::prelude::*;
 use parking_lot::RwLock;
 use revm::context::BlockEnv;
@@ -23,6 +25,7 @@ pub struct Minimizer<'a> {
     pub oracle: &'a dyn VulnerabilityOracle,
     pub initial_db: EvmCacheDb,
     pub initial_block_env: BlockEnv,
+    time_warp: rustyfuzz_evm::time_warp::TimeWarp,
 }
 
 impl<'a> Minimizer<'a> {
@@ -37,7 +40,53 @@ impl<'a> Minimizer<'a> {
             oracle,
             initial_db,
             initial_block_env,
+            time_warp: rustyfuzz_evm::time_warp::TimeWarp::NONE,
         }
+    }
+
+    pub fn with_replay_context(mut self, context: &ReplayContext) -> anyhow::Result<Self> {
+        context.validate(&self.initial_db.db)?;
+        anyhow::ensure!(self.initial_block_env == context.initial_block, "minimizer block context mismatch");
+        self.time_warp = context.time_warp;
+        Ok(self)
+    }
+
+    pub fn minimize_violation(
+        &self,
+        original: &EvmInput,
+        predicate: &ViolationPredicate,
+        context: &ReplayContext,
+    ) -> anyhow::Result<(EvmInput, ViolationPredicate)> {
+        context.validate(&self.initial_db.db)?;
+        anyhow::ensure!(self.time_warp == context.time_warp && self.initial_block_env == context.initial_block,
+            "minimization requires the recorded execution context");
+        anyhow::ensure!(original.base_snapshot_id == 0 && original.validate(), "minimization requires a portable root input");
+        let preserves = |input: &EvmInput, predicate: &ViolationPredicate| {
+            self.replay_input(input).ok().is_some_and(|execution| predicate.holds_in_context(&execution, context))
+        };
+        anyhow::ensure!(preserves(original, predicate), "original violation does not reproduce under recorded assumptions");
+        let mut input = original.clone();
+        let mut predicate = predicate.clone();
+        let mut index = 0;
+        while index < input.txs.len() && input.txs.len() > 1 {
+            let Some(candidate_predicate) = predicate.after_removing_transaction(index) else {
+                index += 1;
+                continue;
+            };
+            let mut candidate = input.clone();
+            candidate.txs.remove(index);
+            if preserves(&candidate, &candidate_predicate) {
+                input = candidate;
+                predicate = candidate_predicate;
+            } else {
+                index += 1;
+            }
+        }
+        let holds = |execution: &SequenceExecutionResult| predicate.holds_in_context(execution, context);
+        self.minimize_values(&mut input, &holds);
+        self.minimize_calldata(&mut input, &holds);
+        anyhow::ensure!(preserves(&input, &predicate), "minimized violation no longer holds");
+        Ok((input, predicate))
     }
 
     pub fn minimize_crash<F>(&self, original: &EvmInput, preserves_crash: F) -> Option<EvmInput>
@@ -137,14 +186,15 @@ impl<'a> Minimizer<'a> {
     }
 
     pub fn replay_input(&self, input: &EvmInput) -> anyhow::Result<SequenceExecutionResult> {
-        let mut current_db = self.initial_db.clone();
-        let mut block_env = self.initial_block_env.clone();
+        anyhow::ensure!(input.validate(), "invalid minimization input");
+        let mut chain_state = ChainState::Evm(self.initial_db.clone());
         let mut dataflow = DataflowRegistry::new();
         let mut coverage = vec![0u8; MAP_SIZE];
         let mut tx_results = Vec::with_capacity(input.txs.len());
 
         for (idx, tx) in input.txs.iter().enumerate() {
-            let mut chain_state = ChainState::Evm(current_db.clone());
+            let mut block_env = self.initial_block_env.clone();
+            self.time_warp.apply(&mut block_env, idx);
             let mut waypoints = Vec::new();
             let result = self.executor.execute_with_result(
                 &mut chain_state,
@@ -155,8 +205,6 @@ impl<'a> Minimizer<'a> {
                 &mut waypoints,
                 idx,
             )?;
-            let ChainState::Evm(new_db) = chain_state;
-            current_db = new_db;
             tx_results.push(result);
         }
 
@@ -381,33 +429,7 @@ pub struct MinimizedCrashArtifact {
 fn sequence_result_from_tx_results(
     tx_results: Vec<crate::common::types::TxExecutionResult>,
 ) -> SequenceExecutionResult {
-    let total_gas_used = tx_results.iter().map(|result| result.gas_used).sum();
-    let final_coverage_hash = tx_results
-        .last()
-        .map(|result| result.coverage_hash)
-        .unwrap_or_default();
-    SequenceExecutionResult {
-        total_gas_used,
-        final_coverage_hash,
-        storage_reads: tx_results
-            .iter()
-            .flat_map(|result| result.storage_reads.clone())
-            .collect(),
-        storage_writes: tx_results
-            .iter()
-            .flat_map(|result| result.storage_writes.clone())
-            .collect(),
-        storage_diffs: tx_results
-            .iter()
-            .flat_map(|result| result.storage_diffs.clone())
-            .collect(),
-        call_trace: tx_results
-            .iter()
-            .flat_map(|result| result.call_trace.clone())
-            .collect(),
-        oracle_observations: Vec::new(),
-        tx_results,
-    }
+    SequenceExecutionResult::from_tx_results(tx_results)
 }
 
 fn execution_coverage_material(execution: &SequenceExecutionResult) -> Vec<u8> {

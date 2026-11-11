@@ -1830,6 +1830,9 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                 let environment_policy = rustyfuzz_evm::environment::EnvironmentPolicy::resolve(
                     &initial_db.db, &initial_env,
                 ).map_err(|error| libafl::Error::unknown(error.to_string()))?;
+                let replay_context = super::replay_context::ReplayContext::new(
+                    &initial_db.db, &initial_env, time_warp,
+                ).map_err(|error| libafl::Error::unknown(error.to_string()))?;
                 let mut harness = |input: &EvmInput| {
                     if !budget.reserve_execution() {
                         return ExitKind::Ok;
@@ -2089,6 +2092,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     if let (Some(violation), Some(candidate)) =
                         (invariant_checker.violation(), exploit_candidate.as_mut())
                     {
+                        candidate.sequence = input.txs.clone();
                         violation.attach_to(candidate, &execution, &findings);
                     }
 
@@ -2119,6 +2123,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     if let Err(error) = super::provenance::persist(
                         config.corpus_dir.as_ref(),
                         super::provenance::PersistRequest {
+                            replay_context: &replay_context,
                             execution_index: telemetry.execution_count(),
                             budget_consumed: budget.reserved(),
                             input,
@@ -2214,6 +2219,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                                 std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE);
 
                             persistent_corpus.persist_campaign_artifact(CampaignArtifactRequest {
+                                replay_context: Some(&replay_context),
                                 input,
                                 execution: &execution,
                                 coverage: map_slice,
@@ -2978,6 +2984,9 @@ async fn run_single_process_campaign(
 
     let environment_policy =
         rustyfuzz_evm::environment::EnvironmentPolicy::resolve(&initial_db.db, &initial_env)?;
+    let replay_context = super::replay_context::ReplayContext::new(
+        &initial_db.db, &initial_env, time_warp,
+    )?;
     let mut harness = |input: &EvmInput| {
         if !budget.reserve_execution() {
             return ExitKind::Ok;
@@ -2988,6 +2997,7 @@ async fn run_single_process_campaign(
             log::error!("Input has incomplete or oversized snapshot lineage");
             return ExitKind::Crash;
         };
+        let prefix_tx_count = root_replay_input.txs.len() - input.txs.len();
         if !snapshot_corpus_guard.pin_snapshot(snap_id) {
             return ExitKind::Crash;
         }
@@ -3009,7 +3019,7 @@ async fn run_single_process_campaign(
         for (tx_idx, tx) in input.txs.iter().enumerate() {
             // Same deterministic advance as the unbounded harness.
             let mut current_env = initial_env.clone();
-            time_warp.apply(&mut current_env, tx_idx);
+            time_warp.apply(&mut current_env, prefix_tx_count + tx_idx);
             let mut waypoints = Vec::new();
             let mut df = dataflow_registry.write();
             let exec_result = ForkDb::with_thread_rpc_budget(
@@ -3200,6 +3210,7 @@ async fn run_single_process_campaign(
         if let (Some(violation), Some(candidate)) =
             (invariant_checker.violation(), exploit_candidate.as_mut())
         {
+            candidate.sequence = input.txs.clone();
             violation.attach_to(candidate, &execution, &findings);
         }
 
@@ -3230,6 +3241,7 @@ async fn run_single_process_campaign(
         if let Err(error) = super::provenance::persist(
             config.corpus_dir.as_ref(),
             super::provenance::PersistRequest {
+                replay_context: &replay_context,
                 execution_index: telemetry.execution_count(),
                 budget_consumed: budget.reserved(),
                 input,
@@ -3287,6 +3299,7 @@ async fn run_single_process_campaign(
                 let map_slice = std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE);
                 persistent_corpus.persist_root_replayed_artifact(
                     CampaignArtifactRequest {
+                        replay_context: Some(&replay_context),
                         input,
                         execution: &execution,
                         coverage: map_slice,
@@ -5075,35 +5088,7 @@ fn int256_from_u256(value: revm::primitives::U256) -> rustyfuzz_predicate::Int25
 fn sequence_result_from_tx_results(
     tx_results: Vec<crate::common::types::TxExecutionResult>,
 ) -> SequenceExecutionResult {
-    let total_gas_used = tx_results.iter().map(|result| result.gas_used).sum();
-
-    let final_coverage_hash = tx_results
-        .last()
-        .map(|result| result.coverage_hash)
-        .unwrap_or_default();
-
-    SequenceExecutionResult {
-        total_gas_used,
-        final_coverage_hash,
-        storage_reads: tx_results
-            .iter()
-            .flat_map(|result| result.storage_reads.clone())
-            .collect(),
-        storage_writes: tx_results
-            .iter()
-            .flat_map(|result| result.storage_writes.clone())
-            .collect(),
-        storage_diffs: tx_results
-            .iter()
-            .flat_map(|result| result.storage_diffs.clone())
-            .collect(),
-        call_trace: tx_results
-            .iter()
-            .flat_map(|result| result.call_trace.clone())
-            .collect(),
-        oracle_observations: Vec::new(),
-        tx_results,
-    }
+    SequenceExecutionResult::from_tx_results(tx_results)
 }
 
 fn reward_state_novelty(coverage: &mut [u8], report: &StateNoveltyReport) {
@@ -5466,6 +5451,8 @@ mod tests {
         for index in 0..5 {
             let input_id = format!("candidate-{index}");
             let artifact = crate::evm::corpus::CampaignArtifactRecord {
+                replay_context: None,
+                discovery_execution_hash: None,
                 input_id: input_id.clone(),
                 fork_cache_id: "fork".to_string(),
                 artifact_key: String::new(),

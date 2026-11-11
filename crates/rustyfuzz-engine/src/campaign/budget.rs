@@ -3,13 +3,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-fn campaign_shutdown_grace() -> u64 {
-    std::env::var("RUSTYFUZZ_CAMPAIGN_SHUTDOWN_GRACE_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(15)
-}
-
 /// Bounds a campaign by execution count and wall-clock deadline.
 ///
 /// The deadline reserves a shutdown grace window so in-flight work can finish.
@@ -86,11 +79,29 @@ impl CampaignBudget {
     }
 
     fn with_limit(max_execs: Option<u64>, duration_secs: Option<u64>) -> Self {
-        let shutdown_grace = campaign_shutdown_grace();
+        // Compute grace period: use env override if set, else proportional to duration
+        let duration = duration_secs.unwrap_or(0);
+        let configured_grace: u64 = std::env::var("RUSTYFUZZ_CAMPAIGN_SHUTDOWN_GRACE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                // Proportional grace: 10% of duration, clamped to [1, 15]
+                let proportional = duration / 10;
+                proportional.max(1).min(15)
+            });
+        // If configured grace >= duration, no time is left for execution
+        // If configured grace < duration, use the configured grace
+        let effective_grace = configured_grace.min(duration);
         Self {
             max_execs,
             deadline: duration_secs.map(|secs| {
-                Instant::now() + Duration::from_secs(secs.saturating_sub(shutdown_grace))
+                // If grace >= duration, deadline is now (exhausted immediately)
+                // otherwise, deadline is (now + duration - grace)
+                if effective_grace >= secs {
+                    Instant::now()
+                } else {
+                    Instant::now() + Duration::from_secs(secs.saturating_sub(effective_grace))
+                }
             }),
             reserved_execs: AtomicU64::new(0),
         }
