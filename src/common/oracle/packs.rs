@@ -766,7 +766,7 @@ impl ProtocolOraclePack {
             }
             let mut emitted: BTreeSet<(Address, usize)> = BTreeSet::new();
             for call in &tx.call_trace {
-                let depth = call.depth as usize;
+                let depth = call.depth;
                 match call.phase {
                     CallPhase::Start => {
                         let reentered = stack
