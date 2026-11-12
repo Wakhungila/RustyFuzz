@@ -1,0 +1,98 @@
+# PRODUCTION_READINESS.md — checklist for launch
+
+Status as of 2026-11-12, branch `prod-hardening`, 12 commits on top of
+upstream `main` (`a9e2589`). Every claim below is verified by a command you
+can run; nothing is aspirational unless it says **ROADMAP**.
+
+---
+
+## 1. Verification discipline (the core product)
+
+| # | Item | Status | Proof |
+|---|------|--------|-------|
+| 1.1 | Promotion routes `Confirmed` through `FindingConfirmationGate` — one confirmation authority for corpus triage and report artifacts | DONE (`1b29ed8`) | `cargo test -p rusty-fuzz --lib promotion` — 5 gate-routing tests; gate verdict persisted in `finding.json` (`confirmation` field) |
+| 1.2 | Campaign↔promotion replay environment parity: promotion replays with the campaign's `TimeWarp`, not a silent default | DONE (`db7f1db`) | `PromotionRequest.time_warp` plumbed at both construction sites (`fuzz_engine.rs`, `cli/handlers.rs`) |
+| 1.3 | Fail-closed evidence: economic-view failure is recorded as a caveat, never silently-empty `replay.json` | DONE (`db7f1db`) | promotion.rs `replay_with_economic_views` match + caveat |
+| 1.4 | Offline fork cache fails loudly on missing code (`code_by_hash_ref`) instead of executing empty bytecode | DONE (`db7f1db`) | fork_db.rs Decode error; `cargo test -p rustyfuzz-evm --lib` 58/58 |
+| 1.5 | Realism preflight distinguishes absent account from unreadable state (RPC outage ≠ `MissingBalance`) | DONE (`db7f1db`) | verifier.rs preflight match |
+| 1.6 | Satori bounded-command temp files are `0600` (pre-redaction output exposure) | DONE (`db7f1db`) | fsutil.rs OpenOptionsExt |
+| 1.7 | Gate-confirmed tier can never be downgraded by evidence attachment (`with_foundry_poc_path` / `with_economic_delta`) | DONE (`6fe97c2`) | proof.rs upgrade-only recomputation |
+| 1.8 | Tri-state predicate discipline (Unknown never promotes) | PRE-EXISTING, verified | audit pass: `eval.rs`/`resolve.rs`/`signal.rs` airtight; every consumer gates on `Outcome::False` only |
+| 1.9 | Digest-bound artifact verification (SHA-256, tamper-detection) | PRE-EXISTING, verified | `verify_record_evidence` tests in `rustyfuzz_runner.rs` |
+
+## 2. Rediscovery baseline (the honest headline)
+
+| # | Item | Status | Proof |
+|---|------|--------|-------|
+| 2.1 | Move off 0/7: five `known_vulnerable` cases converted to `executable_evm` fixtures with authored invariant files (`7699d19`…`6b1fe31`) | DONE — **5/5** | `python3 scripts/validate_rediscovery_gate.py` → `rediscovered: 5`, each `found` + `confirmed` + typed predicate + offline Foundry PoC |
+| 2.2 | Reentrancy-shaped bugs reachable: replay-mode **Security pack** derives a reentrancy witness from the call trace (re-entry into an open frame from a different account) | DONE (`6fe97c2`) | `known-read-only-reentrancy` produces `VulnType::Reentrancy`; negative controls stay silent |
+| 2.3 | Offline Foundry PoC generation for `poc_generation = "required"` cases (no RPC needed) | DONE (`6fe97c2`) | `synthesize_local_validation_poc` wired into the executable path |
+| 2.4 | CI regression gate: `rediscovery-gate` job pins 5/5 + 0 false positives + gate2 parity; ratchet can only tighten | DONE (`cd685b9`) | `.github/workflows/ci.yml`; script exits non-zero on any regression |
+| 2.5 | Historical `mainnet_fork` cases (Audius 2022, Euler 2023) | **BLOCKED — needs one-time RPC capture** | Audius capture lacks token/WETH balance-mapping slots; Euler has no capture at block 16817995. Re-capture with extended slot manifest, then add typed predicates; the gate already fails any discovery claim without one. ROADMAP until captures exist |
+| 2.6 | Baseline report updated honestly | DONE | `docs/backtest/BASELINE_REPORT.md` header |
+
+## 3. Dead code and provenance hygiene
+
+| # | Item | Status | Proof |
+|---|------|--------|-------|
+| 3.1 | Dead-code purge: ~8,100 LOC across 4 verified groups (orphan files, islands, dead subsystems, crate leaf fns) | DONE (`adfdbab`, `0b5c36f`, `352c1d4`, `842c224`) | `git diff --stat a9e2589..HEAD` ≈ −8.4k; clippy 0 warnings; every group committed after `check`+`clippy`+`fmt` |
+| 3.2 | Dormant `z3` feature removed (advertised a capability with zero references) | DONE (`d364bf5`) | `rg z3 Cargo.toml` empty; lock updated |
+| 3.3 | Live items deliberately kept were re-verified before keeping | DONE | purge agent skip-list (telemetry `first_finding`, `DataflowScoreReport`, `EvidenceGrade`, `compare_cached_vs_live`, manifest load/generate/evaluate) |
+
+## 4. Attacker-contract harness
+
+| # | Item | Status | Proof |
+|---|------|--------|-------|
+| 4.1 | Compiled attacker contract with receive/callback executed mid-sequence inside REVM | DONE for the validation/benchmark path (`6417d3d` + `6fe97c2`) | `ReentrantAttacker`/`HookToken`/`ReentrantVault` fixtures: withdraw → token transfer → attacker `onReceive` → vault re-entry; oracle sees the nested write |
+| 4.2 | Campaign-time attacker-contract synthesis (the fuzzer evolving attacker bytecode during discovery) | **ROADMAP** | the seeded/validated path is fully wired; campaign-side synthesis needs mutation-space work. Honest statement: fixture/validation layer proves the model end-to-end; discovery-time generation remains future work |
+
+## 5. Tooling, crates, throughput
+
+| # | Item | Status | Proof |
+|---|------|-------|-------|
+| 5.1 | `rustyfuzz-testkit` has real consumers (deterministic fixture builders in integration tests) | DONE (`d364bf5`) | `tests/violation_predicate.rs`, `tests/snapshot_exploration.rs` |
+| 5.2 | Release throughput profile (LTO, codegen-units, panic strategy) | PRE-EXISTING | `Cargo.toml` build profiles; `RUSTFLAGS="-C target-cpu=native"` documented for local campaigns |
+| 5.3 | Targeted exec/s measurement (350 dev vs 30k tuned claim) | **ROADMAP** | measurement is campaign-side and machine-dependent; no CI-runnable exec/s gate exists. The rediscovery gate pins correctness, not speed |
+| 5.4 | SMT-backed concolic | **ROADMAP** | concolic stub was dead code (purged). Future integration point: an SMT solver discharging the typed `ViolationPredicate` language (`crates/rustyfuzz-predicate`) the replay verifier already evaluates |
+
+## 6. Launch gates (run these before announcing)
+
+```bash
+# 1. Clean gates
+cargo fmt --all --check
+cargo clippy --workspace --all-targets          # 0 warnings
+cargo test --workspace --lib                     # ~790 tests, 0 failures
+cargo test --test benchmarks                     # 52 tests
+cargo test --test end_to_end_smoke               # 2 tests (1 live-gated, ignored)
+
+# 2. Detection gates (after cargo build --release --bin rusty-fuzz)
+python3 scripts/validate-oracle-controls.py      # negatives silent, gate2 matches
+python3 scripts/validate_rediscovery_gate.py     # 5/5 rediscovered, gate exits 0
+
+# 3. Release build
+cargo build --release --locked --bin rusty-fuzz --bin benchmark
+scripts/verify-release-artifacts.sh              # if cutting a tagged release
+```
+
+## 7. What must happen outside this sandbox (durability)
+
+1. **Push the branch**: `git push origin prod-hardening` — this environment has
+   no GitHub credentials; the 12 commits exist only locally until pushed.
+   Open the PR against `main` and let CI (including `rediscovery-gate`) run.
+2. **Historical captures** (when RPC access exists):
+   `rusty-fuzz capture` at Euler block 16817995 and an Audius re-capture with
+   token/WETH mapping slots, then author their `InvariantViolated` predicates
+   and flip the gate to include them.
+3. **Release tag**: cut `v0.2.0` after CI green; `build-release.sh` +
+   `verify-release-artifacts.sh` handle provenance.
+
+## 8. Honest capability statement (for the launch post)
+
+- **Strong**: replay, verification, minimization, PoC generation of a
+  suspected bug on forked mainnet state; typed three-state invariant
+  language where `Unknown` can never promote; digest-bound, gate-confirmed
+  evidence artifacts; now with reentrancy detectable in replay and a
+  5/5 rediscovery regression gate in CI.
+- **Not claimed**: autonomous cold-start discovery at ityfuzz/Foundry-invariant
+  strength; SMT-backed path solving; exec/s parity with tuned builds. These
+  are roadmap items with named integration points, not silent gaps.
