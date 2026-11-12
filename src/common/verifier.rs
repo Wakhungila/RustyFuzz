@@ -747,18 +747,33 @@ fn preflight_realism_rejections(base_state: &ChainState, input: &EvmInput) -> Ve
         return vec![RejectionReason::ReplayFailed];
     }
     let ChainState::Evm(db) = base_state;
-    // Only the first transaction can be checked against the initial balance.
-    // Later callers may receive funds during earlier transactions. REVM checks
-    // their actual sequential balances, including gas, during proof replay.
     if let Some(tx) = input.txs.first() {
-        let balance = db
-            .basic_ref(tx.caller)
-            .ok()
-            .flatten()
-            .map(|account| account.balance)
-            .unwrap_or_default();
-        if balance < tx.value {
-            return vec![RejectionReason::MissingBalance];
+        // Only the first transaction can be checked against the initial
+        // balance. Later callers may receive funds during earlier
+        // transactions. REVM checks their actual sequential balances,
+        // including gas, during proof replay.
+        match db.basic_ref(tx.caller) {
+            Ok(Some(account)) => {
+                if account.balance < tx.value {
+                    return vec![RejectionReason::MissingBalance];
+                }
+            }
+            Ok(None) => {
+                // Absent account: zero balance, cannot cover any value.
+                if !tx.value.is_zero() {
+                    return vec![RejectionReason::MissingBalance];
+                }
+            }
+            Err(error) => {
+                // Preflight could not read state (RPC outage, cache gap).
+                // Fabricating `MissingBalance` here would turn a transient
+                // infrastructure failure into a permanent-looking proof
+                // rejection, so skip the preflight and let the realism
+                // proof surface the real error instead.
+                log::warn!(
+                    "realism preflight could not read caller balance; skipping balance check: {error}"
+                );
+            }
         }
     }
     Vec::new()

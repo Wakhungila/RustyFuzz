@@ -4347,6 +4347,10 @@ fn promote_outbox(
             rpc_url: &config.rpc_url,
             synthetic_mode: false,
             config: &config.promotion,
+            time_warp: rustyfuzz_evm::time_warp::TimeWarp::from_seconds(
+                config.hardened_defi.time_warp_seconds,
+                config.hardened_defi.time_warp_blocks,
+            ),
         }) {
             Ok(record) => promotion_stats.record(&record),
             Err(error) => {

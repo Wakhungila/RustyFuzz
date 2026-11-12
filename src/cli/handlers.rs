@@ -1272,6 +1272,10 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 rpc_url: &config.rpc_url,
                 synthetic_mode: false,
                 config: &promotion_config,
+                time_warp: rustyfuzz_evm::time_warp::TimeWarp::from_seconds(
+                    config.hardened_defi.time_warp_seconds,
+                    config.hardened_defi.time_warp_blocks,
+                ),
             })?;
             println!(
                 "Promoted finding {}: stage={:?}, confidence={}, replay={}, poc={}",

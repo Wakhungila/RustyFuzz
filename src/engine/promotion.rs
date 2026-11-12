@@ -475,6 +475,12 @@ pub struct PromotionRequest<'a> {
     pub rpc_url: &'a str,
     pub synthetic_mode: bool,
     pub config: &'a PromotionConfig,
+    /// The campaign's per-transaction block/timestamp advance policy. The
+    /// replay must advance blocks exactly as the campaign did, or a
+    /// time-dependent finding (vesting, timelock, TWAP) silently fails to
+    /// reproduce — or worse, "proves" under a block environment the discovery
+    /// never observed.
+    pub time_warp: rustyfuzz_evm::time_warp::TimeWarp,
 }
 
 pub fn promote_finding_artifact(
@@ -536,7 +542,8 @@ pub fn promote_finding_artifact(
         )?
     };
     let base_db: EvmCacheDb = CacheDB::new(fork_db.clone());
-    let verifier = ReplayVerifier::new(MAP_SIZE);
+    // The replay verifier must advance blocks exactly as the campaign did.
+    let verifier = ReplayVerifier::with_time_warp(MAP_SIZE, request.time_warp);
     let replay_result = verifier.verify_deterministic(
         &ChainState::Evm(CacheDB::new(fork_db)),
         request.block_env,
@@ -562,16 +569,23 @@ pub fn promote_finding_artifact(
 
     match replay_result {
         Ok(execution) => {
-            let final_balances = verifier
-                .replay_with_economic_views(
-                    &ChainState::Evm(base_db.clone()),
-                    request.block_env,
-                    &input,
-                    request.artifact.target,
-                )
-                .ok()
-                .map(|result| result.after.token_balances)
-                .unwrap_or_default();
+            let final_balances = match verifier.replay_with_economic_views(
+                &ChainState::Evm(base_db.clone()),
+                request.block_env,
+                &input,
+                request.artifact.target,
+            ) {
+                Ok(result) => result.after.token_balances,
+                Err(error) => {
+                    // Fail-open on the *evidence* only, loudly: the finding
+                    // validity is untouched, but the published replay.json
+                    // must not silently claim empty balances as fact.
+                    caveats.push(format!(
+                        "economic views unavailable during replay; replay.json omits token balances: {error:#}"
+                    ));
+                    Vec::new()
+                }
+            };
             let replay_findings = ProtocolOraclePack::default().evaluate(&execution);
             let replay_report_value =
                 replay_report(&input, &execution, &replay_findings, final_balances);
@@ -788,7 +802,7 @@ pub fn promote_finding_artifact(
                 });
             }
 
-            let realism_verifier = RealismVerifier::new(MAP_SIZE);
+            let realism_verifier = RealismVerifier::with_time_warp(MAP_SIZE, request.time_warp);
             let realism = if let Some(predicate) = predicate.as_ref() {
                 realism_verifier.prove_violation(
                     &ChainState::Evm(base_db.clone()),

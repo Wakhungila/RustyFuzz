@@ -8,6 +8,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -310,11 +312,23 @@ impl CommandOutputFile {
                 std::process::id(),
                 Uuid::new_v4()
             ));
-            match fs::OpenOptions::new()
+            // Owner-only mode: these files hold PRE-REDACTION external
+            // command output (untrusted project stdout/stderr, potentially
+            // including secrets the redactor is about to strip). World or
+            // group readability in a shared temp dir would leak them to
+            // co-located users for the lifetime of the run.
+            #[cfg(unix)]
+            let opened = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&path)
-            {
+                .mode(0o600)
+                .open(&path);
+            #[cfg(not(unix))]
+            let opened = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path);
+            match opened {
                 Ok(file) => {
                     return Ok(Self {
                         path,

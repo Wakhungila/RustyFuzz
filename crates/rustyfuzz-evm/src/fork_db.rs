@@ -2,7 +2,7 @@ use crate::rpc_url::{resolve_rpc_url, test_loopback_allowed};
 use parking_lot::Mutex;
 use revm::database::CacheDB;
 use revm::database_interface::{DBErrorMarker, DatabaseRef};
-use revm::primitives::{Address, StorageKey, StorageValue, B256, U256};
+use revm::primitives::{keccak256, Address, StorageKey, StorageValue, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1169,13 +1169,18 @@ impl DatabaseRef for ForkDb {
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        Ok(self
-            .inner
-            .code_by_hash
-            .lock()
-            .get(&code_hash)
-            .cloned()
-            .unwrap_or_default())
+        // Fail closed on incompleteness: a digest-verified cache proves
+        // integrity, not completeness. A missing non-empty code hash means
+        // the fork capture never walked that account's code (e.g. a proxy
+        // implementation). Executing as empty code would produce confident,
+        // silently-wrong replays instead of a loud, actionable gap.
+        match self.inner.code_by_hash.lock().get(&code_hash) {
+            Some(code) => Ok(code.clone()),
+            None if code_hash == keccak256([]) => Ok(Bytecode::new()),
+            None => Err(ForkDbError::Decode(format!(
+                "fork cache is missing code for hash {code_hash}; the captured snapshot is incomplete and must be re-captured before replay"
+            ))),
+        }
     }
 
     fn storage_ref(
