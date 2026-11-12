@@ -1,5 +1,3 @@
-#[cfg(feature = "evm")]
-pub mod chain;
 // The allocator is library-level so every binary target (the fuzzer and the
 // benchmark harness) gets the same allocation behaviour.
 pub mod allocator;
@@ -10,13 +8,7 @@ pub mod config;
 #[cfg(feature = "evm")]
 pub mod engine;
 #[cfg(feature = "evm")]
-pub mod error;
-#[cfg(feature = "evm")]
 pub mod evm;
-#[cfg(feature = "evm")]
-pub mod hybrid;
-#[cfg(feature = "evm")]
-pub mod oracles;
 #[cfg(feature = "evm")]
 pub mod satori;
 

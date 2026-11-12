@@ -3,7 +3,6 @@ pub mod criticality;
 pub mod detectors;
 pub mod foundry;
 pub mod slither;
-pub mod storage;
 
 use crate::satori::analysis::ast::extract_contracts_and_functions;
 use crate::satori::analysis::detectors::detect_in_project;
