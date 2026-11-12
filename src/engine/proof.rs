@@ -147,13 +147,22 @@ impl ProofCarryingFinding {
 
     pub fn with_foundry_poc_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.foundry_poc_path = Some(path.into());
-        self.confidence_tier = self.compute_confidence_tier();
+        // `Confirmed` is a confirmation-gate verdict, strictly above anything
+        // compute_confidence_tier can derive. Recomputation after attaching
+        // evidence must never downgrade a gate-confirmed tier.
+        let recomputed = self.compute_confidence_tier();
+        if recomputed > self.confidence_tier {
+            self.confidence_tier = recomputed;
+        }
         self
     }
 
     pub fn with_economic_delta(mut self, economic_delta: EconomicDeltaReport) -> Self {
         self.economic_delta = economic_delta;
-        self.confidence_tier = self.compute_confidence_tier();
+        let recomputed = self.compute_confidence_tier();
+        if recomputed > self.confidence_tier {
+            self.confidence_tier = recomputed;
+        }
         self
     }
 
