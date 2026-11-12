@@ -144,10 +144,15 @@ def funded_eoa(address: str) -> dict:
     return dict(address=address, balance=FUNDING, nonce=0, runtime_bytecode='0x', storage=[])
 
 
+def hexword(value: str) -> str:
+    """Normalize a 32-byte word to the 0x-prefixed hex form fixtures use."""
+    return value if value.startswith('0x') else '0x' + value
+
+
 def contract_account(address: str, bytecode: str, storage: dict) -> dict:
     return dict(
         address=address, balance='0x0', nonce=0, runtime_bytecode=bytecode,
-        storage=[dict(slot=slot if slot.startswith('0x') else '0x' + slot, value=value)
+        storage=[dict(slot=hexword(slot), value=hexword(value))
                  for slot, value in storage.items()],
     )
 
@@ -155,8 +160,9 @@ def contract_account(address: str, bytecode: str, storage: dict) -> dict:
 def tx(caller: str, to: str, calldata: str, *, output=None, slots=None, status='Success'):
     return dict(
         caller=caller, to=to, calldata=calldata, value='0x0', timestamp=1000,
-        expected_status=status, expected_output=output,
-        expected_storage=[dict(slot=slot, value=value) for slot, value in (slots or {}).items()],
+        expected_status=status, expected_output=hexword(output) if output else None,
+        expected_storage=[dict(slot=hexword(slot), value=hexword(value))
+                          for slot, value in (slots or {}).items()],
     )
 
 

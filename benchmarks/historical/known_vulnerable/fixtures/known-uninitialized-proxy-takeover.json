@@ -1,9 +1,97 @@
 {
-  "outcome": "found",
-  "time_to_signal_secs": 1.0,
-  "executions_to_signal": 96,
-  "replayable": true,
-  "foundry_poc_generated": true,
-  "false_positive_notes": ["known-vulnerable validation fixture"],
-  "notes": "models attacker initialize and privileged upgrade path"
+  "schema_version": 1,
+  "bytecode_kind": "runtime",
+  "target": "0x6200000000000000000000000000000000000002",
+  "attacker": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "victim": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "environment": {
+    "chain_id": 1,
+    "block_number": 1,
+    "timestamp": 1000,
+    "gas_limit": 30000000,
+    "base_fee": 0
+  },
+  "accounts": [
+    {
+      "address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "balance": "0xd3c21bcecceda1000000",
+      "nonce": 0,
+      "runtime_bytecode": "0x",
+      "storage": []
+    },
+    {
+      "address": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "balance": "0xd3c21bcecceda1000000",
+      "nonce": 0,
+      "runtime_bytecode": "0x",
+      "storage": []
+    },
+    {
+      "address": "0x1111111111111111111111111111111111111111",
+      "balance": "0xd3c21bcecceda1000000",
+      "nonce": 0,
+      "runtime_bytecode": "0x",
+      "storage": []
+    },
+    {
+      "address": "0x6200000000000000000000000000000000000002",
+      "balance": "0x0",
+      "nonce": 0,
+      "runtime_bytecode": "0x608060405234801561000f575f5ffd5b506004361061004a575f3560e01c80633659cfe61461004e5780635c60da1b146100635780638da5cb5b146100a2578063c4d66de8146100b4575b5f5ffd5b61006161005c366004610153565b6100e3565b005b7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc545b6040516001600160a01b03909116815260200160405180910390f35b5f54610086906001600160a01b031681565b6100616100c2366004610153565b5f80546001600160a01b0319166001600160a01b0392909216919091179055565b5f546001600160a01b0316331461012f5760405162461bcd60e51b815260206004820152600c60248201526b15539055551213d49256915160a21b604482015260640160405180910390fd5b7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc55565b5f60208284031215610163575f5ffd5b81356001600160a01b0381168114610179575f5ffd5b939250505056fea26469706673582212207845a9c69e11ebc60dfb0c0ad05dad22f90195f84a27600efdf2aceb0cf680d864736f6c634300081e0033",
+      "storage": []
+    }
+  ],
+  "transactions": [
+    {
+      "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "to": "0x6200000000000000000000000000000000000002",
+      "calldata": "0xc4d66de8000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "value": "0x0",
+      "timestamp": 1000,
+      "expected_status": "Success",
+      "expected_output": null,
+      "expected_storage": [
+        {
+          "slot": "0x0",
+          "value": "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    },
+    {
+      "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "to": "0x6200000000000000000000000000000000000002",
+      "calldata": "0x3659cfe6000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "value": "0x0",
+      "timestamp": 1000,
+      "expected_status": "Success",
+      "expected_output": null,
+      "expected_storage": [
+        {
+          "slot": "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc",
+          "value": "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    },
+    {
+      "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "to": "0x6200000000000000000000000000000000000002",
+      "calldata": "0x8da5cb5b",
+      "value": "0x0",
+      "timestamp": 1000,
+      "expected_status": "Success",
+      "expected_output": "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_storage": []
+    },
+    {
+      "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "to": "0x6200000000000000000000000000000000000002",
+      "calldata": "0x5c60da1b",
+      "value": "0x0",
+      "timestamp": 1000,
+      "expected_status": "Success",
+      "expected_output": "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_storage": []
+    }
+  ],
+  "expected_safe_behavior": "DELIBERATELY VULNERABLE WITNESS: The proxy ships with an unset EIP-1967 slot and an unguarded initializer: the attacker initializes itself to owner and repoints the implementation."
 }
