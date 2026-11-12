@@ -69,6 +69,7 @@ async fn synthetic_abi_smoke_campaign_does_not_promote_findings() {
             max_finding_noise: Some(0),
             poc_out: None,
             promotion_limit: Some(8),
+            confirmation: Default::default(),
         },
     };
 

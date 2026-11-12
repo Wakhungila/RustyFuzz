@@ -140,7 +140,10 @@ async fn complete_json_impl(_model: &str, _prompt: &str) -> SatoriResult<String>
 #[cfg(feature = "llm")]
 async fn complete_json_impl(model: &str, prompt: &str) -> SatoriResult<String> {
     // Check for NVIDIA API key first
-    if let Some(nvapi_key) = std::env::var("NVIDIA_API_KEY").ok().filter(|k| !k.trim().is_empty()) {
+    if let Some(nvapi_key) = std::env::var("NVIDIA_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+    {
         // Map the model name to NVIDIA-compatible ID
         let nv_model = map_to_nvidia_model(model);
         return request_json_nvidia(NVIDIA_API_ENDPOINT, &nvapi_key, &nv_model, prompt).await;
@@ -160,7 +163,9 @@ async fn complete_json_impl(model: &str, prompt: &str) -> SatoriResult<String> {
 #[cfg(feature = "llm")]
 fn map_to_nvidia_model(model: &str) -> String {
     match model {
-        "nemotron-3.5-lightning-free" | "iceman-contributor-free" => "nvidia/nemotron-3.5-lightning-30b-a3b".to_string(),
+        "nemotron-3.5-lightning-free" | "iceman-contributor-free" => {
+            "nvidia/nemotron-3.5-lightning-30b-a3b".to_string()
+        }
         "nemotron-3.5-super-vl-free" => "nvidia/nemotron-3.5-super-vl-120b-a12b".to_string(),
         "big-pickle" => "poolside/laguna-xs-2.1".to_string(),
         "deepseek-v4.1-flash-free" => "deepseek-ai/deepseek-v4.1-flash".to_string(),
@@ -214,11 +219,7 @@ fn nvidia_timeout() -> std::time::Duration {
 /// parsed as strict JSON, and `chat_template_kwargs.enable_thinking` is sent
 /// unless the caller opted back into the scratchpad.
 #[cfg(feature = "llm")]
-fn nvidia_request_body(
-    model: &str,
-    prompt: &str,
-    enable_thinking: bool,
-) -> serde_json::Value {
+fn nvidia_request_body(model: &str, prompt: &str, enable_thinking: bool) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
         "messages": [
@@ -276,13 +277,10 @@ async fn request_json_nvidia(
                     "NVIDIA connection failed; check network connectivity"
                 ));
             }
-            return Err(anyhow::anyhow!(
-                "NVIDIA request failed: {}",
-                e
-            ));
+            return Err(anyhow::anyhow!("NVIDIA request failed: {}", e));
         }
     };
-    
+
     let status = response.status();
     if !status.is_success() {
         return Err(anyhow::anyhow!(
@@ -291,7 +289,7 @@ async fn request_json_nvidia(
             model
         ));
     }
-    
+
     let body_text = response.text().await?;
     let value: serde_json::Value = serde_json::from_str(&body_text)
         .map_err(|_| anyhow::anyhow!("NVIDIA returned an invalid response envelope"))?;
@@ -305,31 +303,34 @@ fn extract_response_text_nvidia(value: &serde_json::Value) -> SatoriResult<Strin
         .and_then(|v| v.as_array())
         .and_then(|v| v.first())
         .ok_or_else(|| anyhow::anyhow!("NVIDIA response missing choices"))?;
-    
+
     // Check finish_reason - "length" means truncation
     if let Some("length") = choice["finish_reason"].as_str() {
         return Err(anyhow::anyhow!(
             "NVIDIA response truncated (finish_reason=length); increase max_tokens or reduce prompt complexity"
         ));
     }
-    
+
     // Nemotron models put the actual answer in "content", reasoning in "reasoning_content"
     // We ONLY parse from content - reasoning_content is scratchpad with drafts/partial JSON
-    let content = choice["message"]["content"].as_str().ok_or_else(|| {
-        anyhow::anyhow!("NVIDIA response missing message content")
-    })?;
-    
+    let content = choice["message"]["content"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("NVIDIA response missing message content"))?;
+
     if content.is_empty() {
         return Err(anyhow::anyhow!(
             "NVIDIA response content is empty; model may have been forced to output in reasoning_content"
         ));
     }
-    
+
     // Extract first balanced JSON object, handling common wrappers
     let json_text = extract_json_object(content).ok_or_else(|| {
-        anyhow::anyhow!("NVIDIA response did not contain valid JSON: {}", content[..content.len().min(200)].to_string())
+        anyhow::anyhow!(
+            "NVIDIA response did not contain valid JSON: {}",
+            content[..content.len().min(200)].to_string()
+        )
     })?;
-    
+
     validate_json(json_text)?;
     Ok(json_text.to_string())
 }
@@ -341,7 +342,7 @@ fn extract_json_object(s: &str) -> Option<&str> {
     let start = s.find(|c| c == '{' || c == '[')?;
     let bytes = s.as_bytes();
     let (mut depth, mut in_str, mut esc) = (0i32, false, false);
-    
+
     for (i, &b) in bytes.iter().enumerate().skip(start) {
         if in_str {
             if esc {
@@ -790,13 +791,15 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 name
             );
-            let content = fs::read_to_string(&path).expect(&format!("Failed to read fixture: {}", path));
+            let content =
+                fs::read_to_string(&path).expect(&format!("Failed to read fixture: {}", path));
             serde_json::from_str(&content).expect(&format!("Invalid JSON in fixture: {}", path))
         }
 
         #[test]
         fn request_body_disables_thinking_by_default() {
-            let body = nvidia_request_body("nvidia/nemotron-3.5-lightning-30b-a3b", "prompt", false);
+            let body =
+                nvidia_request_body("nvidia/nemotron-3.5-lightning-30b-a3b", "prompt", false);
             assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
             assert_eq!(body["stream"], false);
             assert_eq!(body["max_tokens"], 8192);
@@ -854,7 +857,11 @@ mod tests {
 
             for value in ["0", "false", "no", "off", ""] {
                 std::env::set_var("NVIDIA_ENABLE_THINKING", value);
-                assert!(!nvidia_enable_thinking(), "{} must not enable thinking", value);
+                assert!(
+                    !nvidia_enable_thinking(),
+                    "{} must not enable thinking",
+                    value
+                );
             }
 
             match previous {
@@ -868,7 +875,7 @@ mod tests {
             let value = load_fixture("normal_response");
             let result = extract_response_text_nvidia(&value);
             assert!(result.is_ok(), "Expected success, got error: {:?}", result);
-            
+
             let json_text = result.unwrap();
             assert!(json_text.contains("function_id"));
             assert!(json_text.contains("hypotheses"));
@@ -888,7 +895,7 @@ mod tests {
             let value = load_fixture("fenced_json_response");
             let result = extract_response_text_nvidia(&value);
             assert!(result.is_ok(), "Expected success, got error: {:?}", result);
-            
+
             let json_text = result.unwrap();
             // Should extract the JSON object, not include the ``` wrapper
             assert!(json_text.contains("function_id"));
@@ -934,7 +941,10 @@ mod tests {
         fn plain_text_without_json_returns_error() {
             let value = load_fixture("plain_text_response");
             let result = extract_response_text_nvidia(&value);
-            assert!(result.is_err(), "Expected error for plain text response without valid JSON");
+            assert!(
+                result.is_err(),
+                "Expected error for plain text response without valid JSON"
+            );
         }
     }
 }

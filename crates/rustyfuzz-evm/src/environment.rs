@@ -61,7 +61,12 @@ impl EnvironmentPolicy {
         // too. Only fixtures without chain identity receive synthetic semantics.
         let synthetic = provenance.chain_id.is_none() && provenance.provider_sanitized.is_empty();
         let (chain_id, spec, fraction, source) = if synthetic {
-            (1, SpecId::OSAKA, Some(5_007_716), "synthetic-osaka".to_string())
+            (
+                1,
+                SpecId::OSAKA,
+                Some(5_007_716),
+                "synthetic-osaka".to_string(),
+            )
         } else {
             let chain_id = provenance
                 .chain_id
@@ -125,7 +130,12 @@ impl EnvironmentPolicy {
                     "post-Cancun header is missing excess blob gas"
                 );
             }
-            (chain_id, spec, profile.blob_fraction(timestamp), format!("pinned-{}", profile.name))
+            (
+                chain_id,
+                spec,
+                profile.blob_fraction(timestamp),
+                format!("pinned-{}", profile.name),
+            )
         };
         ensure!(
             block.gas_limit >= 21_000,

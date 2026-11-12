@@ -143,10 +143,16 @@ mod panic_code_tests {
             "failed assertion or invariant check"
         );
         assert_eq!(describe_panic_code(0x32), "array index out of bounds");
-        assert_eq!(describe_panic_code(0x11), "arithmetic overflow or underflow");
+        assert_eq!(
+            describe_panic_code(0x11),
+            "arithmetic overflow or underflow"
+        );
         assert_eq!(describe_panic_code(0x12), "division or modulo by zero");
         assert_eq!(describe_panic_code(0x31), "pop() on an empty array");
-        assert_eq!(describe_panic_code(0x51), "call to a zero-initialized internal function pointer");
+        assert_eq!(
+            describe_panic_code(0x51),
+            "call to a zero-initialized internal function pointer"
+        );
         assert_eq!(describe_panic_code(0xdead), "unknown panic code");
     }
 

@@ -595,6 +595,7 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
             max_finding_noise: options.max_finding_noise,
             poc_out: options.poc_out,
             promotion_limit: Some(options.promotion_limit),
+            confirmation: Default::default(),
         },
     };
     let watchdog = install_campaign_watchdog(

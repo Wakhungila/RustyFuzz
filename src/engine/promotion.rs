@@ -6,9 +6,16 @@ use crate::common::types::{
     CallObservation, ChainState, ExecutionStatus, SequenceExecutionResult, Snapshot, StorageDiff,
 };
 use crate::common::verifier::{RealismVerifier, ReplayVerifier, ViolationPredicate};
-use crate::engine::economic_delta::TokenBalanceView;
+use crate::engine::actors::ActorModel;
+use crate::engine::confirmation::{
+    FindingConfirmation, FindingConfirmationConfig, FindingConfirmationGate,
+};
+use crate::engine::economic_delta::{EconomicDeltaReport, TokenBalanceView};
+use crate::engine::exploit_path::{CounterexampleProofStatus, MinimizedSequenceStatus};
 use crate::engine::exploit_synthesizer::synthesize_foundry_poc_with_findings;
 use crate::engine::minimizer::Minimizer;
+use crate::engine::proof::{ProofCarryingFinding, ProofConfidenceTier, ReplayVerificationStatus};
+use crate::engine::scoring::CampaignScore;
 use crate::evm::corpus::{CampaignArtifactRecord, PersistentCorpus};
 use crate::evm::fuzz::EvmInput;
 use crate::satori::fsutil::{
@@ -28,6 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -87,6 +95,12 @@ pub struct PromotionConfig {
     #[serde(default)]
     pub poc_out: Option<String>,
     pub promotion_limit: Option<u64>,
+    /// Single confirmation authority: the gate that decides `Confirmed`.
+    /// Promotion must route its lifecycle promotion through this gate so
+    /// corpus triage and report artifacts answer the same question with the
+    /// same rule.
+    #[serde(default)]
+    pub confirmation: FindingConfirmationConfig,
 }
 
 impl Default for PromotionConfig {
@@ -105,6 +119,7 @@ impl Default for PromotionConfig {
             max_finding_noise: None,
             poc_out: None,
             promotion_limit: None,
+            confirmation: FindingConfirmationConfig::default(),
         }
     }
 }
@@ -145,6 +160,12 @@ pub struct FindingPromotionRecord {
     pub synthetic_mode: bool,
     pub caveats: Vec<String>,
     pub artifact_paths: BTreeMap<String, String>,
+    /// Verdict of the `FindingConfirmationGate` over this artifact's
+    /// pipeline-verified evidence, including every unmet requirement when it
+    /// refused `Confirmed`. `None` only in records written before the gate
+    /// became the single confirmation authority.
+    #[serde(default)]
+    pub confirmation: Option<FindingConfirmation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -535,6 +556,9 @@ pub fn promote_finding_artifact(
     let mut generated_poc_hash = None;
     let mut realism_proof = None;
     let mut policy_rejections = Vec::new();
+    // Hoisted so the confirmation gate below can see the pipeline's replayed
+    // violation predicate even though it is derived inside the Ok arm.
+    let mut predicate: Option<ViolationPredicate> = None;
 
     match replay_result {
         Ok(execution) => {
@@ -566,7 +590,7 @@ pub fn promote_finding_artifact(
                 request.block_env.clone(),
             );
             let original_len = input.txs.len();
-            let predicate = (input.base_snapshot_id == 0)
+            predicate = (input.base_snapshot_id == 0)
                 .then_some(finding.as_ref())
                 .flatten()
                 .and_then(|finding| ViolationPredicate::from_finding(finding, &execution));
@@ -814,17 +838,36 @@ pub fn promote_finding_artifact(
         }
     }
 
-    if lifecycle_stage == FindingLifecycleStage::PocGenerated
-        && !request.synthetic_mode
-        && (!request.config.require_poc_for_confirmed || poc_status == "validated")
-        && replay_status == "success"
-        && realism_proof.as_ref().is_some_and(|proof| proof.success)
-    {
-        lifecycle_stage = FindingLifecycleStage::Confirmed;
-    }
-
-    if request.synthetic_mode && lifecycle_stage == FindingLifecycleStage::Confirmed {
-        lifecycle_stage = FindingLifecycleStage::PocGenerated;
+    // FIX 6: promotion to `Confirmed` is decided by the same
+    // `FindingConfirmationGate` that corpus triage uses — never by this
+    // function's own inline criteria. The gate sees the pipeline's verified
+    // state (replay, minimization, violation predicate, realism proof, PoC)
+    // folded over the artifact's campaign-time proof, so the two call sites
+    // answer one question with one rule.
+    let poc_path = artifact_paths.get("poc").map(String::as_str);
+    let gate_proof = promotion_gate_proof(
+        request.artifact.proof.as_ref(),
+        finding.as_ref(),
+        &minimized_input,
+        replay_status == "success",
+        &minimize_status,
+        predicate.as_ref(),
+        realism_proof.as_ref().is_some_and(|proof| proof.success),
+        poc_path,
+        request.artifact.target,
+    );
+    let confirmation = gate_confirmation_for_promotion(
+        &request.config.confirmation,
+        &gate_proof,
+        &request.artifact.findings,
+        &request.artifact.score,
+    );
+    lifecycle_stage =
+        promotion_stage_after_gate(lifecycle_stage, request.synthetic_mode, &confirmation);
+    if lifecycle_stage == FindingLifecycleStage::PocGenerated {
+        for reason in &confirmation.reasons {
+            caveats.push(format!("confirmation gate: {reason}"));
+        }
     }
 
     let strict_proof = request.config.strict_proof;
@@ -936,6 +979,7 @@ pub fn promote_finding_artifact(
         synthetic_mode: request.synthetic_mode,
         caveats,
         artifact_paths,
+        confirmation: Some(confirmation),
     };
 
     let finding_json = finding_dir.join("finding.json");
@@ -953,6 +997,112 @@ pub fn promote_finding_artifact(
         finding_json.display()
     );
     Ok(record)
+}
+
+/// Builds the gate's evidence view from the promotion pipeline's own verified
+/// state. When the artifact carries a campaign-time proof, pipeline-verified
+/// facts (replay, minimization, predicate, realism, PoC path) are folded over
+/// it; otherwise a minimal proof is synthesized from the pipeline state so
+/// the gate can still evaluate — and honestly refuse — the candidate.
+#[allow(clippy::too_many_arguments)]
+fn promotion_gate_proof(
+    artifact_proof: Option<&ProofCarryingFinding>,
+    finding: Option<&ProtocolFinding>,
+    minimized_input: &EvmInput,
+    replay_success: bool,
+    minimize_status: &str,
+    predicate: Option<&ViolationPredicate>,
+    realism_success: bool,
+    poc_path: Option<&str>,
+    target: Option<Address>,
+) -> ProofCarryingFinding {
+    let vuln_label = || {
+        finding
+            .map(|finding| finding.vuln.to_string())
+            .unwrap_or_else(|| "unlabeled-violated-condition".to_string())
+    };
+    let mut proof = artifact_proof
+        .cloned()
+        .unwrap_or_else(|| ProofCarryingFinding {
+            target,
+            vulnerability_class: finding.map(|finding| finding.vuln.to_string()),
+            invariant_id: None,
+            violation_predicate: None,
+            original_state_violation_verified: false,
+            // Positional role labeling is the canonical actor model used at
+            // campaign time; callers in the replayed sequence are left untouched.
+            actor_roles: ActorModel::default()
+                .generate(std::iter::empty())
+                .assign_roles(minimized_input.txs.len()),
+            tx_sequence: minimized_input.txs.clone(),
+            pre_state_evidence: Vec::new(),
+            post_state_evidence: Vec::new(),
+            storage_diffs: Vec::new(),
+            economic_delta: EconomicDeltaReport::default(),
+            violated_condition: vuln_label(),
+            replay_result: ReplayVerificationStatus::NotAttempted,
+            minimization_result: MinimizedSequenceStatus::NotAttempted,
+            confidence: 0,
+            caveats: Vec::new(),
+            foundry_poc_path: None,
+            proof_status: CounterexampleProofStatus::HeuristicOnly,
+            confidence_tier: ProofConfidenceTier::Heuristic,
+        });
+
+    proof.replay_result = if replay_success {
+        ReplayVerificationStatus::Verified
+    } else {
+        ReplayVerificationStatus::Mismatch {
+            reason: "promotion replay did not succeed".to_string(),
+        }
+    };
+    proof.minimization_result =
+        if minimize_status == "reduced" || minimize_status == "not_reducible" {
+            MinimizedSequenceStatus::Minimized
+        } else {
+            MinimizedSequenceStatus::NeedsMinimization
+        };
+    if let Some(predicate) = predicate {
+        proof.violation_predicate = Some(predicate.clone());
+    }
+    // "Verified from original state" means the pipeline's realism verifier
+    // proved the violation predicate holds when replayed from the original
+    // forked state — not merely that a heuristic fired.
+    proof.original_state_violation_verified =
+        realism_success && proof.violation_predicate.is_some();
+    if let Some(path) = poc_path {
+        proof.foundry_poc_path = Some(PathBuf::from(path));
+    }
+    if proof.violated_condition.is_empty() {
+        proof.violated_condition = vuln_label();
+    }
+    proof
+}
+
+/// The single confirmation authority for promotion. Corpus triage and this
+/// pipeline both answer "is this Confirmed?" through the same gate config.
+fn gate_confirmation_for_promotion(
+    config: &FindingConfirmationConfig,
+    proof: &ProofCarryingFinding,
+    findings: &[ProtocolFinding],
+    score: &CampaignScore,
+) -> FindingConfirmation {
+    FindingConfirmationGate::new(config.clone()).evaluate(Some(proof), findings, score)
+}
+
+/// Applies the gate verdict to the lifecycle stage. `Confirmed` requires the
+/// gate's blessing on top of the pipeline having reached `PocGenerated`; the
+/// gate can refuse but never bypass the pipeline's own evidence bar.
+fn promotion_stage_after_gate(
+    stage: FindingLifecycleStage,
+    synthetic_mode: bool,
+    confirmation: &FindingConfirmation,
+) -> FindingLifecycleStage {
+    if confirmation.confirmed && !synthetic_mode && stage == FindingLifecycleStage::PocGenerated {
+        FindingLifecycleStage::Confirmed
+    } else {
+        stage
+    }
 }
 
 fn forge_version_is_unavailable(version: &std::io::Result<BoundedCommandOutput>) -> bool {
@@ -1840,6 +1990,7 @@ mod tests {
             synthetic_mode: false,
             caveats: Vec::new(),
             artifact_paths: BTreeMap::new(),
+            confirmation: None,
         };
         let mut rejected = confirmed.clone();
         rejected.finding_id = "rejected".to_string();
@@ -1919,6 +2070,7 @@ mod tests {
             synthetic_mode: false,
             caveats: Vec::new(),
             artifact_paths: BTreeMap::new(),
+            confirmation: None,
         };
         let input = EvmInput {
             txs: Vec::new(),
@@ -1974,5 +2126,208 @@ mod tests {
             .canonical()
             .transition(FindingLifecycle::Proved)
             .is_err());
+    }
+
+    // ── FIX 6: promotion routes confirmation through FindingConfirmationGate ──
+
+    use crate::common::oracle::ProtocolOraclePackKind;
+    use crate::common::types::SingletonTx;
+    use crate::engine::actors::ActorType;
+    use revm::primitives::U256;
+    use std::collections::BTreeMap;
+
+    fn gate_pipeline_evidence(
+        artifact_proof: Option<&ProofCarryingFinding>,
+        replay_success: bool,
+        minimize_status: &str,
+        realism_success: bool,
+        poc_validated: bool,
+    ) -> ProofCarryingFinding {
+        let finding = ProtocolFinding {
+            pack: ProtocolOraclePackKind::Lending,
+            vuln: VulnType::InvariantViolation("bad debt".to_string()),
+            severity: ProtocolSeverity::High,
+            target: Some(Address::repeat_byte(0xaa)),
+            tx_index: Some(0),
+            evidence: "bad debt invariant failed".to_string(),
+        };
+        let predicate = realism_success.then(|| ViolationPredicate::DeniedMint {
+            target: Address::repeat_byte(0xaa),
+            caller: Address::repeat_byte(0x13),
+            recipient: Address::repeat_byte(0x21),
+            mint_calldata: vec![0x40, 0xc1, 0x0f, 0x19],
+            policy_calldata: vec![0x40, 0xc1, 0x0f, 0x19],
+        });
+        let minimized_input = EvmInput {
+            txs: vec![SingletonTx {
+                input: vec![1, 2, 3, 4],
+                caller: Address::repeat_byte(0x13),
+                to: Address::repeat_byte(0xaa),
+                value: U256::ZERO,
+                is_victim: false,
+            }],
+            base_snapshot_id: 0,
+        };
+        promotion_gate_proof(
+            artifact_proof,
+            Some(&finding),
+            &minimized_input,
+            replay_success,
+            minimize_status,
+            predicate.as_ref(),
+            realism_success,
+            poc_validated.then_some("findings/x/poc.t.sol"),
+            Some(Address::repeat_byte(0xaa)),
+        )
+    }
+
+    fn gate_score(total: u64) -> CampaignScore {
+        CampaignScore {
+            total,
+            economic_pressure: total,
+            invariant_pressure: 0,
+            counterexample_pressure: 0,
+            oracle_pressure: 0,
+            state_pressure: 0,
+            exploration_pressure: 0,
+            explanation: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn promotion_gate_refuses_heuristic_pipeline_without_predicate() {
+        // Replay + minimization alone (no violation predicate, no realism
+        // proof, no PoC) must never confirm — the gate lists every blocker.
+        let proof = gate_pipeline_evidence(None, true, "reduced", false, false);
+        let confirmation = gate_confirmation_for_promotion(
+            &FindingConfirmationConfig::default(),
+            &proof,
+            &[],
+            &gate_score(1_000),
+        );
+        assert!(!confirmation.confirmed);
+        assert!(confirmation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("missing invariant or economic proof")));
+        assert!(confirmation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("missing protocol-specific PoC assertion")));
+    }
+
+    #[test]
+    fn promotion_gate_refuses_fully_replayed_candidate_below_score_floor() {
+        // Full evidence chain but the artifact score is under the gate floor:
+        // the old inline path confirmed this; the gate must refuse it.
+        let proof = gate_pipeline_evidence(None, true, "not_reducible", true, true);
+        let confirmation = gate_confirmation_for_promotion(
+            &FindingConfirmationConfig::default(),
+            &proof,
+            &[],
+            &gate_score(600),
+        );
+        assert!(!confirmation.confirmed);
+        assert!(confirmation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("score below confirmed threshold")));
+    }
+
+    #[test]
+    fn promotion_gate_confirms_fully_evidenced_candidate() {
+        // Replay + minimized + predicate verified from original state +
+        // validated Foundry PoC + actor labels + score above the floor: the
+        // single authority confirms, exactly as corpus triage would.
+        let proof = gate_pipeline_evidence(None, true, "reduced", true, true);
+        assert!(proof.original_state_violation_verified);
+        assert!(proof.actor_roles.contains_key(&0));
+        let confirmation = gate_confirmation_for_promotion(
+            &FindingConfirmationConfig::default(),
+            &proof,
+            &[],
+            &gate_score(1_000),
+        );
+        assert!(
+            confirmation.confirmed,
+            "reasons: {:?}",
+            confirmation.reasons
+        );
+        assert_eq!(confirmation.tier, ProofConfidenceTier::Confirmed);
+    }
+
+    #[test]
+    fn promotion_gate_proof_folds_pipeline_state_over_artifact_proof() {
+        // The artifact's campaign-time proof is authoritative for actor
+        // labels, but pipeline-verified facts always win.
+        let artifact_proof = ProofCarryingFinding {
+            target: Some(Address::repeat_byte(0xaa)),
+            vulnerability_class: Some("bad debt".to_string()),
+            invariant_id: Some("lending-health".to_string()),
+            violation_predicate: None,
+            original_state_violation_verified: false,
+            actor_roles: BTreeMap::from([(0, ActorType::Attacker)]),
+            tx_sequence: Vec::new(),
+            pre_state_evidence: Vec::new(),
+            post_state_evidence: Vec::new(),
+            storage_diffs: Vec::new(),
+            economic_delta: EconomicDeltaReport::default(),
+            violated_condition: "lending-health".to_string(),
+            replay_result: ReplayVerificationStatus::NotAttempted,
+            minimization_result: MinimizedSequenceStatus::NotAttempted,
+            confidence: 90,
+            caveats: Vec::new(),
+            foundry_poc_path: None,
+            proof_status: CounterexampleProofStatus::ConcretelyReplayed,
+            confidence_tier: ProofConfidenceTier::PocGenerated,
+        };
+        let proof = gate_pipeline_evidence(Some(&artifact_proof), true, "reduced", true, true);
+        assert!(matches!(
+            proof.replay_result,
+            ReplayVerificationStatus::Verified
+        ));
+        assert_eq!(
+            proof.minimization_result,
+            MinimizedSequenceStatus::Minimized
+        );
+        assert!(proof.foundry_poc_path.is_some());
+        assert!(proof.original_state_violation_verified);
+        // Actor labels survive the fold.
+        assert_eq!(proof.actor_roles.get(&0), Some(&ActorType::Attacker));
+    }
+
+    #[test]
+    fn promotion_stage_after_gate_demands_pipeline_and_non_synthetic() {
+        let confirmed = FindingConfirmation {
+            tier: ProofConfidenceTier::Confirmed,
+            confirmed: true,
+            high_value_artifact: true,
+            replay_success: true,
+            minimized_path: true,
+            invariant_or_economic_proof: true,
+            actor_labels: true,
+            protocol_specific_assertion: true,
+            reasons: Vec::new(),
+        };
+        assert_eq!(
+            promotion_stage_after_gate(FindingLifecycleStage::PocGenerated, false, &confirmed),
+            FindingLifecycleStage::Confirmed
+        );
+        // The gate can confirm but synthetic evidence can never hold the
+        // Confirmed stage.
+        assert_eq!(
+            promotion_stage_after_gate(FindingLifecycleStage::PocGenerated, true, &confirmed),
+            FindingLifecycleStage::PocGenerated
+        );
+        // The gate never bypasses the pipeline's own evidence bar.
+        let refused = FindingConfirmation {
+            confirmed: false,
+            reasons: vec!["missing replay success".to_string()],
+            ..confirmed
+        };
+        assert_eq!(
+            promotion_stage_after_gate(FindingLifecycleStage::Minimized, false, &refused),
+            FindingLifecycleStage::Minimized
+        );
     }
 }

@@ -92,7 +92,9 @@ pub async fn create_fork_db(
     // profile — or a block outside the profile's covered range — is refused
     // here, before any state is read.
     let profile = rustyfuzz_evm::chain_profile::ChainProfile::for_chain(
-        provenance.chain_id.expect("chain id presence was checked above"),
+        provenance
+            .chain_id
+            .expect("chain id presence was checked above"),
     )
     .map_err(|message| anyhow::anyhow!(message))?;
     anyhow::ensure!(

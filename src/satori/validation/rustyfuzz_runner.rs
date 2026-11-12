@@ -395,6 +395,7 @@ pub async fn execute_bounded_job(
             max_finding_noise: Some(0),
             poc_out: None,
             promotion_limit: Some(8),
+            confirmation: Default::default(),
         },
     };
 
@@ -723,18 +724,27 @@ mod tests {
         let temp = std::env::temp_dir().join(format!(
             "satori-report-snapshot-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
-        let layout = rustyfuzz_artifacts::RunLayout::new(&temp.join("canonical"), "campaign-snapshot");
+        let layout =
+            rustyfuzz_artifacts::RunLayout::new(&temp.join("canonical"), "campaign-snapshot");
         layout.materialize_new().expect("canonical layout");
         std::fs::write(
             layout.reports_dir().join("required_seed_replay.json"),
             br#"{"completed":true}"#,
         )
         .expect("replay marker");
-        std::fs::create_dir_all(layout.reports_dir().join("findings").join("f1")).expect("findings");
+        std::fs::create_dir_all(layout.reports_dir().join("findings").join("f1"))
+            .expect("findings");
         std::fs::write(
-            layout.reports_dir().join("findings").join("f1").join("finding.json"),
+            layout
+                .reports_dir()
+                .join("findings")
+                .join("f1")
+                .join("finding.json"),
             b"{}",
         )
         .expect("finding");
@@ -743,7 +753,11 @@ mod tests {
         snapshot_campaign_reports(&layout, &report_dir).expect("snapshot must succeed");
 
         assert!(report_dir.join("required_seed_replay.json").is_file());
-        assert!(report_dir.join("findings").join("f1").join("finding.json").is_file());
+        assert!(report_dir
+            .join("findings")
+            .join("f1")
+            .join("finding.json")
+            .is_file());
         assert_eq!(
             std::fs::read(report_dir.join("required_seed_replay.json")).expect("marker"),
             br#"{"completed":true}"#
@@ -919,6 +933,7 @@ mod tests {
             synthetic_mode: false,
             caveats: vec![],
             artifact_paths: Default::default(),
+            confirmation: None,
         };
         assert!(finding_matches_job(
             &job,
@@ -1007,6 +1022,7 @@ mod tests {
             synthetic_mode: false,
             caveats: vec![],
             artifact_paths,
+            confirmation: None,
         };
         verify_record_evidence(&record, &root).unwrap();
         std::fs::write(root.join("poc"), b"tampered").unwrap();

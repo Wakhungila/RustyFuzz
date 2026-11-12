@@ -879,7 +879,8 @@ fn migrate_required_seed_bundle(
     let Some(bundle_id) = bundle_id.map(str::trim).filter(|id| !id.is_empty()) else {
         return Ok(());
     };
-    if bundle_id == "." || bundle_id == ".." || bundle_id.contains('/') || bundle_id.contains('\\') {
+    if bundle_id == "." || bundle_id == ".." || bundle_id.contains('/') || bundle_id.contains('\\')
+    {
         anyhow::bail!("seed bundle id contains unsupported path characters");
     }
     let source = caller_corpus_dir.join("mainnet_seeds").join(bundle_id);
@@ -1053,8 +1054,11 @@ pub async fn run_fuzz_campaign_with_cancellation_locked(
     cancellation: Option<Arc<AtomicBool>>,
     owner: rustyfuzz_artifacts::CampaignLock,
 ) -> anyhow::Result<()> {
-    let (terminal_config, owner) =
-        prepare_canonical_run_lifecycle_at(config, Path::new(CANONICAL_ARTIFACTS_ROOT), Some(owner))?;
+    let (terminal_config, owner) = prepare_canonical_run_lifecycle_at(
+        config,
+        Path::new(CANONICAL_ARTIFACTS_ROOT),
+        Some(owner),
+    )?;
     run_fuzz_campaign_owned(terminal_config, cancellation, owner).await
 }
 
@@ -4564,10 +4568,7 @@ fn load_canonical_run_manifest(
 }
 
 fn canonical_run_layout(config: &Config) -> Option<rustyfuzz_artifacts::RunLayout> {
-    config
-        .campaign_id
-        .as_deref()
-        .map(canonical_layout)
+    config.campaign_id.as_deref().map(canonical_layout)
 }
 
 fn write_run_terminal_status(
@@ -5217,10 +5218,18 @@ mod tests {
         ));
         let caller = temp.join("caller-corpus");
         let inputs = temp.join("canonical").join("inputs");
-        std::fs::create_dir_all(caller.join("mainnet_seeds").join("satori-sequence").join("inputs"))
-            .expect("caller bundle");
+        std::fs::create_dir_all(
+            caller
+                .join("mainnet_seeds")
+                .join("satori-sequence")
+                .join("inputs"),
+        )
+        .expect("caller bundle");
         std::fs::write(
-            caller.join("mainnet_seeds").join("satori-sequence").join("manifest.json"),
+            caller
+                .join("mainnet_seeds")
+                .join("satori-sequence")
+                .join("manifest.json"),
             b"{\"bundle\":true}",
         )
         .expect("manifest");
@@ -5228,7 +5237,10 @@ mod tests {
 
         migrate_required_seed_bundle(&caller, &inputs, Some("satori-sequence"))
             .expect("bundle must migrate");
-        let migrated = inputs.join("mainnet_seeds").join("satori-sequence").join("manifest.json");
+        let migrated = inputs
+            .join("mainnet_seeds")
+            .join("satori-sequence")
+            .join("manifest.json");
         assert_eq!(
             std::fs::read(&migrated).expect("migrated manifest"),
             b"{\"bundle\":true}"
@@ -6329,12 +6341,17 @@ mod tests {
             explanation: vec!["high anomaly".to_string()],
         };
         let result = campaign_artifact_reason(false, &score, &[], None);
-        assert!(result.is_none(), "score-only should not produce artifact reason");
+        assert!(
+            result.is_none(),
+            "score-only should not produce artifact reason"
+        );
     }
 
     #[test]
     fn campaign_artifact_reason_returns_reason_for_oracle_finding() {
-        use crate::common::oracle::{ProtocolFinding, ProtocolOraclePackKind, ProtocolSeverity, VulnType};
+        use crate::common::oracle::{
+            ProtocolFinding, ProtocolOraclePackKind, ProtocolSeverity, VulnType,
+        };
 
         let finding = ProtocolFinding {
             pack: ProtocolOraclePackKind::Erc20,
@@ -6372,6 +6389,9 @@ mod tests {
         };
         // Synthetic fork mode should always return None regardless of other conditions
         let result = campaign_artifact_reason(true, &score, &[], None);
-        assert!(result.is_none(), "synthetic fork mode should suppress artifacts");
+        assert!(
+            result.is_none(),
+            "synthetic fork mode should suppress artifacts"
+        );
     }
 }

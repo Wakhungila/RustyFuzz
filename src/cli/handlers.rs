@@ -324,6 +324,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     max_finding_noise,
                     poc_out,
                     promotion_limit,
+                    confirmation: Default::default(),
                 },
             };
             let run_layout = rustyfuzz_artifacts::RunLayout::new(
@@ -1088,6 +1089,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                         max_finding_noise: Some(0),
                         poc_out: None,
                         promotion_limit: Some(8),
+                        confirmation: Default::default(),
                     },
                 };
                 rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await?;
@@ -1256,6 +1258,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 max_finding_noise,
                 poc_out,
                 promotion_limit: None,
+                confirmation: Default::default(),
             };
             let campaign_id_value =
                 campaign_id.unwrap_or_else(|| format!("manual-promote-{}", Uuid::new_v4()));

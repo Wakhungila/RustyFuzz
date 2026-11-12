@@ -1075,14 +1075,8 @@ pub fn should_ignore(path: &Path) -> bool {
 ///
 /// Only the top level is excluded: a project's own `src/lib/` is still
 /// project source.
-pub const DEPENDENCY_DIR_NAMES: &[&str] = &[
-    "lib",
-    "libs",
-    "vendor",
-    "vendors",
-    "dependencies",
-    "deps",
-];
+pub const DEPENDENCY_DIR_NAMES: &[&str] =
+    &["lib", "libs", "vendor", "vendors", "dependencies", "deps"];
 
 /// Whether `path` is a vendored dependency directory directly under `root`.
 pub fn is_top_level_dependency_dir(root: &Path, path: &Path) -> bool {
@@ -1606,17 +1600,16 @@ An apitoken, clientsecret, passwordhash, and seedphrase are discussed in ordinar
     fn external_containment_enforces_memory_limits() {
         // Skip in environments without proper cgroup v2 memory controller
         // (containerized environments often have restricted cgroup access)
-        let has_memory_controller = std::fs::read_to_string(
-            std::path::Path::new("/sys/fs/cgroup/cgroup.controllers")
-        )
-        .map(|c| c.contains("memory"))
-        .unwrap_or(false);
-        
+        let has_memory_controller =
+            std::fs::read_to_string(std::path::Path::new("/sys/fs/cgroup/cgroup.controllers"))
+                .map(|c| c.contains("memory"))
+                .unwrap_or(false);
+
         if !has_memory_controller {
             eprintln!("Skipping: cgroup memory controller not available");
             return;
         }
-        
+
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "sleep 30"]);
         let started = std::time::Instant::now();

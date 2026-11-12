@@ -135,14 +135,12 @@ fn resolve_live_target(
     let target_contract = match target_contract {
         Some(value) => {
             let trimmed = value.trim().to_string();
-            anyhow::ensure!(
-                !trimmed.is_empty(),
-                "--target-contract must not be empty"
-            );
+            anyhow::ensure!(!trimmed.is_empty(), "--target-contract must not be empty");
             // Accept only a 0x-prefixed 20-byte address so a typo cannot
             // silently widen what the campaign touches.
-            let parsed = alloy_primitives::Address::from_str(&trimmed)
-                .map_err(|_| anyhow::anyhow!("--target-contract must be a 0x-prefixed 20-byte address"))?;
+            let parsed = alloy_primitives::Address::from_str(&trimmed).map_err(|_| {
+                anyhow::anyhow!("--target-contract must be a 0x-prefixed 20-byte address")
+            })?;
             Some(parsed.to_string())
         }
         None => None,
@@ -352,7 +350,11 @@ mod tests {
     #[test]
     fn an_invalid_target_address_is_refused() {
         let _lock = ENV_LOCK.lock().unwrap();
-        for candidate in ["not-an-address", "0x1234", "0xZZ97ee98f3423222f7B4CDdb383f2EE2907E628"] {
+        for candidate in [
+            "not-an-address",
+            "0x1234",
+            "0xZZ97ee98f3423222f7B4CDdb383f2EE2907E628",
+        ] {
             let error = resolve_live_target(
                 Some(candidate.to_string()),
                 Some("https://arb-mainnet.g.alchemy.com/v2/example".to_string()),

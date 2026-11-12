@@ -27,9 +27,9 @@ use crate::satori::types::{
     VulnerabilityHypothesis,
 };
 use crate::satori::validation::sequence_resolver::{
-    authorization_probe_step, balance_probe_step, default_attacker, is_mint_action,
-    mint_recipient, policy_probe_for_preconditions, resolve_attack_sequence_with_hints,
-    step_caller, ResolverContext, ERC20_BALANCE_OF_SIGNATURE,
+    authorization_probe_step, balance_probe_step, default_attacker, is_mint_action, mint_recipient,
+    policy_probe_for_preconditions, resolve_attack_sequence_with_hints, step_caller,
+    ResolverContext, ERC20_BALANCE_OF_SIGNATURE,
 };
 use crate::satori::validation::validate_jobs_async;
 use chrono::Utc;
@@ -170,13 +170,15 @@ pub async fn run_model_audit(path: &Path, config: SatoriConfig) -> SatoriResult<
             .await
             .map_err(|e| anyhow::anyhow!("Model call failed for {}: {}", func_id, e))?;
         budget.record_call(&prompt, &response, cached);
-        let audit: FunctionAuditResult = parse_function_audit(&response, &packet.target_function.id)
-            .map_err(|e| {
-            anyhow::anyhow!("Failed to parse response for {}: {}\nResponse was: {}", 
-                func_id, e, 
-                response.chars().take(200).collect::<String>()
-            )
-        })?;
+        let audit: FunctionAuditResult =
+            parse_function_audit(&response, &packet.target_function.id).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to parse response for {}: {}\nResponse was: {}",
+                    func_id,
+                    e,
+                    response.chars().take(200).collect::<String>()
+                )
+            })?;
         ensure_hypothesis_count(
             audit.hypotheses.len(),
             config.max_hypotheses_per_function,
@@ -650,7 +652,8 @@ fn parse_function_audit(
     parse_strict_json(&value.to_string())
 }
 
-fn ensure_hypothesis_count(count: usize, cap: usize, scope: &str) -> SatoriResult<()> {    anyhow::ensure!(
+fn ensure_hypothesis_count(count: usize, cap: usize, scope: &str) -> SatoriResult<()> {
+    anyhow::ensure!(
         count <= cap,
         "Satori model returned {count} hypotheses, exceeding the {scope} cap of {cap}"
     );

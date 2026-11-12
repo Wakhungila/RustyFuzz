@@ -60,13 +60,13 @@ pub fn resolve_attack_sequence(
 
 fn resolve_step(step: &AttackStep, context: &ResolverContext<'_>) -> Option<AttackStep> {
     let actor = resolve_address(&step.actor).unwrap_or(context.attacker);
-    let target = resolve_address(step.target.as_deref().unwrap_or_default())
-        .unwrap_or(context.target);
+    let target =
+        resolve_address(step.target.as_deref().unwrap_or_default()).unwrap_or(context.target);
     let calldata = resolve_calldata(step, context)?;
     let value = step
         .value_hint
         .as_deref()
-        .and_then(|value| parse_value(value))
+        .and_then(parse_value)
         .unwrap_or(U256::ZERO);
     Some(AttackStep {
         actor: format!("{actor}"),
@@ -132,11 +132,16 @@ fn resolve_calldata(step: &AttackStep, context: &ResolverContext<'_>) -> Option<
 /// Accepts only concrete hex payloads of at least one selector word.
 fn normalize_calldata(value: &str) -> Option<String> {
     let trimmed = value.trim();
-    let hex_part = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X"))?;
+    let hex_part = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))?;
     if hex_part.len() < 8 || hex_part.len() % 2 != 0 {
         return None;
     }
-    if !hex_part.chars().all(|character| character.is_ascii_hexdigit()) {
+    if !hex_part
+        .chars()
+        .all(|character| character.is_ascii_hexdigit())
+    {
         return None;
     }
     Some(format!("0x{}", hex_part.to_ascii_lowercase()))
@@ -246,10 +251,7 @@ fn split_top_level(text: &str, separator: char) -> Vec<String> {
 fn encode_default_arguments(types: &[String], attacker: Address) -> Option<Vec<u8>> {
     let mut heads: Vec<Vec<u8>> = Vec::with_capacity(types.len());
     let mut tails: Vec<Vec<u8>> = Vec::new();
-    let head_slots = types
-        .iter()
-        .map(|kind| if is_dynamic_kind(kind) { 1usize } else { 1usize })
-        .sum::<usize>();
+    let head_slots = types.len();
 
     let mut tail_cursor = head_slots;
     for kind in types {
@@ -271,14 +273,6 @@ fn encode_default_arguments(types: &[String], attacker: Address) -> Option<Vec<u
         out.extend_from_slice(&tail);
     }
     Some(out)
-}
-
-/// Whether a type is dynamically encoded (offset + tail).
-fn is_dynamic_kind(type_text: &str) -> bool {
-    matches!(
-        classify_kind(type_text, default_attacker()),
-        Some(AbiKind::Dynamic(_))
-    )
 }
 
 enum AbiKind {
@@ -489,14 +483,11 @@ pub fn resolve_attack_sequence_with_hints(
                 .and_then(normalize_calldata)
                 .is_none()
         {
-            let function = affected_functions
-                .iter()
-                .find_map(|name| {
-                    context.functions.iter().find(|function| {
-                        function.name.eq_ignore_ascii_case(name.trim())
-                            && function.selector.is_some()
-                    })
-                })?;
+            let function = affected_functions.iter().find_map(|name| {
+                context.functions.iter().find(|function| {
+                    function.name.eq_ignore_ascii_case(name.trim()) && function.selector.is_some()
+                })
+            })?;
             let selector = function.selector.as_deref()?;
             let types = parameter_types(&function.signature);
             let arguments = encode_default_arguments(&types, context.attacker)?;
@@ -539,7 +530,11 @@ mod tests {
         let functions = Box::leak(Box::new(vec![
             function("approve", "approve(address,uint256)", "0x095ea7b3"),
             function("withdraw", "withdraw(uint256)", "0x2e1a7d4d"),
-            function("addCollateral", "addCollateral(address,uint256)", "0x1c7a4fff"),
+            function(
+                "addCollateral",
+                "addCollateral(address,uint256)",
+                "0x1c7a4fff",
+            ),
         ]));
         ResolverContext {
             target: Address::from_str("0x00000000000000000000000000000000000000aa").unwrap(),
@@ -579,7 +574,9 @@ mod tests {
             actor: "0x00000000000000000000000000000000000000bb".to_string(),
             action: "call withdraw".to_string(),
             target: Some("0x00000000000000000000000000000000000000cc".to_string()),
-            calldata_hint: Some("0x2e1a7d4d00000000000000000000000000000000000000000000000000000001".to_string()),
+            calldata_hint: Some(
+                "0x2e1a7d4d00000000000000000000000000000000000000000000000000000001".to_string(),
+            ),
             value_hint: None,
         }];
         let resolved = resolve_attack_sequence(&steps, &context()).expect("must resolve");
