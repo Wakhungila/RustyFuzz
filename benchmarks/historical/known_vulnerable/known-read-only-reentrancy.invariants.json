@@ -1,0 +1,29 @@
+{
+  "target": "0x6200000000000000000000000000000000000003",
+  "symbols": {
+    "vaultBalances": {
+      "kind": "mapping",
+      "slot": "0x0",
+      "offset_bits": 0,
+      "width_bits": 256,
+      "key_type": "address",
+      "keys": [
+        "0x3300000000000000000000000000000000000003",
+        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ]
+    },
+    "poolHolding": {
+      "kind": "return_value",
+      "slot": "0x70a08231",
+      "offset_bits": 0,
+      "width_bits": 256,
+      "call_target": "0x7000000000000000000000000000000000000003"
+    }
+  },
+  "invariants": [
+    {
+      "name": "vaultRemainsSolvent",
+      "predicate": "sum(vaultBalances) <= poolHolding"
+    }
+  ]
+}

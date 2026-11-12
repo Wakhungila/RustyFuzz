@@ -253,12 +253,8 @@ def build_amm():
 def build_read_only_reentrancy():
     target = '0x6200000000000000000000000000000000000003'
     token = '0x7000000000000000000000000000000000000003'
-    vault_balances = {
-        mapping_slot('address', AC, 0): word(0),
-        mapping_slot('address', V, 0): word(300 * E),
-    }
     token_storage = {
-        mapping_slot('address', target, 0): word(300 * E),
+        mapping_slot('address', V, 0): word(300 * E),
         mapping_slot('address', AC, 0): word(100 * E),
         '0x2': word(400 * E),
     }
@@ -270,20 +266,21 @@ def build_read_only_reentrancy():
         'accounts': [
             funded_eoa(A), funded_eoa(V), funded_eoa(M),
             contract_account(AC, code['ReentrantAttacker'], {}),
-            contract_account(target, code['ReentrantVault'], vault_balances),
+            contract_account(target, code['ReentrantVault'], {}),
             contract_account(token, code['HookToken'], token_storage),
         ],
         'transactions': [
-            # The attacker contract approves the vault, deposits 100 tokens...
-            tx(AC, token, encode_call('approve(address,uint256)', target, 100 * E), output=word(1)),
-            tx(AC, target, encode_call('deposit(uint256)', 100 * E),
-               slots={mapping_slot('address', AC, 0): word(100 * E),
-                      mapping_slot('address', target, 0): word(400 * E)}),
+            # The victim funds the vault: 300 tokens on deposit (the vault's
+            # owed-to-victim credit is written on-chain, not pre-seeded).
+            tx(V, token, encode_call('approve(address,uint256)', target, 300 * E), output=word(1)),
+            tx(V, target, encode_call('deposit(uint256)', 300 * E)),
+            # The attacker EOA drives the callback contract: it approves the
+            # vault and deposits 100 tokens as itself...
+            tx(A, AC, encode_call('enterDeposit(uint256)', 100 * E)),
             # ...then withdraws: the transfer hook re-enters, reads the STALE
             # pre-decrement balance through the vault's view, and mints that
             # value as profit the vault's token holdings never back.
-            tx(AC, target, encode_call('withdraw(uint256)', 100 * E),
-               slots={mapping_slot('address', AC, 0): word(100 * E)}),
+            tx(A, AC, encode_call('enterWithdraw(uint256)', 100 * E)),
             # Top-level observation of the drained pool for the return_value
             # binding: the vault holds 300 tokens against 400 owed.
             tx(A, token, encode_call('balanceOf(address)', target), output=word(300 * E),

