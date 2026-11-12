@@ -12,10 +12,11 @@ use rusty_fuzz::{
     evm::fork::create_offline_fallback_block_env,
 };
 use rustyfuzz_evm::fork_db::ForkDb;
+use rustyfuzz_testkit::evm_address;
 
 fn fixture(safe: bool) -> (ChainState, EvmInput) {
-    let caller = Address::repeat_byte(0x11);
-    let target = Address::repeat_byte(0x22);
+    let caller = Address::from(evm_address(0x11));
+    let target = Address::from(evm_address(0x22));
     // Minimal executable token: balanceOf reads slot zero, canMint returns false,
     // mint either increments the balance or rejects the unauthorized caller.
     let mut code = vec![0x5f, 0x35, 0x60, 0xe0, 0x1c, 0x80, 0x63];
@@ -103,7 +104,7 @@ fn denied_mint_predicate_proves_violation_and_rejects_safe_counterpart() {
             .success
     );
     let mut changed = input.clone();
-    changed.txs[2].caller = Address::repeat_byte(0x33);
+    changed.txs[2].caller = Address::from(evm_address(0x33));
     assert!(
         !verifier
             .prove_violation(&state, &env, &changed, &predicate)
@@ -124,7 +125,7 @@ fn denied_mint_predicate_proves_violation_and_rejects_safe_counterpart() {
     );
     for tx_index in [1, 2, 3] {
         let mut other_target = input.clone();
-        other_target.txs[tx_index].to = Address::repeat_byte(0x44);
+        other_target.txs[tx_index].to = Address::from(evm_address(0x44));
         let report = verifier.prove_violation(&state, &env, &other_target, &predicate);
         assert!(!report.success);
         assert_eq!(report.status, FindingStatus::Rejected);
@@ -149,8 +150,8 @@ fn denied_mint_predicate_proves_violation_and_rejects_safe_counterpart() {
 #[test]
 fn proof_replay_uses_funds_received_during_earlier_transactions() {
     let first = Address::repeat_byte(0x11);
-    let second = Address::repeat_byte(0x12);
-    let recipient = Address::repeat_byte(0x13);
+    let second = Address::from(evm_address(0x12));
+    let recipient = Address::from(evm_address(0x13));
     let mut db = CacheDB::new(ForkDb::empty());
     db.insert_account_info(
         first,
@@ -207,7 +208,7 @@ fn predicate_binds_target_actor_policy_and_recipient() {
     let env = create_offline_fallback_block_env(1);
     let mut variants = Vec::new();
     let mut target = input.clone();
-    target.txs[2].to = Address::repeat_byte(0x44);
+    target.txs[2].to = Address::from(evm_address(0x44));
     variants.push(target);
     let mut actor = input.clone();
     actor.txs[1].input[35] ^= 1;
@@ -239,7 +240,7 @@ fn proof_rejects_snapshot_suffix_without_root_lineage() {
 fn proof_accepts_later_caller_funded_by_previous_transaction() {
     let (state, _) = fixture(false);
     let first = Address::repeat_byte(0x11);
-    let second = Address::repeat_byte(0x66);
+    let second = Address::from(evm_address(0x66));
     let input = EvmInput::new(
         vec![
             SingletonTx {
@@ -251,7 +252,7 @@ fn proof_accepts_later_caller_funded_by_previous_transaction() {
             },
             SingletonTx {
                 caller: second,
-                to: Address::repeat_byte(0x77),
+                to: Address::from(evm_address(0x77)),
                 value: U256::from(10u128.pow(17)),
                 input: vec![],
                 is_victim: false,

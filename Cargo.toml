@@ -58,7 +58,6 @@ required-features = ["evm"]
 # FEATURES
 # Build EVM only (default):   cargo build --release
 # SVM/SGX:                    unsupported; feature flags emit controlled errors
-# Build with Z3 solver:       cargo build --release --features "evm,z3"
 # Build with notifications:   cargo build --release --features "evm,notifier"
 # ─────────────────────────────────────────────────────────────────────────────
 [features]
@@ -72,7 +71,6 @@ evm      = [
     "dep:reqwest"
 ]
 svm      = []
-z3       = ["dep:z3"]
 llm      = ["dep:reqwest"]
 live-tests = []
 notifier = ["dep:reqwest"]
@@ -235,14 +233,6 @@ version = "0.11.0"
 version = "0.15.7"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OPTIONAL: Z3 concolic solver
-#   Linux:  sudo apt install libz3-dev
-#   macOS:  brew install z3
-[dependencies.z3]
-version  = "0.21.0"
-optional = true
-
-# ─────────────────────────────────────────────────────────────────────────────
 # OPTIONAL: HTTP client (notifications + LLM API)
 # ─────────────────────────────────────────────────────────────────────────────
 [dependencies.reqwest]
@@ -258,3 +248,11 @@ optional = true
 [dependencies.mimalloc]
 version  = "0.1.52"
 optional = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEST FIXTURES
+#   Deterministic address/slot builders shared by integration tests. Never a
+#   production dependency: the crate sits on top of the fuzzer's public APIs.
+# ─────────────────────────────────────────────────────────────────────────────
+[dev-dependencies.rustyfuzz-testkit]
+path = "crates/rustyfuzz-testkit"

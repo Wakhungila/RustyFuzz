@@ -4686,6 +4686,7 @@ dependencies = [
  "rustyfuzz-evm",
  "rustyfuzz-operations",
  "rustyfuzz-predicate",
+ "rustyfuzz-testkit",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4695,7 +4696,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
- "z3",
  "zeroize",
 ]
 
@@ -6279,25 +6279,6 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "synstructure",
-]
-
-[[package]]
-name = "z3"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08975512fd325de2a15eede8ed293b2189c745e0770886fae2b30ae229c5b886"
-dependencies = [
- "log",
- "z3-sys",
-]
-
-[[package]]
-name = "z3-sys"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96975839f50a909f6ec19671e5c06d7f0d6fc67287a120e1b010c5f8d91944d6"
-dependencies = [
- "pkg-config",
 ]
 
 [[package]]

@@ -18,6 +18,7 @@ use rusty_fuzz::{
     evm::{corpus::SnapshotCorpus, fork::create_offline_fallback_block_env},
 };
 use rustyfuzz_evm::{fork_db::ForkDb, inspector::MAP_SIZE};
+use rustyfuzz_testkit::evm_address;
 use std::{collections::HashSet, sync::Arc};
 
 const CODE: &[u8] = &[0x60, 0, 0x54, 0x60, 1, 1, 0x60, 0, 0x55, 0];
@@ -25,7 +26,7 @@ const CODE: &[u8] = &[0x60, 0, 0x54, 0x60, 1, 1, 0x60, 0, 0x55, 0];
 fn state() -> ChainState {
     let mut db = CacheDB::new(ForkDb::empty());
     db.insert_account_info(
-        Address::repeat_byte(0x11),
+        Address::from(evm_address(0x11)),
         AccountInfo::default().with_code(Bytecode::new_raw(CODE.to_vec().into())),
     );
     ChainState::Evm(db)
@@ -34,8 +35,8 @@ fn state() -> ChainState {
 fn input(base: u64) -> EvmInput {
     EvmInput::new(
         vec![SingletonTx {
-            caller: Address::repeat_byte(0x13),
-            to: Address::repeat_byte(0x11),
+            caller: Address::from(evm_address(0x13)),
+            to: Address::from(evm_address(0x11)),
             value: U256::ZERO,
             input: vec![],
             is_victim: false,
@@ -95,7 +96,7 @@ fn snapshot_campaign_worker() {
     let config = Config {
         rpc_url: "offline-test".into(),
         fork_block: 1,
-        target_contract: Some(Address::repeat_byte(0x11)),
+        target_contract: Some(Address::from(evm_address(0x11))),
         corpus_dir: root.join("corpus").display().to_string(),
         report_dir: root.join("reports").display().to_string(),
         foundry_harness: None,

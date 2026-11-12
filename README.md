@@ -468,24 +468,12 @@ Satori does not broadcast transactions, use private keys, or label model output 
 
 - Rust 1.97.1, pinned by `rust-toolchain.toml`
 - Cargo
-- libz3-dev (optional, for Z3 concolic solver integration)
 
 ### Build
 
 **Default (EVM only)**:
 ```bash
 cargo build --release
-```
-
-**With Z3 concolic solver**:
-```bash
-# Linux
-sudo apt install libz3-dev
-cargo build --release --features z3
-
-# macOS
-brew install z3
-cargo build --release --features z3
 ```
 
 **Unsupported configurations**:
@@ -558,12 +546,6 @@ For BSC, keep `--chain bsc` in the commands below and use a BSC archive RPC. For
 
 ```bash
 cargo build --release --bin rusty-fuzz --bin benchmark
-```
-
-Optional Z3 build:
-
-```bash
-cargo build --release --features z3 --bin rusty-fuzz
 ```
 
 **3. Create or update `config.toml`**
