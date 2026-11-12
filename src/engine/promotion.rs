@@ -330,10 +330,6 @@ impl PromotionCampaignStats {
             .remove(finding_id);
     }
 
-    pub fn record_pending(&self) {
-        self.promotion_pending.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub fn record_capped(&self, finding_id: &str) {
         let mut capped_ids = match self.capped_ids.lock() {
             Ok(capped_ids) => capped_ids,

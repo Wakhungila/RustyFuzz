@@ -7,8 +7,6 @@ pub mod fuzz;
 pub mod registry;
 pub mod snapshot;
 
-pub mod trace;
-
 #[cfg(feature = "evm")]
 pub mod etherscan_abi_fetcher;
 #[cfg(feature = "evm")]

@@ -1,7 +1,6 @@
 use crate::common::types::{CallPhase, ChainState, SequenceExecutionResult};
 use crate::evm::etherscan_abi_fetcher::EtherscanAbiFetcher;
 use crate::evm::fuzz::AbiRegistry;
-use crate::evm::trace::ExecutionTrace;
 use alloy_dyn_abi::DynSolType;
 use alloy_json_abi::JsonAbi;
 use libafl_bolts::rands::Rand;
@@ -168,30 +167,6 @@ impl GlobalAccountRegistry {
 
         for (sel, types) in common_sigs {
             registry.functions.entry(sel).or_insert(types);
-        }
-    }
-
-    /// Updates the protocol graph based on an execution trace.
-    /// This captures internal calls and contract creations (deployments).
-    pub fn record_trace(&mut self, trace: &ExecutionTrace) {
-        for call in &trace.calls {
-            self.contracts.insert(call.target);
-            self.contracts.insert(call.caller);
-
-            self.call_graph
-                .entry(call.caller)
-                .or_default()
-                .insert(call.target);
-        }
-
-        for create in &trace.creates {
-            if let Some(deployed) = create.deployed_address {
-                self.contracts.insert(deployed);
-                self.call_graph
-                    .entry(create.creator)
-                    .or_default()
-                    .insert(deployed);
-            }
         }
     }
 

@@ -215,11 +215,6 @@ impl EtherscanAbiFetcher {
         Ok(abi)
     }
 
-    /// Clears the ABI cache
-    pub fn clear_cache(&self) {
-        self.cache.write().clear();
-    }
-
     /// Returns the number of cached ABIs
     pub fn cache_size(&self) -> usize {
         self.cache.read().len()

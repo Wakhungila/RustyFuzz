@@ -216,20 +216,6 @@ impl EvmMutator {
         len.saturating_add(count) <= MAX_SEQUENCE_LENGTH
     }
 
-    pub fn with_concolic_hints(
-        abi_registry: Arc<AbiRegistry>,
-        account_registry: Arc<RwLock<GlobalAccountRegistry>>,
-        concolic_hints: Arc<Mutex<Vec<ConcolicHint>>>,
-    ) -> Self {
-        Self::with_concolic_hints_and_stats(
-            abi_registry,
-            account_registry,
-            concolic_hints,
-            Arc::new(ConcolicHintStats::default()),
-            EvmTestcaseMetadataStore::default(),
-        )
-    }
-
     pub fn with_concolic_hints_and_stats(
         abi_registry: Arc<AbiRegistry>,
         account_registry: Arc<RwLock<GlobalAccountRegistry>>,
@@ -307,10 +293,6 @@ impl EvmMutator {
     ) -> std::collections::BTreeMap<String, rustyfuzz_engine::campaign::telemetry::StrategyCounts>
     {
         self.strategy_counters.snapshot()
-    }
-
-    pub fn metadata_store(&self) -> EvmTestcaseMetadataStore {
-        self.testcase_metadata.clone()
     }
 
     fn apply_queued_concolic_hint(

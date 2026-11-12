@@ -177,27 +177,12 @@ mod panic_code_tests {
     }
 }
 
-/// CustomInvariant trait: Allows researchers to define their own protocol-specific
-/// economic or logical invariants.
-pub trait CustomInvariant: Send + Sync + 'static {
-    fn name(&self) -> &str;
-    fn check_invariant(&self, before: &Snapshot, after: &Snapshot) -> Option<VulnType>;
-}
-
 // Re-export oracle modules
-pub mod defi;
-pub mod governance;
-pub mod mev;
 pub mod packs;
 pub mod protocol_invariants;
 pub mod security;
-pub mod svm;
 
 // Re-export common oracle implementations
-pub use defi::*;
-pub use governance::*;
-pub use mev::*;
 pub use packs::*;
 pub use protocol_invariants::*;
 pub use security::*;
-pub use svm::*;

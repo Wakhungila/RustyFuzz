@@ -25,7 +25,6 @@ pub mod minimizer;
 pub mod checkpoint;
 #[cfg(test)]
 mod ordering_mutations;
-pub mod permission_model;
 pub mod promotion;
 pub mod proof;
 pub mod protocol_model;
@@ -33,6 +32,4 @@ pub mod provenance;
 pub mod scheduler;
 pub mod scoring;
 pub mod seed_intelligence;
-pub mod state_transition_checker;
 pub mod target_profile;
-pub mod temporal_constraints;

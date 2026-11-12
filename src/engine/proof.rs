@@ -289,10 +289,6 @@ impl ProofCarryingFinding {
     pub fn confidence_is_confirmed(&self) -> bool {
         self.violation_predicate.is_some() && self.confidence_tier == ProofConfidenceTier::Confirmed
     }
-
-    pub fn confidence_is_strictly_confirmed(&self) -> bool {
-        matches!(self.confidence_tier, ProofConfidenceTier::Confirmed)
-    }
 }
 
 fn build_post_state_evidence(

@@ -1,11 +1,10 @@
 use crate::common::oracle::{EvidenceGrade, ProtocolInvariantEvaluator, RejectionReason, VulnType};
 use crate::common::types::{
-    CallKind, CallObservation, CallPhase, ExecutionStatus, OracleObservation,
-    SequenceExecutionResult, StorageDiff,
+    CallKind, CallObservation, CallPhase, ExecutionStatus, SequenceExecutionResult, StorageDiff,
 };
 use revm::primitives::{keccak256, Address, B256, U256};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 /// Result of establishing whether a caller may upgrade a proxy.
 ///
@@ -733,21 +732,6 @@ impl ProtocolOraclePack {
         }
     }
 
-    pub fn evaluate_as_observations(
-        &self,
-        execution: &SequenceExecutionResult,
-    ) -> Vec<OracleObservation> {
-        self.evaluate(execution)
-            .into_iter()
-            .map(|finding| OracleObservation {
-                oracle: format!("{:?}", finding.pack),
-                finding: finding.vuln.to_string(),
-                tx_index: finding.tx_index,
-                evidence: finding.evidence,
-            })
-            .collect()
-    }
-
     fn evaluate_erc20(
         &self,
         execution: &SequenceExecutionResult,
@@ -1383,16 +1367,6 @@ fn eip1967_slot(label: &str) -> B256 {
 fn sig(signature: &str) -> [u8; 4] {
     let hash = keccak256(signature.as_bytes());
     [hash[0], hash[1], hash[2], hash[3]]
-}
-
-pub fn summarize_findings_by_pack(
-    findings: &[ProtocolFinding],
-) -> BTreeMap<ProtocolOraclePackKind, usize> {
-    let mut out = BTreeMap::new();
-    for finding in findings {
-        *out.entry(finding.pack.clone()).or_insert(0) += 1;
-    }
-    out
 }
 
 #[cfg(test)]

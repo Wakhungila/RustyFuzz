@@ -115,15 +115,6 @@ pub fn write_atomic_under(root: &Path, path: &Path, bytes: impl AsRef<[u8]>) -> 
     rustyfuzz_artifacts::fsutil::write_atomic(safe_path, bytes).map_err(|error| error.to_string())
 }
 
-pub fn write_json_atomic_under<T: serde::Serialize>(
-    root: &Path,
-    path: &Path,
-    value: &T,
-) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
-    write_atomic_under(root, path, bytes)
-}
-
 /// Copies a directory tree into `destination`.
 ///
 /// Security hardening:

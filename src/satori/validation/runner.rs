@@ -11,26 +11,6 @@ use crate::satori::validation::rustyfuzz_runner::{
 };
 use std::path::Path;
 
-pub fn validate_jobs(
-    project: &ProjectModel,
-    run_dir: &Path,
-    hypotheses: &[VulnerabilityHypothesis],
-    jobs: &[RustyFuzzJobSpec],
-    external_foundry_opt_in: bool,
-) -> SatoriResult<(Vec<ValidationVerdict>, Vec<FoundryPocSpec>)> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| anyhow::anyhow!("validation runtime failed: {error}"))?
-        .block_on(validate_jobs_async(
-            project,
-            run_dir,
-            hypotheses,
-            jobs,
-            external_foundry_opt_in,
-        ))
-}
-
 pub async fn validate_jobs_async(
     project: &ProjectModel,
     run_dir: &Path,
