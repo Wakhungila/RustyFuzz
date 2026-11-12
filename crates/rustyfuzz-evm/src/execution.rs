@@ -15,9 +15,6 @@ pub const MAX_WAYPOINTS_PER_TX: usize = 1000;
 /// Maximum total waypoints allowed across all transactions in an input
 pub const MAX_TOTAL_WAYPOINTS: usize = 10000;
 
-/// Maximum memory usage in bytes before triggering backpressure (default: 2GB)
-pub const MAX_MEMORY_USAGE_BYTES: usize = 2 * 1024 * 1024 * 1024;
-
 /// Maximum number of memory bytes inspected for taint propagation in one execution.
 pub const MAX_MEMORY_TAINT_TRACKING_BYTES: usize = 64 * 1024;
 
@@ -40,60 +37,6 @@ pub(crate) fn bounded_returndata(bytes: &[u8]) -> Vec<u8> {
 
 fn bounded_telemetry_bytes(bytes: &[u8], limit: usize) -> Vec<u8> {
     bytes.iter().copied().take(limit).collect()
-}
-
-/// Memory usage monitoring utilities
-pub struct MemoryMonitor;
-
-impl MemoryMonitor {
-    /// Gets the current memory usage of the process in bytes
-    pub fn current_memory_usage() -> usize {
-        #[cfg(target_os = "linux")]
-        {
-            // Read from /proc/self/status
-            if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-                for line in status.lines() {
-                    if line.starts_with("VmRSS:") {
-                        // VmRSS is in kB
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() >= 2 {
-                            if let Ok(kb) = parts[1].parse::<usize>() {
-                                return kb * 1024;
-                            }
-                        }
-                    }
-                }
-            }
-            // Fallback: estimate based on allocation
-            0
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            // On non-Linux systems, we can't easily get memory usage without external crates
-            // Return 0 to indicate unknown, or use platform-specific code
-            0
-        }
-    }
-
-    /// Checks if memory usage exceeds the limit
-    pub fn exceeds_limit() -> bool {
-        Self::current_memory_usage() > MAX_MEMORY_USAGE_BYTES
-    }
-
-    /// Gets memory usage as a human-readable string
-    pub fn memory_usage_string() -> String {
-        let bytes = Self::current_memory_usage();
-        let mb = bytes / (1024 * 1024);
-        let gb = mb / 1024;
-        if gb > 0 {
-            format!("{} GB", gb)
-        } else if mb > 0 {
-            format!("{} MB", mb)
-        } else {
-            format!("{} KB", bytes / 1024)
-        }
-    }
 }
 
 #[derive(Clone)]

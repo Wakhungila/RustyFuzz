@@ -61,12 +61,6 @@ impl DataflowRegistry {
         self.storage_expressions.get(&(address, slot)).cloned()
     }
 
-    /// Records that `slot` was seeded with a non-zero value in the base state,
-    /// so reads of it are not reported as uninitialized.
-    pub fn seed_initialized_slot(&mut self, address: Address, slot: B256) {
-        self.initialized_slots.insert((address, slot));
-    }
-
     pub fn is_initialized_slot(&self, address: Address, slot: B256) -> bool {
         self.initialized_slots.contains(&(address, slot))
     }

@@ -376,13 +376,6 @@ impl ForkDbError {
             Self::Rpc(message) => classify_rpc_failure(message, None),
         }
     }
-
-    pub fn is_retryable(&self) -> bool {
-        matches!(
-            self.failure_kind(),
-            RpcFailureKind::RateLimited | RpcFailureKind::Timeout | RpcFailureKind::ProviderError
-        )
-    }
 }
 
 impl fmt::Display for ForkDbError {

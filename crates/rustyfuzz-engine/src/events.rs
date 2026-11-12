@@ -67,15 +67,6 @@ impl EventSink {
             }
         }
     }
-
-    /// Events dropped so far due to backpressure.
-    pub fn dropped_count(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
 }
 
 impl Clone for EventSink {
@@ -93,29 +84,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn emits_within_capacity_and_counts_drops_beyond() {
+    fn emits_within_capacity_and_drops_beyond() {
         let (sink, rx) = EventSink::bounded(2);
         for id in 0..5u64 {
             sink.emit(CampaignEvent::NewSnapshot { id, parent: 0 });
         }
-        assert_eq!(sink.dropped_count(), 3);
         let received: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(received.len(), 2);
         assert_eq!(received[0], CampaignEvent::NewSnapshot { id: 0, parent: 0 });
-    }
-
-    #[test]
-    fn clones_share_queue_and_drop_counter() {
-        let (sink, _rx) = EventSink::bounded(1);
-        let clone = sink.clone();
-        clone.emit(CampaignEvent::CandidateFinding {
-            input_id: "a".into(),
-        });
-        clone.emit(CampaignEvent::CampaignCheckpoint {
-            executions: 1,
-            artifacts: 1,
-        });
-        assert_eq!(sink.dropped_count(), 1);
-        assert_eq!(sink.capacity(), 1);
     }
 }
