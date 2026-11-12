@@ -1,0 +1,40 @@
+{
+  "target": "0x6200000000000000000000000000000000000001",
+  "symbols": {
+    "attackerBalance": {
+      "kind": "mapping",
+      "slot": "0x0",
+      "offset_bits": 0,
+      "width_bits": 256,
+      "key_type": "address",
+      "keys": ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+    },
+    "balances": {
+      "kind": "mapping",
+      "slot": "0x0",
+      "offset_bits": 0,
+      "width_bits": 256,
+      "key_type": "address",
+      "keys": [
+        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ]
+    },
+    "totalSupply": {
+      "kind": "slot",
+      "slot": "0x2",
+      "offset_bits": 0,
+      "width_bits": 256
+    }
+  },
+  "invariants": [
+    {
+      "name": "attackerBalanceRemainsZero",
+      "predicate": "sum(attackerBalance) == 0"
+    },
+    {
+      "name": "supplyMatchesBalances",
+      "predicate": "totalSupply == sum(balances)"
+    }
+  ]
+}

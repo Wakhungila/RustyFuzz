@@ -1,9 +1,96 @@
 {
-  "outcome": "found",
-  "time_to_signal_secs": 0.8,
-  "executions_to_signal": 64,
-  "replayable": true,
-  "foundry_poc_generated": true,
-  "false_positive_notes": ["known-vulnerable validation fixture"],
-  "notes": "models unauthorized ERC20 mint and total supply inflation"
+  "schema_version": 1,
+  "bytecode_kind": "runtime",
+  "target": "0x6200000000000000000000000000000000000001",
+  "attacker": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "victim": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "environment": {
+    "chain_id": 1,
+    "block_number": 1,
+    "timestamp": 1000,
+    "gas_limit": 30000000,
+    "base_fee": 0
+  },
+  "accounts": [
+    {
+      "address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "balance": "0xd3c21bcecceda1000000",
+      "nonce": 0,
+      "runtime_bytecode": "0x",
+      "storage": []
+    },
+    {
+      "address": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "balance": "0xd3c21bcecceda1000000",
+      "nonce": 0,
+      "runtime_bytecode": "0x",
+      "storage": []
+    },
+    {
+      "address": "0x1111111111111111111111111111111111111111",
+      "balance": "0xd3c21bcecceda1000000",
+      "nonce": 0,
+      "runtime_bytecode": "0x",
+      "storage": []
+    },
+    {
+      "address": "0x6200000000000000000000000000000000000001",
+      "balance": "0x0",
+      "nonce": 0,
+      "runtime_bytecode": "0x608060405234801561000f575f5ffd5b506004361061007a575f3560e01c806370a082311161005857806370a08231146100d2578063a9059cbb146100f1578063c2ba474414610104578063dd62ed3e14610134575f5ffd5b8063095ea7b31461007e57806318160ddd146100a657806340c10f19146100bd575b5f5ffd5b61009161008c366004610292565b61015e565b60405190151581526020015b60405180910390f35b6100af60025481565b60405190815260200161009d565b6100d06100cb366004610292565b61018b565b005b6100af6100e03660046102ba565b5f6020819052908152604090205481565b6100916100ff366004610292565b6101d3565b6100916101123660046102ba565b6001600160a01b03167311111111111111111111111111111111111111111490565b6100af6101423660046102da565b600160209081525f928352604080842090915290825290205481565b335f9081526001602081815260408084206001600160a01b03871685529091529091208290555b92915050565b6001600160a01b0382165f90815260208190526040812080548392906101b290849061031f565b925050819055508060025f8282546101ca919061031f565b90915550505050565b335f9081526020819052604081205482111561021f5760405162461bcd60e51b815260206004820152600760248201526662616c616e636560c81b604482015260640160405180910390fd5b335f908152602081905260408120805484929061023d908490610332565b90915550506001600160a01b0383165f908152602081905260408120805484929061026990849061031f565b909155506001949350505050565b80356001600160a01b038116811461028d575f5ffd5b919050565b5f5f604083850312156102a3575f5ffd5b6102ac83610277565b946020939093013593505050565b5f602082840312156102ca575f5ffd5b6102d382610277565b9392505050565b5f5f604083850312156102eb575f5ffd5b6102f483610277565b915061030260208401610277565b90509250929050565b634e487b7160e01b5f52601160045260245ffd5b808201808211156101855761018561030b565b818103818111156101855761018561030b56fea2646970667358221220a78580799c71bbfdef0dfde0ceba4012f47ec2ef6bb11bb7638a40f8da573a8964736f6c634300081e0033",
+      "storage": []
+    }
+  ],
+  "transactions": [
+    {
+      "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "to": "0x6200000000000000000000000000000000000001",
+      "calldata": "0xc2ba4744000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "value": "0x0",
+      "timestamp": 1000,
+      "expected_status": "Success",
+      "expected_output": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "expected_storage": []
+    },
+    {
+      "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "to": "0x6200000000000000000000000000000000000001",
+      "calldata": "0x40c10f19000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000000000000000000000000000000000000056bc75e2d63100000",
+      "value": "0x0",
+      "timestamp": 1000,
+      "expected_status": "Success",
+      "expected_output": null,
+      "expected_storage": [
+        {
+          "slot": "0x2",
+          "value": "0x0000000000000000000000000000000000000000000000056bc75e2d63100000"
+        },
+        {
+          "slot": "0x1bfd945afb434ed902aa821149f45ebda8b1e3eba6797fc235eb1e3fb6674b2a",
+          "value": "0x0000000000000000000000000000000000000000000000056bc75e2d63100000"
+        }
+      ]
+    },
+    {
+      "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "to": "0x6200000000000000000000000000000000000001",
+      "calldata": "0x70a08231000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "value": "0x0",
+      "timestamp": 1000,
+      "expected_status": "Success",
+      "expected_output": "0x0000000000000000000000000000000000000000000000056bc75e2d63100000",
+      "expected_storage": []
+    },
+    {
+      "caller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "to": "0x6200000000000000000000000000000000000001",
+      "calldata": "0x18160ddd",
+      "value": "0x0",
+      "timestamp": 1000,
+      "expected_status": "Success",
+      "expected_output": "0x0000000000000000000000000000000000000000000000056bc75e2d63100000",
+      "expected_storage": []
+    }
+  ],
+  "expected_safe_behavior": "DELIBERATELY VULNERABLE WITNESS: Attacker is not the minter, yet mint() grants it 100 tokens and inflates total supply."
 }
