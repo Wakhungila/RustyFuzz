@@ -290,6 +290,32 @@ pub fn create_in_memory_fork_db(target_contract: Address, runtime_bytecode: Vec<
     db
 }
 
+/// Create an in-memory fork DB seeded with ALL accounts from a fuzz fixture
+/// (target + attacker + victim + auxiliary contracts), each with decoded
+/// bytecode, balance, nonce, and storage. Used by `--fixture` on the `fuzz`
+/// command so the fuzzer can target offline known-vulnerable fixtures without
+/// an RPC endpoint.
+pub fn create_in_memory_fork_db_from_fixture(
+    state: &crate::engine::executable_fixture::FuzzFixtureState,
+) -> EvmCacheDb {
+    let mut db = CacheDB::new(ForkDb::empty());
+    for account in &state.accounts {
+        db.insert_account_info(
+            account.address,
+            AccountInfo {
+                balance: account.balance,
+                nonce: account.nonce,
+                ..AccountInfo::default()
+            }
+            .with_code(Bytecode::new_raw(account.bytecode.clone().into())),
+        );
+        for (slot, value) in &account.storage {
+            let _ = db.insert_account_storage(account.address, *slot, *value);
+        }
+    }
+    db
+}
+
 pub fn create_offline_fallback_block_env(block_number: u64) -> BlockEnv {
     let mut block_env = BlockEnv {
         number: U256::from(block_number),

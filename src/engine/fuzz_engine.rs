@@ -427,6 +427,11 @@ pub struct Config {
     /// reentrancy-shaped call sequences via the `ReentrancyProbe` mutator.
     /// Off by default; enables reentrancy-class bug discovery in campaign mode.
     pub attacker_harness: bool,
+    /// Path to an executable fixture JSON whose pre-deployed accounts + target
+    /// bytecode should seed the fuzz campaign's CacheDB. When set, the in-memory
+    /// fork branch loads the fixture's accounts (bytecode + storage + balance)
+    /// so the fuzzer can target offline known-vulnerable fixtures without RPC.
+    pub fixture_path: Option<String>,
     pub hardened_defi: HardenedDefiConfig,
     pub target_invariant_manifest: Option<String>,
     /// Path to the predicate-layer invariant file (`--invariants`).
@@ -1111,6 +1116,15 @@ async fn run_fuzz_campaign_with_cancellation_inner(
         let restored_provenance = restored_db.db.provenance();
         let restored_is_synthetic = !valid_fork_provenance(&restored_provenance, config.fork_block);
         (restored_db, saved.block_env.clone(), restored_is_synthetic)
+    } else if let Some(fixture_path) = config.fixture_path.as_ref() {
+        let state = crate::engine::executable_fixture::ExecutableFixture::load_for_fuzz(
+            std::path::Path::new(fixture_path),
+        )?;
+        (
+            crate::evm::fork::create_in_memory_fork_db_from_fixture(&state),
+            crate::evm::fork::create_offline_fallback_block_env(config.fork_block),
+            true,
+        )
     } else if let Some(bytecode) = config.in_memory_bytecode.as_ref() {
         let target = config
             .target_contract
@@ -5327,6 +5341,7 @@ mod tests {
             mainnet_seed_bundle: None,
             in_memory_bytecode: Some(hex::decode("60003560005500").unwrap()),
             attacker_harness: false,
+            fixture_path: None,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,
@@ -5472,6 +5487,7 @@ mod tests {
             mainnet_seed_bundle: None,
             in_memory_bytecode: None,
             attacker_harness: false,
+            fixture_path: None,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,
@@ -5567,6 +5583,7 @@ mod tests {
             mainnet_seed_bundle: None,
             in_memory_bytecode: None,
             attacker_harness: false,
+            fixture_path: None,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,
@@ -5682,6 +5699,7 @@ mod tests {
             mainnet_seed_bundle: None,
             in_memory_bytecode: None,
             attacker_harness: false,
+            fixture_path: None,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,
@@ -5748,6 +5766,7 @@ mod tests {
             mainnet_seed_bundle: None,
             in_memory_bytecode: Some(vec![0x60, 0x00]),
             attacker_harness: false,
+            fixture_path: None,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: true,
@@ -5874,6 +5893,7 @@ mod tests {
             mainnet_seed_bundle: None,
             in_memory_bytecode: None,
             attacker_harness: false,
+            fixture_path: None,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,
@@ -6020,6 +6040,7 @@ mod tests {
             mainnet_seed_bundle: None,
             in_memory_bytecode: None,
             attacker_harness: false,
+            fixture_path: None,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,
@@ -6179,6 +6200,7 @@ mod tests {
             mainnet_seed_bundle: None,
             in_memory_bytecode: Some(vec![0x60, 0x00]),
             attacker_harness: false,
+            fixture_path: None,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,
@@ -6233,6 +6255,7 @@ mod tests {
             mainnet_seed_bundle: None,
             in_memory_bytecode: Some(vec![0x60, 0x00]),
             attacker_harness: false,
+            fixture_path: None,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,

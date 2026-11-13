@@ -103,6 +103,7 @@ fn snapshot_campaign_worker() {
         mainnet_seed_bundle: None,
         in_memory_bytecode: Some(CODE.to_vec()),
         attacker_harness: false,
+        fixture_path: None,
         cores: None,
         require_seed_bundle: false,
         require_rpc_fork: false,

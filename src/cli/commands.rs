@@ -95,6 +95,11 @@ pub enum Command {
         /// enables reentrancy-class bug discovery in campaign mode.
         #[arg(long, default_value_t = false)]
         attacker_harness: bool,
+        /// Path to an executable fixture JSON whose pre-deployed accounts + target
+        /// bytecode seed the fuzz campaign's CacheDB. Lets the fuzzer target
+        /// offline known-vulnerable fixtures without an RPC endpoint.
+        #[arg(long)]
+        fixture: Option<String>,
         #[arg(long)]
         abi: Option<String>,
         #[arg(long)]

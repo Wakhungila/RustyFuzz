@@ -241,6 +241,7 @@ async fn run_benchmark_contract(
         mainnet_seed_bundle: None,
         in_memory_bytecode: Some(artifact.runtime_bytecode.clone()),
         attacker_harness: false,
+        fixture_path: None,
         cores: None,
         require_seed_bundle: false,
         require_rpc_fork: false,

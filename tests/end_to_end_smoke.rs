@@ -37,6 +37,7 @@ async fn synthetic_abi_smoke_campaign_does_not_promote_findings() {
         target_contract: Some(target),
         in_memory_bytecode: None,
         attacker_harness: false,
+        fixture_path: None,
         cores: None,
         corpus_dir: corpus_dir.display().to_string(),
         report_dir: report_dir.display().to_string(),
@@ -311,6 +312,7 @@ fn invariant_campaign_worker() {
         // SLOAD(0), +1, SSTORE(0): guarantees slot 0 is written and observable.
         in_memory_bytecode: Some(vec![0x60, 0, 0x54, 0x60, 1, 1, 0x60, 0, 0x55, 0]),
         attacker_harness: false,
+        fixture_path: None,
         cores: None,
         corpus_dir: root.join("corpus").display().to_string(),
         report_dir: root.join("reports").display().to_string(),
