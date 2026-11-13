@@ -218,15 +218,14 @@ jobs:
           name: rediscovery-gate-evidence
           path: benchmarks/results/rediscovery-gate/
 
-  # Autonomous discovery smoke gate: runs `rusty-fuzz fuzz --attacker-harness`
-  # with a tight deterministic budget against the synthetic fallback target.
-  # Proves the autonomous campaign path (fuzzer's own mutator + attacker
-  # harness + SMT concolic) boots, runs, and produces a report without
-  # crashing. NOT a rediscovery gate (synthetic target is benign; 0 findings
-  # is the expected honest outcome). A non-zero historical rediscovery rate
-  # requires the `--fixture` integration — ROADMAP, see PRODUCTION_READINESS §2.7.
+  # Autonomous rediscovery gate: runs `rusty-fuzz fuzz --fixture <known_vulnerable>
+  # > --attacker-harness` against each executable fixture with a tight budget.
+  # Reports whether the fuzzer's OWN mutator found the bug (no authored calldata).
+  # This is the ItyFuzz-class capability gate. The honest baseline rate is the
+  # ratchet — it only tightens. A 0/N rate is the honest starting point, not a
+  # gate failure; crashes ARE. See docs/PRODUCTION_READINESS.md §2.7.
   autonomous-smoke:
-    name: Autonomous Discovery Smoke
+    name: Autonomous Rediscovery Gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -235,11 +234,11 @@ jobs:
           toolchain: 1.97.1
       - name: Build
         run: cargo build --release --locked --bin rusty-fuzz
-      - name: Run autonomous discovery smoke gate
+      - name: Run autonomous rediscovery gate
         run: |
           test ! -e config.toml
-          rm -rf benchmarks/results/autonomous-smoke
-          python3 scripts/validate_autonomous_discovery.py
+          rm -rf benchmarks/results/autonomous-rediscovery
+          python3 scripts/validate_autonomous_discovery.py --max-execs 500 --duration-secs 15
 
       - name: Upload smoke evidence
         if: always()
