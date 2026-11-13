@@ -67,6 +67,10 @@ pub struct EvmMutator {
     /// Worker-local snapshot catalog. Brokered workers deliberately leave this
     /// unset: their snapshot handles are not portable across processes.
     snapshot_corpus: Option<Arc<RwLock<crate::evm::corpus::SnapshotCorpus>>>,
+    /// When true, the ReentrancyProbe mutator inserts attacker-contract probes
+    /// that send ETH to the deployed attacker, triggering its receive() callback
+    /// which re-enters the fuzz target. Off by default; enabled by --attacker-harness.
+    attacker_harness_enabled: bool,
 }
 
 /// Named mutation strategy buckets (attempt order fixed by probability table).
@@ -85,6 +89,7 @@ pub enum MutationStrategyKind {
     OraclePressure,
     MevSandwich,
     ValueBoundary,
+    ReentrancyProbe,
 }
 
 impl MutationStrategyKind {
@@ -104,6 +109,7 @@ impl MutationStrategyKind {
             MutationStrategyKind::OraclePressure => "oracle_pressure",
             MutationStrategyKind::MevSandwich => "mev_sandwich",
             MutationStrategyKind::ValueBoundary => "value_boundary",
+            MutationStrategyKind::ReentrancyProbe => "reentrancy_probe",
         }
     }
 }
@@ -127,6 +133,21 @@ where
             && rand.below(NonZero::new(100).unwrap()) < 15
             && matches!(
                 self.apply_queued_concolic_hint(input, &mut metadata),
+                MutationResult::Mutated
+            )
+        {
+            self.testcase_metadata.insert(input, metadata);
+            return Ok(MutationResult::Mutated);
+        }
+
+        // ReentrancyProbe: ~2% probability, only when the attacker harness is enabled.
+        // Inserts a probe that sends ETH to the deployed attacker contract,
+        // triggering its receive() callback which re-enters the fuzz target.
+        if self.attacker_harness_enabled
+            && rand.below(NonZero::new(50).unwrap()) == 0
+            && matches!(
+                self.record_attempt(MutationStrategyKind::ReentrancyProbe)
+                    .reentrancy_probe(rand, input, &mut metadata),
                 MutationResult::Mutated
             )
         {
@@ -201,6 +222,7 @@ impl EvmMutator {
             testcase_metadata: EvmTestcaseMetadataStore::default(),
             strategy_counters: Arc::new(StrategyCounters::default()),
             snapshot_corpus: None,
+            attacker_harness_enabled: false,
         }
     }
 
@@ -233,7 +255,15 @@ impl EvmMutator {
             testcase_metadata,
             strategy_counters: Arc::new(StrategyCounters::default()),
             snapshot_corpus: None,
+            attacker_harness_enabled: false,
         }
+    }
+
+    /// Enable the ReentrancyProbe mutator (the attacker contract is deployed
+    /// at campaign setup via `--attacker-harness`).
+    pub fn with_attacker_harness(mut self, enabled: bool) -> Self {
+        self.attacker_harness_enabled = enabled;
+        self
     }
 
     pub fn with_snapshot_corpus(
@@ -836,6 +866,47 @@ impl EvmMutator {
             Some(idx),
             Some([0x02, 0x2c, 0x0d, 0x9f]),
             "wrapped victim transaction with attacker frontrun/backrun",
+        );
+        MutationResult::Mutated
+    }
+
+    /// Insert a probe transaction that sends ETH to the deployed attacker
+    /// contract (`ATTACKER_ADDRESS`), triggering its `receive()` callback which
+    /// re-enters the fuzz target with the configured selector. Modeled on
+    /// `mev_sandwich`. No-op when `attacker_harness_enabled` is false.
+    fn reentrancy_probe<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
+    ) -> MutationResult {
+        if !self.attacker_harness_enabled {
+            return MutationResult::Skipped;
+        }
+        if !self.can_add_transactions(input, 1) {
+            return MutationResult::Skipped;
+        }
+        let idx = match self.random_index(rand, input.txs.len()) {
+            Some(i) => i,
+            None => return MutationResult::Skipped,
+        };
+        let caller = input.txs[idx].caller;
+        let attacker = crate::engine::attacker_harness::ATTACKER_ADDRESS;
+        // Send 1 ETH to the attacker to trigger its receive() → target re-entry.
+        let probe = SingletonTx {
+            input: Vec::new(),
+            caller,
+            to: attacker,
+            value: U256::from(1_000_000_000_000_000_000u64),
+            is_victim: false,
+        };
+        input.txs.insert(idx, probe);
+        self.record_mutation(
+            metadata,
+            "reentrancy_probe",
+            Some(idx),
+            None,
+            "inserted ETH probe to attacker contract to trigger re-entry callback",
         );
         MutationResult::Mutated
     }

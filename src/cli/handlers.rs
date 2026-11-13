@@ -295,7 +295,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     .transpose()?,
                 mainnet_seed_bundle: config.mainnet_seed_bundle.clone(),
                 in_memory_bytecode: None,
-                attacker_harness: attacker_harness,
+                attacker_harness,
                 cores,
                 require_seed_bundle: config.require_seed_bundle || require_seed_bundle,
                 require_rpc_fork: config.require_rpc_fork || require_rpc_fork,

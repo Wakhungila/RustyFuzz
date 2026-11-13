@@ -1205,7 +1205,9 @@ async fn run_fuzz_campaign_with_cancellation_inner(
         (db, env, synthetic_fork_mode)
     };
     if config.attacker_harness {
-        let target = config.target_contract.unwrap_or(revm::primitives::Address::ZERO);
+        let target = config
+            .target_contract
+            .unwrap_or(revm::primitives::Address::ZERO);
         crate::engine::attacker_harness::deploy_reentrancy_attacker(&mut initial_db, target)
             .map_err(|e| anyhow::anyhow!("attacker harness deploy failed: {e}"))?;
         log::info!(target: "rustyfuzz.attacker", "reentrancy attacker harness deployed at campaign setup");
@@ -1789,7 +1791,8 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     concolic_hints.clone(),
                     telemetry.concolic_hint_stats.clone(),
                     testcase_metadata_store.clone(),
-                );
+                )
+                    .with_attacker_harness(config.attacker_harness);
                 let mut stages = tuple_list!(StdMutationalStage::with_max_iterations(
                     mutator,
                     mutational_stage_iterations(&config),
@@ -2955,7 +2958,8 @@ async fn run_single_process_campaign(
         concolic_hints.clone(),
         telemetry.concolic_hint_stats.clone(),
         testcase_metadata_store.clone(),
-    );
+    )
+    .with_attacker_harness(config.attacker_harness);
     let mutator = mutator.with_snapshot_corpus(snapshot_corpus.clone());
     let strategy_counters = mutator.strategy_counters.clone();
     if let Some(saved) = restored_strategies {
