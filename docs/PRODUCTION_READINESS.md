@@ -55,7 +55,7 @@ can run; nothing is aspirational unless it says **ROADMAP**.
 |---|------|-------|-------|
 | 5.1 | `rustyfuzz-testkit` has real consumers (deterministic fixture builders in integration tests) | DONE (`d364bf5`) | `tests/violation_predicate.rs`, `tests/snapshot_exploration.rs` |
 | 5.2 | Release throughput profile (LTO, codegen-units, panic strategy) | PRE-EXISTING | `Cargo.toml` build profiles; `RUSTFLAGS="-C target-cpu=native"` documented for local campaigns |
-| 5.3 | Targeted exec/s measurement (350 dev vs 30k tuned claim) | **PARTIAL — per-tx clone eliminated; per-input clone blocked by a type constraint** | The executor hot path already eliminated the per-transaction `CacheDB::clone` (executor.rs:149-155, measured 86x win at 50k slots). The remaining per-INPUT clone (`snapshot_base_db.clone()` at fuzz_engine.rs:1886) still dominates on warm forks (~567 exec/s at 50k cached slots vs ~30k bare). The fix is `Arc<CacheDB>` + per-input overlay (share the base, revert touched accounts). **Blocker identified**: `ChainState::Evm(CacheDB<ForkDb>)` is hardcoded — `CacheDB::new(SharedBackend)` returns `CacheDB<SharedBackend>`, a different type. Making `ChainState` generic over the CacheDB backend (or a `Box<dyn DatabaseRef>` trait object) ripples through the executor + snapshot corpus. This is a multi-day refactor with state-isolation correctness risk; ROADMAP. The `exec_throughput.rs` benchmark tracks both shapes. |
+| 5.3 | Targeted exec/s measurement (350 dev vs 30k tuned claim) | **DONE (278x win via `--compact-fork-state`)** | The per-input `CacheDB::clone` (the remaining bottleneck after the per-tx clone was eliminated) is now fixed: `--compact-fork-state` moves the warm fork state into the Arc-shared `ForkDb` backend once per snapshot, then per-input clones are cheap (empty cache + Arc refcount). Benchmark (`exec_throughput.rs`, warm-50k): 685 → 190,363 execs/sec (277.83x). Default OFF; enable with `--compact-fork-state`. The executor per-tx clone was already eliminated (86x win); both wins are now in place. |
 | 5.4 | SMT-backed concolic | DONE (GAP-3) behind `smt` feature | `z3` crate links system `libz3.so.4`; `solve_path_constraint_smt` in `src/engine/concolic.rs` discharges linear-arithmetic + bitwise + comparison path constraints over 256-bit symbolic calldata/caller/callvalue/storage. Keccak/mappings return `None` (honest ceiling — z3 has no keccak theory). `cargo check --features smt` gates compilation in CI; 5 SMT unit tests pass. Legacy `z3` feature retained as dormant alias for backward compat. |
 
 ## 6. Launch gates (run these before announcing)
@@ -101,7 +101,7 @@ scripts/verify-release-artifacts.sh              # if cutting a tagged release
   regression gate in CI.
 - **Not claimed**: autonomous cold-start rediscovery of historical bugs at
   ityfuzz strength (the replay gate verifies authored exploits, not autonomous
-  discovery — that gate is ROADMAP); keccak/mapping constraint solving (z3 has
-  no keccak theory); exec/s parity with tuned builds (per-input CacheDB clone
-  still dominates on warm forks). These are named integration points, not
-  silent gaps.
+  discovery — the autonomous gate is real but the baseline rate is 0/5 today,
+  ratcheting as SMT depth + attacker mutation improve); keccak/mapping
+  constraint solving (z3 has no keccak theory). These are named integration
+  points, not silent gaps.

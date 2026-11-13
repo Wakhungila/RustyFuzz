@@ -66,6 +66,7 @@ allow_synthetic_fallback = true
             str(binary), 'fuzz',
             '--fixture', str(fixture),
             '--attacker-harness',
+            '--compact-fork-state',
             '--deterministic',
             '--rng-seed', '1',
             '--max-execs', str(args.max_execs),
