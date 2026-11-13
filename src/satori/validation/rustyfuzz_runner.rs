@@ -366,6 +366,7 @@ pub async fn execute_bounded_job(
         foundry_harness: None,
         mainnet_seed_bundle: Some("satori-sequence".to_string()),
         in_memory_bytecode: None,
+        attacker_harness: false,
         cores: None,
         require_seed_bundle: true,
         require_rpc_fork: true,

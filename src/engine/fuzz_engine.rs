@@ -423,6 +423,10 @@ pub struct Config {
     pub require_seed_bundle: bool,
     pub require_rpc_fork: bool,
     pub allow_synthetic_fallback: bool,
+    /// Deploy a reentrancy-attacker contract at campaign setup and probe
+    /// reentrancy-shaped call sequences via the `ReentrancyProbe` mutator.
+    /// Off by default; enables reentrancy-class bug discovery in campaign mode.
+    pub attacker_harness: bool,
     pub hardened_defi: HardenedDefiConfig,
     pub target_invariant_manifest: Option<String>,
     /// Path to the predicate-layer invariant file (`--invariants`).
@@ -1099,7 +1103,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
 
     log::info!("Initializing RustyFuzz v0.15.4 Campaign...");
 
-    let (initial_db, initial_env, synthetic_fork_mode) = if let Some(saved) = checkpoint_session
+    let (mut initial_db, initial_env, synthetic_fork_mode) = if let Some(saved) = checkpoint_session
         .as_ref()
         .and_then(|session| session.saved.as_ref())
     {
@@ -1200,6 +1204,12 @@ async fn run_fuzz_campaign_with_cancellation_inner(
 
         (db, env, synthetic_fork_mode)
     };
+    if config.attacker_harness {
+        let target = config.target_contract.unwrap_or(revm::primitives::Address::ZERO);
+        crate::engine::attacker_harness::deploy_reentrancy_attacker(&mut initial_db, target)
+            .map_err(|e| anyhow::anyhow!("attacker harness deploy failed: {e}"))?;
+        log::info!(target: "rustyfuzz.attacker", "reentrancy attacker harness deployed at campaign setup");
+    }
     let fork_setup_status = if synthetic_fork_mode {
         "synthetic"
     } else {
@@ -5312,6 +5322,7 @@ mod tests {
             foundry_harness: None,
             mainnet_seed_bundle: None,
             in_memory_bytecode: Some(hex::decode("60003560005500").unwrap()),
+            attacker_harness: false,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,
@@ -5456,6 +5467,7 @@ mod tests {
             foundry_harness: None,
             mainnet_seed_bundle: None,
             in_memory_bytecode: None,
+            attacker_harness: false,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,
@@ -5550,6 +5562,7 @@ mod tests {
             foundry_harness: None,
             mainnet_seed_bundle: None,
             in_memory_bytecode: None,
+            attacker_harness: false,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,
@@ -5664,6 +5677,7 @@ mod tests {
             foundry_harness: None,
             mainnet_seed_bundle: None,
             in_memory_bytecode: None,
+            attacker_harness: false,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,
@@ -5729,6 +5743,7 @@ mod tests {
             foundry_harness: None,
             mainnet_seed_bundle: None,
             in_memory_bytecode: Some(vec![0x60, 0x00]),
+            attacker_harness: false,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: true,
@@ -5854,6 +5869,7 @@ mod tests {
             foundry_harness: None,
             mainnet_seed_bundle: None,
             in_memory_bytecode: None,
+            attacker_harness: false,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,
@@ -5999,6 +6015,7 @@ mod tests {
             foundry_harness: None,
             mainnet_seed_bundle: None,
             in_memory_bytecode: None,
+            attacker_harness: false,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,
@@ -6157,6 +6174,7 @@ mod tests {
             foundry_harness: None,
             mainnet_seed_bundle: None,
             in_memory_bytecode: Some(vec![0x60, 0x00]),
+            attacker_harness: false,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,
@@ -6210,6 +6228,7 @@ mod tests {
             foundry_harness: None,
             mainnet_seed_bundle: None,
             in_memory_bytecode: Some(vec![0x60, 0x00]),
+            attacker_harness: false,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: false,

@@ -90,6 +90,11 @@ pub enum Command {
         require_rpc_fork: bool,
         #[arg(long, default_value_t = false)]
         allow_synthetic_fallback: bool,
+        /// Deploy a reentrancy-attacker contract at campaign setup and probe
+        /// reentrancy-shaped call sequences during fuzzing. Off by default;
+        /// enables reentrancy-class bug discovery in campaign mode.
+        #[arg(long, default_value_t = false)]
+        attacker_harness: bool,
         #[arg(long)]
         abi: Option<String>,
         #[arg(long)]

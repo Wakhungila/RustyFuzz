@@ -34,6 +34,7 @@ fn checkpoint_campaign_worker() {
         mainnet_seed_bundle: None,
         // SSTORE(calldataload(0)); SLOAD; return the resulting word.
         in_memory_bytecode: Some(hex::decode("60003560005560005460005260206000f3").unwrap()),
+        attacker_harness: false,
         cores: None,
         require_seed_bundle: false,
         require_rpc_fork: false,
