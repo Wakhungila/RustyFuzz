@@ -475,6 +475,31 @@ impl ForkDb {
         }
     }
 
+    /// Absorb a warm-state `CacheDB` account cache into the `ForkDb` backend
+    /// (behind the `Arc<Mutex>` inner). After this + clearing the `CacheDB`
+    /// cache, per-input `CacheDB::clone()` is cheap (empty cache + Arc-shared
+    /// backend) instead of O(cached accounts × storage slots). This is the
+    /// throughput fix for warm-fork fuzzing: the warm state lives in the
+    /// Arc-shared backend, not the per-clone BTreeMap cache.
+    pub fn absorb_warm_accounts<'a, I>(&self, accounts: I)
+    where
+        I: IntoIterator<Item = (&'a revm::primitives::Address, &'a revm::database::DbAccount)>,
+    {
+        let mut acct = self.inner.accounts.lock();
+        let mut code = self.inner.code_by_hash.lock();
+        let mut storage = self.inner.storage.lock();
+        for (address, account) in accounts {
+            if let Some(code_bytecode) = &account.info.code {
+                let hash = code_bytecode.hash_slow();
+                code.insert(hash, code_bytecode.clone());
+            }
+            acct.insert(*address, Some(account.info.clone()));
+            for (slot, value) in &account.storage {
+                storage.insert((*address, *slot), *value);
+            }
+        }
+    }
+
     pub fn new_offline(block_tag: impl Into<String>) -> Self {
         let block_tag = block_tag.into();
         let block_number = parse_block_tag_number(&block_tag);

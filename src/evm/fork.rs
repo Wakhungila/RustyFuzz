@@ -316,6 +316,17 @@ pub fn create_in_memory_fork_db_from_fixture(
     db
 }
 
+/// Move the `CacheDB`'s warm-state account cache into the `ForkDb` backend
+/// (behind the `Arc<Mutex>` inner), then clear the cache. After this, per-input
+/// `CacheDB::clone()` is cheap (empty cache + Arc-shared backend) instead of
+/// O(cached accounts × storage slots). This is the throughput fix for warm-fork
+/// fuzzing: the warm state lives in the Arc-shared `ForkDb` backend, not the
+/// per-clone `CacheDB` BTreeMap cache.
+pub fn compact_cache_to_backend(db: &mut EvmCacheDb) {
+    let accounts = std::mem::take(&mut db.cache.accounts);
+    db.db.absorb_warm_accounts(&accounts);
+}
+
 pub fn create_offline_fallback_block_env(block_number: u64) -> BlockEnv {
     let mut block_env = BlockEnv {
         number: U256::from(block_number),
