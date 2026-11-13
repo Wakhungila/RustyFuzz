@@ -139,7 +139,38 @@ async fn complete_json_impl(_model: &str, _prompt: &str) -> SatoriResult<String>
 
 #[cfg(feature = "llm")]
 async fn complete_json_impl(model: &str, prompt: &str) -> SatoriResult<String> {
-    // Check for NVIDIA API key first
+    // Production LLM override: if SATORI_LLM_API_BASE + SATORI_LLM_API_KEY are
+    // set, use that OpenAI-compatible endpoint with SATORI_LLM_MODEL. This lets
+    // Satori use a real LLM (OpenAI, Anthropic-via-proxy, local Ollama/vLLM)
+    // instead of the free Zen toy models. The endpoint must accept the standard
+    // OpenAI chat-completions JSON shape.
+    if let (Some(base), Some(key)) = (
+        std::env::var("SATORI_LLM_API_BASE")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
+        std::env::var("SATORI_LLM_API_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
+    ) {
+        let override_model = std::env::var("SATORI_LLM_MODEL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| model.to_string());
+        let endpoint = if base.ends_with("/chat/completions") {
+            base
+        } else if base.ends_with('/') {
+            format!("{}chat/completions", base)
+        } else {
+            format!("{}/chat/completions", base)
+        };
+        log::info!(
+            "Satori LLM override: endpoint={} model={}",
+            endpoint,
+            override_model
+        );
+        return request_json(&endpoint, &key, &override_model, prompt).await;
+    }
+    // Check for NVIDIA API key next
     if let Some(nvapi_key) = std::env::var("NVIDIA_API_KEY")
         .ok()
         .filter(|k| !k.trim().is_empty())
@@ -327,7 +358,7 @@ fn extract_response_text_nvidia(value: &serde_json::Value) -> SatoriResult<Strin
     let json_text = extract_json_object(content).ok_or_else(|| {
         anyhow::anyhow!(
             "NVIDIA response did not contain valid JSON: {}",
-            content[..content.len().min(200)].to_string()
+            &content[..content.len().min(200)]
         )
     })?;
 
@@ -339,7 +370,7 @@ fn extract_response_text_nvidia(value: &serde_json::Value) -> SatoriResult<Strin
 #[cfg(feature = "llm")]
 fn extract_json_object(s: &str) -> Option<&str> {
     // Find first opening brace or bracket
-    let start = s.find(|c| c == '{' || c == '[')?;
+    let start = s.find(['{', '['])?;
     let bytes = s.as_bytes();
     let (mut depth, mut in_str, mut esc) = (0i32, false, false);
 
