@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
-"""Rediscovery baseline regression gate.
+"""Replay regression gate (detection pipeline integrity).
 
-The 5 executable known_vulnerable cases must stay rediscovered: each has an
-authored invariant file bound to a typed violation predicate, a confirmed
-proof tier, and an offline-generated Foundry PoC. Losing any one of these is
-a regression in the detection pipeline, not a benchmark flake.
+Verifies the detection PIPELINE end-to-end on the 5 executable
+known_vulnerable cases: each case has a pre-recorded exploit sequence
+(human-authored calldata in the fixture JSON), an authored invariant file
+bound to a typed violation predicate, a confirmed proof tier, and an
+offline-generated Foundry PoC. This gate replays the exploit calldata and
+confirms the oracle fires, the proof confirms, and the PoC generates.
+
+This is NOT autonomous rediscovery: the exploit calldata is authored, not
+discovered by the fuzzer. The '5/5' this gate reports means '5/5
+pre-recorded exploits replay-verified end-to-end', not 'the fuzzer
+autonomously found 5 bugs'. Autonomous rediscovery (the fuzzer finding bugs
+without authored calldata) is ROADMAP; the --attacker-harness flag + SMT `smt`
+feature are the concrete steps toward it.
 
 The 2 historical mainnet_fork cases (Audius 2022, Euler 2023) are reported
 but excluded from the pass rule: their fork captures are incomplete (missing
@@ -149,7 +158,7 @@ with tempfile.TemporaryDirectory(prefix='rustyfuzz-rediscovery-') as temp_dir:
 
 if rediscovered < args.min_rediscovered:
     failures.append(
-        f'rediscovered {rediscovered} < required {args.min_rediscovered}'
+        f'replay-verified {rediscovered} < required {args.min_rediscovered}'
     )
 
 report['rediscovered_executable'] = rediscovered
@@ -163,4 +172,4 @@ if failures:
     for failure in failures:
         print(f'GATE FAILURE: {failure}')
     raise SystemExit(1)
-print(f'Rediscovery gate passed: {rediscovered}/{REQUIRED_FOR_REDISCOVERY} executable cases rediscovered')
+print(f'Replay regression gate passed: {rediscovered}/{REQUIRED_FOR_REDISCOVERY} executable cases replay-verified (pipeline: oracle + confirmed proof + typed predicate + offline PoC). Autonomous rediscovery is ROADMAP.')

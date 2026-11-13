@@ -154,7 +154,7 @@ Custom LibAFL scheduler (`CampaignScore`) prioritizes corpus entries by:
 
 ### Concolic Solving
 
-Deterministic taint-guided expression solver—**no Z3 dependency required by default**. Tracks symbolic expressions through:
+Deterministic taint-guided expression solver by default; SMT-backed path solving (z3) behind the `smt` feature. Tracks symbolic expressions through:
 - Calldata and memory
 - Arithmetic and bitwise operations
 - Storage reads/writes across transactions
@@ -771,7 +771,7 @@ target/release/rusty-fuzz promote \
 
 ```bash
 cargo check
-cargo check --features z3
+cargo check --features smt
 cargo test benchmark --lib
 target/release/rusty-fuzz validate \
   --benchmarks benchmarks/realistic \
@@ -1031,8 +1031,8 @@ docs/
 - **SVM**: Intentionally unsupported and excluded from the production EVM path.
 - **SGX**: Unsupported status shim only.
 - **LLM guidance**: Scaffolding present but inert unless explicitly integrated.
-- **Z3 integration**: Optional; core concolic path is deterministic and internal.
-- **Symbolic execution**: Not full symbolic execution; bounded, deterministic concolic assistance.
+- **SMT solver (z3)**: Behind the `smt` feature; discharges linear-arithmetic + bitwise + comparison path constraints over 256-bit symbolic calldata. Keccak/mappings unsupported (z3 has no keccak theory). Deterministic taint-guided heuristic remains the default when `smt` is off.
+- **Symbolic execution**: Not full symbolic execution; bounded concolic assistance (deterministic by default, SMT-backed when `smt` feature is on).
 - **Keccak preimage solving**: Not implemented.
 - **Dynamic array constraint solving**: Partial; offset tables are repaired for simple cases.
 - **Protocol-specific exploit synthesis**: Future work; oracles are evidence-driven, not protocol replacements.
@@ -1119,8 +1119,8 @@ Priority engineering tasks:
 - **SVM**: Intentionally unsupported; future work is quarantine, not Stage 1 repair
 - **SGX**: Unsupported status shim only
 - **LLM guidance**: Scaffolding present but inert unless explicitly integrated
-- **Z3 integration**: Optional; core concolic path is deterministic and internal
-- **Symbolic execution**: Bounded, deterministic concolic assistance only
+- **SMT solver (z3)**: Behind the `smt` feature; discharges linear-arith + bitwise + comparison path constraints. Deterministic heuristic is the default.
+- **Symbolic execution**: Bounded concolic assistance (deterministic by default, SMT-backed when `smt` is on)
 - **Keccak preimage solving**: Not implemented
 - **Dynamic array constraint solving**: Partial; offset tables repaired for simple cases
 - **Protocol-specific exploit synthesis**: Oracles are evidence-driven, not protocol replacements

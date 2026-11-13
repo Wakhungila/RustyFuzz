@@ -24,27 +24,30 @@ can run; nothing is aspirational unless it says **ROADMAP**.
 
 | # | Item | Status | Proof |
 |---|------|--------|-------|
-| 2.1 | Move off 0/7: five `known_vulnerable` cases converted to `executable_evm` fixtures with authored invariant files (`7699d19`…`6b1fe31`) | DONE — **5/5** | `python3 scripts/validate_rediscovery_gate.py` → `rediscovered: 5`, each `found` + `confirmed` + typed predicate + offline Foundry PoC |
+| 2.1 | Five `known_vulnerable` cases converted to `executable_evm` fixtures with authored invariant files (`7699d19`…`6b1fe31`) | DONE — **5/5 replay-verified** | `python3 scripts/validate_rediscovery_gate.py` → `rediscovered: 5`, each `found` + `confirmed` + typed predicate + offline Foundry PoC. **Note**: this is replay verification of human-authored exploit calldata, NOT autonomous discovery by the fuzzer. |
 | 2.2 | Reentrancy-shaped bugs reachable: replay-mode **Security pack** derives a reentrancy witness from the call trace (re-entry into an open frame from a different account) | DONE (`6fe97c2`) | `known-read-only-reentrancy` produces `VulnType::Reentrancy`; negative controls stay silent |
 | 2.3 | Offline Foundry PoC generation for `poc_generation = "required"` cases (no RPC needed) | DONE (`6fe97c2`) | `synthesize_local_validation_poc` wired into the executable path |
-| 2.4 | CI regression gate: `rediscovery-gate` job pins 5/5 + 0 false positives + gate2 parity; ratchet can only tighten | DONE (`cd685b9`) | `.github/workflows/ci.yml`; script exits non-zero on any regression |
+| 2.4 | CI replay regression gate pins 5/5 replay-verified + 0 false positives + gate2 parity; ratchet can only tighten | DONE (`cd685b9`) | `.github/workflows/ci.yml` (Replay Regression Gate job); script exits non-zero on any regression |
 | 2.5 | Historical `mainnet_fork` cases (Audius 2022, Euler 2023) | **BLOCKED — needs one-time RPC capture** | Audius capture lacks token/WETH balance-mapping slots; Euler has no capture at block 16817995. Re-capture with extended slot manifest, then add typed predicates; the gate already fails any discovery claim without one. ROADMAP until captures exist |
 | 2.6 | Baseline report updated honestly | DONE | `docs/backtest/BASELINE_REPORT.md` header |
+| 2.7 | **Autonomous rediscovery** (fuzz engine finds bugs WITHOUT authored calldata) — the ItyFuzz-class capability | **ROADMAP** | The `validate` path replays authored sequences; no CI gate runs `rusty-fuzz fuzz` against these targets and reports autonomous discovery. The `--attacker-harness` flag (GAP-2) + SMT `smt` feature (GAP-3) are the concrete steps toward a non-zero autonomous rate; a real autonomous-discovery CI gate is the remaining integration (GAP-1). |
 
 ## 3. Dead code and provenance hygiene
 
 | # | Item | Status | Proof |
 |---|------|--------|-------|
 | 3.1 | Dead-code purge: ~8,100 LOC across 4 verified groups (orphan files, islands, dead subsystems, crate leaf fns) | DONE (`adfdbab`, `0b5c36f`, `352c1d4`, `842c224`) | `git diff --stat a9e2589..HEAD` ≈ −8.4k; clippy 0 warnings; every group committed after `check`+`clippy`+`fmt` |
-| 3.2 | Dormant `z3` feature removed (advertised a capability with zero references) | DONE (`d364bf5`) | `rg z3 Cargo.toml` empty; lock updated |
+| 3.2 | Dormant `z3` feature removed (d364bf5) then re-added as real `smt` feature with working solver (GAP-3) | DONE | `rg z3 Cargo.toml` shows `smt = ["dep:z3"]` (real solver) + legacy `z3 = ["dep:z3"]` (dormant alias). `cargo check --features smt` gates in CI. The old dormant stub is gone; the solver is real. |
 | 3.3 | Live items deliberately kept were re-verified before keeping | DONE | purge agent skip-list (telemetry `first_finding`, `DataflowScoreReport`, `EvidenceGrade`, `compare_cached_vs_live`, manifest load/generate/evaluate) |
 
 ## 4. Attacker-contract harness
 
 | # | Item | Status | Proof |
 |---|------|--------|-------|
-| 4.1 | Compiled attacker contract with receive/callback executed mid-sequence inside REVM | DONE for the validation/benchmark path (`6417d3d` + `6fe97c2`) | `ReentrantAttacker`/`HookToken`/`ReentrantVault` fixtures: withdraw → token transfer → attacker `onReceive` → vault re-entry; oracle sees the nested write |
-| 4.2 | Campaign-time attacker-contract synthesis (the fuzzer evolving attacker bytecode during discovery) | **ROADMAP** | the seeded/validated path is fully wired; campaign-side synthesis needs mutation-space work. Honest statement: fixture/validation layer proves the model end-to-end; discovery-time generation remains future work |
+| 4.1 | Compiled attacker contract with receive/callback executed mid-sequence inside REVM (validation/benchmark path) | DONE (`6417d3d` + `6fe97c2`) | `ReentrantAttacker`/`HookToken`/`ReentrantVault` fixtures: withdraw → token transfer → attacker `onReceive` → vault re-entry; oracle sees the nested write |
+| 4.2 | Campaign-time attacker-contract deployment + `ReentrancyProbe` mutator (flag-guarded `--attacker-harness`, default OFF) | DONE (GAP-2) | `src/engine/attacker_harness.rs`; deploys a reentrancy-attacker template at `ATTACKER_ADDRESS` into the campaign CacheDB at setup; `ReentrancyProbe` mutator inserts probe sequences. 486 lib tests pass with flag OFF (zero regressions). |
+| 4.3 | Parameterized attacker with `setTarget(address)` + `setReentrySelector(bytes4)` (re-enter ANY fuzz target, not just pre-baked fixtures) | DONE (GAP-2) | `param_attacker_runtime.bin` (solc-js 0.8.38 compiled); revm unit test `test_param_attacker_reentrancy_callback` proves the deployed attacker re-enters a configured target with the configured selector. |
+| 4.4 | Campaign-time attacker-bytecode mutation (evolve attacker behavior alongside calldata) | **ROADMAP** | `ReentrancyProbe` inserts fixed probe sequences; evolving attacker bytecode in parallel with calldata is future work |
 
 ## 5. Tooling, crates, throughput
 
@@ -53,7 +56,7 @@ can run; nothing is aspirational unless it says **ROADMAP**.
 | 5.1 | `rustyfuzz-testkit` has real consumers (deterministic fixture builders in integration tests) | DONE (`d364bf5`) | `tests/violation_predicate.rs`, `tests/snapshot_exploration.rs` |
 | 5.2 | Release throughput profile (LTO, codegen-units, panic strategy) | PRE-EXISTING | `Cargo.toml` build profiles; `RUSTFLAGS="-C target-cpu=native"` documented for local campaigns |
 | 5.3 | Targeted exec/s measurement (350 dev vs 30k tuned claim) | **ROADMAP** | measurement is campaign-side and machine-dependent; no CI-runnable exec/s gate exists. The rediscovery gate pins correctness, not speed |
-| 5.4 | SMT-backed concolic | **ROADMAP** | concolic stub was dead code (purged). Future integration point: an SMT solver discharging the typed `ViolationPredicate` language (`crates/rustyfuzz-predicate`) the replay verifier already evaluates |
+| 5.4 | SMT-backed concolic | DONE (GAP-3) behind `smt` feature | `z3` crate links system `libz3.so.4`; `solve_path_constraint_smt` in `src/engine/concolic.rs` discharges linear-arithmetic + bitwise + comparison path constraints over 256-bit symbolic calldata/caller/callvalue/storage. Keccak/mappings return `None` (honest ceiling — z3 has no keccak theory). `cargo check --features smt` gates compilation in CI; 5 SMT unit tests pass. Legacy `z3` feature retained as dormant alias for backward compat. |
 
 ## 6. Launch gates (run these before announcing)
 
@@ -91,8 +94,14 @@ scripts/verify-release-artifacts.sh              # if cutting a tagged release
 - **Strong**: replay, verification, minimization, PoC generation of a
   suspected bug on forked mainnet state; typed three-state invariant
   language where `Unknown` can never promote; digest-bound, gate-confirmed
-  evidence artifacts; now with reentrancy detectable in replay and a
-  5/5 rediscovery regression gate in CI.
-- **Not claimed**: autonomous cold-start discovery at ityfuzz/Foundry-invariant
-  strength; SMT-backed path solving; exec/s parity with tuned builds. These
-  are roadmap items with named integration points, not silent gaps.
+  evidence artifacts; reentrancy detectable in replay AND reachable in
+  campaign mode via the `--attacker-harness` flag (parameterized attacker);
+  SMT-backed concolic path solving behind the `smt` feature (linear-arith +
+  bitwise + comparison over 256-bit symbolic calldata); 5/5 replay-verified
+  regression gate in CI.
+- **Not claimed**: autonomous cold-start rediscovery of historical bugs at
+  ityfuzz strength (the replay gate verifies authored exploits, not autonomous
+  discovery — that gate is ROADMAP); keccak/mapping constraint solving (z3 has
+  no keccak theory); exec/s parity with tuned builds (per-input CacheDB clone
+  still dominates on warm forks). These are named integration points, not
+  silent gaps.

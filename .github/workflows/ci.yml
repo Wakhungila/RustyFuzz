@@ -84,8 +84,8 @@ jobs:
         run: cargo test --workspace --locked
       - name: Zen client protocol tests
         run: cargo test --features llm --lib --locked satori::reasoning::zen_client
-      - name: Z3 feature check
-        run: cargo check --features z3 --locked
+      - name: SMT (z3) feature check
+        run: cargo check --workspace --locked --features smt
       - name: SGX unsupported shim check
         run: cargo check --features sgx --locked
       - name: SVM is explicitly unsupported
@@ -185,13 +185,17 @@ jobs:
           name: oracle-control-evidence
           path: benchmarks/results/oracle-controls/
 
-  # Rediscovery baseline regression gate: the 5 executable known_vulnerable
-  # cases must stay rediscovered (found + confirmed proof + typed violation
-  # predicate + offline Foundry PoC), negatives must stay silent, gate2
+  # Replay regression gate: verifies the detection PIPELINE (replay → oracle →
+  # confirmed proof → typed predicate → offline Foundry PoC) on pre-recorded
+  # exploit sequences for the 5 executable known_vulnerable cases. This is NOT
+  # autonomous rediscovery — the exploit calldata is human-authored in the
+  # fixture, not discovered by the fuzzer. Negatives must stay silent, gate2
   # positives must keep matching. Historical mainnet_fork cases are reported
-  # but excluded until their fork captures are complete.
+  # but excluded until their fork captures are complete. Autonomous
+  # rediscovery is ROADMAP; the --attacker-harness flag + SMT `smt` feature
+  # are the concrete steps toward it.
   rediscovery-gate:
-    name: Rediscovery Baseline Gate
+    name: Replay Regression Gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -231,5 +235,3 @@ jobs:
 
       - name: Release checksums
         run: RUSTYFUZZ_ALLOW_UNSIGNED_RELEASE=1 ./scripts/build-release.sh dist
-      - name: Build with supported optional proof feature
-        run: cargo build --verbose --features z3 --locked

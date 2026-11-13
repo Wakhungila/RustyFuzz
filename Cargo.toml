@@ -46,8 +46,11 @@ inherits = "release"
 
 [package]
 name = "rusty-fuzz"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "EVM smart-contract fuzzer: fork-aware campaigns, DeFi oracles, and replayable proof-of-concept findings."
+license = "Apache-2.0"
+repository = "https://github.com/Wakhungila/RustyFuzz"
 
 [[bin]]
 name = "benchmark"
@@ -58,6 +61,8 @@ required-features = ["evm"]
 # FEATURES
 # Build EVM only (default):   cargo build --release
 # SVM/SGX:                    unsupported; feature flags emit controlled errors
+# SMT-backed concolic:        cargo build --release --features "evm,smt"
+# Legacy dormant z3 stub:     cargo build --release --features "evm,z3"  (still advertised, zero Rust references)
 # Build with notifications:   cargo build --release --features "evm,notifier"
 # ─────────────────────────────────────────────────────────────────────────────
 [features]
@@ -71,6 +76,16 @@ evm      = [
     "dep:reqwest"
 ]
 svm      = []
+# `smt` is the real SMT-backed concolic solver path (GAP-3). It pulls in `z3`
+# and wires it into `src/engine/concolic.rs` to discharge linear-arithmetic,
+# bitwise, and comparison path constraints over 256-bit symbolic calldata.
+# Keccak/mappings remain unsupported (honest ceiling). Default build does NOT
+# enable this; `cargo check --features smt` gates compilation in CI.
+smt      = ["dep:z3"]
+# `z3` is the legacy dormant stub: declared dependency, zero Rust references
+# in the source tree. Retained for backwards compatibility with documented
+# build instructions; new work should prefer `smt`.
+z3       = ["dep:z3"]
 llm      = ["dep:reqwest"]
 live-tests = []
 notifier = ["dep:reqwest"]
@@ -233,6 +248,23 @@ version = "0.11.0"
 version = "0.15.7"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# OPTIONAL: Z3 SMT solver  (used by both the `smt` and legacy `z3` features)
+#   Linux:  sudo apt install libz3-dev   (or rely on the bundled fallback below)
+#   macOS:  brew install z3
+# Linking strategy (GAP-3, verified): the system libz3 link path is used by
+# default. z3-sys 0.13 ships pre-built bindgen bindings, so `cargo check
+# --features smt` succeeds WITHOUT libz3-dev installed (it does not link). The
+# `cargo test --features smt` step DOES link and requires either libz3-dev OR a
+# `libz3.so` symlink to `libz3.so.4` on the host. If linking fails on a clean
+# host, switch the `z3` dependency below to `features = ["bundled"]` to build
+# z3 from C++ source via g++ (slower, but self-contained). The bundled path was
+# NOT needed in this environment — system libz3.so.4 linked cleanly.
+# ─────────────────────────────────────────────────────────────────────────────
+[dependencies.z3]
+version  = "0.21.0"
+optional = true
+
+# ─────────────────────────────────────────────────────────────────────────────
 # OPTIONAL: HTTP client (notifications + LLM API)
 # ─────────────────────────────────────────────────────────────────────────────
 [dependencies.reqwest]
@@ -248,11 +280,3 @@ optional = true
 [dependencies.mimalloc]
 version  = "0.1.52"
 optional = true
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST FIXTURES
-#   Deterministic address/slot builders shared by integration tests. Never a
-#   production dependency: the crate sits on top of the fuzzer's public APIs.
-# ─────────────────────────────────────────────────────────────────────────────
-[dev-dependencies.rustyfuzz-testkit]
-path = "crates/rustyfuzz-testkit"
