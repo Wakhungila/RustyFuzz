@@ -67,12 +67,12 @@ allow_synthetic_fallback = true
             '--fixture', str(fixture),
             '--attacker-harness',
             '--compact-fork-state',
+            '--allow-synthetic-fallback',
             '--deterministic',
             '--rng-seed', '1',
             '--max-execs', str(args.max_execs),
             '--duration-secs', str(args.duration_secs),
             '--single-process',
-            '--report-dir', f'{case_dir}/reports',
         ]
         start = time.monotonic()
         try:

@@ -198,6 +198,20 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                         raw_target.unwrap_or("")
                     )
                 })?;
+            // If --fixture is set without --contract, derive the target from the
+            // fixture so the campaign knows which contract to fuzz.
+            let target_contract = if target_contract.is_none() {
+                if let Some(fixture_path) = fixture.as_deref() {
+                    let state = rusty_fuzz::engine::executable_fixture::ExecutableFixture::load_for_fuzz(
+                        std::path::Path::new(fixture_path),
+                    )?;
+                    Some(state.target)
+                } else {
+                    None
+                }
+            } else {
+                target_contract
+            };
             // Validate the invariant and its target before fork or campaign work.
             if let Some(path) = invariants.as_deref() {
                 let invariants_path = std::path::Path::new(path);
