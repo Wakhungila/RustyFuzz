@@ -73,6 +73,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             require_seed_bundle: false,
             require_rpc_fork: true,
             allow_synthetic_fallback: false,
+            attacker_harness: false,
             abi: None,
             max_execs,
             duration_secs: Some(duration_secs),
