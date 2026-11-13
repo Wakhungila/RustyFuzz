@@ -237,6 +237,77 @@ fn measure_current(label: &str, accounts: usize, slots: usize, iterations: usize
     }
 }
 
+/// Compacted shape: the warm state is moved from the CacheDB cache into the
+/// ForkDb backend (Arc-shared) once, then each input clones the compacted
+/// CacheDB (empty cache + Arc backend). This is the throughput fix: per-input
+/// clone cost drops from O(cached accounts × storage) to O(1 Arc refcount).
+fn measure_compacted(label: &str, accounts: usize, slots: usize, iterations: usize) -> Measurement {
+    let fixture = fixture(accounts, slots);
+    let cached = cached_slots(&fixture.state);
+    let executor = EvmExecutor::exploration();
+    let mut coverage = vec![0u8; MAP_SIZE];
+
+    // One-time compaction: move warm cache → ForkDb backend (Arc-shared).
+    let mut compacted = fixture.state.clone();
+    let ChainState::Evm(db) = &mut compacted;
+    let accounts = std::mem::take(&mut db.cache.accounts);
+    db.db.absorb_warm_accounts(&accounts);
+
+    for _ in 0..3usize.min(iterations) {
+        let mut state = compacted.clone();
+        let mut env = fixture.env.clone();
+        let mut dataflow = DataflowRegistry::new();
+        for tx_idx in 0..TXS_PER_INPUT {
+            let mut waypoints = Vec::new();
+            executor
+                .execute_with_result(
+                    &mut state,
+                    &mut env,
+                    &fixture.tx,
+                    &mut coverage,
+                    &mut dataflow,
+                    &mut waypoints,
+                    tx_idx,
+                )
+                .expect("warm-up execution must succeed");
+        }
+    }
+
+    let mut samples = Vec::new();
+    for _ in 0..5 {
+        let started = Instant::now();
+        for _ in 0..iterations {
+            let mut state = compacted.clone();
+            let mut env = fixture.env.clone();
+            let mut dataflow = DataflowRegistry::new();
+            for tx_idx in 0..TXS_PER_INPUT {
+                let mut waypoints = Vec::new();
+                executor
+                    .execute_with_result(
+                        &mut state,
+                        &mut env,
+                        &fixture.tx,
+                        &mut coverage,
+                        &mut dataflow,
+                        &mut waypoints,
+                        tx_idx,
+                    )
+                    .expect("measured execution must succeed");
+            }
+        }
+        samples.push(started.elapsed());
+    }
+    samples.sort();
+    let executions_per_sample = iterations * TXS_PER_INPUT;
+    let median = samples[samples.len() / 2];
+    Measurement {
+        label: label.to_string(),
+        cached_slots: cached,
+        per_exec_us: median.as_secs_f64() * 1e6 / executions_per_sample as f64,
+        execs_per_sec: executions_per_sample as f64 / median.as_secs_f64(),
+    }
+}
+
 /// Pre-change shape: an additional full cache copy for every transaction.
 ///
 /// This reproduces the removed cost inside the same binary and the same run, so
@@ -507,6 +578,41 @@ fn main() {
             after.cached_slots,
             after.execs_per_sec / before.execs_per_sec,
             after.execs_per_sec
+        );
+    }
+
+    println!("\nthroughput, compacted (warm state in Arc backend, empty cache per clone):");
+    println!(
+        "{:<10} {:>12} {:>14} {:>16}",
+        "fixture", "cached slots", "us/exec", "execs/sec"
+    );
+    println!("{}", "-".repeat(56));
+    let compacted: Vec<Measurement> = CONFIGS
+        .iter()
+        .map(|(label, accounts, slots, iterations)| {
+            measure_compacted(label, *accounts, *slots, *iterations)
+        })
+        .collect();
+    for m in &compacted {
+        println!(
+            "{:<10} {:>12} {:>14.2} {:>16.0}",
+            m.label, m.cached_slots, m.per_exec_us, m.execs_per_sec
+        );
+    }
+
+    println!("\nspeedup (compacted vs current — the throughput fix):");
+    println!(
+        "{:<10} {:>12} {:>14} {:>16}",
+        "fixture", "cached slots", "x faster", "execs/sec"
+    );
+    println!("{}", "-".repeat(56));
+    for (cur, comp) in current.iter().zip(compacted.iter()) {
+        println!(
+            "{:<10} {:>12} {:>14.2} {:>16.0}",
+            comp.label,
+            comp.cached_slots,
+            comp.execs_per_sec / cur.execs_per_sec,
+            comp.execs_per_sec
         );
     }
 
