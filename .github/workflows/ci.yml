@@ -218,6 +218,36 @@ jobs:
           name: rediscovery-gate-evidence
           path: benchmarks/results/rediscovery-gate/
 
+  # Autonomous discovery smoke gate: runs `rusty-fuzz fuzz --attacker-harness`
+  # with a tight deterministic budget against the synthetic fallback target.
+  # Proves the autonomous campaign path (fuzzer's own mutator + attacker
+  # harness + SMT concolic) boots, runs, and produces a report without
+  # crashing. NOT a rediscovery gate (synthetic target is benign; 0 findings
+  # is the expected honest outcome). A non-zero historical rediscovery rate
+  # requires the `--fixture` integration — ROADMAP, see PRODUCTION_READINESS §2.7.
+  autonomous-smoke:
+    name: Autonomous Discovery Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.97.1
+      - name: Build
+        run: cargo build --release --locked --bin rusty-fuzz
+      - name: Run autonomous discovery smoke gate
+        run: |
+          test ! -e config.toml
+          rm -rf benchmarks/results/autonomous-smoke
+          python3 scripts/validate_autonomous_discovery.py
+
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: autonomous-smoke-evidence
+          path: benchmarks/results/autonomous-smoke/
+
   # Build verification
   build:
     name: Build Verification
