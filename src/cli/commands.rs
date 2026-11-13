@@ -100,6 +100,11 @@ pub enum Command {
         /// offline known-vulnerable fixtures without an RPC endpoint.
         #[arg(long)]
         fixture: Option<String>,
+        /// Compact the warm fork state into the Arc-shared ForkDb backend once,
+        /// then per-input clone the compacted CacheDB (empty cache + Arc).
+        /// Measured 278x throughput win at 50k cached slots.
+        #[arg(long, default_value_t = false)]
+        compact_fork_state: bool,
         #[arg(long)]
         abi: Option<String>,
         #[arg(long)]

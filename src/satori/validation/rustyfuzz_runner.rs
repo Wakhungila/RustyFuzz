@@ -368,6 +368,7 @@ pub async fn execute_bounded_job(
         in_memory_bytecode: None,
         attacker_harness: false,
         fixture_path: None,
+        compact_fork_state: false,
         cores: None,
         require_seed_bundle: true,
         require_rpc_fork: true,

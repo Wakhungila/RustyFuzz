@@ -36,6 +36,7 @@ fn checkpoint_campaign_worker() {
         in_memory_bytecode: Some(hex::decode("60003560005560005460005260206000f3").unwrap()),
         attacker_harness: false,
         fixture_path: None,
+        compact_fork_state: false,
         cores: None,
         require_seed_bundle: false,
         require_rpc_fork: false,
