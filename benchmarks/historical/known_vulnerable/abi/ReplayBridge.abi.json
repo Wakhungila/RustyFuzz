@@ -1,0 +1,4 @@
+[{"type":"function","name":"finalize","inputs":[{"name":"messageHash","type":"bytes32"}],"outputs":[],"stateMutability":"nonpayable"},
+ {"type":"function","name":"claim","inputs":[{"name":"messageHash","type":"bytes32"}],"outputs":[],"stateMutability":"nonpayable"},
+ {"type":"function","name":"released","inputs":[{"name":"","type":"bytes32"}],"outputs":[{"type":"uint256"}],"stateMutability":"view"},
+ {"type":"function","name":"processed","inputs":[{"name":"","type":"bytes32"}],"outputs":[{"type":"bool"}],"stateMutability":"view"}]

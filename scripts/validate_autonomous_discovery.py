@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 """Autonomous rediscovery gate (REAL — targets known_vulnerable fixtures).
 
 Runs `rusty-fuzz fuzz --fixture <path> --attacker-harness` against each
@@ -74,11 +75,34 @@ allow_synthetic_fallback = true
             '--duration-secs', str(args.duration_secs),
             '--single-process',
         ]
+        # Attach the ABI so the mutator generates valid calldata (with correct arg
+        # types) instead of random bytes that revert. Without the ABI, the fuzzer
+        # extracts selectors from bytecode but doesn't know the arg types, so most
+        # calls revert and the bug is never reached.
+        abi_map = {
+            'known-erc20-bad-mint-inflation': 'abi/UnauthMintToken.abi.json',
+            'known-flashloan-price-manipulation': 'abi/NoProductCheckPool.abi.json',
+            'known-uninitialized-proxy-takeover': 'abi/UninitializedProxy.abi.json',
+            'known-bridge-nonce-replay': 'abi/ReplayBridge.abi.json',
+            'known-read-only-reentrancy': 'abi/ReentrantAttacker.abi.json',
+        }
+        abi_rel = abi_map.get(case_id)
+        if abi_rel:
+            abi_path = REPO_ROOT / 'benchmarks/historical/known_vulnerable' / abi_rel
+            cmd.extend(['--abi', str(abi_path)])
+        # For reentrancy: the fixture's default target is the vault, but the
+        # reentrancy requires a CONTRACT caller (the ReentrantAttacker at
+        # 0x3300...03) whose onReceive callback fires during the withdraw token
+        # transfer. Target the attacker so the fuzzer calls enterDeposit +
+        # enterWithdraw, which orchestrate the reentrancy.
+        if case_id == 'known-read-only-reentrancy':
+            cmd.extend(['--contract', '0x3300000000000000000000000000000000000003'])
         start = time.monotonic()
         try:
             proc = subprocess.run(
                 cmd, cwd=case_dir, capture_output=True, text=True,
                 timeout=args.duration_secs + 60,
+                env={**os.environ, 'RUSTYFUZZ_CAMPAIGN_SHUTDOWN_GRACE_SECS': '0'},
             )
             elapsed = time.monotonic() - start
             exit_status = proc.returncode

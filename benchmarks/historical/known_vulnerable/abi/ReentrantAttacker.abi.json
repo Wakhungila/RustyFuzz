@@ -1,0 +1,3 @@
+[{"type":"function","name":"enterDeposit","inputs":[{"name":"amount","type":"uint256"}],"outputs":[],"stateMutability":"nonpayable"},
+ {"type":"function","name":"enterWithdraw","inputs":[{"name":"amount","type":"uint256"}],"outputs":[],"stateMutability":"nonpayable"},
+ {"type":"function","name":"onReceive","inputs":[{"name":"","type":"address"},{"name":"","type":"address"},{"name":"","type":"uint256"}],"outputs":[],"stateMutability":"nonpayable"}]
