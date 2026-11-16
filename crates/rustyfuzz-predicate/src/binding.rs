@@ -22,9 +22,6 @@ use std::fmt;
 /// Width of one EVM storage slot in bits.
 pub const SLOT_BITS: u16 = 256;
 
-/// Largest address span in bits, used to sanity-check `address` bindings.
-const ADDRESS_BITS: u16 = 160;
-
 /// Errors raised while loading or validating a binding manifest.
 ///
 /// All of these are **load-time** failures. Nothing here can surface mid-campaign.
@@ -434,11 +431,6 @@ impl fmt::Display for Binding {
             self.offset_bits + self.width_bits
         )
     }
-}
-
-/// Convenience: the address-width check used by tests and by future validation.
-pub fn is_address_width(width_bits: u16) -> bool {
-    width_bits == ADDRESS_BITS
 }
 
 #[cfg(test)]

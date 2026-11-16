@@ -79,22 +79,7 @@ impl RustyFuzzScheduler {
             evaluated_score: None,
         }
     }
-
-    pub fn attach_score<I, S>(
-        state: &mut S,
-        id: CorpusId,
-        score: CampaignScore,
-    ) -> Result<(), Error>
-    where
-        S: HasTestcase<I>,
-    {
-        state
-            .testcase_mut(id)?
-            .add_metadata(RustyFuzzCampaignMetadata::new(score));
-        Ok(())
-    }
 }
-
 impl Default for RustyFuzzScheduler {
     fn default() -> Self {
         Self::new()
@@ -307,8 +292,14 @@ mod tests {
             .corpus_mut()
             .add(Testcase::new(empty_input()))
             .expect("add high");
-        RustyFuzzScheduler::attach_score(&mut state, low, score(10, 0, 0)).expect("low score");
-        RustyFuzzScheduler::attach_score(&mut state, high, score(100, 50, 50)).expect("high score");
+        state
+            .testcase_mut(low)
+            .expect("testcase")
+            .add_metadata(RustyFuzzCampaignMetadata::new(score(10, 0, 0)));
+        state
+            .testcase_mut(high)
+            .expect("testcase")
+            .add_metadata(RustyFuzzCampaignMetadata::new(score(100, 50, 50)));
 
         let mut scheduler = RustyFuzzScheduler::new();
         let selected = scheduler.next(&mut state).expect("next");
@@ -328,9 +319,18 @@ mod tests {
         let high = add(&mut state, 0);
         let low = add(&mut state, 1);
         let missing = add(&mut state, 2);
-        RustyFuzzScheduler::attach_score(&mut state, high, score(u64::MAX, u64::MAX, u64::MAX))
-            .unwrap();
-        RustyFuzzScheduler::attach_score(&mut state, low, score(1, 0, 0)).unwrap();
+        state
+            .testcase_mut(high)
+            .expect("testcase")
+            .add_metadata(RustyFuzzCampaignMetadata::new(score(
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+            )));
+        state
+            .testcase_mut(low)
+            .expect("testcase")
+            .add_metadata(RustyFuzzCampaignMetadata::new(score(1, 0, 0)));
         let mut scheduler = RustyFuzzScheduler::new();
         for _ in 0..10 {
             let selected: Vec<_> = (0..6)
@@ -353,7 +353,10 @@ mod tests {
         assert_eq!(scheduler.next(&mut state).unwrap(), first);
         state.corpus_mut().remove(removed).unwrap();
         let fourth = add(&mut state, 3);
-        RustyFuzzScheduler::attach_score(&mut state, fourth, score(100, 1, 1)).unwrap();
+        state
+            .testcase_mut(fourth)
+            .expect("testcase")
+            .add_metadata(RustyFuzzCampaignMetadata::new(score(100, 1, 1)));
         let corpus_json = serde_json::to_vec(&state.corpus).unwrap();
         let mut restored_state = TestState {
             corpus: serde_json::from_slice(&corpus_json).unwrap(),

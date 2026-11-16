@@ -1,0 +1,23 @@
+{
+  "target": "0x6200000000000000000000000000000000000002",
+  "symbols": {
+    "proxyOwner": {
+      "kind": "slot",
+      "slot": "0x0",
+      "offset_bits": 0,
+      "width_bits": 256
+    },
+    "implSlot": {
+      "kind": "slot",
+      "slot": "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc",
+      "offset_bits": 0,
+      "width_bits": 256
+    }
+  },
+  "invariants": [
+    {
+      "name": "proxyInitializedAndDeployerOwned",
+      "predicate": "proxyOwner == 0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb && implSlot != 0"
+    }
+  ]
+}

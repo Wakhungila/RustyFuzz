@@ -293,31 +293,56 @@ mod tests {
     }
 
     #[test]
+    // The assertions below intentionally pin constants: they fail loudly if a
+    // chain profile's blob header flags ever drift, which is exactly the
+    // regression this test guards.
+    #[allow(clippy::assertions_on_constants)]
     fn revm_blob_change_preserves_l1_fork_behavior() {
         // Regression test: the REVM blob handling change must not alter L1 fork behavior.
-        // 
+        //
         // Pre-Cancun blocks must leave blob_excess_gas_and_price unset (None).
         // Post-Cancun blocks must derive the field from the block header.
-        // 
+        //
         // Arbitrum One and ANVIL_LOCAL run Cancun-era rules but have
         // BlobPricing::Absent, so they report zero excess and zero base fee.
         // BLOBBASEFEE must return 0 for such chains.
 
         // ETHEREUM_MAINNET pre-Cancun: no blob fraction
         let mainnet = ChainProfile::ETHEREUM_MAINNET;
-        assert_eq!(mainnet.blob_fraction(1_600_000_000), None, "pre-Cancun mainnet has no blob fraction");
+        assert_eq!(
+            mainnet.blob_fraction(1_600_000_000),
+            None,
+            "pre-Cancun mainnet has no blob fraction"
+        );
 
         // ETHEREUM_MAINNET post-Cancun: has blob fraction from header
-        assert_eq!(mainnet.blob_fraction(1_710_338_135), Some(3_338_477), "post-Cancun mainnet has blob fraction");
+        assert_eq!(
+            mainnet.blob_fraction(1_710_338_135),
+            Some(3_338_477),
+            "post-Cancun mainnet has blob fraction"
+        );
 
         // ARBITRUM_ONE: Cancun-era but Absent blob pricing -> zero excess/price
         let arbitrum = ChainProfile::ARBITRUM_ONE;
-        assert_eq!(arbitrum.blob_fraction(1_710_338_135), None, "Arbitrum Absent pricing has no fraction");
+        assert_eq!(
+            arbitrum.blob_fraction(1_710_338_135),
+            None,
+            "Arbitrum Absent pricing has no fraction"
+        );
 
         // Verify the chain profiles have the expected blob settings
-        assert!(matches!(ChainProfile::ETHEREUM_MAINNET.blobs, BlobPricing::FromHeader { .. }));
-        assert!(matches!(ChainProfile::ARBITRUM_ONE.blobs, BlobPricing::Absent));
-        assert!(matches!(ChainProfile::ANVIL_LOCAL.blobs, BlobPricing::Absent));
+        assert!(matches!(
+            ChainProfile::ETHEREUM_MAINNET.blobs,
+            BlobPricing::FromHeader { .. }
+        ));
+        assert!(matches!(
+            ChainProfile::ARBITRUM_ONE.blobs,
+            BlobPricing::Absent
+        ));
+        assert!(matches!(
+            ChainProfile::ANVIL_LOCAL.blobs,
+            BlobPricing::Absent
+        ));
 
         // Verify header requirements: only ETHEREUM_MAINNET requires excess_blob_gas
         assert!(ChainProfile::ETHEREUM_MAINNET.header.excess_blob_gas);

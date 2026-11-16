@@ -1,0 +1,19 @@
+{
+  "target": "0x6200000000000000000000000000000000000005",
+  "symbols": {
+    "releasedFor": {
+      "kind": "mapping",
+      "slot": "0x0",
+      "offset_bits": 0,
+      "width_bits": 256,
+      "key_type": "bytes32",
+      "keys": ["0xd63ce7c0036e01876cb2dae6f19530fbee1ab118ccc28b8eebeb35d63828152d"]
+    }
+  },
+  "invariants": [
+    {
+      "name": "messageReleasesAtMostOnce",
+      "predicate": "sum(releasedFor) <= 1000000000000000000"
+    }
+  ]
+}

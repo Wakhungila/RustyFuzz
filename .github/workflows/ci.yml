@@ -84,8 +84,8 @@ jobs:
         run: cargo test --workspace --locked
       - name: Zen client protocol tests
         run: cargo test --features llm --lib --locked satori::reasoning::zen_client
-      - name: Z3 feature check
-        run: cargo check --features z3 --locked
+      - name: SMT (z3) feature check
+        run: cargo check --workspace --locked --features smt
       - name: SGX unsupported shim check
         run: cargo check --features sgx --locked
       - name: SVM is explicitly unsupported
@@ -185,6 +185,68 @@ jobs:
           name: oracle-control-evidence
           path: benchmarks/results/oracle-controls/
 
+  # Replay regression gate: verifies the detection PIPELINE (replay → oracle →
+  # confirmed proof → typed predicate → offline Foundry PoC) on pre-recorded
+  # exploit sequences for the 5 executable known_vulnerable cases. This is NOT
+  # autonomous rediscovery — the exploit calldata is human-authored in the
+  # fixture, not discovered by the fuzzer. Negatives must stay silent, gate2
+  # positives must keep matching. Historical mainnet_fork cases are reported
+  # but excluded until their fork captures are complete. Autonomous
+  # rediscovery is ROADMAP; the --attacker-harness flag + SMT `smt` feature
+  # are the concrete steps toward it.
+  rediscovery-gate:
+    name: Replay Regression Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.97.1
+      - name: Build validator
+        run: cargo build --release --locked --bin rusty-fuzz
+      - name: Run rediscovery regression gate
+        run: |
+          test ! -e config.toml
+          rm -rf benchmarks/results/rediscovery-gate
+          trap 'rm -f config.toml' EXIT
+          python3 scripts/validate_rediscovery_gate.py
+
+      - name: Upload gate evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rediscovery-gate-evidence
+          path: benchmarks/results/rediscovery-gate/
+
+  # Autonomous rediscovery gate: runs `rusty-fuzz fuzz --fixture <known_vulnerable>
+  # > --attacker-harness` against each executable fixture with a tight budget.
+  # Reports whether the fuzzer's OWN mutator found the bug (no authored calldata).
+  # This is the ItyFuzz-class capability gate. The honest baseline rate is the
+  # ratchet — it only tightens. A 0/N rate is the honest starting point, not a
+  # gate failure; crashes ARE. See docs/PRODUCTION_READINESS.md §2.7.
+  autonomous-smoke:
+    name: Autonomous Rediscovery Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.97.1
+      - name: Build
+        run: cargo build --release --locked --bin rusty-fuzz
+      - name: Run autonomous rediscovery gate
+        run: |
+          test ! -e config.toml
+          rm -rf benchmarks/results/autonomous-rediscovery
+          python3 scripts/validate_autonomous_discovery.py --max-execs 500 --duration-secs 15
+
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: autonomous-smoke-evidence
+          path: benchmarks/results/autonomous-smoke/
+
   # Build verification
   build:
     name: Build Verification
@@ -202,5 +264,3 @@ jobs:
 
       - name: Release checksums
         run: RUSTYFUZZ_ALLOW_UNSIGNED_RELEASE=1 ./scripts/build-release.sh dist
-      - name: Build with supported optional proof feature
-        run: cargo build --verbose --features z3 --locked

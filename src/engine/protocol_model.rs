@@ -1080,7 +1080,8 @@ mod tests {
             "the candidate must record the executed transaction count"
         );
         assert_eq!(
-            candidate.input.txs[0].input, executed_selector.to_vec(),
+            candidate.input.txs[0].input,
+            executed_selector.to_vec(),
             "the candidate must record the executed calldata, not a generated template"
         );
         assert_eq!(

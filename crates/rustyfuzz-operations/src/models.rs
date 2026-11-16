@@ -204,37 +204,6 @@ pub struct MetricSample {
     pub labels: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperationState {
-    Accepted,
-    Running,
-    Succeeded,
-    Failed,
-    Rejected,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperationKind {
-    Inventory,
-    Integrity,
-    Backup,
-    Preflight,
-    Restore,
-    RecoveryDrill,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Operation {
-    pub schema_version: u32,
-    pub operation_id: String,
-    pub kind: OperationKind,
-    pub campaign_id: Option<String>,
-    pub requested_at_unix: u64,
-    pub state: OperationState,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupManifest {
     pub schema_version: u32,

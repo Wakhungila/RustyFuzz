@@ -173,3 +173,13 @@ Thumbs.db
 # Foundry build artifacts (regenerable)
 /benchmarks/historical/out/
 /benchmarks/historical/cache/
+
+# ─────────────────────────────────────────────────────────────
+# Launch hygiene — AI-assistant working files and sandbox artifacts
+# (never ship these; they are instructions for an assistant, not tool docs)
+# ─────────────────────────────────────────────────────────────
+CLAUDE_CONTINUATION_PROMPT.md
+CODEX_HANDOFF.md
+/tool-results/
+/.agent-ctx/
+/AGENTS.md

@@ -557,7 +557,10 @@ mod tests {
             .map(|function| function.signature.as_str())
             .collect::<Vec<_>>();
         assert!(signatures.contains(&"store(bytes,bool)"), "{signatures:?}");
-        assert!(signatures.contains(&"widen(uint256,int256)"), "{signatures:?}");
+        assert!(
+            signatures.contains(&"widen(uint256,int256)"),
+            "{signatures:?}"
+        );
         assert!(
             signatures.contains(&"table(mapping(address=>uint256))"),
             "{signatures:?}"

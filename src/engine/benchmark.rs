@@ -1511,7 +1511,7 @@ impl ValidationRunner {
                         exploit_candidate = Some(candidate);
                         proof = Some(finding_proof);
                     }
-                    let observation = ValidationObservation {
+                    let mut observation = ValidationObservation {
                         findings,
                         exploit_candidate,
                         proof,
@@ -1520,6 +1520,43 @@ impl ValidationRunner {
                         synthetic_profile: true,
                         ..Default::default()
                     };
+                    // Offline PoC synthesis for cases that demand it
+                    // (`poc_generation = "required"`): a confirmed proof over
+                    // authored invariants earns a replayable Foundry PoC even
+                    // without an RPC endpoint. Expected/not_required cases
+                    // (gate2 controls, negative pack) are untouched.
+                    if manifest.poc_generation == PocGenerationExpectation::Required
+                        && observation
+                            .proof
+                            .as_ref()
+                            .is_some_and(|proof| proof.confidence_is_confirmed())
+                        && !observation.findings.is_empty()
+                    {
+                        let report_dir = context
+                            .report_dir
+                            .clone()
+                            .unwrap_or_else(|| PathBuf::from("reports"));
+                        let poc_dir = report_dir.join("validation").join(&manifest.id);
+                        fs::create_dir_all(&poc_dir).with_context(|| {
+                            format!("create validation artifact dir {}", poc_dir.display())
+                        })?;
+                        let poc_path = synthesize_local_validation_poc(
+                            manifest,
+                            &input,
+                            &execution,
+                            &observation.findings,
+                            &poc_dir,
+                        )?;
+                        observation.foundry_poc_path = Some(poc_path.clone());
+                        observation.artifact_path = Some(poc_path.clone());
+                        if let Some(proof) = observation.proof.take() {
+                            observation.proof = Some(proof.with_foundry_poc_path(poc_path.clone()));
+                        }
+                        observation.false_positive_notes.push(format!(
+                            "generated offline validation Foundry PoC at {}",
+                            poc_path.display()
+                        ));
+                    }
                     let mut result = self.evaluate_observation(manifest, &observation);
                     if registry.is_none() {
                         // Existing controls without authored predicates continue to measure

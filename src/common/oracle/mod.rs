@@ -143,10 +143,16 @@ mod panic_code_tests {
             "failed assertion or invariant check"
         );
         assert_eq!(describe_panic_code(0x32), "array index out of bounds");
-        assert_eq!(describe_panic_code(0x11), "arithmetic overflow or underflow");
+        assert_eq!(
+            describe_panic_code(0x11),
+            "arithmetic overflow or underflow"
+        );
         assert_eq!(describe_panic_code(0x12), "division or modulo by zero");
         assert_eq!(describe_panic_code(0x31), "pop() on an empty array");
-        assert_eq!(describe_panic_code(0x51), "call to a zero-initialized internal function pointer");
+        assert_eq!(
+            describe_panic_code(0x51),
+            "call to a zero-initialized internal function pointer"
+        );
         assert_eq!(describe_panic_code(0xdead), "unknown panic code");
     }
 
@@ -171,27 +177,12 @@ mod panic_code_tests {
     }
 }
 
-/// CustomInvariant trait: Allows researchers to define their own protocol-specific
-/// economic or logical invariants.
-pub trait CustomInvariant: Send + Sync + 'static {
-    fn name(&self) -> &str;
-    fn check_invariant(&self, before: &Snapshot, after: &Snapshot) -> Option<VulnType>;
-}
-
 // Re-export oracle modules
-pub mod defi;
-pub mod governance;
-pub mod mev;
 pub mod packs;
 pub mod protocol_invariants;
 pub mod security;
-pub mod svm;
 
 // Re-export common oracle implementations
-pub use defi::*;
-pub use governance::*;
-pub use mev::*;
 pub use packs::*;
 pub use protocol_invariants::*;
 pub use security::*;
-pub use svm::*;

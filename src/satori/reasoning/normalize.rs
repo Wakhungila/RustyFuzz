@@ -164,10 +164,7 @@ fn coerce_attack_step(value: Value) -> Value {
         Value::Null => Map::new(),
         other => {
             let mut map = Map::new();
-            map.insert(
-                "action".to_string(),
-                Value::String(other.to_string()),
-            );
+            map.insert("action".to_string(), Value::String(other.to_string()));
             map
         }
     };
@@ -202,10 +199,7 @@ fn coerce_validation_step(value: Value) -> Value {
         Value::Null => Map::new(),
         other => {
             let mut map = Map::new();
-            map.insert(
-                "action".to_string(),
-                Value::String(other.to_string()),
-            );
+            map.insert("action".to_string(), Value::String(other.to_string()));
             map
         }
     };
@@ -302,11 +296,17 @@ mod tests {
         }));
         let hypothesis = &audit.hypotheses[0];
         assert_eq!(hypothesis.evidence_from_context, vec!["line 3"]);
-        assert_eq!(hypothesis.false_positive_checks, vec!["owner is a multisig"]);
+        assert_eq!(
+            hypothesis.false_positive_checks,
+            vec!["owner is a multisig"]
+        );
         assert_eq!(hypothesis.required_conditions, Vec::<String>::new());
         assert_eq!(hypothesis.confidence_before_validation, 0.7);
         assert_eq!(hypothesis.attack_sequence.len(), 1);
-        assert_eq!(hypothesis.attack_sequence[0].action, "attacker calls withdraw()");
+        assert_eq!(
+            hypothesis.attack_sequence[0].action,
+            "attacker calls withdraw()"
+        );
         assert!(hypothesis.attack_sequence[0].target.is_none());
         assert_eq!(hypothesis.validation_plan.len(), 0);
     }

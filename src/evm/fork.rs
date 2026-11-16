@@ -92,7 +92,9 @@ pub async fn create_fork_db(
     // profile — or a block outside the profile's covered range — is refused
     // here, before any state is read.
     let profile = rustyfuzz_evm::chain_profile::ChainProfile::for_chain(
-        provenance.chain_id.expect("chain id presence was checked above"),
+        provenance
+            .chain_id
+            .expect("chain id presence was checked above"),
     )
     .map_err(|message| anyhow::anyhow!(message))?;
     anyhow::ensure!(
@@ -286,6 +288,43 @@ pub fn create_in_memory_fork_db(target_contract: Address, runtime_bytecode: Vec<
         AccountInfo::default().with_code(Bytecode::new_raw(runtime_bytecode.into())),
     );
     db
+}
+
+/// Create an in-memory fork DB seeded with ALL accounts from a fuzz fixture
+/// (target + attacker + victim + auxiliary contracts), each with decoded
+/// bytecode, balance, nonce, and storage. Used by `--fixture` on the `fuzz`
+/// command so the fuzzer can target offline known-vulnerable fixtures without
+/// an RPC endpoint.
+pub fn create_in_memory_fork_db_from_fixture(
+    state: &crate::engine::executable_fixture::FuzzFixtureState,
+) -> EvmCacheDb {
+    let mut db = CacheDB::new(ForkDb::empty());
+    for account in &state.accounts {
+        db.insert_account_info(
+            account.address,
+            AccountInfo {
+                balance: account.balance,
+                nonce: account.nonce,
+                ..AccountInfo::default()
+            }
+            .with_code(Bytecode::new_raw(account.bytecode.clone().into())),
+        );
+        for (slot, value) in &account.storage {
+            let _ = db.insert_account_storage(account.address, *slot, *value);
+        }
+    }
+    db
+}
+
+/// Move the `CacheDB`'s warm-state account cache into the `ForkDb` backend
+/// (behind the `Arc<Mutex>` inner), then clear the cache. After this, per-input
+/// `CacheDB::clone()` is cheap (empty cache + Arc-shared backend) instead of
+/// O(cached accounts × storage slots). This is the throughput fix for warm-fork
+/// fuzzing: the warm state lives in the Arc-shared `ForkDb` backend, not the
+/// per-clone `CacheDB` BTreeMap cache.
+pub fn compact_cache_to_backend(db: &mut EvmCacheDb) {
+    let accounts = std::mem::take(&mut db.cache.accounts);
+    db.db.absorb_warm_accounts(&accounts);
 }
 
 pub fn create_offline_fallback_block_env(block_number: u64) -> BlockEnv {

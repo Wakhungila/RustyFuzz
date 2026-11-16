@@ -2,7 +2,7 @@ use crate::rpc_url::{resolve_rpc_url, test_loopback_allowed};
 use parking_lot::Mutex;
 use revm::database::CacheDB;
 use revm::database_interface::{DBErrorMarker, DatabaseRef};
-use revm::primitives::{Address, StorageKey, StorageValue, B256, U256};
+use revm::primitives::{keccak256, Address, StorageKey, StorageValue, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -376,13 +376,6 @@ impl ForkDbError {
             Self::Rpc(message) => classify_rpc_failure(message, None),
         }
     }
-
-    pub fn is_retryable(&self) -> bool {
-        matches!(
-            self.failure_kind(),
-            RpcFailureKind::RateLimited | RpcFailureKind::Timeout | RpcFailureKind::ProviderError
-        )
-    }
 }
 
 impl fmt::Display for ForkDbError {
@@ -479,6 +472,31 @@ impl ForkDb {
                 storage: Mutex::new(HashMap::new()),
                 block_hashes: Mutex::new(HashMap::new()),
             }),
+        }
+    }
+
+    /// Absorb a warm-state `CacheDB` account cache into the `ForkDb` backend
+    /// (behind the `Arc<Mutex>` inner). After this + clearing the `CacheDB`
+    /// cache, per-input `CacheDB::clone()` is cheap (empty cache + Arc-shared
+    /// backend) instead of O(cached accounts × storage slots). This is the
+    /// throughput fix for warm-fork fuzzing: the warm state lives in the
+    /// Arc-shared backend, not the per-clone BTreeMap cache.
+    pub fn absorb_warm_accounts<'a, I>(&self, accounts: I)
+    where
+        I: IntoIterator<Item = (&'a revm::primitives::Address, &'a revm::database::DbAccount)>,
+    {
+        let mut acct = self.inner.accounts.lock();
+        let mut code = self.inner.code_by_hash.lock();
+        let mut storage = self.inner.storage.lock();
+        for (address, account) in accounts {
+            if let Some(code_bytecode) = &account.info.code {
+                let hash = code_bytecode.hash_slow();
+                code.insert(hash, code_bytecode.clone());
+            }
+            acct.insert(*address, Some(account.info.clone()));
+            for (slot, value) in &account.storage {
+                storage.insert((*address, *slot), *value);
+            }
         }
     }
 
@@ -1169,13 +1187,18 @@ impl DatabaseRef for ForkDb {
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        Ok(self
-            .inner
-            .code_by_hash
-            .lock()
-            .get(&code_hash)
-            .cloned()
-            .unwrap_or_default())
+        // Fail closed on incompleteness: a digest-verified cache proves
+        // integrity, not completeness. A missing non-empty code hash means
+        // the fork capture never walked that account's code (e.g. a proxy
+        // implementation). Executing as empty code would produce confident,
+        // silently-wrong replays instead of a loud, actionable gap.
+        match self.inner.code_by_hash.lock().get(&code_hash) {
+            Some(code) => Ok(code.clone()),
+            None if code_hash == keccak256([]) => Ok(Bytecode::new()),
+            None => Err(ForkDbError::Decode(format!(
+                "fork cache is missing code for hash {code_hash}; the captured snapshot is incomplete and must be re-captured before replay"
+            ))),
+        }
     }
 
     fn storage_ref(

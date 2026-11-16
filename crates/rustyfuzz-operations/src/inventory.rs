@@ -1,4 +1,4 @@
-use crate::error::{ensure_directory, read_bounded_regular, OperationsError};
+use crate::error::{read_bounded_regular, OperationsError};
 use crate::models::{CampaignState, CampaignStatus, IntegrityState, OperationConfig};
 use rustyfuzz_artifacts::layout::RunLayout;
 use serde::{Deserialize, Serialize};
@@ -375,21 +375,6 @@ pub fn readiness(config: &OperationConfig) -> crate::models::ReadinessStatus {
             Some("operations root is not ready".to_string())
         },
     }
-}
-
-pub fn ensure_runs_root(config: &OperationConfig) -> Result<PathBuf, OperationsError> {
-    ensure_directory(&config.runs_root())?;
-    Ok(config.runs_root())
-}
-
-pub fn status_for<'a>(
-    report: &'a InventoryReport,
-    campaign_id: &str,
-) -> Option<&'a CampaignInventory> {
-    report
-        .campaigns
-        .iter()
-        .find(|entry| entry.campaign_id == campaign_id)
 }
 
 pub fn unknown_status(campaign_id: &str) -> CampaignStatus {

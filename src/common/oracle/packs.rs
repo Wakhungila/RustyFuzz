@@ -1,11 +1,10 @@
 use crate::common::oracle::{EvidenceGrade, ProtocolInvariantEvaluator, RejectionReason, VulnType};
 use crate::common::types::{
-    CallKind, CallObservation, CallPhase, ExecutionStatus, OracleObservation,
-    SequenceExecutionResult, StorageDiff,
+    CallKind, CallObservation, CallPhase, ExecutionStatus, SequenceExecutionResult, StorageDiff,
 };
 use revm::primitives::{keccak256, Address, B256, U256};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 /// Result of establishing whether a caller may upgrade a proxy.
 ///
@@ -253,6 +252,7 @@ pub enum ProtocolOraclePackKind {
     Governance,
     ProxyUpgradeability,
     Bridge,
+    Security,
     RuntimePanic,
 }
 
@@ -634,6 +634,7 @@ impl Default for ProtocolOraclePack {
                 ProtocolOraclePackKind::Governance,
                 ProtocolOraclePackKind::ProxyUpgradeability,
                 ProtocolOraclePackKind::Bridge,
+                ProtocolOraclePackKind::Security,
                 ProtocolOraclePackKind::RuntimePanic,
             ]
             .into_iter()
@@ -670,6 +671,9 @@ impl ProtocolOraclePack {
             .contains(&ProtocolOraclePackKind::ProxyUpgradeability)
         {
             self.evaluate_proxy_upgradeability(execution, &mut findings);
+        }
+        if self.enabled.contains(&ProtocolOraclePackKind::Security) {
+            self.evaluate_reentrancy(execution, &mut findings);
         }
         findings.extend(
             ProtocolInvariantEvaluator {
@@ -733,19 +737,78 @@ impl ProtocolOraclePack {
         }
     }
 
-    pub fn evaluate_as_observations(
+    /// Replay-mode reentrancy witness from the call trace.
+    ///
+    /// Reconstructs each transaction's call stack from the flat Start/End
+    /// trace entries. A witness fires when a nested call re-enters a target
+    /// with an open ancestor frame — the contract is executing again before
+    /// its earlier frame finished — and the re-entrant call was made by a
+    /// different account (direct self-calls are ordinary internal reads, not
+    /// reentrancy). This is the property the legacy snapshot pipeline keyed
+    /// on (`depth > 1` storage writes); replay snapshots are always taken at
+    /// depth 0, so the witness must come from the trace itself.
+    fn evaluate_reentrancy(
         &self,
         execution: &SequenceExecutionResult,
-    ) -> Vec<OracleObservation> {
-        self.evaluate(execution)
-            .into_iter()
-            .map(|finding| OracleObservation {
-                oracle: format!("{:?}", finding.pack),
-                finding: finding.vuln.to_string(),
-                tx_index: finding.tx_index,
-                evidence: finding.evidence,
-            })
-            .collect()
+        findings: &mut Vec<ProtocolFinding>,
+    ) {
+        for tx in &execution.tx_results {
+            // Top-level frame (depth 0) is the contract the transaction
+            // targets; the trace only records depth >= 1 calls, so recover it
+            // from the first depth-1 entry's caller.
+            let mut stack: Vec<(Address, String)> = Vec::new();
+            if let Some(first) = tx
+                .call_trace
+                .iter()
+                .find(|call| call.phase == CallPhase::Start && call.depth >= 1)
+            {
+                stack.push((first.caller, "tx".to_string()));
+            }
+            let mut emitted: BTreeSet<(Address, usize)> = BTreeSet::new();
+            for call in &tx.call_trace {
+                let depth = call.depth;
+                match call.phase {
+                    CallPhase::Start => {
+                        let reentered = stack
+                            .iter()
+                            .take(depth.min(stack.len()))
+                            .position(|(target, _)| *target == call.target);
+                        if let Some(ancestor_depth) = reentered {
+                            if call.caller != call.target
+                                && emitted.insert((call.target, ancestor_depth))
+                            {
+                                let chain = stack
+                                    .iter()
+                                    .take(depth.min(stack.len()))
+                                    .enumerate()
+                                    .map(|(level, (target, sel))| {
+                                        format!("d{level}:{sel}->{}", short_target(*target))
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(" | ");
+                                findings.push(ProtocolFinding {
+                                    pack: ProtocolOraclePackKind::Security,
+                                    vuln: VulnType::Reentrancy,
+                                    severity: ProtocolSeverity::High,
+                                    tx_index: Some(call.tx_index),
+                                    target: Some(call.target),
+                                    evidence: format!(
+                                        "reentrant call into {} at depth {depth} while its depth-{ancestor_depth} frame was still executing (entry via {}, not the target itself); chain: {chain}",
+                                        short_target(call.target),
+                                        short_target(call.caller),
+                                    ),
+                                });
+                            }
+                        }
+                        stack.truncate(depth);
+                        stack.push((call.target, selector_hex(call)));
+                    }
+                    CallPhase::End => {
+                        stack.truncate(depth);
+                    }
+                }
+            }
+        }
     }
 
     fn evaluate_erc20(
@@ -1234,6 +1297,12 @@ fn selector_hex(call: &CallObservation) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
+/// Compact address rendering for evidence text: first 6 hex chars + last 4.
+fn short_target(address: Address) -> String {
+    let hex = hex::encode(address.as_slice());
+    format!("0x{}…{}", &hex[..6], &hex[hex.len() - 4..])
+}
+
 fn writes_for_target(
     execution: &SequenceExecutionResult,
     target: Address,
@@ -1383,16 +1452,6 @@ fn eip1967_slot(label: &str) -> B256 {
 fn sig(signature: &str) -> [u8; 4] {
     let hash = keccak256(signature.as_bytes());
     [hash[0], hash[1], hash[2], hash[3]]
-}
-
-pub fn summarize_findings_by_pack(
-    findings: &[ProtocolFinding],
-) -> BTreeMap<ProtocolOraclePackKind, usize> {
-    let mut out = BTreeMap::new();
-    for finding in findings {
-        *out.entry(finding.pack.clone()).or_insert(0) += 1;
-    }
-    out
 }
 
 #[cfg(test)]

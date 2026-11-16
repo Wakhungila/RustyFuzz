@@ -5,8 +5,8 @@ use revm::database_interface::DatabaseRef;
 use revm::primitives::{Address, U256};
 use revm::state::{AccountInfo, Bytecode};
 use rusty_fuzz::common::oracle::{
-    AccessControlOracle, ERC4626InflationOracle, ProtocolFinding, ProtocolOraclePack,
-    ProtocolOraclePackKind, ProtocolSeverity, ReentrancyOracle, VulnType, VulnerabilityOracle,
+    AccessControlOracle, ProtocolFinding, ProtocolOraclePack, ProtocolOraclePackKind,
+    ProtocolSeverity, ReentrancyOracle, VulnType, VulnerabilityOracle,
 };
 use rusty_fuzz::common::types::{
     CallKind, CallObservation, CallPhase, ChainState, EvmInput, SequenceExecutionResult,
@@ -1166,32 +1166,6 @@ fn benchmark_reentrancy_detection() {
     );
     assert!(matches!(observed, Some(VulnType::Reentrancy)));
     assert_eq!(execution.oracle_observations.len(), 1);
-}
-
-#[test]
-fn benchmark_erc4626_inflation_detection() {
-    let mut db = test_db();
-    let vault_addr = addr(0x22);
-
-    // Setup: Initial state (100 assets, 100 shares -> price 1:1)
-    db.insert_account_storage(vault_addr, U256::ZERO, U256::from(100))
-        .unwrap(); // totalSupply
-    db.insert_account_storage(vault_addr, U256::from(1), U256::from(100))
-        .unwrap(); // totalAssets
-    let before = new_evm_snapshot(0, db.clone());
-
-    // Exploit: Donation attack doubles the price per share
-    db.insert_account_storage(vault_addr, U256::from(1), U256::from(300))
-        .unwrap();
-    let after = new_evm_snapshot(1, db);
-
-    let oracle = ERC4626InflationOracle { vault: vault_addr };
-    let result = oracle.check(&before, &after);
-
-    assert!(
-        matches!(result, Some(VulnType::VaultInflation)),
-        "Failed to detect donation-based inflation"
-    );
 }
 
 #[test]

@@ -565,6 +565,9 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
         foundry_harness: None,
         mainnet_seed_bundle: seed_bundle_id,
         in_memory_bytecode: None,
+        attacker_harness: false,
+        fixture_path: None,
+        compact_fork_state: false,
         cores: None,
         require_seed_bundle,
         require_rpc_fork: true,
@@ -595,6 +598,7 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
             max_finding_noise: options.max_finding_noise,
             poc_out: options.poc_out,
             promotion_limit: Some(options.promotion_limit),
+            confirmation: Default::default(),
         },
     };
     let watchdog = install_campaign_watchdog(
@@ -898,6 +902,9 @@ mod tests {
             foundry_harness: None,
             mainnet_seed_bundle: None,
             in_memory_bytecode: None,
+            attacker_harness: false,
+            fixture_path: None,
+            compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
             require_rpc_fork: true,

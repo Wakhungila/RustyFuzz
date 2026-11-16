@@ -1,46 +1,6 @@
 use crate::common::oracle::{VulnType, VulnerabilityOracle};
 use crate::common::types::{ChainState, Snapshot, Waypoint};
 use revm::primitives::{Address, B256, U256};
-use std::collections::HashMap;
-
-/// StaleViewOracle: Detects Read-only Reentrancy by identifying cases where
-/// a view function returns inconsistent values during a single execution sequence.
-pub struct StaleViewOracle;
-
-impl VulnerabilityOracle for StaleViewOracle {
-    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
-        let mut observed_outputs: HashMap<(Address, Vec<u8>), Vec<u8>> = HashMap::new();
-        let mut state_changed = false;
-
-        for waypoint in &after.waypoints {
-            match waypoint {
-                Waypoint::StorageWrite { .. } | Waypoint::TransientStorageWrite { .. } => {
-                    state_changed = true;
-                }
-                Waypoint::StaticCall {
-                    target,
-                    data,
-                    output,
-                    ..
-                } => {
-                    let key = (Address::from_slice(target.as_slice()), data.clone());
-                    if let Some(previous_output) = observed_outputs.get(&key) {
-                        if previous_output != output && state_changed {
-                            log::error!(
-                                "CRITICAL: Read-Only Reentrancy detected at target {}",
-                                key.0
-                            );
-                            return Some(VulnType::ReadOnlyReentrancy);
-                        }
-                    }
-                    observed_outputs.insert(key, output.clone());
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-}
 
 /// ReentrancyOracle: Detects state-change violations within reentrant call depths.
 pub struct ReentrancyOracle;
@@ -100,62 +60,6 @@ impl VulnerabilityOracle for PanicOracle {
                     }
                 }
             }
-        }
-        None
-    }
-}
-
-/// PrecisionLossOracle: Detects arithmetic rounding that leads to value leakage.
-pub struct PrecisionLossOracle;
-
-impl VulnerabilityOracle for PrecisionLossOracle {
-    fn check(&self, _before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
-        for waypoint in &after.waypoints {
-            if let Waypoint::Arithmetic {
-                op,
-                lhs,
-                rhs,
-                taint_source,
-                ..
-            } = waypoint
-            {
-                if (*op == 0x04 || *op == 0x05) && !rhs.is_zero() {
-                    let result = lhs.wrapping_div(*rhs);
-                    if taint_source.is_some() && result.is_zero() && !lhs.is_zero() {
-                        return Some(VulnType::PrecisionLossExploit);
-                    }
-                }
-            }
-        }
-        None
-    }
-}
-
-/// StateRootOracle: Detects massive unexpected state changes signaling a systemic exploit.
-pub struct StateRootOracle;
-
-impl VulnerabilityOracle for StateRootOracle {
-    fn check(&self, before: &Snapshot, after: &Snapshot) -> Option<VulnType> {
-        let state_before = before.state.read();
-        let state_after = after.state.read();
-
-        let (ChainState::Evm(db_before), ChainState::Evm(db_after)) =
-            (&*state_before, &*state_after);
-        let changed_accounts = db_after
-            .cache
-            .accounts
-            .iter()
-            .filter(|(addr, acc)| {
-                db_before
-                    .cache
-                    .accounts
-                    .get(*addr)
-                    .is_none_or(|prev| prev.info != acc.info)
-            })
-            .count();
-
-        if changed_accounts > 50 && db_before.cache.accounts.len() > 10 {
-            return Some(VulnType::SystemicStateCorruption);
         }
         None
     }

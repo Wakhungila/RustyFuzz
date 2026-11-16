@@ -130,7 +130,8 @@ pub const FUNCTION_AUDIT_JSON_SCHEMA: &str = r#"{
 mod tests {
     use super::*;
     use crate::satori::types::{
-        AttackStep, CandidateInvariant, FunctionAuditResult, ValidationStep, VulnerabilityHypothesis,
+        AttackStep, CandidateInvariant, FunctionAuditResult, ValidationStep,
+        VulnerabilityHypothesis,
     };
     use serde_json::Value;
     use std::collections::BTreeSet;

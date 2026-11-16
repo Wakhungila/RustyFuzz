@@ -90,6 +90,21 @@ pub enum Command {
         require_rpc_fork: bool,
         #[arg(long, default_value_t = false)]
         allow_synthetic_fallback: bool,
+        /// Deploy a reentrancy-attacker contract at campaign setup and probe
+        /// reentrancy-shaped call sequences during fuzzing. Off by default;
+        /// enables reentrancy-class bug discovery in campaign mode.
+        #[arg(long, default_value_t = false)]
+        attacker_harness: bool,
+        /// Path to an executable fixture JSON whose pre-deployed accounts + target
+        /// bytecode seed the fuzz campaign's CacheDB. Lets the fuzzer target
+        /// offline known-vulnerable fixtures without an RPC endpoint.
+        #[arg(long)]
+        fixture: Option<String>,
+        /// Compact the warm fork state into the Arc-shared ForkDb backend once,
+        /// then per-input clone the compacted CacheDB (empty cache + Arc).
+        /// Measured 278x throughput win at 50k cached slots.
+        #[arg(long, default_value_t = false)]
+        compact_fork_state: bool,
         #[arg(long)]
         abi: Option<String>,
         #[arg(long)]

@@ -59,6 +59,23 @@ pub struct StorageAssertion {
     pub slot: U256,
     pub value: U256,
 }
+/// A fixture decoded for fuzz-mode targeting: the target address plus all
+/// initial accounts with decoded bytecode and storage. Produced by
+/// `ExecutableFixture::load_for_fuzz`; consumed by
+/// `crate::evm::fork::create_in_memory_fork_db_from_fixture`.
+#[derive(Debug, Clone)]
+pub struct FuzzFixtureState {
+    pub target: Address,
+    pub accounts: Vec<FuzzFixtureAccount>,
+}
+#[derive(Debug, Clone)]
+pub struct FuzzFixtureAccount {
+    pub address: Address,
+    pub balance: U256,
+    pub nonce: u64,
+    pub bytecode: Vec<u8>,
+    pub storage: Vec<(U256, U256)>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FixtureTransaction {
@@ -113,6 +130,57 @@ impl ExecutableFixture {
         fixture.validate()?;
         Ok(fixture)
     }
+    /// Load a fixture for fuzz-mode targeting. Unlike `load`, this does NOT
+    /// require the `transactions` array (the fuzzer generates its own) or the
+    /// `expected_safe_behavior` field. It validates the account/target structure
+    /// and decodes bytecode + storage so the fuzz campaign's CacheDB can be
+    /// seeded directly. Used by `--fixture` on the `fuzz` command.
+    pub fn load_for_fuzz(path: &Path) -> Result<FuzzFixtureState> {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("read fuzz fixture {}", path.display()))?;
+        let fixture: Self = match path.extension().and_then(|v| v.to_str()) {
+            Some("json") => serde_json::from_str(&raw).context("parse fuzz fixture JSON")?,
+            Some("toml") => toml::from_str(&raw).context("parse fuzz fixture TOML")?,
+            _ => anyhow::bail!("fuzz fixture must be JSON or TOML"),
+        };
+        ensure!(
+            fixture.schema_version == 1,
+            "unsupported fuzz fixture schema_version"
+        );
+        let mut decoded: Vec<FuzzFixtureAccount> = Vec::with_capacity(fixture.accounts.len());
+        let mut seen = BTreeSet::new();
+        for account in &fixture.accounts {
+            ensure!(
+                seen.insert(account.address),
+                "duplicate fuzz fixture account"
+            );
+            let code = bytes(&account.runtime_bytecode).context("invalid runtime bytecode")?;
+            ensure!(
+                code.len() <= 24_576,
+                "runtime bytecode exceeds EIP-170 limit"
+            );
+            decoded.push(FuzzFixtureAccount {
+                address: account.address,
+                balance: account.balance,
+                nonce: account.nonce,
+                bytecode: code,
+                storage: account.storage.iter().map(|s| (s.slot, s.value)).collect(),
+            });
+        }
+        let target_account = decoded
+            .iter()
+            .find(|a| a.address == fixture.target)
+            .context("fuzz fixture target account missing")?;
+        ensure!(
+            !target_account.bytecode.is_empty(),
+            "fuzz fixture target has empty bytecode"
+        );
+        Ok(FuzzFixtureState {
+            target: fixture.target,
+            accounts: decoded,
+        })
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.schema_version == 1,

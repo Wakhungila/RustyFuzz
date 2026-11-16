@@ -73,6 +73,9 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             require_seed_bundle: false,
             require_rpc_fork: true,
             allow_synthetic_fallback: false,
+            attacker_harness: false,
+            fixture: None,
+            compact_fork_state: false,
             abi: None,
             max_execs,
             duration_secs: Some(duration_secs),
@@ -119,6 +122,9 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             require_seed_bundle,
             require_rpc_fork,
             allow_synthetic_fallback,
+            attacker_harness,
+            fixture,
+            compact_fork_state,
             abi,
             max_execs,
             duration_secs,
@@ -192,6 +198,20 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                         raw_target.unwrap_or("")
                     )
                 })?;
+            // If --fixture is set without --contract, derive the target from the
+            // fixture so the campaign knows which contract to fuzz.
+            let target_contract = if target_contract.is_none() {
+                if let Some(fixture_path) = fixture.as_deref() {
+                    let state = rusty_fuzz::engine::executable_fixture::ExecutableFixture::load_for_fuzz(
+                        std::path::Path::new(fixture_path),
+                    )?;
+                    Some(state.target)
+                } else {
+                    None
+                }
+            } else {
+                target_contract
+            };
             // Validate the invariant and its target before fork or campaign work.
             if let Some(path) = invariants.as_deref() {
                 let invariants_path = std::path::Path::new(path);
@@ -293,6 +313,9 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     .transpose()?,
                 mainnet_seed_bundle: config.mainnet_seed_bundle.clone(),
                 in_memory_bytecode: None,
+                attacker_harness,
+                fixture_path: fixture.clone(),
+                compact_fork_state,
                 cores,
                 require_seed_bundle: config.require_seed_bundle || require_seed_bundle,
                 require_rpc_fork: config.require_rpc_fork || require_rpc_fork,
@@ -324,6 +347,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     max_finding_noise,
                     poc_out,
                     promotion_limit,
+                    confirmation: Default::default(),
                 },
             };
             let run_layout = rustyfuzz_artifacts::RunLayout::new(
@@ -1054,6 +1078,9 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     foundry_harness: None,
                     mainnet_seed_bundle: seed_bundle.or(config.mainnet_seed_bundle.clone()),
                     in_memory_bytecode: None,
+                    attacker_harness: false,
+                    fixture_path: None,
+                    compact_fork_state: false,
                     cores: None,
                     require_seed_bundle: config.require_seed_bundle || require_seed_bundle,
                     require_rpc_fork: true,
@@ -1088,6 +1115,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                         max_finding_noise: Some(0),
                         poc_out: None,
                         promotion_limit: Some(8),
+                        confirmation: Default::default(),
                     },
                 };
                 rusty_fuzz::engine::fuzz_engine::run_fuzz_campaign(fuzz_config).await?;
@@ -1256,6 +1284,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 max_finding_noise,
                 poc_out,
                 promotion_limit: None,
+                confirmation: Default::default(),
             };
             let campaign_id_value =
                 campaign_id.unwrap_or_else(|| format!("manual-promote-{}", Uuid::new_v4()));
@@ -1269,6 +1298,10 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 rpc_url: &config.rpc_url,
                 synthetic_mode: false,
                 config: &promotion_config,
+                time_warp: rustyfuzz_evm::time_warp::TimeWarp::from_seconds(
+                    config.hardened_defi.time_warp_seconds,
+                    config.hardened_defi.time_warp_blocks,
+                ),
             })?;
             println!(
                 "Promoted finding {}: stage={:?}, confidence={}, replay={}, poc={}",
