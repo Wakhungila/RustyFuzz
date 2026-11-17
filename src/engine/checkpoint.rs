@@ -578,6 +578,7 @@ mod tests {
             in_memory_bytecode: Some(vec![0x60, 0x00]),
             attacker_harness: false,
             fixture_path: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,

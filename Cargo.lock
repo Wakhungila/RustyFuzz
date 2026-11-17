@@ -4753,6 +4753,7 @@ dependencies = [
  "anyhow",
  "bitvec",
  "hex",
+ "k256",
  "parking_lot",
  "reqwest",
  "revm",

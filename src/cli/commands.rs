@@ -100,6 +100,15 @@ pub enum Command {
         /// offline known-vulnerable fixtures without an RPC endpoint.
         #[arg(long)]
         fixture: Option<String>,
+        /// Foundry project root (the directory holding `out/` from `forge build`).
+        /// The test contract is deployed in memory, its `setUp()` runs with
+        /// Foundry cheatcodes, and its `invariant_*` functions are evaluated after
+        /// every fuzzed transaction. Mutually exclusive with `--fixture`.
+        #[arg(long, conflicts_with = "fixture")]
+        foundry_project: Option<std::path::PathBuf>,
+        /// Test contract to run when several contracts declare invariants.
+        #[arg(long, requires = "foundry_project")]
+        foundry_test: Option<String>,
         /// Compact the warm fork state into the Arc-shared ForkDb backend once,
         /// then per-input clone the compacted CacheDB (empty cache + Arc).
         /// Measured 278x throughput win at 50k cached slots.
