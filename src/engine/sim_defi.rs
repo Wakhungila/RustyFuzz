@@ -244,6 +244,71 @@ pub fn deploy_atomic_attacker(db: &mut Db, tokens: &[Address], credit: U256) -> 
     Ok((ATTACKER_ADDR, skipped))
 }
 
+/// What the mutator and the profit oracle need to know about the attacker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlashloanEnv {
+    pub attacker: Address,
+    /// Tokens the attacker borrows and must repay; `Address::ZERO` is ETH.
+    pub tokens: Vec<Address>,
+    /// Fee charged on the opening balance (Aave V2 charges 9 bps).
+    pub fee_bps: u64,
+}
+
+pub const DEFAULT_FEE_BPS: u64 = 9;
+
+/// Installs the attacker with virtual ETH plus a virtual balance of every
+/// ERC-20-shaped contract found in `db` whose balance mapping can be probed.
+pub fn setup_flashloan(db: &mut Db, fee_bps: u64) -> Result<FlashloanEnv> {
+    let credit = U256::from(DEFAULT_CREDIT);
+    let erc20s = discover_tokens(db);
+    let (attacker, skipped) = deploy_atomic_attacker(db, &erc20s, credit)?;
+    let mut tokens = vec![Address::ZERO];
+    tokens.extend(erc20s.into_iter().filter(|t| !skipped.contains(t)));
+    Ok(FlashloanEnv { attacker, tokens, fee_bps })
+}
+
+/// Attacker balances of `tokens` (`Address::ZERO` = ETH) in `db`, measured on a
+/// throwaway copy so the live sequence state is untouched.
+pub fn attacker_balances(db: &Db, tokens: &[Address]) -> Vec<U256> {
+    let mut copy = db.clone();
+    tokens
+        .iter()
+        .map(|token| {
+            if token.is_zero() {
+                copy.cache.accounts.get(&ATTACKER_ADDR).map(|a| a.info.balance).unwrap_or_default()
+            } else {
+                balance_of(&mut copy, *token, ATTACKER_ADDR).unwrap_or_default()
+            }
+        })
+        .collect()
+}
+
+/// Human-readable evidence for a successful `run`: per-token net gain after
+/// repaying the fee (`closing - opening - fee`, from before/after balances).
+pub fn profit_summary(env: &FlashloanEnv, before: &[U256], after: &[U256]) -> String {
+    let parts: Vec<String> = env
+        .tokens
+        .iter()
+        .zip(before.iter().zip(after.iter()))
+        .filter(|(_, (b, a))| *a > *b)
+        .map(|(token, (b, a))| {
+            let fee = *b * U256::from(env.fee_bps) / U256::from(10_000u64);
+            let name = if token.is_zero() { "ETH".to_string() } else { format!("{token}") };
+            format!("{name}: +{} (opening {b}, closing {a}, fee {fee})", *a - *b - fee.min(*a - *b))
+        })
+        .collect();
+    format!(
+        "atomic flash-loan sequence repaid every borrowed token plus {} bps and netted a profit: {}",
+        env.fee_bps,
+        if parts.is_empty() { "balance deltas unavailable".to_string() } else { parts.join("; ") }
+    )
+}
+
+/// True when `input` is a call to `AtomicAttacker.run`.
+pub fn is_run_call(input: &[u8]) -> bool {
+    input.len() >= 4 && input[..4] == selector(RUN_SIGNATURE)
+}
+
 /// Parses `Profit(address indexed token, uint256 opening, uint256 closing, uint256 fee)`
 /// logs emitted by the attacker: `(token, opening, closing, fee)`.
 pub fn parse_profit_logs(result: &ExecutionResult) -> Vec<(Address, U256, U256, U256)> {

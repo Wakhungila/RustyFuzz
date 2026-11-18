@@ -1242,6 +1242,29 @@ async fn run_fuzz_campaign_with_cancellation_inner(
             .map_err(|e| anyhow::anyhow!("attacker harness deploy failed: {e}"))?;
         log::info!(target: "rustyfuzz.attacker", "reentrancy attacker harness deployed at campaign setup");
     }
+    // Real atomic flash-loan attacker (virtual balances, repay+fee+profit gate).
+    let flashloan_env = if config.attacker_harness {
+        let env = crate::engine::sim_defi::setup_flashloan(
+            &mut initial_db,
+            crate::engine::sim_defi::DEFAULT_FEE_BPS,
+        )
+        .map_err(|e| anyhow::anyhow!("flash-loan attacker setup failed: {e}"))?;
+        log::info!(
+            target: "rustyfuzz.attacker",
+            "atomic flash-loan attacker at {} with virtual balances in {} token(s) (ETH + {} ERC-20)",
+            env.attacker,
+            env.tokens.len(),
+            env.tokens.len() - 1
+        );
+        Some(env)
+    } else {
+        None
+    };
+    let _ = &flashloan_env;
+    let amm_pools: Vec<Address> = {
+        let mut probe_db = initial_db.clone();
+        crate::engine::amm_probe::discover_pools(&mut probe_db, &initial_env)
+    };
     let fork_setup_status = if synthetic_fork_mode {
         "synthetic"
     } else {
@@ -1377,6 +1400,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
             launcher_fallback_env,
             launcher_fallback_actor_set,
             launcher_fallback_synthetic_fork_mode,
+            flashloan_env.clone(),
             fork_setup_status,
             target_bytecode_loaded,
             InitialBytecode {
@@ -1865,6 +1889,9 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     testcase_metadata_store.clone(),
                 )
                     .with_attacker_harness(config.attacker_harness)
+                    .with_flashloan_env(flashloan_env.clone())
+                    .with_abi_target(config.target_contract)
+                    .with_value_dictionary(crate::evm::fuzz::value_dictionary_from_state(&initial_db, 96))
                     .with_caller_pool(config
                         .foundry_bootstrap
                         .as_ref()
@@ -1977,6 +2004,8 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         usize,
                         crate::engine::foundry_project::FoundryInvariantViolation,
                     )> = None;
+                    let mut flashloan_hit: Option<(usize, String)> = None;
+        let mut kinv_hit: Option<(usize, Address, String)> = None;
                     *dataflow_registry.write() = DataflowRegistry::new();
 
                     for (tx_idx, tx) in input.txs.iter().enumerate() {
@@ -1987,6 +2016,24 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         let mut current_env = initial_env.clone();
                         time_warp.apply(&mut current_env, tx_idx);
                         let mut waypoints = Vec::new();
+                        let amm_before: Vec<(Address, Vec<u8>)> = if !amm_pools.is_empty()
+                            && crate::engine::amm_probe::tx_mentions_v2_swap(&tx.input)
+                        {
+                            let ChainState::Evm(db) = &mut current_state;
+                            amm_pools
+                                .iter()
+                                .filter_map(|pool| crate::engine::amm_probe::probe_reserves(db, &current_env, *pool).map(|out| (*pool, out)))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let flashloan_before = flashloan_env
+                            .as_ref()
+                            .filter(|env| tx.to == env.attacker && crate::engine::sim_defi::is_run_call(&tx.input))
+                            .map(|env| {
+                                let ChainState::Evm(db) = &current_state;
+                                crate::engine::sim_defi::attacker_balances(db, &env.tokens)
+                            });
                         let mut df = dataflow_registry.write();
 
                         let exec_result = ForkDb::with_thread_rpc_budget(
@@ -2057,6 +2104,19 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         // Foundry invariants: only the first violation per sequence is
                         // kept, and a probe that cannot run is an infrastructure error,
                         // never a finding.
+                        if log::log_enabled!(target: "rustyfuzz.trace", log::Level::Debug) {
+                            let word = |n: usize| tx.input.get(4 + 32 * n..36 + 32 * n).map(|w| revm::primitives::U256::from_be_slice(w).to_string()).unwrap_or_default();
+                            log::debug!(target: "rustyfuzz.trace", "to={} caller={} sel={} w0={} w1={} status={:?}", tx.to, tx.caller, hex::encode(tx.input.get(..4).unwrap_or(&[])), word(0), word(1), result.status);
+                        }
+                        if let (Some(env), Some(before)) = (flashloan_env.as_ref(), flashloan_before.as_ref()) {
+                            // `run` reverts unless every borrowed token is repaid with the fee
+                            // and one ended strictly ahead, so success IS the proof of profit.
+                            if flashloan_hit.is_none() && matches!(result.status, rustyfuzz_core::execution::ExecutionStatus::Success) {
+                                let ChainState::Evm(db) = &current_state;
+                                let after = crate::engine::sim_defi::attacker_balances(db, &env.tokens);
+                                flashloan_hit = Some((tx_idx, crate::engine::sim_defi::profit_summary(env, before, &after)));
+                            }
+                        }
                         if foundry_violation.is_none() {
                             if let Some(set) = foundry_invariants.as_deref() {
                                 let ChainState::Evm(probe_db) = &mut current_state;
@@ -2076,6 +2136,40 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                                     }
                                 }
                             }
+                        }
+
+                        let mut result = result;
+
+                        if !amm_before.is_empty() {
+
+                            let reads = amm_before
+
+                                .iter()
+
+                                .map(|(pool, pre)| {
+
+                                    let ChainState::Evm(db) = &mut current_state;
+
+                                    (*pool, pre.clone(), crate::engine::amm_probe::probe_reserves(db, &current_env, *pool))
+
+                                })
+
+                                .collect();
+                if matches!(result.status, rustyfuzz_core::execution::ExecutionStatus::Success) && kinv_hit.is_none() {
+                    let reads_ref: &Vec<(Address, Vec<u8>, Option<Vec<u8>>)> = &reads;
+                    for (pool, pre, post) in reads_ref {
+                        log::debug!(target: "rustyfuzz.trace", "amm pool={pool} pre={} post={:?}", alloy_primitives::hex::encode(pre), post.as_ref().map(alloy_primitives::hex::encode));
+                        if let Some(post) = post {
+                            if let Some((kb, ka)) = crate::engine::amm_probe::k_regression(pre, post) {
+                                kinv_hit = Some((tx_idx, *pool, format!("V2 K-invariant violated by swap in tx {tx_idx}: reserve product {kb} -> {ka} (pool {pool}); a swap must never reduce k")));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                            crate::engine::amm_probe::bracket_trace(&mut result.call_trace, tx_idx, reads);
+
                         }
 
                         tx_results.push(result);
@@ -2141,6 +2235,26 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             tx_index: Some(violation.tx_index),
                             target: Some(target),
                             evidence: violation.evidence.summary_line(),
+                        });
+                    }
+                    if let Some((tx_index, pool, evidence)) = kinv_hit.take() {
+                        findings.push(crate::common::oracle::ProtocolFinding {
+                            pack: crate::common::oracle::ProtocolOraclePackKind::Amm,
+                            vuln: crate::common::oracle::VulnType::InvariantViolation("v2_k_invariant".to_string()),
+                            severity: crate::common::oracle::ProtocolSeverity::High,
+                            tx_index: Some(tx_index),
+                            target: Some(pool),
+                            evidence,
+                        });
+                    }
+                    if let Some((tx_index, evidence)) = flashloan_hit.take() {
+                        findings.push(crate::common::oracle::ProtocolFinding {
+                            pack: crate::common::oracle::ProtocolOraclePackKind::Amm,
+                            vuln: crate::common::oracle::VulnType::FlashLoanProfit,
+                            severity: crate::common::oracle::ProtocolSeverity::High,
+                            tx_index: Some(tx_index),
+                            target: Some(target_contract),
+                            evidence,
                         });
                     }
                     if let Some((tx_index, violation)) = foundry_violation.take() {
@@ -2361,7 +2475,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             config.artifact_limit
                         );
                     } else if let Some(reason) = campaign_artifact_reason(
-                        synthetic_fork_mode && config.foundry_bootstrap.is_none(),
+                        synthetic_fork_mode && config.foundry_bootstrap.is_none() && config.fixture_path.is_none(),
                         &campaign_score,
                         &findings,
                         exploit_candidate.as_ref(),
@@ -2572,6 +2686,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     launcher_fallback_env,
                     launcher_fallback_actor_set,
                     launcher_fallback_synthetic_fork_mode,
+                    flashloan_env.clone(),
                     fork_setup_status,
                     target_bytecode_loaded,
                     InitialBytecode {
@@ -2639,6 +2754,7 @@ async fn run_single_process_campaign(
     initial_env: revm::context::BlockEnv,
     hardened_actor_set: Option<ActorSet>,
     synthetic_fork_mode: bool,
+    flashloan_env: Option<crate::engine::sim_defi::FlashloanEnv>,
     fork_setup_status: &'static str,
     target_bytecode_loaded: bool,
     bytecode: InitialBytecode,
@@ -2655,6 +2771,13 @@ async fn run_single_process_campaign(
     } = bytecode;
     anyhow::ensure!(checkpoint_session.is_none() || synthetic_fork_mode,
         "live-RPC checkpointing is not implemented; refusing to checkpoint an online fork as offline");
+    let amm_pools: Vec<Address> = {
+        let mut probe_db = initial_db.clone();
+        crate::engine::amm_probe::discover_pools(&mut probe_db, &initial_env)
+    };
+    if !amm_pools.is_empty() {
+        log::info!("engine reserve probes active for {} V2-style pool(s): {:?}", amm_pools.len(), amm_pools);
+    }
     let start_time = Instant::now();
     let execution_timeout = campaign_execution_timeout();
     // Deterministic per-transaction time advance, derived from configuration so
@@ -3135,6 +3258,9 @@ async fn run_single_process_campaign(
         testcase_metadata_store.clone(),
     )
     .with_attacker_harness(config.attacker_harness)
+    .with_flashloan_env(flashloan_env.clone())
+                    .with_abi_target(config.target_contract)
+                    .with_value_dictionary(crate::evm::fuzz::value_dictionary_from_state(&initial_db, 96))
     .with_caller_pool(config
                         .foundry_bootstrap
                         .as_ref()
@@ -3222,6 +3348,8 @@ async fn run_single_process_campaign(
             usize,
             crate::engine::foundry_project::FoundryInvariantViolation,
         )> = None;
+        let mut flashloan_hit: Option<(usize, String)> = None;
+        let mut kinv_hit: Option<(usize, Address, String)> = None;
         *dataflow_registry.write() = DataflowRegistry::new();
 
         for (tx_idx, tx) in input.txs.iter().enumerate() {
@@ -3229,6 +3357,24 @@ async fn run_single_process_campaign(
             let mut current_env = initial_env.clone();
             time_warp.apply(&mut current_env, tx_idx);
             let mut waypoints = Vec::new();
+            let amm_before: Vec<(Address, Vec<u8>)> = if !amm_pools.is_empty()
+                && crate::engine::amm_probe::tx_mentions_v2_swap(&tx.input)
+            {
+                let ChainState::Evm(db) = &mut current_state;
+                amm_pools
+                    .iter()
+                    .filter_map(|pool| crate::engine::amm_probe::probe_reserves(db, &current_env, *pool).map(|out| (*pool, out)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let flashloan_before = flashloan_env
+                .as_ref()
+                .filter(|env| tx.to == env.attacker && crate::engine::sim_defi::is_run_call(&tx.input))
+                .map(|env| {
+                    let ChainState::Evm(db) = &current_state;
+                    crate::engine::sim_defi::attacker_balances(db, &env.tokens)
+                });
             let mut df = dataflow_registry.write();
             let exec_result = ForkDb::with_thread_rpc_budget(
                 Some(execution_rpc_budget()),
@@ -3290,6 +3436,32 @@ async fn run_single_process_campaign(
                 );
             }
 
+            if log::log_enabled!(target: "rustyfuzz.trace", log::Level::Debug) {
+
+                let word = |n: usize| tx.input.get(4 + 32 * n..36 + 32 * n).map(|w| revm::primitives::U256::from_be_slice(w).to_string()).unwrap_or_default();
+
+                log::debug!(target: "rustyfuzz.trace", "to={} caller={} sel={} w0={} w1={} status={:?}", tx.to, tx.caller, hex::encode(tx.input.get(..4).unwrap_or(&[])), word(0), word(1), result.status);
+
+            }
+
+            if let (Some(env), Some(before)) = (flashloan_env.as_ref(), flashloan_before.as_ref()) {
+
+                // `run` reverts unless every borrowed token is repaid with the fee
+
+                // and one ended strictly ahead, so success IS the proof of profit.
+
+                if flashloan_hit.is_none() && matches!(result.status, rustyfuzz_core::execution::ExecutionStatus::Success) {
+
+                    let ChainState::Evm(db) = &current_state;
+
+                    let after = crate::engine::sim_defi::attacker_balances(db, &env.tokens);
+
+                    flashloan_hit = Some((tx_idx, crate::engine::sim_defi::profit_summary(env, before, &after)));
+
+                }
+
+            }
+
             if foundry_violation.is_none() {
                 if let Some(set) = foundry_invariants.as_deref() {
                     let ChainState::Evm(probe_db) = &mut current_state;
@@ -3310,6 +3482,40 @@ async fn run_single_process_campaign(
                         }
                     }
                 }
+            }
+
+            let mut result = result;
+
+            if !amm_before.is_empty() {
+
+                let reads = amm_before
+
+                    .iter()
+
+                    .map(|(pool, pre)| {
+
+                        let ChainState::Evm(db) = &mut current_state;
+
+                        (*pool, pre.clone(), crate::engine::amm_probe::probe_reserves(db, &current_env, *pool))
+
+                    })
+
+                    .collect();
+                if matches!(result.status, rustyfuzz_core::execution::ExecutionStatus::Success) && kinv_hit.is_none() {
+                    let reads_ref: &Vec<(Address, Vec<u8>, Option<Vec<u8>>)> = &reads;
+                    for (pool, pre, post) in reads_ref {
+                        log::debug!(target: "rustyfuzz.trace", "amm pool={pool} pre={} post={:?}", alloy_primitives::hex::encode(pre), post.as_ref().map(alloy_primitives::hex::encode));
+                        if let Some(post) = post {
+                            if let Some((kb, ka)) = crate::engine::amm_probe::k_regression(pre, post) {
+                                kinv_hit = Some((tx_idx, *pool, format!("V2 K-invariant violated by swap in tx {tx_idx}: reserve product {kb} -> {ka} (pool {pool}); a swap must never reduce k")));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                crate::engine::amm_probe::bracket_trace(&mut result.call_trace, tx_idx, reads);
+
             }
 
             tx_results.push(result);
@@ -3362,6 +3568,26 @@ async fn run_single_process_campaign(
                 tx_index: Some(violation.tx_index),
                 target: Some(target_contract),
                 evidence: violation.evidence.summary_line(),
+            });
+        }
+        if let Some((tx_index, pool, evidence)) = kinv_hit.take() {
+            findings.push(crate::common::oracle::ProtocolFinding {
+                pack: crate::common::oracle::ProtocolOraclePackKind::Amm,
+                vuln: crate::common::oracle::VulnType::InvariantViolation("v2_k_invariant".to_string()),
+                severity: crate::common::oracle::ProtocolSeverity::High,
+                tx_index: Some(tx_index),
+                target: Some(pool),
+                evidence,
+            });
+        }
+        if let Some((tx_index, evidence)) = flashloan_hit.take() {
+            findings.push(crate::common::oracle::ProtocolFinding {
+                pack: crate::common::oracle::ProtocolOraclePackKind::Amm,
+                vuln: crate::common::oracle::VulnType::FlashLoanProfit,
+                severity: crate::common::oracle::ProtocolSeverity::High,
+                tx_index: Some(tx_index),
+                target: Some(target_contract),
+                evidence,
             });
         }
         if let Some((tx_index, violation)) = foundry_violation.take() {
@@ -3533,7 +3759,7 @@ async fn run_single_process_campaign(
                 config.artifact_limit
             );
         } else if let Some(reason) = campaign_artifact_reason(
-            synthetic_fork_mode && config.foundry_bootstrap.is_none(),
+            synthetic_fork_mode && config.foundry_bootstrap.is_none() && config.fixture_path.is_none(),
             &campaign_score,
             &findings,
             exploit_candidate.as_ref(),

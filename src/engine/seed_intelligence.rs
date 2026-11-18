@@ -688,7 +688,7 @@ fn encode_default_call(
         .map(|(idx, ty)| default_sol_value(ty, idx, caller, target))
         .collect();
     let mut calldata = selector.to_vec();
-    calldata.extend_from_slice(&DynSolValue::Tuple(values).abi_encode());
+    calldata.extend_from_slice(&DynSolValue::Tuple(values).abi_encode_params());
     calldata
 }
 

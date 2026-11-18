@@ -2,7 +2,6 @@ use crate::common::types::SingletonTx;
 use crate::engine::concolic::{
     ConcolicHint, ConcolicHintStats, ConcolicRepairTarget, ConcolicSolver,
 };
-use crate::engine::flashloan::{FlashLoanTemplate, EIP3156_FLASHLOAN_SELECTOR};
 use crate::evm::registry::GlobalAccountRegistry;
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use hashlink::LruCache;
@@ -75,6 +74,13 @@ pub struct EvmMutator {
     /// used). `caller_mutation` samples these alongside the default role so
     /// state owned by a specific account (deposits, allowances) is reachable.
     caller_pool: Vec<Address>,
+    /// Real atomic-attacker setup; `wrap_flashloan` is a no-op without it.
+    flashloan: Option<crate::engine::sim_defi::FlashloanEnv>,
+    /// Magnitudes that matter in the target's own state (reserves, balances,
+    /// supplies). `uint` arguments are drawn from these, their fractions and
+    /// +-1, so a call can hit "just under the reserve" instead of 1e24.
+    value_dictionary: Vec<U256>,
+    abi_target: Option<Address>,
 }
 
 /// Named mutation strategy buckets (attempt order fixed by probability table).
@@ -228,6 +234,9 @@ impl EvmMutator {
             snapshot_corpus: None,
             attacker_harness_enabled: false,
             caller_pool: Vec::new(),
+            flashloan: None,
+            value_dictionary: Vec::new(),
+            abi_target: None,
         }
     }
 
@@ -262,11 +271,30 @@ impl EvmMutator {
             snapshot_corpus: None,
             attacker_harness_enabled: false,
             caller_pool: Vec::new(),
+            flashloan: None,
+            value_dictionary: Vec::new(),
+            abi_target: None,
         }
     }
 
     /// Enable the ReentrancyProbe mutator (the attacker contract is deployed
     /// at campaign setup via `--attacker-harness`).
+    pub fn with_flashloan_env(mut self, env: Option<crate::engine::sim_defi::FlashloanEnv>) -> Self {
+        self.flashloan = env;
+        self
+    }
+
+    /// The contract the registered ABI describes; ABI-driven calldata is sent there.
+    pub fn with_abi_target(mut self, target: Option<Address>) -> Self {
+        self.abi_target = target.filter(|a| *a != Address::ZERO);
+        self
+    }
+
+    pub fn with_value_dictionary(mut self, values: Vec<U256>) -> Self {
+        self.value_dictionary = values;
+        self
+    }
+
     pub fn with_caller_pool(mut self, callers: Vec<Address>) -> Self {
         self.caller_pool = callers;
         self
@@ -518,7 +546,7 @@ impl EvmMutator {
             rand.below(NonZero::new(input.txs.len() + 1).unwrap())
         };
         let new_tx = SingletonTx {
-            input: self.encode_default_call(selector, types),
+            input: self.encode_default_call(selector, types, rand),
             caller,
             to: target,
             value: self.default_call_value(types, rand),
@@ -566,7 +594,7 @@ impl EvmMutator {
         };
 
         let new_tx = SingletonTx {
-            input: self.encode_default_call(selector, types),
+            input: self.encode_default_call(selector, types, rand),
             caller,
             to: target,
             value: U256::ZERO,
@@ -656,6 +684,14 @@ impl EvmMutator {
             return self.retarget_tx_to_known_abi(rand, input, metadata, idx);
         }
 
+        if self.abi_registry.functions.contains_key(&selector) {
+            if let Some(target) = self.abi_target {
+                if input.txs[idx].to != target && rand.below(NonZero::new(100).unwrap()) < 60 {
+                    input.txs[idx].to = target;
+                }
+            }
+        }
+
         // Drop the read guard before filling a cache miss under the write lock.
         let cached_type = { self.type_cache.read().get(&selector).cloned() };
         let tuple_type = cached_type.or_else(|| {
@@ -675,7 +711,7 @@ impl EvmMutator {
         let mut cache = self.decode_cache.write();
         let mut decoded = cache.get(calldata).cloned();
         if decoded.is_none() {
-            if let Ok(value) = tuple_type.abi_decode(calldata) {
+            if let Ok(value) = tuple_type.abi_decode_params(calldata) {
                 cache.insert(calldata.to_vec(), value.clone());
                 decoded = Some(value);
             }
@@ -685,7 +721,7 @@ impl EvmMutator {
         if let Some(mut value) = decoded {
             self.mutate_sol_value(&mut value, rand);
             let mut new_input = selector.to_vec();
-            let encoded = value.abi_encode();
+            let encoded = value.abi_encode_params();
             new_input.extend_from_slice(&encoded);
             input.txs[idx].input = new_input;
             self.record_mutation(
@@ -703,7 +739,7 @@ impl EvmMutator {
 
     fn wrap_flashloan<R: Rand>(
         &self,
-        rand: &mut R,
+        _rand: &mut R,
         input: &mut EvmInput,
         metadata: &mut EvmTestcaseMetadata,
     ) -> MutationResult {
@@ -711,45 +747,43 @@ impl EvmMutator {
             return MutationResult::Skipped;
         }
 
-        // Enforce maximum sequence length (flashloan wrap adds transactions)
-        // Estimate: flashloan typically adds 2-3 transactions (borrow, execute, repay)
-        if !self.can_add_transactions(input, 3) {
+        // Real atomic attacker: the whole sequence becomes one `run(...)` call
+        // that borrows (virtual balance), executes every original call from the
+        // attacker, then reverts unless every borrowed token is returned with
+        // the fee and at least one ended ahead. No attacker deployed (e.g. no
+        // --attacker-harness) means there is nothing real to wrap with.
+        let Some(env) = self.flashloan.as_ref() else {
             return MutationResult::Skipped;
-        }
-
-        let registry = self.account_registry.read();
-        let lender = match registry.random_contract(rand) {
-            Some(l) => l,
-            None => return MutationResult::Skipped,
         };
-
-        let template = FlashLoanTemplate {
-            lender,
-            receiver: Address::new([0x18; 20]),
-            token: Address::new([0x17; 20]),
-            amount: U256::from(10u128.pow(21)),
-        };
-        *input = template.wrap_sequence(input.clone());
+        use crate::engine::sim_defi::{encode_run, AttackCall};
+        let calls: Vec<AttackCall> = input
+            .txs
+            .iter()
+            .map(|tx| AttackCall {
+                target: tx.to,
+                value: tx.value,
+                data: tx.input.clone(),
+                // Optional so one reverting step doesn't hide the rest of the
+                // path; the profit gate still decides whether it counts.
+                optional: true,
+            })
+            .collect();
+        let caller = input.txs[0].caller;
+        input.txs = vec![crate::common::types::SingletonTx {
+            input: encode_run(&env.tokens, env.fee_bps, &calls),
+            caller,
+            to: env.attacker,
+            value: U256::ZERO,
+            is_victim: false,
+        }];
         self.record_mutation(
             metadata,
-            "flashloan_template",
+            "flashloan_atomic_attacker",
             Some(0),
-            Some(EIP3156_FLASHLOAN_SELECTOR),
-            "borrow->manipulate->exploit->repay wrapper with net-profit validation target",
+            Some(crate::engine::sim_defi::selector(crate::engine::sim_defi::RUN_SIGNATURE)),
+            "atomic attacker: borrow -> original calls -> repay+fee -> require profit",
         );
 
-        // Validate the wrapped sequence doesn't exceed limit
-        if input.txs.len() > MAX_SEQUENCE_LENGTH {
-            return MutationResult::Skipped;
-        }
-
-        self.record_mutation(
-            metadata,
-            "flashloan_wrap",
-            Some(0),
-            Some(EIP3156_FLASHLOAN_SELECTOR),
-            "wrapped sequence in EIP-3156-style flashloan call",
-        );
         MutationResult::Mutated
     }
 
@@ -992,8 +1026,11 @@ impl EvmMutator {
             Some(types) => types,
             None => return MutationResult::Skipped,
         };
-        input.txs[idx].input = self.encode_default_call(selector, types);
+        input.txs[idx].input = self.encode_default_call(selector, types, rand);
         input.txs[idx].value = self.default_call_value(types, rand);
+        if let Some(target) = self.abi_target {
+            input.txs[idx].to = target;
+        }
         self.record_mutation(
             metadata,
             "abi_retarget",
@@ -1004,13 +1041,13 @@ impl EvmMutator {
         MutationResult::Mutated
     }
 
-    fn encode_default_call(&self, selector: [u8; 4], types: &[DynSolType]) -> Vec<u8> {
+    fn encode_default_call<R: Rand>(&self, selector: [u8; 4], types: &[DynSolType], rand: &mut R) -> Vec<u8> {
         let values: Vec<_> = types
             .iter()
-            .map(|ty| self.generate_default_sol_value(ty))
+            .map(|ty| self.generate_seed_sol_value(ty, rand))
             .collect();
         let mut calldata = selector.to_vec();
-        calldata.extend_from_slice(&DynSolValue::Tuple(values).abi_encode());
+        calldata.extend_from_slice(&DynSolValue::Tuple(values).abi_encode_params());
         calldata
     }
 
@@ -1075,27 +1112,67 @@ impl EvmMutator {
                     self.mutate_sol_value(&mut vals[idx], rand);
                 }
             }
-            DynSolValue::Uint(val, _) => {
-                // High-fidelity boundary constants for DeFi logic
-                let choices = [
-                    U256::MAX,
-                    U256::ZERO,
-                    U256::from(1),
-                    U256::from(10u128.pow(18)), // 1e18 (Standard WAD)
-                    U256::from(10u128.pow(6)),  // 1e6 (Standard USDC)
-                    val.wrapping_add(U256::from(1)),
-                    val.wrapping_sub(U256::from(1)),
-                ];
-                *val = choices[rand.below(NonZero::new(choices.len()).unwrap())];
+            DynSolValue::Uint(val, bits) => {
+                let max_for_bits = if *bits >= 256 {
+                    U256::MAX
+                } else {
+                    (U256::from(1u8) << *bits) - U256::from(1u8)
+                };
+                let pick = rand.below(NonZero::new(100).unwrap());
+                let next = if pick < 40 && !self.value_dictionary.is_empty() {
+                    // A magnitude from the target's own state, or a fraction of it.
+                    let base = self.value_dictionary
+                        [rand.below(NonZero::new(self.value_dictionary.len()).unwrap())];
+                    match rand.below(NonZero::new(7).unwrap()) {
+                        0 => base,
+                        1 => base.saturating_sub(U256::from(1u8)),
+                        2 => base.saturating_add(U256::from(1u8)),
+                        3 => base / U256::from(2u8),
+                        4 => base / U256::from(10u8),
+                        5 => base / U256::from(100u8),
+                        _ => base / U256::from(1000u16),
+                    }
+                } else if pick < 55 {
+                    U256::from(1 + rand.below(NonZero::new(100).unwrap()))
+                } else if pick < 70 {
+                    U256::from(10u8).pow(U256::from(rand.below(NonZero::new(31).unwrap())))
+                } else {
+                    // High-fidelity boundary constants for DeFi logic
+                    let choices = [
+                        U256::MAX,
+                        U256::ZERO,
+                        U256::from(1),
+                        U256::from(10u128.pow(18)), // 1e18 (Standard WAD)
+                        U256::from(10u128.pow(6)),  // 1e6 (Standard USDC)
+                        val.wrapping_add(U256::from(1)),
+                        val.wrapping_sub(U256::from(1)),
+                    ];
+                    choices[rand.below(NonZero::new(choices.len()).unwrap())]
+                };
+                *val = next.min(max_for_bits);
             }
             DynSolValue::Address(addr) => {
-                *addr = Address::new([0x1a; 20]);
+                // Known accounts (setUp actors, attacker) plus the legacy constant.
+                let n = self.caller_pool.len() + 1;
+                let pick = rand.below(NonZero::new(n).unwrap());
+                *addr = self
+                    .caller_pool
+                    .get(pick)
+                    .copied()
+                    .unwrap_or_else(|| Address::new([0x1a; 20]));
             }
             DynSolValue::Bool(b) => {
                 *b = !*b;
             }
             DynSolValue::Bytes(b) => {
-                if !b.is_empty() {
+                // Length matters: many entry points require empty `data` (no callback).
+                let roll = rand.below(NonZero::new(100).unwrap());
+                if roll < 35 {
+                    b.clear();
+                } else if roll < 55 {
+                    let n = 1 + rand.below(NonZero::new(96).unwrap());
+                    b.resize(n, 0);
+                } else if !b.is_empty() {
                     let idx = rand.below(NonZero::new(b.len()).unwrap());
                     b[idx] = rand.next() as u8;
                 }
@@ -1109,6 +1186,37 @@ impl EvmMutator {
     }
 
     /// Generates a sensible default value for a given Solidity type to aid in sequence growth.
+    /// Like the zero default, but half the time draws a nonzero amount / real
+    /// address so a freshly retargeted call has a chance to get past input checks.
+    fn generate_seed_sol_value<R: Rand>(&self, ty: &DynSolType, rand: &mut R) -> DynSolValue {
+        let roll = rand.below(NonZero::new(100).unwrap());
+        match ty {
+            DynSolType::Uint(size) if roll < 55 => {
+                let v = if !self.value_dictionary.is_empty() && roll < 20 {
+                    self.value_dictionary[rand.below(NonZero::new(self.value_dictionary.len()).unwrap())]
+                } else {
+                    U256::from(10u64).pow(U256::from(rand.below(NonZero::new(19).unwrap()) as u64))
+                };
+                let v = if *size < 256 { v & ((U256::from(1u8) << *size) - U256::from(1u8)) } else { v };
+                DynSolValue::Uint(v, *size)
+            }
+            DynSolType::Address if roll < 70 => {
+                let pick = self.caller_pool.len();
+                let a = if pick > 0 {
+                    self.caller_pool[rand.below(NonZero::new(pick).unwrap())]
+                } else {
+                    Address::new([0x15; 20])
+                };
+                DynSolValue::Address(a)
+            }
+            DynSolType::Bytes if roll < 60 => DynSolValue::Bytes(Vec::new()),
+            DynSolType::Tuple(inner) => DynSolValue::Tuple(
+                inner.iter().map(|t| self.generate_seed_sol_value(t, rand)).collect(),
+            ),
+            _ => self.generate_default_sol_value(ty),
+        }
+    }
+
     fn generate_default_sol_value(&self, ty: &DynSolType) -> DynSolValue {
         match ty {
             DynSolType::Uint(size) => DynSolValue::Uint(U256::ZERO, *size),
@@ -1289,6 +1397,21 @@ fn align_abi_word(value: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calldata_encoding_has_no_tuple_offset_word_for_dynamic_args() {
+        // Regression: Tuple::abi_encode() prepends a 0x20 offset for dynamic
+        // tuples, corrupting calldata. Calldata must be params-encoded.
+        let ty = DynSolType::Tuple(vec![DynSolType::Uint(256), DynSolType::Bytes]);
+        let v = DynSolValue::Tuple(vec![
+            DynSolValue::Uint(U256::from(7u64), 256),
+            DynSolValue::Bytes(vec![1, 2, 3]),
+        ]);
+        let enc = v.abi_encode_params();
+        assert_eq!(U256::from_be_slice(&enc[..32]), U256::from(7u64));
+        let back = ty.abi_decode_params(&enc).expect("params decode");
+        assert_eq!(back, v);
+    }
     use crate::common::types::{
         CallKind, CallPhase, ComparisonOperand, SymbolicExpression, TaintSource, Waypoint,
     };
@@ -1889,4 +2012,32 @@ mod tests {
             U256::from(10u128.pow(21))
         );
     }
+}
+
+/// Magnitudes worth feeding `uint` arguments: non-trivial storage words and
+/// balances found in `db`, deduplicated and thinned to at most `limit`
+/// values spread across the range.
+pub fn value_dictionary_from_state(
+    db: &revm::database::CacheDB<rustyfuzz_evm::fork_db::ForkDb>,
+    limit: usize,
+) -> Vec<U256> {
+    let ceiling = U256::from(1u8) << 128;
+    let mut values: Vec<U256> = Vec::new();
+    for account in db.cache.accounts.values() {
+        if account.info.balance > U256::ZERO && account.info.balance < ceiling {
+            values.push(account.info.balance);
+        }
+        for value in account.storage.values() {
+            if *value > U256::from(1u8) && *value < ceiling {
+                values.push(*value);
+            }
+        }
+    }
+    values.sort();
+    values.dedup();
+    if values.len() > limit && limit > 0 {
+        let step = values.len() as f64 / limit as f64;
+        values = (0..limit).map(|i| values[(i as f64 * step) as usize]).collect();
+    }
+    values
 }

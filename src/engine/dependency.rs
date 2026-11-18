@@ -557,7 +557,7 @@ fn tx(target: Address, caller: Address, input: Vec<u8>) -> SingletonTx {
 
 fn calldata(signature: &str, values: Vec<DynSolValue>) -> Vec<u8> {
     let mut out = function_selector(signature).to_vec();
-    out.extend_from_slice(&DynSolValue::Tuple(values).abi_encode());
+    out.extend_from_slice(&DynSolValue::Tuple(values).abi_encode_params());
     out
 }
 
