@@ -1,6 +1,7 @@
 pub mod abi_ingest;
 pub mod actors;
 pub mod attacker_harness;
+pub mod sim_defi;
 pub mod benchmark;
 pub mod bounded_search;
 pub mod bytecode_analysis;
