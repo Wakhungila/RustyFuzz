@@ -11,6 +11,7 @@ pub mod environment;
 pub mod execution;
 pub mod executor;
 pub mod fork_db;
+pub mod foundry;
 pub mod inspector;
 pub mod rpc_url;
 pub mod time_warp;

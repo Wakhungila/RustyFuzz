@@ -71,6 +71,10 @@ pub struct EvmMutator {
     /// that send ETH to the deployed attacker, triggering its receive() callback
     /// which re-enters the fuzz target. Off by default; enabled by --attacker-harness.
     attacker_harness_enabled: bool,
+    /// Extra caller identities (e.g. accounts a Foundry `setUp` funded and
+    /// used). `caller_mutation` samples these alongside the default role so
+    /// state owned by a specific account (deposits, allowances) is reachable.
+    caller_pool: Vec<Address>,
 }
 
 /// Named mutation strategy buckets (attempt order fixed by probability table).
@@ -223,6 +227,7 @@ impl EvmMutator {
             strategy_counters: Arc::new(StrategyCounters::default()),
             snapshot_corpus: None,
             attacker_harness_enabled: false,
+            caller_pool: Vec::new(),
         }
     }
 
@@ -256,11 +261,17 @@ impl EvmMutator {
             strategy_counters: Arc::new(StrategyCounters::default()),
             snapshot_corpus: None,
             attacker_harness_enabled: false,
+            caller_pool: Vec::new(),
         }
     }
 
     /// Enable the ReentrancyProbe mutator (the attacker contract is deployed
     /// at campaign setup via `--attacker-harness`).
+    pub fn with_caller_pool(mut self, callers: Vec<Address>) -> Self {
+        self.caller_pool = callers;
+        self
+    }
+
     pub fn with_attacker_harness(mut self, enabled: bool) -> Self {
         self.attacker_harness_enabled = enabled;
         self
@@ -579,7 +590,14 @@ impl EvmMutator {
         metadata: &mut EvmTestcaseMetadata,
     ) -> MutationResult {
         if let Some(idx) = self.random_index(rand, input.txs.len()) {
-            input.txs[idx].caller = Address::new([0x15; 20]);
+            // Pool entries plus the default role; uniform so the default stays reachable.
+            let choices = self.caller_pool.len() + 1;
+            let pick = self.random_index(rand, choices).unwrap_or(0);
+            input.txs[idx].caller = self
+                .caller_pool
+                .get(pick)
+                .copied()
+                .unwrap_or_else(|| Address::new([0x15; 20]));
             self.record_mutation(metadata, "caller", Some(idx), None, "changed caller role");
             MutationResult::Mutated
         } else {

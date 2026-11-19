@@ -75,6 +75,8 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             allow_synthetic_fallback: false,
             attacker_harness: false,
             fixture: None,
+            foundry_project: None,
+            foundry_test: None,
             compact_fork_state: false,
             abi: None,
             max_execs,
@@ -124,6 +126,8 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             allow_synthetic_fallback,
             attacker_harness,
             fixture,
+            foundry_project,
+            foundry_test,
             compact_fork_state,
             abi,
             max_execs,
@@ -200,8 +204,37 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 })?;
             // If --fixture is set without --contract, derive the target from the
             // fixture so the campaign knows which contract to fuzz.
+            let foundry_bootstrap = match foundry_project.as_deref() {
+                Some(root) => {
+                    let bootstrap = rusty_fuzz::engine::foundry_project::bootstrap(
+                        root,
+                        foundry_test.as_deref(),
+                    )?;
+                    println!(
+                        "Foundry project: test contract {} at {:?}; {} contract(s) created by setUp; \
+                         invariants: {:?}; default target {:?}",
+                        bootstrap.test_contract_name,
+                        bootstrap.test_contract,
+                        bootstrap.deployed.len().saturating_sub(1),
+                        bootstrap
+                            .invariants
+                            .functions
+                            .iter()
+                            .map(|f| f.name.as_str())
+                            .collect::<Vec<_>>(),
+                        bootstrap.state.target,
+                    );
+                    for (address, name) in &bootstrap.identified {
+                        println!("  {address:?} = {name}");
+                    }
+                    Some(std::sync::Arc::new(bootstrap))
+                }
+                None => None,
+            };
             let target_contract = if target_contract.is_none() {
-                if let Some(fixture_path) = fixture.as_deref() {
+                if let Some(bootstrap) = foundry_bootstrap.as_ref() {
+                    Some(bootstrap.state.target)
+                } else if let Some(fixture_path) = fixture.as_deref() {
                     let state = rusty_fuzz::engine::executable_fixture::ExecutableFixture::load_for_fuzz(
                         std::path::Path::new(fixture_path),
                     )?;
@@ -315,6 +348,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 in_memory_bytecode: None,
                 attacker_harness,
                 fixture_path: fixture.clone(),
+                foundry_bootstrap,
                 compact_fork_state,
                 cores,
                 require_seed_bundle: config.require_seed_bundle || require_seed_bundle,
@@ -1076,6 +1110,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     in_memory_bytecode: None,
                     attacker_harness: false,
                     fixture_path: None,
+                    foundry_bootstrap: None,
                     compact_fork_state: false,
                     cores: None,
                     require_seed_bundle: config.require_seed_bundle || require_seed_bundle,

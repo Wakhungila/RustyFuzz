@@ -432,6 +432,11 @@ pub struct Config {
     /// fork branch loads the fixture's accounts (bytecode + storage + balance)
     /// so the fuzzer can target offline known-vulnerable fixtures without RPC.
     pub fixture_path: Option<String>,
+    /// A bootstrapped Foundry project (`--foundry-project`): the state after the
+    /// test contract's constructor and `setUp()` ran, plus the `invariant_*`
+    /// functions to evaluate after every fuzzed transaction. Takes the place of
+    /// `fixture_path` as the campaign's starting state.
+    pub foundry_bootstrap: Option<Arc<crate::engine::foundry_project::FoundryBootstrap>>,
     /// When true, the campaign compacts the warm fork state into the ForkDb
     /// backend (Arc-shared) once per snapshot, then per-input clones the
     /// compacted CacheDB (empty cache + Arc) instead of deep-cloning the warm
@@ -1121,6 +1126,12 @@ async fn run_fuzz_campaign_with_cancellation_inner(
         let restored_provenance = restored_db.db.provenance();
         let restored_is_synthetic = !valid_fork_provenance(&restored_provenance, config.fork_block);
         (restored_db, saved.block_env.clone(), restored_is_synthetic)
+    } else if let Some(bootstrap) = config.foundry_bootstrap.as_ref() {
+        (
+            crate::evm::fork::create_in_memory_fork_db_from_fixture(&bootstrap.state),
+            bootstrap.block_env.clone(),
+            true,
+        )
     } else if let Some(fixture_path) = config.fixture_path.as_ref() {
         let state = crate::engine::executable_fixture::ExecutableFixture::load_for_fuzz(
             std::path::Path::new(fixture_path),
@@ -1252,7 +1263,13 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                 fuzzer_address,
                 ..ActorModelConfig::default()
             })
-            .generate([]);
+            .generate(
+                config
+                    .foundry_bootstrap
+                    .as_ref()
+                    .map(|b| b.actors.clone())
+                    .unwrap_or_default(),
+            );
             log::info!(
                 "Hardened DeFi actor model active: {} actors available for exploration",
                 actor_set.actors.len()
@@ -1463,6 +1480,22 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         }
                     };
 
+                // Foundry `invariant_*` functions, evaluated after every transaction
+                // against a throwaway view of the state (see `foundry_project`).
+                let foundry_invariants: Option<Arc<crate::engine::foundry_project::FoundryInvariantSet>> =
+                    config
+                        .foundry_bootstrap
+                        .as_ref()
+                        .map(|bootstrap| Arc::new(bootstrap.invariants.clone()));
+                if let Some(set) = foundry_invariants.as_deref() {
+                    log::info!(
+                        "checking {} Foundry invariant(s) after every transaction on test contract {}: {:?}",
+                        set.functions.len(),
+                        set.test_contract,
+                        set.functions.iter().map(|f| f.name.as_str()).collect::<Vec<_>>()
+                    );
+                }
+
                 let dataflow_registry = Arc::new(RwLock::new(DataflowRegistry::new()));
                 let state_novelty_feedback =
                     Arc::new(RwLock::new(EvmStateNoveltyFeedback::new()));
@@ -1506,6 +1539,20 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                                 "failed to load required ABI `{path}`: {err:#}"
                             )));
                         }
+                    }
+                }
+
+                if let Some(bootstrap) = config.foundry_bootstrap.as_ref() {
+                    for (address, abi) in &bootstrap.abis {
+                        let (registry, report) =
+                            crate::engine::abi_ingest::ingest_abi(abi, Some(*address), None);
+                        merge_abi_registry(&mut initial_abi, &registry);
+                        abi_loaded = true;
+                        log::info!(
+                            "Foundry ABI for {address}: functions={}, classified_selectors={}",
+                            report.function_count,
+                            report.classified_selectors
+                        );
                     }
                 }
 
@@ -1564,6 +1611,12 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             hardened_seed_candidates.extend(bytecode_candidates);
                         }
                     }
+                }
+                if let Some(bootstrap) = config.foundry_bootstrap.as_ref() {
+                    let seeds = bootstrap.actor_function_seeds();
+                    log::info!("Foundry project: {} actor x function seed(s)", seeds.len());
+                    abi_seed_candidate_count += seeds.len();
+                    hardened_seed_candidates.extend(seeds);
                 }
                 if config.hardened_defi.enabled {
                     if let Some(seed_file) = &config.hardened_defi.historical_seed_file {
@@ -1811,7 +1864,12 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     telemetry.concolic_hint_stats.clone(),
                     testcase_metadata_store.clone(),
                 )
-                    .with_attacker_harness(config.attacker_harness);
+                    .with_attacker_harness(config.attacker_harness)
+                    .with_caller_pool(config
+                        .foundry_bootstrap
+                        .as_ref()
+                        .map(|b| b.actors.clone())
+                        .unwrap_or_default());
                 let mut stages = tuple_list!(StdMutationalStage::with_max_iterations(
                     mutator,
                     mutational_stage_iterations(&config),
@@ -1915,6 +1973,10 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     let mut tx_results = Vec::with_capacity(input.txs.len());
                     let mut invariant_checker =
                         crate::engine::invariant_runtime::IncrementalChecker::new();
+                    let mut foundry_violation: Option<(
+                        usize,
+                        crate::engine::foundry_project::FoundryInvariantViolation,
+                    )> = None;
                     *dataflow_registry.write() = DataflowRegistry::new();
 
                     for (tx_idx, tx) in input.txs.iter().enumerate() {
@@ -1992,6 +2054,30 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             );
                         }
 
+                        // Foundry invariants: only the first violation per sequence is
+                        // kept, and a probe that cannot run is an infrastructure error,
+                        // never a finding.
+                        if foundry_violation.is_none() {
+                            if let Some(set) = foundry_invariants.as_deref() {
+                                let ChainState::Evm(probe_db) = &mut current_state;
+                                match set.check(probe_db, &current_env) {
+                                    Ok(Some(violation)) => {
+                                        foundry_violation = Some((tx_idx, violation));
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        static WARNED: std::sync::atomic::AtomicBool =
+                                            std::sync::atomic::AtomicBool::new(false);
+                                        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                            log::error!(
+                                                "Foundry invariant probe could not run (no finding reported): {error:#}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         tx_results.push(result);
                     }
 
@@ -2055,6 +2141,22 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             tx_index: Some(violation.tx_index),
                             target: Some(target),
                             evidence: violation.evidence.summary_line(),
+                        });
+                    }
+                    if let Some((tx_index, violation)) = foundry_violation.take() {
+                        findings.push(crate::common::oracle::ProtocolFinding {
+                            pack: crate::common::oracle::ProtocolOraclePackKind::Bridge,
+                            vuln: crate::common::oracle::VulnType::InvariantViolation(format!(
+                                "foundry:{}",
+                                violation.invariant
+                            )),
+                            severity: crate::common::oracle::ProtocolSeverity::High,
+                            tx_index: Some(tx_index),
+                            target: Some(target_contract),
+                            evidence: format!(
+                                "Foundry invariant {} violated after tx {}: {}",
+                                violation.invariant, tx_index, violation.detail
+                            ),
                         });
                     }
                     apply_min_finding_confidence(&mut findings, config.min_finding_confidence);
@@ -2259,7 +2361,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             config.artifact_limit
                         );
                     } else if let Some(reason) = campaign_artifact_reason(
-                        synthetic_fork_mode,
+                        synthetic_fork_mode && config.foundry_bootstrap.is_none(),
                         &campaign_score,
                         &findings,
                         exploit_candidate.as_ref(),
@@ -2612,6 +2714,20 @@ async fn run_single_process_campaign(
             }
         };
 
+    let foundry_invariants: Option<Arc<crate::engine::foundry_project::FoundryInvariantSet>> =
+        config
+            .foundry_bootstrap
+            .as_ref()
+            .map(|bootstrap| Arc::new(bootstrap.invariants.clone()));
+    if let Some(set) = foundry_invariants.as_deref() {
+        log::info!(
+            "checking {} Foundry invariant(s) after every transaction on test contract {}: {:?}",
+            set.functions.len(),
+            set.test_contract,
+            set.functions.iter().map(|f| f.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
     let dataflow_registry = Arc::new(RwLock::new(DataflowRegistry::new()));
     let state_novelty_feedback = Arc::new(RwLock::new(EvmStateNoveltyFeedback::new()));
     let telemetry = Arc::new(CampaignTelemetry::new());
@@ -2648,6 +2764,20 @@ async fn run_single_process_campaign(
                 abi_report = Some(report);
             }
             Err(err) => anyhow::bail!("failed to load required ABI `{}`: {err:#}", path),
+        }
+    }
+
+    if let Some(bootstrap) = config.foundry_bootstrap.as_ref() {
+        for (address, abi) in &bootstrap.abis {
+            let (registry, report) =
+                crate::engine::abi_ingest::ingest_abi(abi, Some(*address), None);
+            merge_abi_registry(&mut initial_abi, &registry);
+            abi_loaded = true;
+            log::info!(
+                "Foundry ABI for {address}: functions={}, classified_selectors={}",
+                report.function_count,
+                report.classified_selectors
+            );
         }
     }
 
@@ -2706,6 +2836,12 @@ async fn run_single_process_campaign(
                 hardened_seed_candidates.extend(bytecode_candidates);
             }
         }
+    }
+    if let Some(bootstrap) = config.foundry_bootstrap.as_ref() {
+        let seeds = bootstrap.actor_function_seeds();
+        log::info!("Foundry project: {} actor x function seed(s)", seeds.len());
+        abi_seed_candidate_count += seeds.len();
+        hardened_seed_candidates.extend(seeds);
     }
     if config.hardened_defi.enabled {
         if let Some(seed_file) = &config.hardened_defi.historical_seed_file {
@@ -2998,7 +3134,12 @@ async fn run_single_process_campaign(
         telemetry.concolic_hint_stats.clone(),
         testcase_metadata_store.clone(),
     )
-    .with_attacker_harness(config.attacker_harness);
+    .with_attacker_harness(config.attacker_harness)
+    .with_caller_pool(config
+                        .foundry_bootstrap
+                        .as_ref()
+                        .map(|b| b.actors.clone())
+                        .unwrap_or_default());
     let mutator = mutator.with_snapshot_corpus(snapshot_corpus.clone());
     let strategy_counters = mutator.strategy_counters.clone();
     if let Some(saved) = restored_strategies {
@@ -3077,6 +3218,10 @@ async fn run_single_process_campaign(
         drop(snapshot_corpus_guard);
         let mut tx_results = Vec::with_capacity(input.txs.len());
         let mut invariant_checker = crate::engine::invariant_runtime::IncrementalChecker::new();
+        let mut foundry_violation: Option<(
+            usize,
+            crate::engine::foundry_project::FoundryInvariantViolation,
+        )> = None;
         *dataflow_registry.write() = DataflowRegistry::new();
 
         for (tx_idx, tx) in input.txs.iter().enumerate() {
@@ -3145,6 +3290,28 @@ async fn run_single_process_campaign(
                 );
             }
 
+            if foundry_violation.is_none() {
+                if let Some(set) = foundry_invariants.as_deref() {
+                    let ChainState::Evm(probe_db) = &mut current_state;
+                    match set.check(probe_db, &current_env) {
+                        Ok(Some(violation)) => {
+                            log::debug!("foundry invariant violated at tx {tx_idx}: {}", violation.detail);
+                            foundry_violation = Some((tx_idx, violation))
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            static WARNED: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                log::error!(
+                                    "Foundry invariant probe could not run (no finding reported): {error:#}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             tx_results.push(result);
         }
 
@@ -3195,6 +3362,22 @@ async fn run_single_process_campaign(
                 tx_index: Some(violation.tx_index),
                 target: Some(target_contract),
                 evidence: violation.evidence.summary_line(),
+            });
+        }
+        if let Some((tx_index, violation)) = foundry_violation.take() {
+            findings.push(crate::common::oracle::ProtocolFinding {
+                pack: crate::common::oracle::ProtocolOraclePackKind::Bridge,
+                vuln: crate::common::oracle::VulnType::InvariantViolation(format!(
+                    "foundry:{}",
+                    violation.invariant
+                )),
+                severity: crate::common::oracle::ProtocolSeverity::High,
+                tx_index: Some(tx_index),
+                target: Some(target_contract),
+                evidence: format!(
+                    "Foundry invariant {} violated after tx {}: {}",
+                    violation.invariant, tx_index, violation.detail
+                ),
             });
         }
         apply_min_finding_confidence(&mut findings, config.min_finding_confidence);
@@ -3350,7 +3533,7 @@ async fn run_single_process_campaign(
                 config.artifact_limit
             );
         } else if let Some(reason) = campaign_artifact_reason(
-            synthetic_fork_mode,
+            synthetic_fork_mode && config.foundry_bootstrap.is_none(),
             &campaign_score,
             &findings,
             exploit_candidate.as_ref(),
@@ -5383,6 +5566,7 @@ mod tests {
             in_memory_bytecode: Some(hex::decode("60003560005500").unwrap()),
             attacker_harness: false,
             fixture_path: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
@@ -5530,6 +5714,7 @@ mod tests {
             in_memory_bytecode: None,
             attacker_harness: false,
             fixture_path: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
@@ -5627,6 +5812,7 @@ mod tests {
             in_memory_bytecode: None,
             attacker_harness: false,
             fixture_path: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
@@ -5744,6 +5930,7 @@ mod tests {
             in_memory_bytecode: None,
             attacker_harness: false,
             fixture_path: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
@@ -5812,6 +5999,7 @@ mod tests {
             in_memory_bytecode: Some(vec![0x60, 0x00]),
             attacker_harness: false,
             fixture_path: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
@@ -5940,6 +6128,7 @@ mod tests {
             in_memory_bytecode: None,
             attacker_harness: false,
             fixture_path: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
@@ -6088,6 +6277,7 @@ mod tests {
             in_memory_bytecode: None,
             attacker_harness: false,
             fixture_path: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
@@ -6249,6 +6439,7 @@ mod tests {
             in_memory_bytecode: Some(vec![0x60, 0x00]),
             attacker_harness: false,
             fixture_path: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
@@ -6305,6 +6496,7 @@ mod tests {
             in_memory_bytecode: Some(vec![0x60, 0x00]),
             attacker_harness: false,
             fixture_path: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
