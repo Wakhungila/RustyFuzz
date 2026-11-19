@@ -134,7 +134,7 @@ fn missing_pinned_fields_and_unknown_chains_fail_closed() {
         timestamp: U256::from(1_720_000_000u64),
         ..Default::default()
     };
-    backend.set_provenance_chain(10, Some(format!("0x{}", "42".repeat(32))), 1);
+    backend.set_provenance_chain(99_999, Some(format!("0x{}", "42".repeat(32))), 1);
     // The refusal must name the chain AND say a profile is missing. The old message
     // ("unsupported chain 10: chain-specific execution semantics are required") named the
     // chain but not the remedy, which is why a live non-mainnet target produced a
@@ -142,7 +142,7 @@ fn missing_pinned_fields_and_unknown_chains_fail_closed() {
     let error = EnvironmentPolicy::resolve(&backend, &env)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("chain 10"), "must name the chain: {error}");
+    assert!(error.contains("chain 99999"), "must name the chain: {error}");
     assert!(
         error.contains("no execution profile"),
         "must say a profile is missing: {error}"

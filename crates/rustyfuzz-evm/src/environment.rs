@@ -117,6 +117,20 @@ impl EnvironmentPolicy {
             let number = u64::try_from(block.number)?;
             let timestamp =
                 u64::try_from(block.timestamp).context("block timestamp exceeds u64")?;
+            ensure!(
+                profile.covers_block(number),
+                "chain {} profile covers blocks from {} onwards; block {number} is outside \
+                 that range",
+                profile.name,
+                profile.min_block
+            );
+            ensure!(
+                profile.covers_timestamp(timestamp),
+                "chain {} profile covers timestamps from {} onwards; block {number} \
+                 (timestamp {timestamp}) predates the hardfork table",
+                profile.name,
+                profile.min_timestamp
+            );
             let spec = profile.spec_for(number, timestamp);
             if spec >= SpecId::MERGE && profile.header.prevrandao {
                 ensure!(

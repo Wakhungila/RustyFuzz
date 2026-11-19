@@ -682,13 +682,9 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     .ingest_bundle_from_target(&seed_config, &fork_db)
                     .await?;
                 if let Some(scan) = bundle.scan.as_mut() {
-                    scan.chain_id = match chain.as_str() {
-                        "bsc" => Some(56),
-                        "evm" => None,
-                        other => {
-                            anyhow::bail!("unsupported --chain `{other}`; expected evm or bsc")
-                        }
-                    };
+                    scan.chain_id =
+                        rustyfuzz_evm::chain_profile::ChainProfile::id_for_cli_name(&chain)
+                            .map_err(anyhow::Error::msg)?;
                 }
                 std::fs::create_dir_all(output)?;
                 let manifest_path = std::path::Path::new(output).join("manifest.json");

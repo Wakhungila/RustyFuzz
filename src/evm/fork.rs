@@ -219,7 +219,19 @@ async fn fetch_fork_block_env(
             "fork header hash differs from state provenance"
         );
     }
-    if header.number >= 12_965_000 {
+    anyhow::ensure!(
+        profile.covers_timestamp(header.timestamp),
+        "chain {} profile covers timestamps from {} onwards; block {} (timestamp {}) \
+         predates the hardfork table",
+        profile.name,
+        profile.min_timestamp,
+        header.number,
+        header.timestamp
+    );
+    // Ethereum mainnet headers must carry a base fee after London. Other chains
+    // differ (BSC reports a zero or absent base fee for long stretches), so a
+    // missing field there is read as zero rather than refused.
+    if profile.chain_id == 1 && header.number >= 12_965_000 {
         anyhow::ensure!(
             header.base_fee_per_gas.is_some(),
             "post-London header is missing base fee"
