@@ -1,29 +1,46 @@
-# Head-to-head vs ItyFuzz (item 4) — status and first real numbers
+# Head-to-head vs ItyFuzz on Daedaluzz (item 4)
 
-Measured 2026-11-19 in the sandbox, one core each, Daedaluzz `maze-0` (7x7, 43 assertions), 60 s.
+Measured 2026-11-20 in the sandbox. Harness: `scripts/bench/daedaluzz.py`.
 
-| | ItyFuzz (`80e3b44`) | RustyFuzz (`--single-process`) |
-|---|---|---|
-| Executions in 60 s | 770,976 (~13k/s) | 1,350 (~22/s) |
-| Coverage reported | 68.75% instr / 68.43% branch | 2,428 edges (different unit) |
-| Assertion bugs reported | 0 (see below) | 15 `UnintendedPanic` (no bug id) |
+**Setup.** Daedaluzz mazes 0-4 (210 assertion bugs total), each rewritten by
+`scripts/bench/instrument_maze.py` so `emit AssertionFailed("N"); assert(false);` becomes a
+non-reverting `bug(N)` that sets a state flag (read by RustyFuzz `--invariants`) and emits ItyFuzz's
+typed-bug event. Same contract bytes for both tools, one core, tools run one at a time,
+120 s wall clock per tool per maze, one seed (RustyFuzz `--rng-seed 1`).
+A bug counts as found when the tool itself reports that bug id.
 
-**Throughput is the headline gap: ~570x.** Autonomous-gate wins at 2000 execs do not scale to
-mazes that need 10^5+ executions.
+| Maze | Bugs | ItyFuzz | RustyFuzz | RustyFuzz execs |
+|---|---|---|---|---|
+| 0 | 43 | 18 | 0 | 2,121 |
+| 1 | 40 | 16 | 0 | 2,265 |
+| 2 | 45 | 16 | 1 | 8,314 |
+| 3 | 41 | 13 | 2 | 11,672 |
+| 4 | 41 | 16 | 2 | 8,971 |
+| **Total** | **210** | **79 (38%)** | **5 (2%)** | |
 
-## Why bug counts are not comparable yet
-- ItyFuzz only treats an event with the magic `"fuzzland"` topic (or Scribble's) as a bug.
-  Daedaluzz's `AssertionFailed(string)` + `assert(false)` is invisible to it.
-- RustyFuzz reports `Panic(0x1)` but not *which* assertion, so distinct-bug counting is impossible.
-- A fair metric needs either (a) instrumented mazes that emit the ItyFuzz bug event and a per-bug
-  flag RustyFuzz can read via `--invariants`, or (b) a replay judge over both tools' reproducers.
+Every bug RustyFuzz found was also found by ItyFuzz. ItyFuzz executes roughly 13k execs/s on these
+mazes; RustyFuzz 20-100/s (the invariant check per transaction adds cost).
 
-## Not run
-- **Medusa:** needs Go 1.26 and `golang.org/x/*`, unreachable here.
-- **DeFiHackLabs:** fork replays need an archive RPC, blocked here.
+## Reading the result
+- RustyFuzz is far behind on deep-state exploration. The autonomous gate's 5/5 comes from shallow,
+  single-property fixtures; mazes need long, precise argument sequences at 10^5+ executions.
+- Throughput is the dominant factor (see the profiling notes in the commit history); a second factor
+  is that RustyFuzz replays full sequences while ItyFuzz keeps a state-snapshot corpus.
+
+## Limits of this measurement
+- One seed, 120 s, one machine; ItyFuzz was built on stable with patched dependencies
+  (see below) and may differ from a release build.
+- RustyFuzz was given the ABI and an invariant file, ItyFuzz only bytecode + ABI.
+- **Medusa not run:** needs Go 1.26 and `golang.org/x/*`, unreachable from the sandbox.
+- **DeFiHackLabs not run:** fork replays need an archive RPC, blocked in the sandbox.
 
 ## Reproduce
+```
+npm i solc@0.8.28 --prefix <dir>
+python3 scripts/bench/daedaluzz.py --daedaluzz <clone of fuzzland/daedaluzz> \
+  --ityfuzz <ityfuzz binary> --work <scratch> --solcjs-dir <dir> --secs 120
+```
 ItyFuzz on stable: `RUSTC_BOOTSTRAP=1`, edition 2024, bump `time` to 0.3.36, patch `metatype` and
 `serde_traitobject` (add `arbitrary_self_types_pointers`, `transmute` for the Send/Sync casts), replace
-`downcast_ref_unchecked` with `downcast_ref().unwrap()`, wrap `env::set_var` in `unsafe`, `#![allow(static_mut_refs)]`.
-Maze fixtures: `node scripts/bench/maze_fixture.js Maze.sol out.json` (needs `npm i solc@0.8.28`).
+`downcast_ref_unchecked` with `downcast_ref().unwrap()`, wrap `env::set_var` in `unsafe`,
+`#![allow(static_mut_refs)]`.
