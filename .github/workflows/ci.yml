@@ -238,7 +238,7 @@ jobs:
         run: |
           test ! -e config.toml
           rm -rf benchmarks/results/autonomous-rediscovery
-          python3 scripts/validate_autonomous_discovery.py --max-execs 500 --duration-secs 15
+          python3 scripts/validate_autonomous_discovery.py --max-execs 2000 --duration-secs 30 --min-rediscovered 4
       - name: Run throughput regression gate
         run: |
           RF_FLOOR_ERC20=40 RF_FLOOR_FLASH=40 python3 scripts/validate_throughput.py --duration-secs 20

@@ -3872,8 +3872,9 @@ impl SnapshotCorpus {
             ids.dedup();
         }
         let mut weighted_ids = Vec::new();
+        let gap_any = self.priority_gap_map.any();
         for id in &ids {
-            if let Some(energy) = self.snapshot_energy_with_weights(*id, weights) {
+            if let Some(energy) = self.snapshot_energy_inner(*id, weights, gap_any) {
                 weighted_ids.push((*id, energy));
             }
         }
@@ -3903,15 +3904,29 @@ impl SnapshotCorpus {
         id: u64,
         weights: &SnapshotScoreWeights,
     ) -> Option<u128> {
+        self.snapshot_energy_inner(id, weights, self.priority_gap_map.any())
+    }
+
+    fn snapshot_energy_inner(
+        &self,
+        id: u64,
+        weights: &SnapshotScoreWeights,
+        gap_any: bool,
+    ) -> Option<u128> {
         let meta = self.metadata.get(&id)?;
-        let snap = self.snapshots.get(&id)?.read();
-        let gap_intersection: usize = snap
-            .coverage
-            .as_raw_slice()
-            .iter()
-            .zip(self.priority_gap_map.as_raw_slice())
-            .map(|(a, b)| (a & b).count_ones() as usize)
-            .sum();
+        // The gap map is empty unless Forge coverage was supplied; skip the 8 KB AND per snapshot.
+        let gap_intersection: usize = if gap_any {
+            let snap = self.snapshots.get(&id)?.read();
+            snap.coverage
+                .as_raw_slice()
+                .iter()
+                .zip(self.priority_gap_map.as_raw_slice())
+                .map(|(a, b)| (a & b).count_ones() as usize)
+                .sum()
+        } else {
+            self.snapshots.get(&id)?;
+            0
+        };
         Some(
             (meta.coverage_score as u128)
                 .saturating_add((gap_intersection as u128).saturating_mul(10))

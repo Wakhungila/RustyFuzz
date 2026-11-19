@@ -231,16 +231,36 @@ fn classify_selector_edge(
 ) -> Option<(DependencyEdgeKind, u64, String)> {
     let left = left?;
     let right = right?;
-    let approve = function_selector("approve(address,uint256)");
-    let transfer_from = function_selector("transferFrom(address,address,uint256)");
-    let deposit = function_selector("deposit(uint256,address)");
-    let withdraw = function_selector("withdraw(uint256,address,address)");
-    let mint = function_selector("mint(uint256,address)");
-    let redeem = function_selector("redeem(uint256,address,address)");
-    let propose = function_selector("propose(address[],uint256[],bytes[],string)");
-    let vote = function_selector("castVote(uint256,uint8)");
-    let queue = function_selector("queue(uint256)");
-    let execute = function_selector("execute(uint256)");
+    struct Known {
+        approve: [u8; 4],
+        transfer_from: [u8; 4],
+        deposit: [u8; 4],
+        withdraw: [u8; 4],
+        mint: [u8; 4],
+        redeem: [u8; 4],
+        propose: [u8; 4],
+        vote: [u8; 4],
+        queue: [u8; 4],
+        execute: [u8; 4],
+    }
+    // These are constants; hashing ten signatures per adjacent tx pair per execution
+    // was a visible fraction of campaign time.
+    static KNOWN: std::sync::LazyLock<Known> = std::sync::LazyLock::new(|| Known {
+        approve: function_selector("approve(address,uint256)"),
+        transfer_from: function_selector("transferFrom(address,address,uint256)"),
+        deposit: function_selector("deposit(uint256,address)"),
+        withdraw: function_selector("withdraw(uint256,address,address)"),
+        mint: function_selector("mint(uint256,address)"),
+        redeem: function_selector("redeem(uint256,address,address)"),
+        propose: function_selector("propose(address[],uint256[],bytes[],string)"),
+        vote: function_selector("castVote(uint256,uint8)"),
+        queue: function_selector("queue(uint256)"),
+        execute: function_selector("execute(uint256)"),
+    });
+    let k = &*KNOWN;
+    let (approve, transfer_from, deposit, withdraw, mint, redeem, propose, vote, queue, execute) = (
+        k.approve, k.transfer_from, k.deposit, k.withdraw, k.mint, k.redeem, k.propose, k.vote, k.queue, k.execute,
+    );
 
     if left == approve && right == transfer_from {
         return Some((

@@ -29,6 +29,8 @@ parser.add_argument('--binary', default='target/release/rusty-fuzz')
 parser.add_argument('--output', type=Path, default=REPO_ROOT / 'benchmarks/results/autonomous-rediscovery')
 parser.add_argument('--max-execs', type=int, default=2000)
 parser.add_argument('--duration-secs', type=int, default=30)
+parser.add_argument('--min-rediscovered', type=int, default=0,
+                    help='fail the gate if fewer fixtures are rediscovered (the ratchet)')
 parser.add_argument('--attacker-harness', action='store_true', default=True,
                     help='enable --attacker-harness (default on; the reentrancy probes need it)')
 args = parser.parse_args()
@@ -183,6 +185,9 @@ if failures:
 crashed = [r['case_id'] for r in results if r['exit_status'] not in (0, 'timeout')]
 if crashed:
     print(f'GATE FAILURE: campaigns crashed for: {crashed}')
+    raise SystemExit(1)
+if rediscovered_count < args.min_rediscovered:
+    print(f'GATE FAILURE: rediscovered {rediscovered_count}/{total}, ratchet requires >= {args.min_rediscovered}')
     raise SystemExit(1)
 print(f'Gate passed: all {total} campaigns ran. Autonomous rediscovery rate: {rediscovered_count}/{total} '
       f'(honest baseline; ratchet only tightens).')
