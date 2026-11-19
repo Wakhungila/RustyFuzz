@@ -1161,6 +1161,18 @@ impl EvmMutator {
                     .copied()
                     .unwrap_or_else(|| Address::new([0x1a; 20]));
             }
+            DynSolValue::FixedBytes(word, size) => {
+                // Message hashes / ids named by an invariant are unguessable at random,
+                // so draw from the dictionary (which carries the invariant's keys).
+                let roll = rand.below(NonZero::new(100).unwrap());
+                if !self.value_dictionary.is_empty() && roll < 60 {
+                    let v = self.value_dictionary[rand.below(NonZero::new(self.value_dictionary.len()).unwrap())];
+                    *word = alloy_primitives::B256::from(v.to_be_bytes::<32>());
+                } else {
+                    let i = rand.below(NonZero::new((*size).max(1)).unwrap());
+                    word.0[i] = rand.next() as u8;
+                }
+            }
             DynSolValue::Bool(b) => {
                 *b = !*b;
             }
@@ -1208,6 +1220,10 @@ impl EvmMutator {
                     Address::new([0x15; 20])
                 };
                 DynSolValue::Address(a)
+            }
+            DynSolType::FixedBytes(size) if !self.value_dictionary.is_empty() && roll < 70 => {
+                let v = self.value_dictionary[rand.below(NonZero::new(self.value_dictionary.len()).unwrap())];
+                DynSolValue::FixedBytes(alloy_primitives::B256::from(v.to_be_bytes::<32>()), *size)
             }
             DynSolType::Bytes if roll < 60 => DynSolValue::Bytes(Vec::new()),
             DynSolType::Tuple(inner) => DynSolValue::Tuple(

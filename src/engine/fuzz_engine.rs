@@ -1891,7 +1891,15 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     .with_attacker_harness(config.attacker_harness)
                     .with_flashloan_env(flashloan_env.clone())
                     .with_abi_target(config.target_contract)
-                    .with_value_dictionary(crate::evm::fuzz::value_dictionary_from_state(&initial_db, 96))
+                    .with_value_dictionary({
+                        let mut d = crate::evm::fuzz::value_dictionary_from_state(&initial_db, 96);
+                        if let Some(path) = config.predicate_invariants.as_deref() {
+                            if let Ok(f) = crate::engine::invariant_file::InvariantFile::load(std::path::Path::new(path)) {
+                                d.extend(f.dictionary_words());
+                            }
+                        }
+                        d
+                    })
                     .with_caller_pool(config
                         .foundry_bootstrap
                         .as_ref()
@@ -3260,7 +3268,15 @@ async fn run_single_process_campaign(
     .with_attacker_harness(config.attacker_harness)
     .with_flashloan_env(flashloan_env.clone())
                     .with_abi_target(config.target_contract)
-                    .with_value_dictionary(crate::evm::fuzz::value_dictionary_from_state(&initial_db, 96))
+                    .with_value_dictionary({
+                        let mut d = crate::evm::fuzz::value_dictionary_from_state(&initial_db, 96);
+                        if let Some(path) = config.predicate_invariants.as_deref() {
+                            if let Ok(f) = crate::engine::invariant_file::InvariantFile::load(std::path::Path::new(path)) {
+                                d.extend(f.dictionary_words());
+                            }
+                        }
+                        d
+                    })
     .with_caller_pool(config
                         .foundry_bootstrap
                         .as_ref()
