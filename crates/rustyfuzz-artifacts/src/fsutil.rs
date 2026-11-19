@@ -42,6 +42,21 @@ impl From<serde_json::Error> for FsUtilError {
     }
 }
 
+static RELAXED_FSYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Skip the per-file `fsync` (and parent-directory fsync). Writes stay atomic via
+/// temp-file + rename, so a process crash never leaves a torn file; only a power
+/// loss / kernel panic can drop the most recent writes. Campaign loops persist an
+/// artifact or provenance record per execution, where two fsyncs per write cost
+/// ~40% of throughput.
+pub fn set_relaxed_fsync(relaxed: bool) {
+    RELAXED_FSYNC.store(relaxed, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn relaxed_fsync() -> bool {
+    RELAXED_FSYNC.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Writes `bytes` to `path` atomically via temp file + rename + best-effort
 /// parent fsync.
 pub fn write_atomic(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> Result<(), FsUtilError> {
@@ -70,10 +85,14 @@ pub fn write_atomic(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> Result<(
     for chunk in bytes.chunks(64 * 1024) {
         tmp.write_all(chunk)?;
     }
-    tmp.as_file().sync_all()?;
+    if !relaxed_fsync() {
+        tmp.as_file().sync_all()?;
+    }
     tmp.persist(&destination)
         .map_err(|err| FsUtilError::Io(err.error))?;
-    sync_parent_best_effort(&canonical_parent);
+    if !relaxed_fsync() {
+        sync_parent_best_effort(&canonical_parent);
+    }
     Ok(())
 }
 

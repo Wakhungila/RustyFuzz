@@ -46,7 +46,7 @@ use revm::database::CacheDB;
 use revm::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::num::NonZeroUsize;
@@ -1104,6 +1104,9 @@ async fn run_fuzz_campaign_with_cancellation_inner(
     cancellation: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
+    // Per-execution artifact/provenance writes stay atomic (temp + rename) but skip fsync;
+    // set RUSTYFUZZ_STRICT_FSYNC=1 to restore power-loss durability at a large throughput cost.
+    rustyfuzz_artifacts::fsutil::set_relaxed_fsync(std::env::var_os("RUSTYFUZZ_STRICT_FSYNC").is_none());
     let config = config.with_isolated_paths();
     config.ensure_state_isolation()?;
     let run_nonce = Uuid::new_v4().to_string();
@@ -2399,6 +2402,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     if let Err(error) = super::provenance::persist(
                         config.corpus_dir.as_ref(),
                         super::provenance::PersistRequest {
+                interesting: report.interesting,
                             execution_index: telemetry.execution_count(),
                             budget_consumed: budget.reserved(),
                             input,
@@ -3728,6 +3732,7 @@ async fn run_single_process_campaign(
         if let Err(error) = super::provenance::persist(
             config.corpus_dir.as_ref(),
             super::provenance::PersistRequest {
+                interesting: report.interesting,
                 execution_index: telemetry.execution_count(),
                 budget_consumed: budget.reserved(),
                 input,
@@ -4327,6 +4332,42 @@ fn log_seed_bundle_status(
     Ok(())
 }
 
+static FINDING_QUOTA: std::sync::LazyLock<std::sync::Mutex<HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn finding_quota_cap() -> usize {
+    std::env::var("RUSTYFUZZ_MAX_ARTIFACTS_PER_FINDING_KIND")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25)
+}
+
+fn finding_kind_key(finding: &crate::common::oracle::ProtocolFinding) -> String {
+    format!("{:?}|{:?}|{:?}", finding.pack, finding.vuln, finding.target)
+}
+
+/// Heuristic oracles can fire on most executions of a contract. Persisting an artifact plus a
+/// ~1 MB provenance record each time cost ~40% of throughput and gigabytes of disk. Cap the
+/// number kept per (pack, vulnerability, target); `consume` records one against the quota.
+pub(crate) fn finding_quota_open(
+    findings: &[crate::common::oracle::ProtocolFinding],
+    consume: bool,
+) -> bool {
+    let cap = finding_quota_cap();
+    let mut quota = FINDING_QUOTA.lock().unwrap_or_else(|e| e.into_inner());
+    let mut open = false;
+    for finding in findings {
+        let used = quota.entry(finding_kind_key(finding)).or_insert(0);
+        if *used < cap {
+            open = true;
+            if consume {
+                *used += 1;
+            }
+        }
+    }
+    open
+}
+
 fn campaign_artifact_reason(
     synthetic_fork_mode: bool,
     campaign_score: &CampaignScore,
@@ -4350,7 +4391,7 @@ fn campaign_artifact_reason(
         return Some("replayable-minimized-path");
     }
 
-    if !findings.is_empty() {
+    if !findings.is_empty() && finding_quota_open(findings, true) {
         return Some("protocol-oracle-finding");
     }
 
@@ -4413,11 +4454,12 @@ fn enqueue_concolic_hints(
         return;
     }
     stats.record_generated(new_hints.len() as u64);
-    new_hints.sort_by_key(|hint| concolic_hint_priority(hint, waypoints));
+    let prio = HintPriorityCtx::new(waypoints);
+    new_hints.sort_by_cached_key(|hint| prio.priority(hint));
 
     let mut queue = hint_queue.lock();
     queue.extend(new_hints);
-    queue.sort_by_key(|hint| concolic_hint_priority(hint, waypoints));
+    queue.sort_by_cached_key(|hint| prio.priority(hint));
     let before_dedup = queue.len();
     let mut seen = HashSet::new();
     queue.retain(|hint| seen.insert((hint.tx_index, hint.calldata_offset, hint.word)));
@@ -4427,6 +4469,67 @@ fn enqueue_concolic_hints(
     }
     if deduplicated > 0 {
         stats.record_deduplicated(deduplicated as u64);
+    }
+}
+
+/// Per-call index over a tx's waypoints so each queued hint's priority is O(log W)
+/// instead of an O(W) scan (the scan ran N log N times per tx and was ~14% of a campaign).
+struct HintPriorityCtx {
+    branch_distance: HashMap<usize, u64>,
+    storage_pcs: Vec<usize>,
+    influenced_dataflow: bool,
+}
+
+impl HintPriorityCtx {
+    fn new(waypoints: &[crate::common::types::Waypoint]) -> Self {
+        use crate::common::types::Waypoint as W;
+        let mut branch_distance: HashMap<usize, u64> = HashMap::new();
+        let mut storage_pcs = Vec::new();
+        let mut influenced_dataflow = false;
+        let mut note = |pc: usize, d: Option<u64>| {
+            if let Some(d) = d {
+                branch_distance.entry(pc).and_modify(|e| *e = (*e).min(d)).or_insert(d);
+            }
+        };
+        for w in waypoints {
+            match w {
+                W::Comparison { pc, branch_distance: d, .. } => {
+                    note(*pc, d.map(|x| x.saturating_to::<u64>()))
+                }
+                W::BranchPath { pc, constraint, .. } => {
+                    if let W::Comparison { branch_distance: d, .. } = constraint.as_ref() {
+                        note(*pc, d.map(|x| x.saturating_to::<u64>()));
+                    }
+                }
+                W::StorageRead { pc, .. }
+                | W::StorageWrite { pc, .. }
+                | W::TransientStorageRead { pc, .. }
+                | W::TransientStorageWrite { pc, .. } => storage_pcs.push(*pc),
+                W::Dataflow { influenced: true, .. } => influenced_dataflow = true,
+                _ => {}
+            }
+        }
+        storage_pcs.sort_unstable();
+        Self { branch_distance, storage_pcs, influenced_dataflow }
+    }
+
+    fn priority(&self, hint: &ConcolicHint) -> (u64, usize, usize, usize) {
+        let mut priority: u64 = match &hint.strategy {
+            ConcolicStrategy::FlipBranch { .. } => 0,
+            ConcolicStrategy::FlipComparison { .. } => 1_000,
+            ConcolicStrategy::ArithmeticBoundary { .. } => 2_000,
+        };
+        priority = priority.saturating_add(
+            self.branch_distance.get(&hint.pc).copied().unwrap_or(0).min(10_000),
+        );
+        let near = self.influenced_dataflow || {
+            let i = self.storage_pcs.partition_point(|p| *p < hint.pc.saturating_sub(16));
+            self.storage_pcs.get(i).is_some_and(|p| *p <= hint.pc + 16)
+        };
+        if near {
+            priority = priority.saturating_sub(500);
+        }
+        (priority, hint.tx_index, hint.calldata_offset, hint.pc)
     }
 }
 
