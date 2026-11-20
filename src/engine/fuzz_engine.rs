@@ -3332,7 +3332,7 @@ async fn run_single_process_campaign(
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(8);
+        .unwrap_or(32);
     let mut lean_seen = vec![0u8; MAP_SIZE];
     let mut lean_counter: u64 = 0;
     let mut lean_stats: (u64, u64) = (0, 0);

@@ -177,8 +177,9 @@ impl FormalProtocolModel {
                 .map(|edge| format!("dependency edge {:?}: {}", edge.kind, edge.explanation)),
         );
         explanation.extend(economic_delta.storage_delta_summary.iter().map(|summary| {
+            // `{:#x}`: `Display` on an Address computes an EIP-55 checksum (keccak) per call.
             format!(
-                "storage delta {} slots={} abs_delta={}",
+                "storage delta {:#x} slots={} abs_delta={}",
                 summary.address, summary.slot_count, summary.absolute_delta_score
             )
         }));
