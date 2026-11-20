@@ -363,7 +363,7 @@ pub fn build_registry(
             },
             manifest,
         ) {
-            Ok(oracle) => registry.register(Box::new(oracle)),
+            Ok(oracle) => registry.register(Box::new(oracle.with_evidence_on_pass(false))),
             Err(error) => errors.push(format!("{name}: {error}")),
         }
     }
