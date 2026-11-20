@@ -44,3 +44,20 @@ ItyFuzz on stable: `RUSTC_BOOTSTRAP=1`, edition 2024, bump `time` to 0.3.36, pat
 `serde_traitobject` (add `arbitrary_self_types_pointers`, `transmute` for the Send/Sync casts), replace
 `downcast_ref_unchecked` with `downcast_ref().unwrap()`, wrap `env::set_var` in `unsafe`,
 `#![allow(static_mut_refs)]`.
+
+## Re-run after throughput work (lean execution, predicate hot path, lineage length)
+
+RustyFuzz only, 120 s per maze, seeds 1-3, mazes 0-4 (same instrumented mazes as above).
+Bugs counted from `sum(bN) <= 0` invariant violations in campaign artifacts (oracle-based, not the replay judge).
+
+| maze | seed 1 | seed 2 | seed 3 | union |
+|---|---|---|---|---|
+| 0 | 2 | 0 | 2 | 2 |
+| 1 | 3 | 3 | 2 | 5 |
+| 2 | 2 | 5 | 3 | 5 |
+| 3 | 2 | 2 | 2 | 2 |
+| 4 | 3 | 2 | 3 | 3 |
+
+Mean 12.0 / 210 per seed (5.7%), union 17 / 210 (8.1%). Previous single run: 5 / 210; ItyFuzz: 79 / 210.
+Executions per 120 s rose from 2-12k to 33-67k. The dominant win was the predicate oracle
+(eager hex formatting and whole-manifest evidence on every check), not the EVM.
