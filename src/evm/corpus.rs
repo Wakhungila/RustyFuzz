@@ -3667,6 +3667,29 @@ impl SnapshotCorpus {
 
     /// Portable replay material: the complete sequence always starts at the
     /// original root, never at an exploration-modified snapshot cache.
+    /// Total transactions along the lineage of `id` without cloning any input.
+    ///
+    /// `None` when the lineage is missing or cyclic (same condition as [`lineage_inputs`]).
+    pub fn lineage_tx_len(&self, id: u64) -> Option<usize> {
+        let mut total = 0usize;
+        let mut current = id;
+        let mut steps = 0usize;
+        loop {
+            let snapshot = self.snapshots.get(&current)?;
+            let parent = *self.parent_map.get(&current)?;
+            if parent == current {
+                let root_ok = current == 0 && snapshot.read().producing_input.is_none();
+                return root_ok.then_some(total);
+            }
+            total = total.saturating_add(snapshot.read().producing_input.as_ref()?.txs.len());
+            current = parent;
+            steps += 1;
+            if steps > self.snapshots.len() {
+                return None; // cycle
+            }
+        }
+    }
+
     pub fn root_replay_input(&self, input: &EvmInput) -> Option<EvmInput> {
         let mut txs = Vec::new();
         for prefix in self.lineage_inputs(input.base_snapshot_id)? {
@@ -3681,7 +3704,7 @@ impl SnapshotCorpus {
     }
 
     pub fn pin_snapshot(&mut self, id: u64) -> bool {
-        if self.lineage_inputs(id).is_none() {
+        if self.lineage_tx_len(id).is_none() {
             return false;
         }
         self.pinned.insert(id);

@@ -243,8 +243,8 @@ impl EvmMutator {
     /// Checks if adding `count` transactions would exceed the maximum sequence length
     fn can_add_transactions(&self, input: &EvmInput, count: usize) -> bool {
         let len = match &self.snapshot_corpus {
-            Some(corpus) => match corpus.read().root_replay_input(input) {
-                Some(replay) => replay.txs.len(),
+            Some(corpus) => match corpus.read().lineage_tx_len(input.base_snapshot_id) {
+                Some(prefix) => prefix.saturating_add(input.txs.len()),
                 None => return false,
             },
             None => input.txs.len(),
@@ -334,7 +334,10 @@ impl EvmMutator {
         }
         let action = input.txs[rand.below(NonZero::new(input.txs.len()).unwrap())].clone();
         let rebased = EvmInput::new(vec![action], id);
-        if corpus.root_replay_input(&rebased).is_none() || !corpus.pin_snapshot(id) {
+        let fits = corpus
+            .lineage_tx_len(id)
+            .is_some_and(|prefix| prefix.saturating_add(rebased.txs.len()) <= MAX_SEQUENCE_LENGTH);
+        if !fits || !corpus.pin_snapshot(id) {
             return false;
         }
         *input = rebased;
