@@ -3336,6 +3336,8 @@ async fn run_single_process_campaign(
     let mut lean_seen = vec![0u8; MAP_SIZE];
     let mut lean_counter: u64 = 0;
     let mut lean_stats: (u64, u64) = (0, 0);
+    const LEAN_FLAG_RERUN_QUOTA: u32 = 25;
+    let mut lean_flag_reruns = [0u32; 4];
     let lean_rerun = std::cell::Cell::new(false);
     let mut harness_pass = |input: &EvmInput, lean: bool, rerun: bool| {
         if !rerun && !budget.reserve_execution() {
@@ -3558,10 +3560,23 @@ async fn run_single_process_campaign(
 
         rustyfuzz_evm::coverage::set_lean(false);
         if lean {
-            let flagged = flashloan_hit.is_some()
-                || kinv_hit.is_some()
-                || foundry_violation.is_some()
-                || invariant_checker.violation().is_some();
+            // Each flag kind forces a full re-run only while its artifact quota would still be open;
+            // afterwards the same hit repeats thousands of times and sampling is enough.
+            let mut flagged = false;
+            for (idx, hit) in [
+                flashloan_hit.is_some(),
+                kinv_hit.is_some(),
+                foundry_violation.is_some(),
+                invariant_checker.violation().is_some(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if hit && lean_flag_reruns[idx] < LEAN_FLAG_RERUN_QUOTA {
+                    lean_flag_reruns[idx] += 1;
+                    flagged = true;
+                }
+            }
             let mut novel = false;
             // SAFETY: the shared-memory allocation is readable and exactly `MAP_SIZE` bytes for the harness lifetime.
             let map_slice = unsafe { std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE) };
