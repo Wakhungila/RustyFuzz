@@ -1966,10 +1966,24 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                 // is enabled, the warm fork state is compacted into the ForkDb backend
                 // (Arc-shared) once per snapshot, then per-input clones are cheap.
                 let mut compacted_snapshot: Option<(u64, rustyfuzz_evm::execution::ChainState)> = None;
-                let mut harness = |input: &EvmInput| {
-                    if !budget.reserve_execution() {
+                // Lean execution, as in the single-process path (see `run_single_process_campaign`).
+                let lean_enabled = std::env::var("RUSTYFUZZ_LEAN_EXEC").map(|v| v != "0").unwrap_or(true);
+                let lean_sample_every: u64 = std::env::var("RUSTYFUZZ_LEAN_SAMPLE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|n| *n > 0)
+                    .unwrap_or(32);
+                const LEAN_FLAG_RERUN_QUOTA: u32 = 25;
+                let mut lean_seen = vec![0u8; MAP_SIZE];
+                let mut lean_counter: u64 = 0;
+                let mut lean_flag_reruns = [0u32; 4];
+                let lean_rerun = std::cell::Cell::new(false);
+                let mut harness_pass = |input: &EvmInput, lean: bool, rerun: bool| {
+                    if !rerun && !budget.reserve_execution() {
                         return ExitKind::Ok;
                     }
+                    rustyfuzz_evm::coverage::begin_sequence();
+                    rustyfuzz_evm::coverage::set_lean(lean);
                     let snap_id = input.base_snapshot_id;
                     if snap_id != 0 {
                         log::error!("brokered inputs must use portable root state, not worker-local snapshots");
@@ -2186,6 +2200,64 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         tx_results.push(result);
                     }
 
+                    rustyfuzz_evm::coverage::set_lean(false);
+                    if lean {
+                        let mut flagged = false;
+                        for (idx, hit) in [
+                            flashloan_hit.is_some(),
+                            kinv_hit.is_some(),
+                            foundry_violation.is_some(),
+                            invariant_checker.violation().is_some(),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            if hit && lean_flag_reruns[idx] < LEAN_FLAG_RERUN_QUOTA {
+                                lean_flag_reruns[idx] += 1;
+                                flagged = true;
+                            }
+                        }
+                        let mut novel = false;
+                        // SAFETY: the shared-memory allocation is readable and exactly `MAP_SIZE` bytes for the harness lifetime.
+                        let map_slice = unsafe { std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE) };
+                        rustyfuzz_evm::coverage::for_each_sequence_touched(|i| {
+                            let count = map_slice[i];
+                            if count != 0 {
+                                let bit = 1u8 << (8 - count.leading_zeros() as u8 - 1);
+                                if lean_seen[i] & bit == 0 {
+                                    lean_seen[i] |= bit;
+                                    novel = true;
+                                }
+                            }
+                        });
+                        lean_counter += 1;
+                        if novel || flagged || lean_counter % lean_sample_every == 0 {
+                            lean_rerun.set(true);
+                        } else {
+                            let testcase_provenance = testcase_metadata_store
+                                .get_or_default(input)
+                                .mutation_provenance;
+                            let strategies = mutation_strategies(&testcase_provenance);
+                            record_successful_concolic_mutation(
+                                telemetry.concolic_hint_stats.as_ref(),
+                                &strategies,
+                                0,
+                                false,
+                                0,
+                            );
+                            telemetry.record_execution(ExecutionTelemetryRecord {
+                                core_id: core_id.0,
+                                tx_count: input.txs.len(),
+                                findings: 0,
+                                campaign_score: 0,
+                                corpus_size: 0,
+                                coverage_edges: 0,
+                                state_novelty_score: 0,
+                                mutation_strategies: &strategies,
+                            });
+                        }
+                        return ExitKind::Ok;
+                    }
                     let execution = sequence_result_from_tx_results(tx_results);
 
                     let report = state_novelty_feedback
@@ -2558,6 +2630,20 @@ async fn run_fuzz_campaign_with_cancellation_inner(
 
                      ExitKind::Ok
                  };
+                let mut harness = |input: &EvmInput| {
+                    if !lean_enabled {
+                        return harness_pass(input, false, false);
+                    }
+                    lean_rerun.set(false);
+                    let kind = harness_pass(input, true, false);
+                    rustyfuzz_evm::coverage::set_lean(false);
+                    if !lean_rerun.get() {
+                        return kind;
+                    }
+                    // SAFETY: the shared-memory allocation is writable and exactly `MAP_SIZE` bytes for the harness lifetime.
+                    unsafe { std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE).fill(0) };
+                    harness_pass(input, false, true)
+                };
 
                  for input in &required_replay_inputs {
                      let reserved_before = budget.reserved();
@@ -3886,10 +3972,6 @@ async fn run_single_process_campaign(
             &findings,
             exploit_candidate.as_ref(),
         ) {
-            let Some(root_replay_input) = snapshot_corpus.read().root_replay_input(input) else {
-                log::error!("Input has incomplete or oversized snapshot lineage");
-                return ExitKind::Crash;
-            };
             // SAFETY: the shared-memory allocation is readable and exactly `MAP_SIZE` bytes for the harness lifetime.
             let persisted = unsafe {
                 let map_slice = std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE);
