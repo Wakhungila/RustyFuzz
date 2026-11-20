@@ -3324,10 +3324,25 @@ async fn run_single_process_campaign(
         rustyfuzz_evm::environment::EnvironmentPolicy::resolve(&initial_db.db, &initial_env)?;
     // Worker-local cache of the compacted snapshot (see the brokered path above).
     let mut compacted_snapshot: Option<(u64, rustyfuzz_evm::execution::ChainState)> = None;
-    let mut harness = |input: &EvmInput| {
-        if !budget.reserve_execution() {
+    // Lean execution (throughput item 1): run each input with the cheap inspector first and
+    // re-execute with full taint/comparison tracking only when the input is novel (new edge or
+    // hitcount class), flagged by an in-loop oracle, or sampled. Disable with RUSTYFUZZ_LEAN_EXEC=0.
+    let lean_enabled = std::env::var("RUSTYFUZZ_LEAN_EXEC").map(|v| v != "0").unwrap_or(true);
+    let lean_sample_every: u64 = std::env::var("RUSTYFUZZ_LEAN_SAMPLE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(8);
+    let mut lean_seen = vec![0u8; MAP_SIZE];
+    let mut lean_counter: u64 = 0;
+    let mut lean_stats: (u64, u64) = (0, 0);
+    let lean_rerun = std::cell::Cell::new(false);
+    let mut harness_pass = |input: &EvmInput, lean: bool, rerun: bool| {
+        if !rerun && !budget.reserve_execution() {
             return ExitKind::Ok;
         }
+        rustyfuzz_evm::coverage::begin_sequence();
+        rustyfuzz_evm::coverage::set_lean(lean);
         let snap_id = input.base_snapshot_id;
         let mut snapshot_corpus_guard = snapshot_corpus.write();
         let Some(root_replay_input) = snapshot_corpus_guard.root_replay_input(input) else {
@@ -3541,6 +3556,60 @@ async fn run_single_process_campaign(
             tx_results.push(result);
         }
 
+        rustyfuzz_evm::coverage::set_lean(false);
+        if lean {
+            let flagged = flashloan_hit.is_some()
+                || kinv_hit.is_some()
+                || foundry_violation.is_some()
+                || invariant_checker.violation().is_some();
+            let mut novel = false;
+            // SAFETY: the shared-memory allocation is readable and exactly `MAP_SIZE` bytes for the harness lifetime.
+            let map_slice = unsafe { std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE) };
+            rustyfuzz_evm::coverage::for_each_sequence_touched(|i| {
+                let count = map_slice[i];
+                if count != 0 {
+                    let bit = 1u8 << (8 - count.leading_zeros() as u8 - 1);
+                    if lean_seen[i] & bit == 0 {
+                        lean_seen[i] |= bit;
+                        novel = true;
+                    }
+                }
+            });
+            lean_counter += 1;
+            if novel || flagged || lean_counter % lean_sample_every == 0 {
+                lean_rerun.set(true);
+                lean_stats.0 += novel as u64;
+                lean_stats.1 += flagged as u64;
+            }
+            if lean_counter % 5000 == 0 {
+                log::info!("lean stats: execs={lean_counter} novel_reruns={} flagged_reruns={}", lean_stats.0, lean_stats.1);
+            }
+            if !lean_rerun.get() {
+                // Lean-only execution: still an execution for telemetry and strategy accounting.
+                let testcase_provenance = testcase_metadata_store
+                    .get_or_default(input)
+                    .mutation_provenance;
+                let strategies = mutation_strategies(&testcase_provenance);
+                record_successful_concolic_mutation(
+                    telemetry.concolic_hint_stats.as_ref(),
+                    &strategies,
+                    0,
+                    false,
+                    0,
+                );
+                telemetry.record_execution(ExecutionTelemetryRecord {
+                    core_id,
+                    tx_count: input.txs.len(),
+                    findings: 0,
+                    campaign_score: 0,
+                    corpus_size: 0,
+                    coverage_edges: 0,
+                    state_novelty_score: 0,
+                    mutation_strategies: &strategies,
+                });
+            }
+            return ExitKind::Ok;
+        }
         let execution = sequence_result_from_tx_results(tx_results);
         let report = state_novelty_feedback.write().observe_execution(&execution);
         // SAFETY: the shared-memory allocation is readable and exactly `MAP_SIZE` bytes for the harness lifetime.
@@ -3842,6 +3911,21 @@ async fn run_single_process_campaign(
         *pending_campaign_score.write() = Some(campaign_score);
 
         ExitKind::Ok
+    };
+    let mut harness = |input: &EvmInput| {
+        if !lean_enabled {
+            return harness_pass(input, false, false);
+        }
+        lean_rerun.set(false);
+        let kind = harness_pass(input, true, false);
+        rustyfuzz_evm::coverage::set_lean(false);
+        if !lean_rerun.get() {
+            return kind;
+        }
+        // Novel, flagged or sampled: discard the lean coverage and re-execute in full.
+        // SAFETY: the shared-memory allocation is writable and exactly `MAP_SIZE` bytes for the harness lifetime.
+        unsafe { std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE).fill(0) };
+        harness_pass(input, false, true)
     };
 
     for input in &required_replay_inputs {

@@ -46,6 +46,7 @@ pub struct CoverageInspector<'a> {
     pub call_traces_inserted: usize,
     pub call_depth: usize,
     pending_sload: Option<PendingStorageRead>,
+    lean: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +109,69 @@ impl<'a> CoverageInspector<'a> {
             call_traces_inserted: 0,
             call_depth: 0,
             pending_sload: None,
+            lean: crate::coverage::is_lean(),
         }
+    }
+
+    /// Lean per-opcode hook: edge coverage plus the storage telemetry the
+    /// committed-state diff and uninitialised-read heuristic need. No taint,
+    /// symbolic expressions, comparison or arithmetic waypoints; an input that
+    /// proves novel is re-executed in full mode by the harness.
+    #[inline]
+    fn lean_step(&mut self, interp: &mut Interpreter, pc: usize, opcode: u8) {
+        if !self.coverage.is_empty() {
+            let mask = self.coverage.len() - 1;
+            let edge_hash = (pc ^ self.last_pc.rotate_left(1) ^ ((opcode as usize) << 1)) & mask;
+            let slot = &mut self.coverage[edge_hash];
+            if *slot == 0 {
+                crate::coverage::record_touched(edge_hash);
+            }
+            *slot = slot.saturating_add(1);
+            if matches!(opcode, 0xF1 | 0xF2 | 0xF4 | 0xFA) {
+                let call_edge = (edge_hash ^ 0x9e37) & mask;
+                let slot = &mut self.coverage[call_edge];
+                if *slot == 0 {
+                    crate::coverage::record_touched(call_edge);
+                }
+                *slot = slot.saturating_add(1);
+            }
+        }
+        self.instruction_count = self.instruction_count.saturating_add(1);
+        if opcode == 0x54 || opcode == 0x55 {
+            if let Ok(slot_val) = interp.stack.peek(0) {
+                let addr = interp.input.target_address();
+                let slot = B256::from(slot_val);
+                if opcode == 0x54 && self.pending_sload.is_none() {
+                    self.pending_sload = Some(PendingStorageRead {
+                        address: addr,
+                        slot,
+                        pc,
+                        tx_idx: self.current_tx_idx,
+                        taint_source: None,
+                        expression: None,
+                    });
+                }
+                if opcode == 0x55 {
+                    if let Ok(value) = interp.stack.peek(1) {
+                        self.dataflow.mark_influenced(addr, slot);
+                        self.dataflow.mark_initialized_slot(addr, slot);
+                        self.push_waypoint(Waypoint::StorageWrite {
+                            address: addr,
+                            slot: slot.to_vec(),
+                            value,
+                            pc,
+                            tx_idx: self.current_tx_idx,
+                            taint_source_of_value: None,
+                            value_expression: None,
+                        });
+                    }
+                    self.write_set.insert((addr, slot));
+                } else {
+                    self.read_set.insert((addr, slot));
+                }
+            }
+        }
+        self.last_pc = pc;
     }
 
     fn push_symbolic(
@@ -355,6 +418,10 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
     fn step(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
         let pc = interp.bytecode.pc();
         let opcode = interp.bytecode.opcode();
+        if self.lean {
+            self.lean_step(interp, pc, opcode);
+            return;
+        }
         let stack_taint = |stack: &[Option<TaintSource>], idx: usize| {
             stack.iter().rev().nth(idx).cloned().flatten()
         };
