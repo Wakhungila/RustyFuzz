@@ -241,7 +241,7 @@ jobs:
           python3 scripts/validate_autonomous_discovery.py --max-execs 6000 --duration-secs 30 --min-rediscovered 4
       - name: Run throughput regression gate
         run: |
-          RF_FLOOR_ERC20=40 RF_FLOOR_FLASH=40 python3 scripts/validate_throughput.py --duration-secs 20
+          RF_FLOOR_ERC20=150 RF_FLOOR_FLASH=100 python3 scripts/validate_throughput.py --duration-secs 20
 
       - name: Upload smoke evidence
         if: always()

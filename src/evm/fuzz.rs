@@ -34,6 +34,19 @@ pub struct AbiRegistry {
     pub functions: HashMap<[u8; 4], Vec<DynSolType>>,
 }
 
+/// Cap on transactions appended to a single input (default 16, `RUSTYFUZZ_MAX_NEW_TXS`).
+fn max_new_txs() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("RUSTYFUZZ_MAX_NEW_TXS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n: &usize| *n > 0)
+            .unwrap_or(16)
+            .min(MAX_SEQUENCE_LENGTH)
+    })
+}
+
 impl Named for EvmMutator {
     fn name(&self) -> &std::borrow::Cow<'static, str> {
         static NAME: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed("EvmMutator");
@@ -249,7 +262,10 @@ impl EvmMutator {
             },
             None => input.txs.len(),
         };
+        // Item 5: bound the *new* transactions per input as well as the whole lineage. Long delta
+        // runs cost linear time per execution and rarely add signal; snapshots carry the depth.
         len.saturating_add(count) <= MAX_SEQUENCE_LENGTH
+            && input.txs.len().saturating_add(count) <= max_new_txs()
     }
 
     pub fn with_concolic_hints_and_stats(

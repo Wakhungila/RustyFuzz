@@ -3347,10 +3347,15 @@ async fn run_single_process_campaign(
         rustyfuzz_evm::coverage::set_lean(lean);
         let snap_id = input.base_snapshot_id;
         let mut snapshot_corpus_guard = snapshot_corpus.write();
-        let Some(root_replay_input) = snapshot_corpus_guard.root_replay_input(input) else {
+        // The full root replay input (cloning every ancestor's transactions) is only needed when
+        // an artifact is persisted; here only the lineage validity and length are checked.
+        if !snapshot_corpus_guard
+            .lineage_tx_len(snap_id)
+            .is_some_and(|prefix| prefix.saturating_add(input.txs.len()) <= crate::evm::fuzz::MAX_SEQUENCE_LENGTH)
+        {
             log::error!("Input has incomplete or oversized snapshot lineage");
             return ExitKind::Crash;
-        };
+        }
         if !snapshot_corpus_guard.pin_snapshot(snap_id) {
             return ExitKind::Crash;
         }
@@ -3813,6 +3818,18 @@ async fn run_single_process_campaign(
             state_novelty_score: report.novelty_score(),
             mutation_strategies: &mutation_strategies,
         });
+        // provenance::persist skips everything that is not interesting, a finding, or forced by
+        // RUSTYFUZZ_PROVENANCE_ALL; only those need the (clone-heavy) root replay input.
+        let root_replay_input = if report.interesting
+            || !findings.is_empty()
+            || std::env::var_os("RUSTYFUZZ_PROVENANCE_ALL").is_some()
+        {
+            snapshot_corpus.read()
+                .root_replay_input(input)
+                .unwrap_or_else(|| input.clone())
+        } else {
+            input.clone()
+        };
         if let Err(error) = super::provenance::persist(
             config.corpus_dir.as_ref(),
             super::provenance::PersistRequest {
@@ -3869,6 +3886,10 @@ async fn run_single_process_campaign(
             &findings,
             exploit_candidate.as_ref(),
         ) {
+            let Some(root_replay_input) = snapshot_corpus.read().root_replay_input(input) else {
+                log::error!("Input has incomplete or oversized snapshot lineage");
+                return ExitKind::Crash;
+            };
             // SAFETY: the shared-memory allocation is readable and exactly `MAP_SIZE` bytes for the harness lifetime.
             let persisted = unsafe {
                 let map_slice = std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE);

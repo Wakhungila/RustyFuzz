@@ -15,8 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 FIX = ROOT / 'benchmarks/historical/known_vulnerable'
 CASES = {
     # case -> (abi, floor exec/s)
-    'known-erc20-bad-mint-inflation': ('abi/UnauthMintToken.abi.json', int(os.environ.get('RF_FLOOR_ERC20', 60))),
-    'known-flashloan-price-manipulation': ('abi/NoProductCheckPool.abi.json', int(os.environ.get('RF_FLOOR_FLASH', 60))),
+    'known-erc20-bad-mint-inflation': ('abi/UnauthMintToken.abi.json', int(os.environ.get('RF_FLOOR_ERC20', 400))),
+    'known-flashloan-price-manipulation': ('abi/NoProductCheckPool.abi.json', int(os.environ.get('RF_FLOOR_FLASH', 250))),
 }
 ap = argparse.ArgumentParser()
 ap.add_argument('--binary', default=str(ROOT / 'target/release/rusty-fuzz'))
