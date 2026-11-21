@@ -1983,6 +1983,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         return ExitKind::Ok;
                     }
                     rustyfuzz_evm::coverage::begin_sequence();
+        rustyfuzz_evm::cmplog::clear_thread_buffer();
                     rustyfuzz_evm::coverage::set_lean(lean);
                     let snap_id = input.base_snapshot_id;
                     if snap_id != 0 {
@@ -2201,6 +2202,8 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     }
 
                     rustyfuzz_evm::coverage::set_lean(false);
+
+                    rustyfuzz_evm::cmplog::drain_into_table();
                     if lean {
                         let mut flagged = false;
                         for (idx, hit) in [
@@ -3430,6 +3433,7 @@ async fn run_single_process_campaign(
             return ExitKind::Ok;
         }
         rustyfuzz_evm::coverage::begin_sequence();
+        rustyfuzz_evm::cmplog::clear_thread_buffer();
         rustyfuzz_evm::coverage::set_lean(lean);
         let snap_id = input.base_snapshot_id;
         let mut snapshot_corpus_guard = snapshot_corpus.write();
@@ -3650,6 +3654,8 @@ async fn run_single_process_campaign(
         }
 
         rustyfuzz_evm::coverage::set_lean(false);
+
+        rustyfuzz_evm::cmplog::drain_into_table();
         if lean {
             // Each flag kind forces a full re-run only while its artifact quota would still be open;
             // afterwards the same hit repeats thousands of times and sampling is enough.

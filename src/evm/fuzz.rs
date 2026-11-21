@@ -113,6 +113,7 @@ pub enum MutationStrategyKind {
     MevSandwich,
     ValueBoundary,
     ReentrancyProbe,
+    InputToState,
 }
 
 impl MutationStrategyKind {
@@ -133,6 +134,7 @@ impl MutationStrategyKind {
             MutationStrategyKind::MevSandwich => "mev_sandwich",
             MutationStrategyKind::ValueBoundary => "value_boundary",
             MutationStrategyKind::ReentrancyProbe => "reentrancy_probe",
+            MutationStrategyKind::InputToState => "i2s",
         }
     }
 }
@@ -171,6 +173,19 @@ where
             && matches!(
                 self.record_attempt(MutationStrategyKind::ReentrancyProbe)
                     .reentrancy_probe(rand, input, &mut metadata),
+                MutationResult::Mutated
+            )
+        {
+            self.testcase_metadata.insert(input, metadata);
+            return Ok(MutationResult::Mutated);
+        }
+
+        // Input-to-state: splice logged comparison operands into matching calldata words.
+        if !rustyfuzz_evm::cmplog::is_empty()
+            && rand.below(NonZero::new(100).unwrap()) < 20
+            && matches!(
+                self.record_attempt(MutationStrategyKind::InputToState)
+                    .input_to_state(rand, input, &mut metadata),
                 MutationResult::Mutated
             )
         {
@@ -677,6 +692,56 @@ impl EvmMutator {
         } else {
             MutationResult::Skipped
         }
+    }
+
+    /// RedQueen-style input-to-state mutation.
+    ///
+    /// Scans the 32-byte argument words of one transaction for values that the target compared
+    /// against something (see `rustyfuzz_evm::cmplog`) and replaces one with the value it was
+    /// compared to (also the +/-1 neighbours, which flip `<`/`>` guards). When nothing matches,
+    /// a random argument word is overwritten with a random logged operand.
+    fn input_to_state<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
+    ) -> MutationResult {
+        let Some(idx) = self.random_index(rand, input.txs.len()) else {
+            return MutationResult::Skipped;
+        };
+        let calldata = &input.txs[idx].input;
+        if calldata.len() < 36 {
+            return MutationResult::Skipped;
+        }
+        let words = (calldata.len() - 4) / 32;
+        let mut candidates: Vec<(usize, U256)> = Vec::new();
+        for w in 0..words {
+            let off = 4 + w * 32;
+            let word = U256::from_be_slice(&calldata[off..off + 32]);
+            if let Some(partners) = rustyfuzz_evm::cmplog::partners_of(&word) {
+                for partner in partners {
+                    candidates.push((off, partner));
+                }
+            }
+        }
+        let (off, value, detail) = if !candidates.is_empty() {
+            let (off, partner) = candidates[rand.below(NonZero::new(candidates.len()).unwrap())];
+            let value = match rand.below(NonZero::new(6).unwrap()) {
+                0 => partner.saturating_add(U256::from(1u8)),
+                1 => partner.saturating_sub(U256::from(1u8)),
+                _ => partner,
+            };
+            (off, value, "replaced argument word with its comparison partner")
+        } else {
+            let Some(value) = rustyfuzz_evm::cmplog::pick_value(rand.next()) else {
+                return MutationResult::Skipped;
+            };
+            let off = 4 + rand.below(NonZero::new(words).unwrap()) * 32;
+            (off, value, "spliced a logged comparison operand into an argument word")
+        };
+        input.txs[idx].input[off..off + 32].copy_from_slice(&value.to_be_bytes::<32>());
+        self.record_mutation(metadata, "i2s", Some(idx), Some(input.txs[idx].input[..4].try_into().unwrap_or([0u8; 4])), detail);
+        MutationResult::Mutated
     }
 
     fn abi_mutation<R: Rand>(
@@ -1483,6 +1548,47 @@ mod tests {
             metadata.mutation_provenance[0].strategy,
             "abi_sequence_insert"
         );
+    }
+
+    #[test]
+    fn input_to_state_replaces_argument_word_with_logged_partner() {
+        // The process-wide table is shared with other tests; use values nothing else logs.
+        let guard = U256::from(0x1234_5678_9abc_def0_u64);
+        let wanted = U256::from(0xdead_beef_cafe_f00d_u64);
+        rustyfuzz_evm::cmplog::record(guard, wanted);
+        rustyfuzz_evm::cmplog::drain_into_table();
+        let mutator = EvmMutator::new(
+            Arc::new(AbiRegistry::default()),
+            Arc::new(RwLock::new(GlobalAccountRegistry::default())),
+        );
+        let mut calldata = vec![0xaa, 0xbb, 0xcc, 0xdd];
+        calldata.extend_from_slice(&guard.to_be_bytes::<32>());
+        let mut input = EvmInput::new(
+            vec![SingletonTx {
+                input: calldata,
+                caller: Address::repeat_byte(0x11),
+                to: Address::repeat_byte(0x22),
+                value: U256::ZERO,
+                is_victim: false,
+            }],
+            0,
+        );
+        let mut metadata = EvmTestcaseMetadata::default();
+        let mut rand = RomuDuoJrRand::with_seed(3);
+        let mut hit = false;
+        for _ in 0..64 {
+            let mut trial = input.clone();
+            if mutator.input_to_state(&mut rand, &mut trial, &mut metadata) == MutationResult::Mutated {
+                let word = U256::from_be_slice(&trial.txs[0].input[4..36]);
+                if word == wanted {
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        assert!(hit, "i2s never produced the logged partner value");
+        assert_eq!(&input.txs[0].input[..4], &[0xaa, 0xbb, 0xcc, 0xdd]);
+        input.txs[0].input.clear();
     }
 
     #[test]

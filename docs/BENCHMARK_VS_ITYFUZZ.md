@@ -61,3 +61,19 @@ Bugs counted from `sum(bN) <= 0` invariant violations in campaign artifacts (ora
 Mean 12.0 / 210 per seed (5.7%), union 17 / 210 (8.1%). Previous single run: 5 / 210; ItyFuzz: 79 / 210.
 Executions per 120 s rose from 2-12k to 33-67k. The dominant win was the predicate oracle
 (eager hex formatting and whole-manifest evidence on every check), not the EVM.
+
+### With input-to-state (comparison-operand log + `i2s` mutator)
+
+Same setup (120 s, seeds 1-3, mazes 0-4):
+
+| maze | seed 1 | seed 2 | seed 3 | union |
+|---|---|---|---|---|
+| 0 | 3 | 3 | 2 | 4 |
+| 1 | 3 | 2 | 2 | 4 |
+| 2 | 4 | 1 | 3 | 5 |
+| 3 | 3 | 2 | 2 | 3 |
+| 4 | 2 | 5 | 3 | 6 |
+
+Mean 13.3 / 210 per seed (6.3%), union 22 / 210 (10.5%), up from 12.0 / 17. Executions per 120 s: 44-96k.
+The gain is small and within seed noise per maze; the union gain (17 -> 22) is the clearer signal.
+The same shallow bugs are found every run, so the remaining gap is not guard-value solving.

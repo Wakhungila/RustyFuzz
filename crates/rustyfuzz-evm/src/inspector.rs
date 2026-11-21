@@ -418,6 +418,11 @@ impl<'a, CTX: ContextTr> Inspector<CTX> for CoverageInspector<'a> {
     fn step(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
         let pc = interp.bytecode.pc();
         let opcode = interp.bytecode.opcode();
+        if (0x10..=0x14).contains(&opcode) {
+            if let (Ok(a), Ok(b)) = (interp.stack.peek(0), interp.stack.peek(1)) {
+                crate::cmplog::record(a, b);
+            }
+        }
         if self.lean {
             self.lean_step(interp, pc, opcode);
             return;
