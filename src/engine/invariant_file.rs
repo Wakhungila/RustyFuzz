@@ -60,6 +60,26 @@ pub struct InvariantFile {
 }
 
 impl InvariantFile {
+    /// Every mapping key the file names, as 32-byte words. These are the values the
+    /// invariant is *about* (a message hash, a depositor), so the mutator should try
+    /// them as arguments instead of rediscovering them by chance.
+    pub fn dictionary_words(&self) -> Vec<alloy_primitives::U256> {
+        let mut out = Vec::new();
+        for binding in self.symbols.values() {
+            for key in &binding.keys {
+                let hex = key.trim_start_matches("0x");
+                if let Ok(bytes) = alloy_primitives::hex::decode(hex) {
+                    if !bytes.is_empty() && bytes.len() <= 32 {
+                        let mut w = [0u8; 32];
+                        w[32 - bytes.len()..].copy_from_slice(&bytes);
+                        out.push(alloy_primitives::U256::from_be_bytes(w));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Parses and rejects structural problems early, before any binding work.
     pub fn from_json(text: &str) -> anyhow::Result<Self> {
         let file: InvariantFile =

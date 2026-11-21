@@ -299,6 +299,9 @@ impl SavedSnapshots {
             pinned: self.pinned,
             global_read_hotspots: self.hotspots.into_iter().collect(),
             priority_gap_map: self.priority.into_iter().collect(),
+            known_slots_cache: Default::default(),
+            known_selectors_cache: Default::default(),
+            novelty_caches_ready: false,
         })
     }
 }
