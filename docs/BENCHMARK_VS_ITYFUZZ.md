@@ -85,3 +85,14 @@ Per maze (seed1/2/3, union): m0 2/3/4 u7, m1 6/3/2 u7, m2 1/6/3 u7, m3 2/2/1 u2,
 Concolic hints on maze-2 (30k execs): 120k generated, 58k deduplicated, 3.6k applied, 531 successful (15% of applied).
 Per-seed variance (+/-3 per maze) is as large as the per-change gains, so the per-seed mean is not distinguishable from 13.3;
 the union (17 -> 22 -> 26) is the steadier signal. ItyFuzz: 79 / 210.
+
+### Rarity-weighted snapshot selection + `uint_havoc` (item 9)
+
+A/B at 60 s, seeds 1-3, mazes 0-4 (`RUSTYFUZZ_RARITY=0|1`; `uint_havoc` is on in both, so it is not isolated):
+
+| | bugs / 15 runs | per seed | union | mean execs / 60 s |
+|---|---|---|---|---|
+| rarity off | 33 | 11.0 | 17 | 53,392 |
+| rarity on | 36 | 12.0 | 20 | 44,899 |
+
+Direction is positive but inside seed noise; rarity costs ~16% of execs. Kept on by default.

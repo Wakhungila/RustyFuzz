@@ -3261,6 +3261,9 @@ pub struct SnapshotCorpus {
     pub(crate) known_slots_cache: HashSet<(Address, B256)>,
     pub(crate) known_selectors_cache: HashSet<[u8; 4]>,
     pub(crate) novelty_caches_ready: bool,
+    /// Number of retained snapshots covering each edge (rarity-weighted scheduling).
+    /// Empty after a checkpoint restore; rebuilt lazily by `ensure_edge_freq`.
+    pub(crate) edge_freq: Vec<u32>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -3532,7 +3535,50 @@ impl SnapshotScore {
     }
 }
 
+fn bump_edge_freq(freq: &mut [u32], coverage: &BitVec<u8, Lsb0>, delta: i32) {
+    for index in coverage.iter_ones() {
+        if let Some(slot) = freq.get_mut(index) {
+            *slot = if delta >= 0 {
+                slot.saturating_add(delta as u32)
+            } else {
+                slot.saturating_sub(delta.unsigned_abs())
+            };
+        }
+    }
+}
+
+/// Rarity weighting is on unless `RUSTYFUZZ_RARITY=0`.
+fn rarity_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RUSTYFUZZ_RARITY").map(|v| v != "0").unwrap_or(true))
+}
+
 impl SnapshotCorpus {
+    fn ensure_edge_freq(&mut self) {
+        if !self.edge_freq.is_empty() || self.snapshots.is_empty() {
+            return;
+        }
+        let mut freq = vec![0u32; rustyfuzz_evm::inspector::MAP_SIZE];
+        for snapshot in self.snapshots.values() {
+            bump_edge_freq(&mut freq, &snapshot.read().coverage, 1);
+        }
+        self.edge_freq = freq;
+    }
+
+    /// AFL-fast-style rarity: each edge contributes `16 / holders`, so a snapshot that is
+    /// one of the few reaching an edge outweighs one that merely covers many common edges.
+    fn rarity_score(&self, id: u64) -> u128 {
+        let Some(snapshot) = self.snapshots.get(&id) else {
+            return 0;
+        };
+        let snapshot = snapshot.read();
+        snapshot
+            .coverage
+            .iter_ones()
+            .map(|index| 16 / u128::from(self.edge_freq.get(index).copied().unwrap_or(1).max(1)))
+            .sum()
+    }
+
     pub fn new() -> Self {
         Self {
             snapshots: HashMap::new(),
@@ -3543,6 +3589,7 @@ impl SnapshotCorpus {
             global_read_hotspots: HashMap::new(),
             priority_gap_map: bitvec::bitvec![u8, Lsb0; 0; MAP_SIZE],
             known_slots_cache: HashSet::new(),
+            edge_freq: Vec::new(),
             known_selectors_cache: HashSet::new(),
             novelty_caches_ready: false,
         }
@@ -3577,6 +3624,9 @@ impl SnapshotCorpus {
         let depth = snapshot.depth;
         let coverage_score = snapshot.coverage.count_ones();
         let state_fingerprint = hash_snapshot_state(&snapshot);
+        if !self.edge_freq.is_empty() {
+            bump_edge_freq(&mut self.edge_freq, &snapshot.coverage, 1);
+        }
         self.snapshots.insert(id, Arc::new(RwLock::new(snapshot)));
         self.parent_map.insert(id, parent_id);
         if id != parent_id {
@@ -3896,8 +3946,21 @@ impl SnapshotCorpus {
         }
         let mut weighted_ids = Vec::new();
         let gap_any = self.priority_gap_map.any();
+        let rarity = rarity_enabled();
+        if rarity {
+            self.ensure_edge_freq();
+        }
         for id in &ids {
-            if let Some(energy) = self.snapshot_energy_inner(*id, weights, gap_any) {
+            if let Some(mut energy) = self.snapshot_energy_inner(*id, weights, gap_any) {
+                if rarity {
+                    energy = energy.saturating_add(self.rarity_score(*id));
+                    // Stale snapshots (many executions without new coverage) lose weight.
+                    let stale = self
+                        .metadata
+                        .get(id)
+                        .map_or(0, |m| m.executions_since_novelty.min(4096)) as u128;
+                    energy = energy.saturating_mul(256) / (256 + stale);
+                }
                 weighted_ids.push((*id, energy));
             }
         }
@@ -4015,7 +4078,11 @@ impl SnapshotCorpus {
                 siblings.retain(|child_id| *child_id != id);
             }
         }
-        self.snapshots.remove(&id);
+        if let Some(removed) = self.snapshots.remove(&id) {
+            if !self.edge_freq.is_empty() {
+                bump_edge_freq(&mut self.edge_freq, &removed.read().coverage, -1);
+            }
+        }
         self.parent_map.remove(&id);
         self.metadata.remove(&id);
     }

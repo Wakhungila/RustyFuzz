@@ -126,6 +126,7 @@ pub enum MutationStrategyKind {
     ValueBoundary,
     ReentrancyProbe,
     InputToState,
+    UintHavoc,
 }
 
 impl MutationStrategyKind {
@@ -147,6 +148,7 @@ impl MutationStrategyKind {
             MutationStrategyKind::ValueBoundary => "value_boundary",
             MutationStrategyKind::ReentrancyProbe => "reentrancy_probe",
             MutationStrategyKind::InputToState => "i2s",
+            MutationStrategyKind::UintHavoc => "uint_havoc",
         }
     }
 }
@@ -198,6 +200,18 @@ where
             && matches!(
                 self.record_attempt(MutationStrategyKind::InputToState)
                     .input_to_state(rand, input, &mut metadata),
+                MutationResult::Mutated
+            )
+        {
+            self.testcase_metadata.insert(input, metadata);
+            return Ok(MutationResult::Mutated);
+        }
+
+        // Word-level arithmetic havoc on argument words (neighbours, boundaries, shifts, bit flips).
+        if rand.below(NonZero::new(100).unwrap()) < 12
+            && matches!(
+                self.record_attempt(MutationStrategyKind::UintHavoc)
+                    .uint_havoc(rand, input, &mut metadata),
                 MutationResult::Mutated
             )
         {
@@ -704,6 +718,42 @@ impl EvmMutator {
         } else {
             MutationResult::Skipped
         }
+    }
+
+    /// Arithmetic/bitwise havoc on one 32-byte argument word of one transaction.
+    fn uint_havoc<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut EvmInput,
+        metadata: &mut EvmTestcaseMetadata,
+    ) -> MutationResult {
+        let Some(idx) = self.random_index(rand, input.txs.len()) else {
+            return MutationResult::Skipped;
+        };
+        let calldata = &mut input.txs[idx].input;
+        if calldata.len() < 36 {
+            return MutationResult::Skipped;
+        }
+        let words = (calldata.len() - 4) / 32;
+        let off = 4 + rand.below(NonZero::new(words).unwrap()) * 32;
+        let word = U256::from_be_slice(&calldata[off..off + 32]);
+        let small = U256::from(1 + rand.below(NonZero::new(35).unwrap()) as u64);
+        let bits = 1 + rand.below(NonZero::new(255).unwrap());
+        let value = match rand.below(NonZero::new(9).unwrap()) {
+            0 => word.wrapping_add(small),
+            1 => word.wrapping_sub(small),
+            2 => word ^ (U256::from(1u8) << (rand.below(NonZero::new(256).unwrap()))),
+            3 => word << (1 + rand.below(NonZero::new(8).unwrap())),
+            4 => word >> (1 + rand.below(NonZero::new(8).unwrap())),
+            5 => (U256::from(1u8) << bits).wrapping_sub(U256::from(1u8)), // 2^bits - 1
+            6 => U256::from(1u8) << bits.min(255),                        // 2^bits
+            7 => word.wrapping_mul(U256::from(2u8)),
+            _ => !word & ((U256::from(1u8) << (8 * (1 + rand.below(NonZero::new(32).unwrap()))).min(255)) - U256::from(1u8)),
+        };
+        calldata[off..off + 32].copy_from_slice(&value.to_be_bytes::<32>());
+        let selector: [u8; 4] = calldata[..4].try_into().unwrap_or([0u8; 4]);
+        self.record_mutation(metadata, "uint_havoc", Some(idx), Some(selector), "arithmetic havoc on an argument word");
+        MutationResult::Mutated
     }
 
     /// RedQueen-style input-to-state mutation.
