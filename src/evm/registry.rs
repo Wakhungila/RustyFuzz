@@ -5,7 +5,7 @@ use alloy_dyn_abi::DynSolType;
 use alloy_json_abi::JsonAbi;
 use libafl_bolts::rands::Rand;
 use revm::primitives::{Address, U256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZero;
 
 fn populate_remote_abi(abi: &JsonAbi, abi_registry: &mut AbiRegistry) -> anyhow::Result<()> {
@@ -37,9 +37,11 @@ fn populate_remote_abi(abi: &JsonAbi, abi_registry: &mut AbiRegistry) -> anyhow:
 
 #[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GlobalAccountRegistry {
-    pub contracts: HashSet<Address>,
+    /// Ordered: the mutator indexes into this set, so iteration order must not depend on the
+    /// per-process hash seed (identical seeds must replay identical campaigns).
+    pub contracts: BTreeSet<Address>,
     /// Directed Call Graph: Caller -> { Callee1, Callee2, ... }
-    pub call_graph: HashMap<Address, HashSet<Address>>,
+    pub call_graph: BTreeMap<Address, BTreeSet<Address>>,
     pub erc20_balance_slots: HashMap<Address, U256>, // token_address -> balance_slot
     pub erc20_total_supply_slots: HashMap<Address, U256>, // token_address -> total_supply_slot
     #[serde(skip)]

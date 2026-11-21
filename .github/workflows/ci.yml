@@ -242,6 +242,8 @@ jobs:
       - name: Run throughput regression gate
         run: |
           RF_FLOOR_ERC20=150 RF_FLOOR_FLASH=100 python3 scripts/validate_throughput.py --duration-secs 20
+      - name: Run determinism gate
+        run: python3 scripts/validate_determinism.py
 
       - name: Upload smoke evidence
         if: always()
