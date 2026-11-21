@@ -3694,7 +3694,12 @@ async fn run_single_process_campaign(
                 lean_stats.1 += flagged as u64;
             }
             if lean_counter % 5000 == 0 {
-                log::info!("lean stats: execs={lean_counter} novel_reruns={} flagged_reruns={}", lean_stats.0, lean_stats.1);
+                log::info!(
+                    "lean stats: execs={lean_counter} novel_reruns={} flagged_reruns={} concolic={:?}",
+                    lean_stats.0,
+                    lean_stats.1,
+                    telemetry.concolic_hint_stats.snapshot()
+                );
             }
             if !lean_rerun.get() {
                 // Lean-only execution: still an execution for telemetry and strategy accounting.

@@ -77,3 +77,11 @@ Same setup (120 s, seeds 1-3, mazes 0-4):
 Mean 13.3 / 210 per seed (6.3%), union 22 / 210 (10.5%), up from 12.0 / 17. Executions per 120 s: 44-96k.
 The gain is small and within seed noise per maze; the union gain (17 -> 22) is the clearer signal.
 The same shallow bugs are found every run, so the remaining gap is not guard-value solving.
+
+### With hint share 40% (was 15%) and hot-path fixes (memoised mapping slots, coverage-observe skip)
+
+Same setup (120 s, seeds 1-3, mazes 0-4): per seed 13.7 / 210 (6.5%), union 26 / 210 (12.4%).
+Per maze (seed1/2/3, union): m0 2/3/4 u7, m1 6/3/2 u7, m2 1/6/3 u7, m3 2/2/1 u2, m4 3/1/2 u3.
+Concolic hints on maze-2 (30k execs): 120k generated, 58k deduplicated, 3.6k applied, 531 successful (15% of applied).
+Per-seed variance (+/-3 per maze) is as large as the per-change gains, so the per-seed mean is not distinguishable from 13.3;
+the union (17 -> 22 -> 26) is the steadier signal. ItyFuzz: 79 / 210.

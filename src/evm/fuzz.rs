@@ -34,6 +34,18 @@ pub struct AbiRegistry {
     pub functions: HashMap<[u8; 4], Vec<DynSolType>>,
 }
 
+/// Percentage of mutations that first try a queued concolic hint (`RUSTYFUZZ_HINT_PCT`).
+fn concolic_hint_pct() -> usize {
+    static PCT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PCT.get_or_init(|| {
+        std::env::var("RUSTYFUZZ_HINT_PCT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(|v: usize| v.min(100))
+            .unwrap_or(40)
+    })
+}
+
 /// Cap on transactions appended to a single input (default 16, `RUSTYFUZZ_MAX_NEW_TXS`).
 fn max_new_txs() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -155,7 +167,7 @@ where
         }
         let has_concolic_hints = { !self.concolic_hints.lock().is_empty() };
         if has_concolic_hints
-            && rand.below(NonZero::new(100).unwrap()) < 15
+            && rand.below(NonZero::new(100).unwrap()) < concolic_hint_pct()
             && matches!(
                 self.apply_queued_concolic_hint(input, &mut metadata),
                 MutationResult::Mutated
