@@ -160,3 +160,24 @@ gate 5/5, replay gate 5/5 with 0 false positives on 10 negative controls.
   estimate (~6x) until both run back-to-back with the same time budget.
 - "No real-target finding" means: none produced by RustyFuzz in this project's own runs; no
   independently verified novel finding on a live contract is documented.
+
+## Back-to-back head-to-head (same session, same 2-core sandbox, mazes 0-4, 120 s per tool per maze)
+Run with `scripts/bench/daedaluzz.py --secs 120 --seeds 1,2,3`; raw output
+`benchmarks/results/daedaluzz/h2h_120s_seeds123.log`. ItyFuzz ran once per maze (typed-bug event, one core);
+RustyFuzz ran three seeds per maze (replay-judge confirmed).
+
+| maze | bugs | ItyFuzz (1 run) | RustyFuzz per seed (1/2/3) | RustyFuzz union |
+|---|---|---|---|---|
+| 0 | 43 | 15 | 3 / 2 / 3 | 3 |
+| 1 | 40 | 17 | 3 / 1 / 5 | 6 |
+| 2 | 45 | 17 | 1 / 2 / 4 | 5 |
+| 3 | 41 | 15 | 4 / 2 / 1 | 4 |
+| 4 | 41 | 14 | 2 / 3 / 2 | 3 |
+| **total** | 210 | **78 (37.1%)** | **13 / 10 / 15 (mean 12.7, 6.0%)** | **21 (10.0%)** |
+
+Result: ItyFuzz finds ~6x more per equal wall-clock; every bug RustyFuzz confirmed was also found by ItyFuzz
+(`only_rustyfuzz` empty on all mazes). RustyFuzz's per-seed totals reproduce the earlier 13/10/15 exactly
+(deterministic). Zero oracle claims failed judge replay. ItyFuzz variance was not measured (single run).
+
+CI: `scripts/validate_daedaluzz_subset.py` (mazes 0 and 3, seeds 1-2, 60 s) fails on any oracle claim the judge
+cannot reproduce or if the judge-confirmed union < 3 (measured 6); wired into the `autonomous-smoke` job.

@@ -244,13 +244,19 @@ jobs:
           RF_FLOOR_ERC20=150 RF_FLOOR_FLASH=100 python3 scripts/validate_throughput.py --duration-secs 20
       - name: Run determinism gate
         run: python3 scripts/validate_determinism.py
+      - name: Build replay judge
+        run: cargo build --release --locked --bin replay-judge
+      - name: Run Daedaluzz subset through the replay judge
+        run: python3 scripts/validate_daedaluzz_subset.py --mazes 0,3 --seeds 1,2 --secs 60
 
       - name: Upload smoke evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: autonomous-smoke-evidence
-          path: benchmarks/results/autonomous-smoke/
+          path: |
+            benchmarks/results/autonomous-smoke/
+            benchmarks/results/daedaluzz-subset/
 
   # Build verification
   build:
