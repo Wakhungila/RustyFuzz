@@ -59,6 +59,55 @@ fn max_new_txs() -> usize {
     })
 }
 
+/// Concolic hints paired with the exact input whose execution produced them.
+///
+/// A hint ("at tx k set calldata word w") only means something relative to the path that
+/// generated it. The global hint queue applies hints to arbitrary corpus entries, which is why
+/// only ~10% ever helped. Here each hint is applied to a clone of its origin input, so a
+/// satisfied guard is retried on the sequence that actually reached it.
+#[derive(Default)]
+pub struct TargetedHints {
+    queue: std::collections::VecDeque<(EvmInput, ConcolicHint)>,
+    seen: std::collections::HashSet<u64>,
+}
+
+impl TargetedHints {
+    const MAX_QUEUED: usize = 512;
+    const MAX_SEEN: usize = 400_000;
+
+    /// Queue `hints` (already priority-ordered) against `origin`; returns how many were new.
+    pub fn push(&mut self, origin: &EvmInput, hints: &[ConcolicHint]) -> usize {
+        use std::hash::{Hash, Hasher};
+        if self.seen.len() > Self::MAX_SEEN {
+            self.seen.clear();
+        }
+        let mut base = std::collections::hash_map::DefaultHasher::new();
+        origin.base_snapshot_id.hash(&mut base);
+        for tx in &origin.txs {
+            tx.input.hash(&mut base);
+            tx.caller.hash(&mut base);
+        }
+        let mut added = 0;
+        for hint in hints {
+            let mut h = base.clone();
+            (hint.tx_index, hint.calldata_offset, hint.word).hash(&mut h);
+            if self.seen.insert(h.finish()) {
+                self.queue.push_back((origin.clone(), hint.clone()));
+                added += 1;
+            }
+        }
+        while self.queue.len() > Self::MAX_QUEUED {
+            self.queue.pop_front();
+        }
+        added
+    }
+
+    fn pop(&mut self) -> Option<(EvmInput, ConcolicHint)> {
+        // Newest first: the freshest origin is the one most recently found interesting.
+        self.queue.pop_back()
+    }
+}
+
 impl Named for EvmMutator {
     fn name(&self) -> &std::borrow::Cow<'static, str> {
         static NAME: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed("EvmMutator");
@@ -72,6 +121,8 @@ impl Named for EvmMutator {
 /// EVM semantics, including ABI-aware mutations, concolic solving, economic pressure,
 /// and MEV patterns like sandwich attacks.
 pub struct EvmMutator {
+    /// Hints bound to the input that produced them (branch-flip children).
+    pub targeted_hints: Arc<Mutex<TargetedHints>>,
     /// Registry of known function selectors and their input types
     pub abi_registry: Arc<AbiRegistry>,
     /// Registry of known contracts and their relationships
@@ -166,6 +217,29 @@ where
         {
             self.testcase_metadata.insert(input, metadata);
             return Ok(MutationResult::Mutated);
+        }
+        if rand.below(NonZero::new(100).unwrap()) < env_pct("RUSTYFUZZ_TARGETED_HINT_PCT", 0) {
+            let next = self.targeted_hints.lock().pop();
+            if let Some((origin, hint)) = next {
+                *input = origin;
+                if let Some(tx) = input.txs.get_mut(hint.tx_index) {
+                    let parameter_types = selector_for_calldata(&tx.input)
+                        .and_then(|selector| self.abi_registry.functions.get(&selector))
+                        .cloned();
+                    let placement = apply_concolic_hint(tx, &hint, parameter_types.as_deref());
+                    let selector = selector_for_calldata(&tx.input);
+                    self.record_mutation(
+                        &mut metadata,
+                        "concolic_hint",
+                        Some(hint.tx_index),
+                        selector,
+                        &format!("targeted hint from pc {} into {}", hint.pc, placement),
+                    );
+                    self.concolic_hint_stats.record_applied();
+                    self.testcase_metadata.insert(input, metadata);
+                    return Ok(MutationResult::Mutated);
+                }
+            }
         }
         let has_concolic_hints = { !self.concolic_hints.lock().is_empty() };
         if has_concolic_hints
@@ -277,6 +351,7 @@ impl EvmMutator {
         account_registry: Arc<RwLock<GlobalAccountRegistry>>,
     ) -> Self {
         Self {
+            targeted_hints: Arc::new(Mutex::new(TargetedHints::default())),
             abi_registry,
             account_registry,
             concolic_hints: Arc::new(Mutex::new(Vec::new())),
@@ -317,6 +392,7 @@ impl EvmMutator {
         testcase_metadata: EvmTestcaseMetadataStore,
     ) -> Self {
         Self {
+            targeted_hints: Arc::new(Mutex::new(TargetedHints::default())),
             abi_registry,
             account_registry,
             concolic_hints,

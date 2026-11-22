@@ -181,3 +181,14 @@ Result: ItyFuzz finds ~6x more per equal wall-clock; every bug RustyFuzz confirm
 
 CI: `scripts/validate_daedaluzz_subset.py` (mazes 0 and 3, seeds 1-2, 60 s) fails on any oracle claim the judge
 cannot reproduce or if the judge-confirmed union < 3 (measured 6); wired into the `autonomous-smoke` job.
+
+## Search experiment: origin-bound ("targeted") concolic hints — no gain, left off by default
+Diagnosis: the global hint queue applies hints to arbitrary corpus inputs (hint = "tx k, calldata word w"
+only makes sense on the path that produced it); only ~8-10% of applied hints yield new coverage.
+Change: `TargetedHints` pairs each hint with its origin input; the mutator clones the origin, applies the
+hint and executes (`RUSTYFUZZ_TARGETED_HINT_PCT`, single-process path only).
+Result (judge-verified, mazes 0-4, 120 s, seeds 1-3, 30% of mutations): per-seed 9 / 18 / 9, mean 12.0,
+union 24, versus baseline 13 / 10 / 15, mean 12.7, union 21: within seed noise. Hint success rate on maze 2
+(40 s): 8.0% targeted vs 8.6% untargeted. Conclusion: hint/origin mismatch is not the bottleneck; the
+default is now 0 (off). Next candidates: per-guard constraint solving across the whole nested guard
+(not one comparison flip at a time), and corpus scheduling toward the deepest-guard entries.

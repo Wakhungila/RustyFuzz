@@ -2109,6 +2109,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             telemetry.concolic_hint_stats.as_ref(),
                             tx_idx,
                             &waypoints,
+                            None,
                         );
 
                         // Check invariants after this transaction, before the next one
@@ -3379,6 +3380,7 @@ async fn run_single_process_campaign(
                         .map(|b| b.actors.clone())
                         .unwrap_or_default());
     let mutator = mutator.with_snapshot_corpus(snapshot_corpus.clone());
+    let targeted_hints = mutator.targeted_hints.clone();
     let strategy_counters = mutator.strategy_counters.clone();
     if let Some(saved) = restored_strategies {
         strategy_counters.restore(saved);
@@ -3557,6 +3559,7 @@ async fn run_single_process_campaign(
                 telemetry.concolic_hint_stats.as_ref(),
                 tx_idx,
                 &waypoints,
+                Some((&targeted_hints, input)),
             );
             // Per-transaction invariant check. Placed before the result is pushed so the
             // check sees exactly the state the transaction left behind.
@@ -4662,6 +4665,7 @@ fn enqueue_concolic_hints(
     stats: &ConcolicHintStats,
     tx_idx: usize,
     waypoints: &[crate::common::types::Waypoint],
+    targeted: Option<(&Arc<Mutex<crate::evm::fuzz::TargetedHints>>, &EvmInput)>,
 ) {
     const MAX_PENDING_CONCOLIC_HINTS: usize = 1024;
 
@@ -4676,6 +4680,11 @@ fn enqueue_concolic_hints(
     stats.record_generated(new_hints.len() as u64);
     let prio = HintPriorityCtx::new(waypoints);
     new_hints.sort_by_cached_key(|hint| prio.priority(hint));
+    if let Some((targeted, origin)) = targeted {
+        // Best-priority hints last so `pop` (newest first) tries them first.
+        let ordered: Vec<_> = new_hints.to_vec();
+        targeted.lock().push(origin, &ordered);
+    }
 
     let mut queue = hint_queue.lock();
     queue.extend(new_hints);
