@@ -283,3 +283,8 @@ optional = true
 
 [dev-dependencies]
 rustyfuzz-testkit = { path = "crates/rustyfuzz-testkit" }
+
+[[bin]]
+name = "replay-judge"
+path = "src/bin/replay-judge.rs"
+required-features = ["evm"]

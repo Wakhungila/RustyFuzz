@@ -96,3 +96,23 @@ A/B at 60 s, seeds 1-3, mazes 0-4 (`RUSTYFUZZ_RARITY=0|1`; `uint_havoc` is on in
 | rarity on | 36 | 12.0 | 20 | 44,899 |
 
 Direction is positive but inside seed noise; rarity costs ~16% of execs. Kept on by default.
+
+## Replay-judge result (item 16) — oracle-based scores were inflated
+
+`replay-judge` (src/bin/replay-judge.rs) replays every persisted input on pristine fixture state
+(attacker harness + flash-loan setup mirrored) and reads `__bugs[id]` directly from storage.
+It consults no RustyFuzz oracle. Mazes 0–4, 60 s, seed 1, single-process:
+
+| maze | oracle-claimed bugs | judge-confirmed |
+|------|---------------------|-----------------|
+| 0    | 1 ([5])             | 0 |
+| 1    | 1 ([16])            | 0 |
+| 2    | 3 ([2,26,38])       | 0 |
+| 3    | 2 ([3,8])           | 1 ([8]) |
+| 4    | 4 ([5,10,11,17])    | 0 |
+
+Every unconfirmed artifact reverts on replay with no storage writes; the campaign logs
+"snapshot signal did not survive complete replay from original state" for them and
+persists them with `replay_success: false`. The earlier 13.7 (union 26) numbers counted these
+heuristic artifacts and must not be quoted as Daedaluzz scores. Judge-verified is ~1/5 mazes.
+Open bug: findings raised on snapshot-derived executions are not reproducible from root.
