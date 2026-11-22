@@ -2013,7 +2013,10 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             let mut compacted = ChainState::Evm(snapshot_base_db.clone());
                             let ChainState::Evm(db) = &mut compacted;
                             let accts = std::mem::take(&mut db.cache.accounts);
-                            db.db.absorb_warm_accounts(&accts);
+                            if snap_id != 0 {
+                    db.db = db.db.detached_clone();
+                }
+                db.db.absorb_warm_accounts(&accts);
                             let current = compacted.clone();
                             compacted_snapshot = Some((snap_id, compacted));
                             current
@@ -3465,6 +3468,9 @@ async fn run_single_process_campaign(
                 let mut compacted = ChainState::Evm(snapshot_base_db.clone());
                 let ChainState::Evm(db) = &mut compacted;
                 let accts = std::mem::take(&mut db.cache.accounts);
+                if snap_id != 0 {
+                    db.db = db.db.detached_clone();
+                }
                 db.db.absorb_warm_accounts(&accts);
                 let current = compacted.clone();
                 compacted_snapshot = Some((snap_id, compacted));
@@ -4003,6 +4009,7 @@ async fn run_single_process_campaign(
                     &snapshot_corpus.read(),
                     &initial_db,
                     &initial_env,
+                    predicate_registry.as_deref().map(|r| (r, time_warp)),
                 )
             };
 

@@ -196,7 +196,7 @@ where
 
         // Input-to-state: splice logged comparison operands into matching calldata words.
         if !rustyfuzz_evm::cmplog::is_empty()
-            && rand.below(NonZero::new(100).unwrap()) < 20
+            && rand.below(NonZero::new(100).unwrap()) < env_pct("RUSTYFUZZ_I2S_PCT", 20)
             && matches!(
                 self.record_attempt(MutationStrategyKind::InputToState)
                     .input_to_state(rand, input, &mut metadata),
@@ -208,7 +208,7 @@ where
         }
 
         // Word-level arithmetic havoc on argument words (neighbours, boundaries, shifts, bit flips).
-        if rand.below(NonZero::new(100).unwrap()) < 12
+        if rand.below(NonZero::new(100).unwrap()) < env_pct("RUSTYFUZZ_UINT_HAVOC_PCT", 12)
             && matches!(
                 self.record_attempt(MutationStrategyKind::UintHavoc)
                     .uint_havoc(rand, input, &mut metadata),
@@ -2243,4 +2243,13 @@ pub fn value_dictionary_from_state(
         values = (0..limit).map(|i| values[(i as f64 * step) as usize]).collect();
     }
     values
+}
+
+/// Percentage knob read once per process (benchmark A/B runs flip these).
+fn env_pct(name: &'static str, default: usize) -> usize {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str, usize>>> = OnceLock::new();
+    let map = CACHE.get_or_init(Default::default);
+    let mut guard = map.lock().unwrap();
+    *guard.entry(name).or_insert_with(|| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default))
 }

@@ -116,3 +116,25 @@ Every unconfirmed artifact reverts on replay with no storage writes; the campaig
 persists them with `replay_success: false`. The earlier 13.7 (union 26) numbers counted these
 heuristic artifacts and must not be quoted as Daedaluzz scores. Judge-verified is ~1/5 mazes.
 Open bug: findings raised on snapshot-derived executions are not reproducible from root.
+
+### Root cause and fix (compaction leak)
+With `--compact-fork-state`, compacting a non-root snapshot absorbed its warm storage into the
+`Arc`-shared `ForkDb` backend, so bugs set in one lineage appeared pre-set for every other snapshot and the
+root (state leak; oracle then "found" them on reverting txs). Fix: `ForkDb::detached_clone()` before
+compaction of non-root snapshots, plus `findings_reproduce` in artifact persistence: every finding
+(pack and predicate) must re-establish on a stateful replay from pristine state or no artifact is written.
+Autonomous gate after the fix: 5/5 with verified artifacts.
+
+### Judge-verified A/B (mazes 0-4, 45 s, seeds 1-2, single-process; confirmed bugs, all stored inputs)
+| config | seed 1 | seed 2 | mean | union |
+|---|---|---|---|---|
+| baseline | 6 | 12 | 9.0 | 14 |
+| rarity off | 9 | 12 | 10.5 | 17 |
+| i2s off | 7 | 10 | 8.5 | 12 |
+| hint 0% | 14 | 8 | 11.0 | 18 |
+| uint-havoc off | 10 | 13 | 11.5 | 17 |
+
+Differences are within seed noise (±3-4); no knob is shown to help. i2s is the only one whose removal
+lowers both mean and union, and only slightly. The previously reported gains were not demonstrated by
+verified counts. Judge-verified baseline ≈ 9/5 mazes per 45 s run vs ItyFuzz 79/210 over the full suite
+(not directly comparable: different suite coverage and time).

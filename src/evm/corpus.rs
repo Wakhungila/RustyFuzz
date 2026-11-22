@@ -646,8 +646,15 @@ impl PersistentCorpus {
         snapshots: &SnapshotCorpus,
         original: &EvmCacheDb,
         environment: &revm::context::BlockEnv,
+        invariants: Option<(&rustyfuzz_predicate::InvariantRegistry, rustyfuzz_evm::time_warp::TimeWarp)>,
     ) -> anyhow::Result<CampaignArtifactOutcome> {
         if request.input.base_snapshot_id == 0 {
+            // Root-based inputs are verified too: a finding that does not reproduce from the
+            // pristine state (leaked state, nondeterminism) must never become an artifact.
+            anyhow::ensure!(
+                findings_reproduce(request.findings, request.input, original, environment, invariants),
+                "root-based finding did not reproduce from original state"
+            );
             return self.persist_campaign_artifact(CampaignArtifactRequest {
                 base_fork_state: original,
                 ..request
@@ -663,15 +670,15 @@ impl PersistentCorpus {
             execution == verifier.replay(&base, environment, &input)?,
             "complete root replay is nondeterministic"
         );
-        let findings = crate::common::oracle::ProtocolOraclePack::default().evaluate(&execution);
+        let mut findings = crate::common::oracle::ProtocolOraclePack::default().evaluate(&execution);
         anyhow::ensure!(
-            request.findings.iter().all(|expected| findings
-                .iter()
-                .any(|actual| actual.pack == expected.pack
-                    && actual.vuln == expected.vuln
-                    && actual.target == expected.target)),
+            findings_reproduce(request.findings, &input, original, environment, invariants),
             "snapshot signal did not survive complete replay from original state"
         );
+        // Persist the findings the replay itself established, not the live run's claims.
+        findings.extend(request.findings.iter().filter(|f| {
+            matches!(f.vuln, crate::common::oracle::VulnType::InvariantViolation(_))
+        }).cloned());
         self.persist_campaign_artifact(CampaignArtifactRequest {
             input: &input,
             execution: &execution,
@@ -4187,4 +4194,60 @@ impl Default for SnapshotCorpus {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// True when every expected finding is re-established by replaying `input` from the original
+/// state. Pack findings are re-evaluated on the replay; predicate violations are re-checked with
+/// the same per-transaction semantics as the live harness, but on state that started pristine, so
+/// leaked or stale live state cannot confirm them.
+fn findings_reproduce(
+    expected: &[crate::common::oracle::ProtocolFinding],
+    input: &EvmInput,
+    original: &EvmCacheDb,
+    environment: &revm::context::BlockEnv,
+    invariants: Option<(&rustyfuzz_predicate::InvariantRegistry, rustyfuzz_evm::time_warp::TimeWarp)>,
+) -> bool {
+    use crate::common::oracle::VulnType;
+    let verifier = crate::common::verifier::ReplayVerifier::new(MAP_SIZE);
+    let base = ChainState::Evm(original.clone());
+    let Ok(execution) = verifier.replay(&base, environment, input) else {
+        return false;
+    };
+    let pack = crate::common::oracle::ProtocolOraclePack::default().evaluate(&execution);
+    let needs_invariant = expected.iter().any(|f| matches!(f.vuln, VulnType::InvariantViolation(_)));
+    let violation = match (needs_invariant, invariants) {
+        (true, Some((registry, warp))) => {
+            let executor = rustyfuzz_evm::executor::EvmExecutor::new();
+            let mut state = base.clone();
+            let mut coverage = vec![0u8; MAP_SIZE];
+            let mut dataflow = rustyfuzz_evm::dataflow::DataflowRegistry::new();
+            let mut checker = crate::engine::invariant_runtime::IncrementalChecker::new();
+            for (idx, tx) in input.txs.iter().enumerate() {
+                let mut env = environment.clone();
+                warp.apply(&mut env, idx);
+                let mut waypoints = Vec::new();
+                let Ok(result) = executor.execute_with_result(
+                    &mut state, &mut env, tx, &mut coverage, &mut dataflow, &mut waypoints, idx,
+                ) else {
+                    break;
+                };
+                let block = rustyfuzz_predicate::BlockContext {
+                    number: rustyfuzz_predicate::Int256(env.number.to_be_bytes()),
+                    timestamp: rustyfuzz_predicate::Int256(env.timestamp.to_be_bytes()),
+                };
+                checker.observe(registry, &result, &state, block, 16);
+                if checker.violation().is_some() {
+                    break;
+                }
+            }
+            checker.take_violation()
+        }
+        _ => None,
+    };
+    expected.iter().all(|exp| match &exp.vuln {
+        VulnType::InvariantViolation(pred) => violation.as_ref().is_some_and(|v| &v.predicate == pred),
+        _ => pack
+            .iter()
+            .any(|a| a.pack == exp.pack && a.vuln == exp.vuln && a.target == exp.target),
+    })
 }
