@@ -98,6 +98,11 @@ fn main() -> anyhow::Result<()> {
                 }
                 Ok(r) => {
                     if std::env::var("JUDGE_DUMP").is_ok() {
+                        if std::env::var("JUDGE_TRACE").is_ok() {
+                            for c in r.call_trace.iter().take(30) {
+                                println!("  T d={} {:?} {:#x}->{:#x} sel={:?}", c.depth, c.phase, c.caller, c.target, c.input.get(..4).map(hex::encode));
+                            }
+                        }
                         println!("  reads={:?} writes={:?}", r.storage_reads, r.storage_writes);
                         println!("  tx{} status={:?} gas={} diffs={} writes={}", idx, r.status, r.gas_used, r.storage_diffs.len(), r.storage_writes.len());
                     }
