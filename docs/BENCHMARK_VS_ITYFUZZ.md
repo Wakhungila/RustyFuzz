@@ -138,3 +138,11 @@ Differences are within seed noise (±3-4); no knob is shown to help. i2s is the 
 lowers both mean and union, and only slightly. The previously reported gains were not demonstrated by
 verified counts. Judge-verified baseline ≈ 9/5 mazes per 45 s run vs ItyFuzz 79/210 over the full suite
 (not directly comparable: different suite coverage and time).
+
+### Judge-verified long run after oracle fixes (mazes 0-4, 120 s, seeds 1-3, single-process)
+Confirmed bugs per seed: 13 / 10 / 15 (mean 12.7), union across seeds 21. Counting is `replay-judge` only
+(`scripts/bench/daedaluzz.py` now does the same). Versus the 45 s runs (mean ~9, union 14) more time still
+buys more bugs, so the search is not saturated; the shallow bugs (5, 16, 17, 10, 8) are found by every seed.
+Oracle fixes: Reentrancy requires the target to have called out (harness dispatch/self-recursion no longer
+qualifies); GenericAccounting is informational. Maze artifacts dropped from ~47 to 2 per run; autonomous
+gate 5/5, replay gate 5/5 with 0 false positives on 10 negative controls.
