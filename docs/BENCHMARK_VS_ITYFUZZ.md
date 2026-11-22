@@ -146,3 +146,17 @@ buys more bugs, so the search is not saturated; the shallow bugs (5, 16, 17, 10,
 Oracle fixes: Reentrancy requires the target to have called out (harness dispatch/self-recursion no longer
 qualifies); GenericAccounting is informational. Maze artifacts dropped from ~47 to 2 per run; autonomous
 gate 5/5, replay gate 5/5 with 0 false positives on 10 negative controls.
+
+## Methodology and caveats (read before quoting any number)
+- Headline = judge-verified rows only (120 s table above). Every oracle-counted row earlier in this file is
+  **not comparable / not judge-verified** and is kept only as history.
+- Setup: mazes 0-4 of Daedaluzz (210 bugs total), RustyFuzz single-process, 2-core cloud sandbox, seeds 1-3,
+  120 s each, build = commit $(git rev-parse --short HEAD at time of run: see git log for "docs: judge-verified 120s").
+  Raw per-run output: benchmarks/results/daedaluzz/judge_120s_seeds123.log (45 s A/B logs alongside).
+- Seed variance is 3-5 bugs per seed (13/10/15); deltas smaller than that are noise.
+- Not apples-to-apples: ItyFuzz's 79/210 comes from its typed-bug event, RustyFuzz's from the replay judge
+  reading `__bugs[N]` after replaying *all* stored corpus inputs (not only reported artifacts). ItyFuzz was run
+  with the budget/hardware of the earlier session, not re-run alongside the 120 s runs above. Treat the gap as an
+  estimate (~6x) until both run back-to-back with the same time budget.
+- "No real-target finding" means: none produced by RustyFuzz in this project's own runs; no
+  independently verified novel finding on a live contract is documented.
