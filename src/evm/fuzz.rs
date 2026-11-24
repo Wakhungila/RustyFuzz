@@ -67,13 +67,38 @@ fn max_new_txs() -> usize {
 /// satisfied guard is retried on the sequence that actually reached it.
 #[derive(Default)]
 pub struct TargetedHints {
-    queue: std::collections::VecDeque<(EvmInput, ConcolicHint)>,
+    queue: std::collections::VecDeque<(EvmInput, Vec<ConcolicHint>)>,
     seen: std::collections::HashSet<u64>,
 }
 
 impl TargetedHints {
     const MAX_QUEUED: usize = 512;
     const MAX_SEEN: usize = 400_000;
+
+    /// Queue one *group* of hints (applied together to a clone of `origin`).
+    pub fn push_group(&mut self, origin: &EvmInput, group: Vec<ConcolicHint>) -> bool {
+        use std::hash::{Hash, Hasher};
+        if self.seen.len() > Self::MAX_SEEN {
+            self.seen.clear();
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        origin.base_snapshot_id.hash(&mut h);
+        for tx in &origin.txs {
+            tx.input.hash(&mut h);
+            tx.caller.hash(&mut h);
+        }
+        for hint in &group {
+            (hint.tx_index, hint.calldata_offset, hint.word).hash(&mut h);
+        }
+        if !self.seen.insert(h.finish()) {
+            return false;
+        }
+        self.queue.push_back((origin.clone(), group));
+        while self.queue.len() > Self::MAX_QUEUED {
+            self.queue.pop_front();
+        }
+        true
+    }
 
     /// Queue `hints` (already priority-ordered) against `origin`; returns how many were new.
     pub fn push(&mut self, origin: &EvmInput, hints: &[ConcolicHint]) -> usize {
@@ -92,7 +117,7 @@ impl TargetedHints {
             let mut h = base.clone();
             (hint.tx_index, hint.calldata_offset, hint.word).hash(&mut h);
             if self.seen.insert(h.finish()) {
-                self.queue.push_back((origin.clone(), hint.clone()));
+                self.queue.push_back((origin.clone(), vec![hint.clone()]));
                 added += 1;
             }
         }
@@ -102,7 +127,7 @@ impl TargetedHints {
         added
     }
 
-    fn pop(&mut self) -> Option<(EvmInput, ConcolicHint)> {
+    fn pop(&mut self) -> Option<(EvmInput, Vec<ConcolicHint>)> {
         // Newest first: the freshest origin is the one most recently found interesting.
         self.queue.pop_back()
     }
@@ -220,21 +245,27 @@ where
         }
         if rand.below(NonZero::new(100).unwrap()) < env_pct("RUSTYFUZZ_TARGETED_HINT_PCT", 0) {
             let next = self.targeted_hints.lock().pop();
-            if let Some((origin, hint)) = next {
+            if let Some((origin, group)) = next {
                 *input = origin;
-                if let Some(tx) = input.txs.get_mut(hint.tx_index) {
-                    let parameter_types = selector_for_calldata(&tx.input)
-                        .and_then(|selector| self.abi_registry.functions.get(&selector))
-                        .cloned();
-                    let placement = apply_concolic_hint(tx, &hint, parameter_types.as_deref());
-                    let selector = selector_for_calldata(&tx.input);
-                    self.record_mutation(
-                        &mut metadata,
-                        "concolic_hint",
-                        Some(hint.tx_index),
-                        selector,
-                        &format!("targeted hint from pc {} into {}", hint.pc, placement),
-                    );
+                let mut applied_any = false;
+                for hint in &group {
+                    if let Some(tx) = input.txs.get_mut(hint.tx_index) {
+                        let parameter_types = selector_for_calldata(&tx.input)
+                            .and_then(|selector| self.abi_registry.functions.get(&selector))
+                            .cloned();
+                        let placement = apply_concolic_hint(tx, hint, parameter_types.as_deref());
+                        let selector = selector_for_calldata(&tx.input);
+                        self.record_mutation(
+                            &mut metadata,
+                            "concolic_hint",
+                            Some(hint.tx_index),
+                            selector,
+                            &format!("targeted hint from pc {} into {}", hint.pc, placement),
+                        );
+                        applied_any = true;
+                    }
+                }
+                if applied_any {
                     self.concolic_hint_stats.record_applied();
                     self.testcase_metadata.insert(input, metadata);
                     return Ok(MutationResult::Mutated);

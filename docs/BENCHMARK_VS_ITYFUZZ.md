@@ -192,3 +192,25 @@ union 24, versus baseline 13 / 10 / 15, mean 12.7, union 21: within seed noise. 
 (40 s): 8.0% targeted vs 8.6% untargeted. Conclusion: hint/origin mismatch is not the bottleneck; the
 default is now 0 (off). Next candidates: per-guard constraint solving across the whole nested guard
 (not one comparison flip at a time), and corpus scheduling toward the deepest-guard entries.
+
+## Whole-guard solver experiment (z3) — solver is right, integration did not help
+**Ceiling test.** `scripts/bench/solver_ceiling/{solve_guards,gen_inputs}.py` parse each maze's nested guard
+conjunction (uint64 wrap semantics), solve it with z3, build wall-avoiding move paths, and replay through
+`replay-judge`. Result: every satisfiable guard was solved (<20 s each) and judge-confirmed on the real EVM:
+33/43, 26/40, 30/45, 27/41, 31/41 = **147 of 210 bugs are reachable; 63 are provably unsat** (e.g. `p2 != p2`).
+So the real ceiling is 147, ItyFuzz's 78 is 53% of it, RustyFuzz's 12.7 is 8.6%, and the 49% target (103) is
+70% of the reachable set. (Unsat verdicts come from my parser; sat verdicts are execution-verified.)
+
+**Integration.** `--features smt` + `prefix_flip_groups`: for the deepest symbolic comparisons of an execution
+solve "all earlier comparisons keep their outcome AND this one flips" over the observed `SymbolicExpression`s,
+queue the full calldata-word set as a group bound to the origin input, apply 30% of mutations.
+Findings along the way (fixed): the existing per-waypoint SMT path was unbounded and hung the campaign
+(stack-sampled: `Z3_solver_check` under `solve_hint`) and cost ~100 ms/call (10 execs/s); it is now bounded
+(timeout+rlimit) and opt-in (`RUSTYFUZZ_SMT_SINGLE`). Result (judge-verified, 120 s, seeds 1-3): per seed 10 / 4 / 8,
+mean 7.3, union 13 vs baseline 12.7 / 21: **worse**. Only 2.8% of prefix solves were SAT (687 of 24.5k on maze 2);
+the observed symbolic expressions do not capture the 64-bit wrap/mask semantics or storage-derived operands
+well enough, and solver children displace productive mutations. Left opt-in
+(`RUSTYFUZZ_PREFIX_SOLVE=1`, `RUSTYFUZZ_TARGETED_HINT_PCT`), default off.
+**Conclusion:** the solver works when the constraints are exact. The gap is constraint extraction at fuzz time:
+the next step is symbolic execution of the target function from bytecode (exact path conditions), not more
+tuning of runtime hints.

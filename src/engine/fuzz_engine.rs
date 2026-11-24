@@ -4681,9 +4681,19 @@ fn enqueue_concolic_hints(
     let prio = HintPriorityCtx::new(waypoints);
     new_hints.sort_by_cached_key(|hint| prio.priority(hint));
     if let Some((targeted, origin)) = targeted {
-        // Best-priority hints last so `pop` (newest first) tries them first.
-        let ordered: Vec<_> = new_hints.to_vec();
-        targeted.lock().push(origin, &ordered);
+        if std::env::var_os("RUSTYFUZZ_TARGETED_SINGLES").is_some() {
+            let ordered: Vec<_> = new_hints.to_vec();
+            targeted.lock().push(origin, &ordered);
+        }
+        #[cfg(feature = "smt")]
+        if std::env::var_os("RUSTYFUZZ_PREFIX_SOLVE").is_some() {
+            let groups = crate::engine::concolic::prefix_flip_groups(tx_idx, waypoints);
+            stats.record_generated(groups.len() as u64);
+            let mut guard = targeted.lock();
+            for group in groups.into_iter().rev() {
+                guard.push_group(origin, group);
+            }
+        }
     }
 
     let mut queue = hint_queue.lock();
