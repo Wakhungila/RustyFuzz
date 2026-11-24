@@ -409,6 +409,32 @@ fn log_bounded_campaign_progress(
     *last_report = Instant::now();
 }
 
+/// Load every root-based `EvmInput` JSON in `dir` (sorted, `.meta.json` skipped).
+/// Unparseable files and snapshot-based inputs are rejected loudly: a silently
+/// ignored seed would make a "seeded" campaign indistinguishable from an unseeded one.
+pub fn load_seed_inputs_dir(dir: &std::path::Path) -> anyhow::Result<Vec<EvmInput>> {
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading seed input dir {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json") && !p.to_string_lossy().ends_with(".meta.json"))
+        .collect();
+    paths.sort();
+    let mut out = Vec::new();
+    for p in paths {
+        let input: EvmInput = serde_json::from_slice(&std::fs::read(&p)?)
+            .with_context(|| format!("parsing seed input {}", p.display()))?;
+        anyhow::ensure!(
+            input.base_snapshot_id == 0,
+            "seed input {} is snapshot-based (base_snapshot_id={}); only root-based inputs can be imported",
+            p.display(),
+            input.base_snapshot_id
+        );
+        anyhow::ensure!(!input.txs.is_empty(), "seed input {} has no transactions", p.display());
+        out.push(input);
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub rpc_url: String,
@@ -432,6 +458,10 @@ pub struct Config {
     /// fork branch loads the fixture's accounts (bytecode + storage + balance)
     /// so the fuzzer can target offline known-vulnerable fixtures without RPC.
     pub fixture_path: Option<String>,
+    /// Directory of replay-format `EvmInput` JSON files (e.g. produced by the
+    /// symbolic executor) added to the initial corpus. Only used when the
+    /// campaign starts with an empty corpus.
+    pub seed_inputs_dir: Option<String>,
     /// A bootstrapped Foundry project (`--foundry-project`): the state after the
     /// test contract's constructor and `setUp()` ran, plus the `invariant_*`
     /// functions to evaluate after every fuzzed transaction. Takes the place of
@@ -2308,7 +2338,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     // hit, so it is promoted, reported and confirmed by the same code.
                     // Inventing a parallel output path would mean two places to get
                     // promotion wrong.
-                    if let Some(violation) = invariant_checker.violation() {
+                    for violation in invariant_checker.violations() {
                         let target = target_contract;
                         // `Bridge` is the only existing pack whose spec does not claim a
                         // narrower trigger (a specific reentrancy shape, a specific
@@ -3149,6 +3179,7 @@ async fn run_single_process_campaign(
     let resumed = restored_checkpoint.is_some();
     let mut direct_seed_inputs = Vec::new();
     let mut required_replay_inputs = Vec::new();
+    let mut imported_seed_inputs: Vec<EvmInput> = Vec::new();
     if state.corpus().count() == 0 {
         let mut inserted_seed_count = 0usize;
         let mut mainnet_seed_count = 0usize;
@@ -3183,6 +3214,17 @@ async fn run_single_process_campaign(
                         inserted_seed_count
                     );
                 }
+            }
+        }
+
+        if let Some(dir) = &config.seed_inputs_dir {
+            let loaded = load_seed_inputs_dir(std::path::Path::new(dir))?;
+            log::info!("Imported {} seed input(s) from `{}`", loaded.len(), dir);
+            for input in loaded {
+                imported_seed_inputs.push(input.clone());
+                direct_seed_inputs.push(input.clone());
+                state.corpus_mut().add(Testcase::new(input))?;
+                inserted_seed_count += 1;
             }
         }
 
@@ -3773,7 +3815,7 @@ async fn run_single_process_campaign(
         ));
         // Same promotion as the multi-worker path: a predicate violation is a finding like
         // any other once it fires, so it travels the existing pipeline.
-        if let Some(violation) = invariant_checker.violation() {
+        for violation in invariant_checker.violations() {
             findings.push(crate::common::oracle::ProtocolFinding {
                 pack: crate::common::oracle::ProtocolOraclePackKind::Bridge,
                 vuln: crate::common::oracle::VulnType::InvariantViolation(
@@ -4077,6 +4119,15 @@ async fn run_single_process_campaign(
             input,
             budget.reserved() > reserved_before,
         )?;
+    }
+
+    // Imported seeds (e.g. solved symbolic-execution sequences) are executed once up
+    // front through the full harness so oracles and coverage see them immediately,
+    // rather than waiting for the scheduler to pick them as mutation parents.
+    for input in &imported_seed_inputs {
+        if !matches!(harness(input), ExitKind::Ok) {
+            log::warn!("imported seed input did not execute cleanly; it stays in the corpus");
+        }
     }
 
     let capture = |state: &EvmCampaignState,
@@ -6150,6 +6201,7 @@ mod tests {
             in_memory_bytecode: Some(hex::decode("60003560005500").unwrap()),
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
             foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
@@ -6298,6 +6350,7 @@ mod tests {
             in_memory_bytecode: None,
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
             foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
@@ -6396,6 +6449,7 @@ mod tests {
             in_memory_bytecode: None,
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
             foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
@@ -6514,6 +6568,7 @@ mod tests {
             in_memory_bytecode: None,
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
             foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
@@ -6583,6 +6638,7 @@ mod tests {
             in_memory_bytecode: Some(vec![0x60, 0x00]),
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
             foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
@@ -6712,6 +6768,7 @@ mod tests {
             in_memory_bytecode: None,
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
             foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
@@ -6861,6 +6918,7 @@ mod tests {
             in_memory_bytecode: None,
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
             foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
@@ -7023,6 +7081,7 @@ mod tests {
             in_memory_bytecode: Some(vec![0x60, 0x00]),
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
             foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
@@ -7080,6 +7139,7 @@ mod tests {
             in_memory_bytecode: Some(vec![0x60, 0x00]),
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
             foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,

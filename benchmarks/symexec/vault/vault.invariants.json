@@ -1,0 +1,35 @@
+{
+ "target": "0x6200000000000000000000000000000000000001",
+ "symbols": {
+  "b1": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000001"
+   ]
+  },
+  "b2": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000002"
+   ]
+  }
+ },
+ "invariants": [
+  {
+   "name": "bug1",
+   "predicate": "sum(b1) <= 0"
+  },
+  {
+   "name": "bug2",
+   "predicate": "sum(b2) <= 0"
+  }
+ ]
+}

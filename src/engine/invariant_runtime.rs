@@ -174,6 +174,12 @@ pub struct IncrementalChecker {
     /// violating transaction is the shortest counterexample, and re-reporting a
     /// downstream consequence of the same cause adds noise without information.
     violation: Option<SequenceViolation>,
+    /// Every distinct predicate violated so far, in the order first violated (the
+    /// first entry equals `violation`). A later violation of a *different* predicate is
+    /// an independent invariant failing, not a downstream consequence of the first, so
+    /// it is kept: otherwise a sequence that trips an easy invariant early hides every
+    /// deeper one it also trips.
+    violations: Vec<SequenceViolation>,
 }
 
 impl IncrementalChecker {
@@ -197,9 +203,6 @@ impl IncrementalChecker {
         self.reads.extend(reads_from(&result.storage_reads));
         self.call_outputs
             .extend(call_outputs_from(&result.call_trace, result.tx_index));
-        if self.violation.is_some() {
-            return;
-        }
         let view = SequenceView {
             writes: &self.writes,
             reads: &self.reads,
@@ -220,6 +223,9 @@ impl IncrementalChecker {
             if !matches!(outcome, Outcome::False) {
                 continue;
             }
+            if self.violations.iter().any(|v| v.predicate == evidence.predicate) {
+                continue;
+            }
             let terms: Vec<PredicateTerm> = evidence
                 .terms
                 .iter()
@@ -234,14 +240,22 @@ impl IncrementalChecker {
                     tx_index: term.tx_index,
                 })
                 .collect();
-            self.violation = Some(SequenceViolation {
+            let found = SequenceViolation {
                 predicate: evidence.predicate.clone(),
                 tx_index: result.tx_index,
                 terms,
                 evidence,
-            });
-            return;
+            };
+            if self.violation.is_none() {
+                self.violation = Some(found.clone());
+            }
+            self.violations.push(found);
         }
+    }
+
+    /// All distinct violated predicates, first-violated first.
+    pub fn violations(&self) -> &[SequenceViolation] {
+        &self.violations
     }
 
     pub fn violation(&self) -> Option<&SequenceViolation> {

@@ -241,3 +241,26 @@ was 1 low: the reachable set is >=148). Compare ItyFuzz 78/210 (37%), RustyFuzz 
 concrete after one call); it is not yet a stage inside `rusty-fuzz fuzz` (no seed-import path exists), unsupported
 constructs give up per path (symbolic SHA3 input / memory offsets, external calls, loops), and Daedaluzz is the
 friendliest possible target for it (no external calls, no loops, small state). Not evidence about real protocols.
+
+## Seed import + symbolic seeding for real-contract features
+**`rusty-fuzz fuzz --seed-inputs DIR`** loads replay-format `EvmInput` JSONs (root-based only, rejected loudly
+otherwise) into the initial corpus and executes each once through the full harness before fuzzing, so oracles and
+coverage see them immediately (single-process path; the brokered multi-worker path does not import yet).
+
+**Finding-reporting fix this exposed:** `IncrementalChecker` latched the *first* violated predicate, so a sequence
+that tripped an easy invariant early hid every deeper one (artifacts showed only bugs 3/10 for seeds that really set
+bugs 16, 21, ...). It now records every distinct violated predicate, and `findings_reproduce` checks membership in
+that set. Result with symbolic seeds (20 s, seed 1, **artifacts the fuzzer itself verified by stateful replay**):
+mazes 0-4 report 33 / 26 / 31 / 27 / 31 = **148**, same as the standalone symbolic run.
+
+**`scripts/bench/symexec/symseed.py`** (bytecode + ABI + invariants -> seeds): ABI-driven selectors for static-param
+functions; symbolic storage keys and keccak (uninterpreted function tied to real hashes seen so far); external calls
+havoced (free success bit and return bytes; callee side effects not modeled); `--symbolic-depth K` keeps storage
+symbolic across K transactions so a value chosen in tx1 is solved jointly with the guard in tx3 (the concrete-state
+BFS needs minutes on the Vault test and explodes into thousands of balance states; symbolic depth 3 takes <1 s).
+`benchmarks/symexec/vault/` is a small Vault (ERC-20 `transferFrom` call, `mapping(address=>uint)`, a bug that needs a
+specific deposit-then-withdraw and one that needs a symbolic mapping key equal to the caller): symseed finds both,
+replay-judge confirms both on the real EVM, a seeded fuzz run reports both, an unseeded run of the same budget only b1.
+**Still not covered:** dynamic-type params (bytes/arrays/strings), CREATE/CREATE2, delegatecall semantics, callee
+re-entry, ETH balances/value, block-dependent branches beyond constants, symbolic memory offsets, loops past the step
+cap; invariant watch is limited to mapping-kind symbols. Not yet run on any real deployed protocol.

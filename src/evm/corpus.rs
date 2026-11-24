@@ -4235,17 +4235,16 @@ fn findings_reproduce(
                     number: rustyfuzz_predicate::Int256(env.number.to_be_bytes()),
                     timestamp: rustyfuzz_predicate::Int256(env.timestamp.to_be_bytes()),
                 };
+                // Keep going after the first violation: distinct predicates are independent
+                // invariants, and the live harness reports each of them.
                 checker.observe(registry, &result, &state, block, 16);
-                if checker.violation().is_some() {
-                    break;
-                }
             }
-            checker.take_violation()
+            checker.violations().to_vec()
         }
-        _ => None,
+        _ => Vec::new(),
     };
     expected.iter().all(|exp| match &exp.vuln {
-        VulnType::InvariantViolation(pred) => violation.as_ref().is_some_and(|v| &v.predicate == pred),
+        VulnType::InvariantViolation(pred) => violation.iter().any(|v| &v.predicate == pred),
         _ => pack
             .iter()
             .any(|a| a.pack == exp.pack && a.vuln == exp.vuln && a.target == exp.target),

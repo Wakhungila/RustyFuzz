@@ -242,6 +242,7 @@ async fn run_benchmark_contract(
         in_memory_bytecode: Some(artifact.runtime_bytecode.clone()),
         attacker_harness: false,
         fixture_path: None,
+        seed_inputs_dir: None,
         foundry_bootstrap: None,
         compact_fork_state: false,
         cores: None,
