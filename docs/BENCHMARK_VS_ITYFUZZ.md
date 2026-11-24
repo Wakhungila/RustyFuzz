@@ -214,3 +214,30 @@ well enough, and solver children displace productive mutations. Left opt-in
 **Conclusion:** the solver works when the constraints are exact. The gap is constraint extraction at fuzz time:
 the next step is symbolic execution of the target function from bytecode (exact path conditions), not more
 tuning of runtime hints.
+
+## Bytecode symbolic execution (scripts/bench/symexec) — reaches the full ceiling
+`symexec.py` is a z3-based EVM symbolic executor that works from **runtime bytecode only** (no source, no ABI
+parsing): symbolic calldata words, concrete storage, fork on every symbolic JUMPI, solve the path condition at
+completed non-reverting paths, then BFS over concrete storage states (multi-tx), keeping the shortest tx
+sequence that first sets each `__bugs[id]` slot. Bug-flag slots are excluded from the state key (otherwise the
+state space explodes). Lazy forking (no solver call per branch) cut a function run from ~3 s to ~30 ms;
+paths on dead branches that hit unsupported opcodes are dropped only if their condition is unsat.
+Bug found on the way: Solidity 0.8.2x emits MCOPY (0x5E); without it every bug-writing path died as a "giveup".
+
+Judge-verified (replay-judge on the real EVM, pristine state), single core, 4-7 min per maze:
+
+| maze | bugs found & confirmed | z3-source-parser estimate |
+|---|---|---|
+| 0 | 33 | 33 |
+| 1 | 26 | 26 |
+| 2 | 31 | 30 |
+| 3 | 27 | 27 |
+| 4 | 31 | 31 |
+| **total** | **148 / 210 = 70.5%** | 147 |
+
+One bug the source-text parser had called unsat is actually reachable (found by execution, so the 147 ceiling
+was 1 low: the reachable set is >=148). Compare ItyFuzz 78/210 (37%), RustyFuzz fuzzing alone ~13/210.
+**Caveats:** this is an offline, per-contract analysis (the maze's state space is 49 cells, and everything is
+concrete after one call); it is not yet a stage inside `rusty-fuzz fuzz` (no seed-import path exists), unsupported
+constructs give up per path (symbolic SHA3 input / memory offsets, external calls, loops), and Daedaluzz is the
+friendliest possible target for it (no external calls, no loops, small state). Not evidence about real protocols.
