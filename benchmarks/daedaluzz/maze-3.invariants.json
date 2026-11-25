@@ -1,0 +1,581 @@
+{
+ "target": "0x6200000000000000000000000000000000000001",
+ "symbols": {
+  "b1": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000001"
+   ]
+  },
+  "b2": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000002"
+   ]
+  },
+  "b3": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000003"
+   ]
+  },
+  "b6": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000006"
+   ]
+  },
+  "b7": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000007"
+   ]
+  },
+  "b8": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000008"
+   ]
+  },
+  "b9": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000009"
+   ]
+  },
+  "b10": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x000000000000000000000000000000000000000000000000000000000000000a"
+   ]
+  },
+  "b11": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x000000000000000000000000000000000000000000000000000000000000000b"
+   ]
+  },
+  "b12": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x000000000000000000000000000000000000000000000000000000000000000c"
+   ]
+  },
+  "b13": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x000000000000000000000000000000000000000000000000000000000000000d"
+   ]
+  },
+  "b14": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x000000000000000000000000000000000000000000000000000000000000000e"
+   ]
+  },
+  "b15": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x000000000000000000000000000000000000000000000000000000000000000f"
+   ]
+  },
+  "b16": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000010"
+   ]
+  },
+  "b17": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000011"
+   ]
+  },
+  "b18": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000012"
+   ]
+  },
+  "b20": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000014"
+   ]
+  },
+  "b22": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000016"
+   ]
+  },
+  "b23": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000017"
+   ]
+  },
+  "b24": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000018"
+   ]
+  },
+  "b25": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000019"
+   ]
+  },
+  "b26": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x000000000000000000000000000000000000000000000000000000000000001a"
+   ]
+  },
+  "b27": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x000000000000000000000000000000000000000000000000000000000000001b"
+   ]
+  },
+  "b29": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x000000000000000000000000000000000000000000000000000000000000001d"
+   ]
+  },
+  "b30": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x000000000000000000000000000000000000000000000000000000000000001e"
+   ]
+  },
+  "b31": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x000000000000000000000000000000000000000000000000000000000000001f"
+   ]
+  },
+  "b32": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000020"
+   ]
+  },
+  "b33": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000021"
+   ]
+  },
+  "b34": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000022"
+   ]
+  },
+  "b35": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000023"
+   ]
+  },
+  "b36": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000024"
+   ]
+  },
+  "b37": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000025"
+   ]
+  },
+  "b38": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000026"
+   ]
+  },
+  "b39": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000027"
+   ]
+  },
+  "b40": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000028"
+   ]
+  },
+  "b41": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x0000000000000000000000000000000000000000000000000000000000000029"
+   ]
+  },
+  "b42": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x000000000000000000000000000000000000000000000000000000000000002a"
+   ]
+  },
+  "b43": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x000000000000000000000000000000000000000000000000000000000000002b"
+   ]
+  },
+  "b44": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x000000000000000000000000000000000000000000000000000000000000002c"
+   ]
+  },
+  "b45": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x000000000000000000000000000000000000000000000000000000000000002d"
+   ]
+  },
+  "b47": {
+   "kind": "mapping",
+   "slot": "0x0",
+   "offset_bits": 0,
+   "width_bits": 256,
+   "key_type": "uint256",
+   "keys": [
+    "0x000000000000000000000000000000000000000000000000000000000000002f"
+   ]
+  }
+ },
+ "invariants": [
+  {
+   "name": "bug1",
+   "predicate": "sum(b1) <= 0"
+  },
+  {
+   "name": "bug2",
+   "predicate": "sum(b2) <= 0"
+  },
+  {
+   "name": "bug3",
+   "predicate": "sum(b3) <= 0"
+  },
+  {
+   "name": "bug6",
+   "predicate": "sum(b6) <= 0"
+  },
+  {
+   "name": "bug7",
+   "predicate": "sum(b7) <= 0"
+  },
+  {
+   "name": "bug8",
+   "predicate": "sum(b8) <= 0"
+  },
+  {
+   "name": "bug9",
+   "predicate": "sum(b9) <= 0"
+  },
+  {
+   "name": "bug10",
+   "predicate": "sum(b10) <= 0"
+  },
+  {
+   "name": "bug11",
+   "predicate": "sum(b11) <= 0"
+  },
+  {
+   "name": "bug12",
+   "predicate": "sum(b12) <= 0"
+  },
+  {
+   "name": "bug13",
+   "predicate": "sum(b13) <= 0"
+  },
+  {
+   "name": "bug14",
+   "predicate": "sum(b14) <= 0"
+  },
+  {
+   "name": "bug15",
+   "predicate": "sum(b15) <= 0"
+  },
+  {
+   "name": "bug16",
+   "predicate": "sum(b16) <= 0"
+  },
+  {
+   "name": "bug17",
+   "predicate": "sum(b17) <= 0"
+  },
+  {
+   "name": "bug18",
+   "predicate": "sum(b18) <= 0"
+  },
+  {
+   "name": "bug20",
+   "predicate": "sum(b20) <= 0"
+  },
+  {
+   "name": "bug22",
+   "predicate": "sum(b22) <= 0"
+  },
+  {
+   "name": "bug23",
+   "predicate": "sum(b23) <= 0"
+  },
+  {
+   "name": "bug24",
+   "predicate": "sum(b24) <= 0"
+  },
+  {
+   "name": "bug25",
+   "predicate": "sum(b25) <= 0"
+  },
+  {
+   "name": "bug26",
+   "predicate": "sum(b26) <= 0"
+  },
+  {
+   "name": "bug27",
+   "predicate": "sum(b27) <= 0"
+  },
+  {
+   "name": "bug29",
+   "predicate": "sum(b29) <= 0"
+  },
+  {
+   "name": "bug30",
+   "predicate": "sum(b30) <= 0"
+  },
+  {
+   "name": "bug31",
+   "predicate": "sum(b31) <= 0"
+  },
+  {
+   "name": "bug32",
+   "predicate": "sum(b32) <= 0"
+  },
+  {
+   "name": "bug33",
+   "predicate": "sum(b33) <= 0"
+  },
+  {
+   "name": "bug34",
+   "predicate": "sum(b34) <= 0"
+  },
+  {
+   "name": "bug35",
+   "predicate": "sum(b35) <= 0"
+  },
+  {
+   "name": "bug36",
+   "predicate": "sum(b36) <= 0"
+  },
+  {
+   "name": "bug37",
+   "predicate": "sum(b37) <= 0"
+  },
+  {
+   "name": "bug38",
+   "predicate": "sum(b38) <= 0"
+  },
+  {
+   "name": "bug39",
+   "predicate": "sum(b39) <= 0"
+  },
+  {
+   "name": "bug40",
+   "predicate": "sum(b40) <= 0"
+  },
+  {
+   "name": "bug41",
+   "predicate": "sum(b41) <= 0"
+  },
+  {
+   "name": "bug42",
+   "predicate": "sum(b42) <= 0"
+  },
+  {
+   "name": "bug43",
+   "predicate": "sum(b43) <= 0"
+  },
+  {
+   "name": "bug44",
+   "predicate": "sum(b44) <= 0"
+  },
+  {
+   "name": "bug45",
+   "predicate": "sum(b45) <= 0"
+  },
+  {
+   "name": "bug47",
+   "predicate": "sum(b47) <= 0"
+  }
+ ]
+}

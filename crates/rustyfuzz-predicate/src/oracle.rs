@@ -211,6 +211,8 @@ pub struct PredicateOracle {
     checked: CheckedPredicate,
     binding_manifest: String,
     bindings: BTreeMap<String, Binding>,
+    /// When false, evidence (terms, manifest) is built only for a violation.
+    evidence_on_pass: bool,
 }
 
 impl PredicateOracle {
@@ -240,7 +242,14 @@ impl PredicateOracle {
             checked,
             binding_manifest: manifest_json.to_owned(),
             bindings,
+            evidence_on_pass: true,
         })
+    }
+
+    /// Fuzzing hot path: skip building term evidence unless the invariant is violated.
+    pub fn with_evidence_on_pass(mut self, enabled: bool) -> Self {
+        self.evidence_on_pass = enabled;
+        self
     }
 
     pub fn spec(&self) -> &InvariantSpec {
@@ -273,7 +282,14 @@ impl PredicateOracle {
         // caller's budget multiplied by the binding count, which keeps the work finite
         // while letting complete evidence be recorded (§5 item 9b).
         let per_symbol = budget.remaining().max(1);
+        let touched: std::collections::BTreeSet<String> =
+            self.checked.symbols().iter().map(|s| s.0.join(".")).collect();
         for (name, binding) in &self.bindings {
+            // Only symbols the predicate mentions: a shared manifest binds every symbol of every
+            // invariant, and re-resolving all of them per violation made evidence cost O(bindings).
+            if !touched.contains(name) {
+                continue;
+            }
             let symbol = crate::Symbol(name.split('.').map(str::to_string).collect());
             let mut local = ReReadBudget::new(per_symbol + binding.declared_key_count());
             let resolved = if binding.is_mapping() {
@@ -324,9 +340,21 @@ impl InvariantOracle for PredicateOracle {
         let (outcome, counters, coverage) =
             eval::evaluate(self.checked.expr(), &ctx, reader, budget);
 
-        let terms = self.collect_terms(view, tx_index, reader, budget);
+        // Term evidence re-resolves every bound symbol. Fuzzing disables it for non-violations
+        // (`with_evidence_on_pass(false)`), since Held/Unknown checks run once per transaction
+        // per invariant and no caller records their terms.
+        let violated = self.evidence_on_pass || matches!(outcome, Outcome::False);
+        let terms = if violated {
+            self.collect_terms(view, tx_index, reader, budget)
+        } else {
+            Vec::new()
+        };
         let evidence = Evidence {
-            binding_manifest: self.binding_manifest.clone(),
+            binding_manifest: if violated {
+                self.binding_manifest.clone()
+            } else {
+                String::new()
+            },
             predicate: self.spec.predicate.clone(),
             tx_index,
             verdict: Verdict::from(&outcome),

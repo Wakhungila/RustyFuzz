@@ -100,6 +100,10 @@ pub enum Command {
         /// offline known-vulnerable fixtures without an RPC endpoint.
         #[arg(long)]
         fixture: Option<String>,
+        /// Directory of replay-format input JSONs (e.g. from the symbolic executor,
+        /// `scripts/bench/symexec`) added to the initial corpus.
+        #[arg(long)]
+        seed_inputs: Option<String>,
         /// Foundry project root (the directory holding `out/` from `forge build`).
         /// The test contract is deployed in memory, its `setUp()` runs with
         /// Foundry cheatcodes, and its `invariant_*` functions are evaluated after

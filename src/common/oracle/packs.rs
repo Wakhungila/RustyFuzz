@@ -756,13 +756,15 @@ impl ProtocolOraclePack {
             // Top-level frame (depth 0) is the contract the transaction
             // targets; the trace only records depth >= 1 calls, so recover it
             // from the first depth-1 entry's caller.
-            let mut stack: Vec<(Address, String)> = Vec::new();
+            // (target, selector, caller). The caller lets us require a genuine call-out: the
+            // frame right above the re-entered one must have been called BY that contract.
+            let mut stack: Vec<(Address, String, Address)> = Vec::new();
             if let Some(first) = tx
                 .call_trace
                 .iter()
                 .find(|call| call.phase == CallPhase::Start && call.depth >= 1)
             {
-                stack.push((first.caller, "tx".to_string()));
+                stack.push((first.caller, "tx".to_string(), Address::ZERO));
             }
             let mut emitted: BTreeSet<(Address, usize)> = BTreeSet::new();
             for call in &tx.call_trace {
@@ -772,16 +774,23 @@ impl ProtocolOraclePack {
                         let reentered = stack
                             .iter()
                             .take(depth.min(stack.len()))
-                            .position(|(target, _)| *target == call.target);
+                            .position(|(target, _, _)| *target == call.target);
                         if let Some(ancestor_depth) = reentered {
-                            if call.caller != call.target
+                            // Reentrancy needs the target to have made an external call that led
+                            // back to it. A harness/attacker contract that merely dispatches many
+                            // calls (or recurses into itself) is a sibling pattern, not a callback.
+                            let target_called_out = stack
+                                .get(ancestor_depth + 1)
+                                .is_some_and(|frame| frame.2 == call.target);
+                            if target_called_out
+                                && call.caller != call.target
                                 && emitted.insert((call.target, ancestor_depth))
                             {
                                 let chain = stack
                                     .iter()
                                     .take(depth.min(stack.len()))
                                     .enumerate()
-                                    .map(|(level, (target, sel))| {
+                                    .map(|(level, (target, sel, _))| {
                                         format!("d{level}:{sel}->{}", short_target(*target))
                                     })
                                     .collect::<Vec<_>>()
@@ -801,7 +810,7 @@ impl ProtocolOraclePack {
                             }
                         }
                         stack.truncate(depth);
-                        stack.push((call.target, selector_hex(call)));
+                        stack.push((call.target, selector_hex(call), call.caller));
                     }
                     CallPhase::End => {
                         stack.truncate(depth);

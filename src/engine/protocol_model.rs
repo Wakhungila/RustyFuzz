@@ -137,7 +137,26 @@ impl FormalProtocolModel {
             if observed_selectors.is_empty() {
                 TargetProfile::default()
             } else {
-                TargetProfiler::profile_from_selectors(observed_selectors.iter().copied())
+                // The profile is a pure function of the selector set, and a campaign sees a
+                // handful of distinct sets; recomputing it (keccak of every signature) per
+                // execution was ~15% of runtime.
+                thread_local! {
+                    static PROFILE_CACHE: std::cell::RefCell<std::collections::HashMap<Vec<[u8; 4]>, TargetProfile>> =
+                        std::cell::RefCell::new(std::collections::HashMap::new());
+                }
+                let key: Vec<[u8; 4]> = observed_selectors.iter().copied().collect();
+                PROFILE_CACHE.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    if cache.len() > 4096 {
+                        cache.clear();
+                    }
+                    cache
+                        .entry(key)
+                        .or_insert_with(|| {
+                            TargetProfiler::profile_from_selectors(observed_selectors.iter().copied())
+                        })
+                        .clone()
+                })
             }
         });
 
@@ -158,8 +177,9 @@ impl FormalProtocolModel {
                 .map(|edge| format!("dependency edge {:?}: {}", edge.kind, edge.explanation)),
         );
         explanation.extend(economic_delta.storage_delta_summary.iter().map(|summary| {
+            // `{:#x}`: `Display` on an Address computes an EIP-55 checksum (keccak) per call.
             format!(
-                "storage delta {} slots={} abs_delta={}",
+                "storage delta {:#x} slots={} abs_delta={}",
                 summary.address, summary.slot_count, summary.absolute_delta_score
             )
         }));
