@@ -15,6 +15,7 @@ cap, symbolic memory offsets/lengths.
 import argparse, json, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from symexec import *
+from invariants import load_invariants
 
 STATIC = re.compile(r"^(u?int\d*|address|bool|bytes\d+)$")
 
@@ -36,18 +37,36 @@ def main():
         if all(STATIC.match(i["type"]) for i in f["inputs"]):
             widths[f"{f['name']}({','.join(i['type'] for i in f['inputs'])})"] = len(f["inputs"])
         else: skipped.append(f["name"])
-    watch = {}
+    # Legacy watch-dict: every mapping-kind symbol's enumerated keys, used by `explore()` (the
+    # concrete-state BFS, validated on Daedaluzz) and as `explore_sym`'s fallback when the invariants
+    # file has no `invariants` predicate list (just bare `symbols`, as Daedaluzz's do).
+    watch, inv_doc = {}, None
     if a.invariants:
-        for name, sym in json.load(open(a.invariants))["symbols"].items():
+        inv_doc = json.load(open(a.invariants))
+        for name, sym in inv_doc.get("symbols", {}).items():
             if sym.get("kind") != "mapping": continue
             for key in sym.get("keys", []):
                 slot = int(sym["slot"], 16).to_bytes(32, "big")
-                h = int.from_bytes(k256(bytes.fromhex(key[2:]).rjust(32, b"\0") + slot), "big")
+                preimage = bytes.fromhex(key[2:]).rjust(32, b"\0") + slot
+                # Needed for `explore_sym` (storage/calldata stay symbolic across txs); a no-op
+                # for `explore` (the concrete-state BFS), which never carries a symbolic key
+                # across the SHA3 that derives a mapping slot in the first place.
+                register_known_hash(preimage)
+                h = int.from_bytes(k256(preimage), "big")
                 watch[h] = name
     caller = int(fx["attacker"], 16)
     print(f"target={tgt} funcs={len(widths)} skipped(dynamic params)={skipped} watched={len(watch)}")
     if a.symbolic_depth:
-        found, stats = explore_sym(code, widths, init, watch, depth=a.symbolic_depth, budget_s=a.budget, caller=caller)
+        # General invariant predicates (any comparison over `sum(mapping)` / masked `slot` symbols,
+        # not just "some mapping entry became non-zero") are only usable in the symbolic-depth mode,
+        # because checking one needs the whole-path storage model, not a single write.
+        if inv_doc and inv_doc.get("invariants"):
+            symbols, preds = load_invariants(inv_doc)
+            found, stats = explore_sym(code, widths, init, invariants=(symbols, preds),
+                                        depth=a.symbolic_depth, budget_s=a.budget, caller=caller)
+        else:
+            found, stats = explore_sym(code, widths, init, watch=watch, depth=a.symbolic_depth,
+                                        budget_s=a.budget, caller=caller)
         seen = {}
     else:
         found, seen, stats = explore(code, widths, 0, init, watch, budget_s=a.budget, caller=caller)
@@ -66,7 +85,8 @@ def main():
         for st, seq in sorted(seen.items(), key=lambda kv: len(kv[1])):
             if not seq or n >= a.emit_states: continue
             dump(seq, f"state{n}.json"); n += 1
-    print(f"SYMSEED found={len(found)}/{len(watch)} states_seen={len(seen)} state_seeds={n} stats={stats}")
+    denom = len(inv_doc["invariants"]) if (a.symbolic_depth and inv_doc and inv_doc.get("invariants")) else len(watch)
+    print(f"SYMSEED found={len(found)}/{denom} states_seen={len(seen)} state_seeds={n} stats={stats}")
 
 
 if __name__ == "__main__":

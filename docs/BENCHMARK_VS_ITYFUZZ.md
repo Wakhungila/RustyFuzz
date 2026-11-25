@@ -264,3 +264,40 @@ replay-judge confirms both on the real EVM, a seeded fuzz run reports both, an u
 **Still not covered:** dynamic-type params (bytes/arrays/strings), CREATE/CREATE2, delegatecall semantics, callee
 re-entry, ETH balances/value, block-dependent branches beyond constants, symbolic memory offsets, loops past the step
 cap; invariant watch is limited to mapping-kind symbols. Not yet run on any real deployed protocol.
+
+## Real-protocol test: `benchmarks/historical/known_vulnerable/` (judge-confirmed, generalized judge)
+`replay-judge` gained a second, independent check alongside the Daedaluzz bug-id slot reader: it now also
+loads the invariants file's named predicates through the **same predicate layer the live campaign uses**
+(`rustyfuzz-predicate` via `IncrementalChecker`, reused as-is) and reports every one confirmed false during a
+pristine replay, printed on its own `judge_invariants confirmed=N predicates={...}` line. This does not touch
+the existing bug-id output (`ids={...}`), so the CI gate and `scripts/bench/daedaluzz.py` are unaffected.
+
+This is what let `symseed.py` be checked against **real vulnerability classes**, not just Daedaluzz mazes:
+the repo's own `benchmarks/historical/known_vulnerable/` fixtures (five small, realistic, known-vulnerable
+contracts, each with real ABI/bytecode/invariants, already used by other validation scripts).
+
+| fixture | class | symseed result |
+|---|---|---|
+| known-erc20-bad-mint-inflation | unauthorized mint | both invariants found + judge-confirmed (depth 2) |
+| known-uninitialized-proxy-takeover | uninitialized proxy | found + judge-confirmed (depth 1); also reproduced by a **seeded live fuzz campaign** (`Bridge`/`InvariantViolation` + the engine's own `ProxyUpgradeability` oracle both fire) |
+| known-bridge-nonce-replay | replay / double-release | found + judge-confirmed (depth 2) |
+| known-flashloan-price-manipulation | price manipulation | not reached: its only mutator function (`swap`) takes a dynamic-type parameter, which `symseed.py` currently skips entirely |
+| known-read-only-reentrancy | read-only reentrancy | not reached: its invariant needs a `return_value`-kind symbol (the real return value of an **actual external call** to a named contract), and external calls are havoced (free success bit, free bytes), not dispatched into the callee's real bytecode |
+
+**A genuine soundness bug found and fixed along the way:** the first attempt judge-rejected both of this
+fixture's invariants as false positives. Cause: `explore_sym`'s multi-tx mode keeps storage *and* keys
+symbolic across transactions, and the keccak model is an uninterpreted function tied to real hashes only
+through axioms over preimages *seen during execution*. A storage slot the **invariants file** names (e.g. the
+attacker's `balances` entry) is never such a preimage unless some transaction happens to pass that exact value
+concretely, so z3 was free to satisfy "a write lands on slot X" by setting the UF's output equal to X for an
+otherwise-unconstrained symbolic input, without that input actually equaling X's real preimage — a
+true counterexample in the model, not in the EVM. Fix: `register_known_hash()` seeds the axiom set with every
+mapping key the invariants/watch tables name, before exploring, so a watched slot can only be reached by a
+key that genuinely hashes to it. Confirmed by the judge going from 1/2 to 2/2 immediately after the fix, with
+no change to the maze pipeline (`explore()` is unaffected; it never carries a symbolic key across a SHA3).
+
+**Scope for "real contract" claims:** these are small single-contract fixtures built for this benchmark, not
+mainnet protocols (`benchmarks/historical/fixtures/` has real mainnet-fork exploits like Audius, but with only
+a handful of explicitly-recorded storage slots and no full state, so they need real external-call dispatch
+first — see below). They do exercise real patterns (ERC-20 accounting, mapping-keyed balances, an external
+price call, `&&`-combined proxy-slot predicates) that the maze suite does not.

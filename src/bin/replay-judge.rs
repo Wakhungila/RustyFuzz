@@ -4,11 +4,21 @@
 //! reads the Daedaluzz `__bugs[id]` mapping slots straight from contract
 //! storage. No RustyFuzz oracle, invariant or finding is consulted, so the
 //! confirmed-bug set cannot be inflated by the fuzzer's own heuristics.
+//!
+//! It separately runs a **general** check (`judge_invariants confirmed_names=...`):
+//! every named invariant in the manifest, evaluated with the same predicate layer the
+//! live campaign uses (`rustyfuzz_predicate` via `IncrementalChecker`), fed from this
+//! same pristine replay. This is what lets the judge verify a real protocol's
+//! invariants (`totalSupply == sum(balances)`, `guardian != 0`, ...), not just
+//! Daedaluzz's `sum(bN) <= 0` bug flags; it runs unconditionally and does not change
+//! the bug-id path above, so existing `ids={...}` consumers are unaffected.
 use clap::Parser;
 use revm::primitives::{keccak256, Address, U256};
 use revm::Database;
 use rusty_fuzz::common::types::ChainState;
 use rusty_fuzz::engine::executable_fixture::ExecutableFixture;
+use rusty_fuzz::engine::invariant_file::InvariantFile;
+use rusty_fuzz::engine::invariant_runtime::IncrementalChecker;
 use rusty_fuzz::evm::fork::{create_in_memory_fork_db_from_fixture, create_offline_fallback_block_env};
 use rusty_fuzz::evm::fuzz::EvmInput;
 use rustyfuzz_evm::dataflow::DataflowRegistry;
@@ -60,6 +70,16 @@ fn main() -> anyhow::Result<()> {
         ids.insert(n);
     }
 
+    // General invariant registry (named predicates over arbitrary symbols), separate from the
+    // bug-id slot reading above. Optional: a manifest with no `invariants` list (or that fails to
+    // build, e.g. a target mismatch) just means this pass finds nothing, never a hard error — the
+    // bug-id path is still the one CI depends on.
+    let registry = InvariantFile::load(&args.invariants)
+        .ok()
+        .filter(|f| !f.invariants.is_empty())
+        .and_then(|f| f.build_registry().ok());
+    let mut confirmed_names: BTreeSet<String> = BTreeSet::new();
+
     let executor = EvmExecutor::new();
     let mut confirmed: BTreeSet<u64> = BTreeSet::new();
     let mut replayed = 0usize;
@@ -88,6 +108,7 @@ fn main() -> anyhow::Result<()> {
         let mut dataflow = DataflowRegistry::new();
         let mut coverage = vec![0u8; MAP_SIZE];
         let mut ok = true;
+        let mut checker = IncrementalChecker::new();
         for (idx, tx) in input.txs.iter().enumerate() {
             let mut cs = ChainState::Evm(db.clone());
             let mut wp = Vec::new();
@@ -106,10 +127,20 @@ fn main() -> anyhow::Result<()> {
                         println!("  reads={:?} writes={:?}", r.storage_reads, r.storage_writes);
                         println!("  tx{} status={:?} gas={} diffs={} writes={}", idx, r.status, r.gas_used, r.storage_diffs.len(), r.storage_writes.len());
                     }
+                    if let Some(registry) = &registry {
+                        let block = rustyfuzz_predicate::BlockContext {
+                            number: rustyfuzz_predicate::Int256(block_env.number.to_be_bytes()),
+                            timestamp: rustyfuzz_predicate::Int256(block_env.timestamp.to_be_bytes()),
+                        };
+                        checker.observe(registry, &r, &cs, block, 16);
+                    }
                 }
             }
             let ChainState::Evm(n) = cs;
             db = n;
+        }
+        for v in checker.violations() {
+            confirmed_names.insert(v.predicate.clone());
         }
         if !ok {
             failed += 1;
@@ -145,5 +176,12 @@ fn main() -> anyhow::Result<()> {
         confirmed.len(),
         confirmed
     );
+    if registry.is_some() {
+        println!(
+            "judge_invariants confirmed={} predicates={:?}",
+            confirmed_names.len(),
+            confirmed_names
+        );
+    }
     Ok(())
 }

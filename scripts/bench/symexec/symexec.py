@@ -26,6 +26,18 @@ def k256(b):
 KNOWN_HASHES = {}
 
 
+def register_known_hash(preimage: bytes):
+    """Tells the symbolic SHA3 model that `preimage` is a real preimage, so a symbolic input
+    forced equal to `keccak(preimage)` is also forced equal to `preimage` (see the keccak axiom
+    in `Exec.step_until_fork`'s SHA3 case). Without this, a mapping key named only in the
+    invariants file (never passed as *concrete* calldata during the symbolic run) has no axiom,
+    and z3 can satisfy "write lands on this slot" by picking an arbitrary, unconstrained symbolic
+    key whose uninterpreted hash it is merely free to set equal to the target slot — a modeling
+    artifact, not a real path. Call this for every key a predicate/watch dict names, before
+    exploring, so results they produce reproduce on the real EVM."""
+    KNOWN_HASHES.setdefault(len(preimage), {})[int.from_bytes(k256(preimage), "big")] = preimage
+
+
 class Giveup(Exception):
     pass
 
@@ -68,6 +80,21 @@ def need(e, what):
     return v
 
 
+def read_storage(p, k):
+    """Value at symbolic/concrete slot `k` in path `p`'s storage (init overridden by wlog, in order)."""
+    kc = conc(k)
+    if kc is not None: base = BV(p.init.get(kc, 0))
+    else:
+        base = BV(0)
+        for ik, iv in p.init.items(): base = z3.If(k == BV(ik), BV(iv), base)
+    for wk, wv in p.wlog:
+        wc = conc(wk)
+        if kc is not None and wc is not None:
+            if kc == wc: base = wv
+        else: base = z3.If(k == wk, wv, base)
+    return z3.simplify(base)
+
+
 class Exec:
     def __init__(self, code, calldata_words, selector, caller=int('13' * 20, 16), timeout_ms=3000, max_steps=200000):
         self.code, self.jd = code, disasm_jumpdests(code)
@@ -96,17 +123,7 @@ class Exec:
         for j in range(32): p.mem[off + j] = z3.simplify(z3.Extract(255 - 8 * j, 248 - 8 * j, v))
 
     def sload(self, p, k):
-        kc = conc(k)
-        if kc is not None: base = BV(p.init.get(kc, 0))
-        else:
-            base = BV(0)
-            for ik, iv in p.init.items(): base = z3.If(k == BV(ik), BV(iv), base)
-        for wk, wv in p.wlog:
-            wc = conc(wk)
-            if kc is not None and wc is not None:
-                if kc == wc: base = wv
-            else: base = z3.If(k == wk, wv, base)
-        return z3.simplify(base)
+        return read_storage(p, k)
 
     lazy = True  # skip solver calls at forks; only completed non-revert paths are solved
 
@@ -383,16 +400,24 @@ def explore(code, sigs, nargs, init_store, watch, max_states=100000, max_frontie
     return found, seen, stats
 
 
-def explore_sym(code, widths, init_store, watch, depth=3, max_paths=300, budget_s=600, caller=int('13' * 20, 16), log=print):
+def explore_sym(code, widths, init_store, watch=None, invariants=None, depth=3, max_paths=300,
+                 budget_s=600, caller=int('13' * 20, 16), log=print):
     """Multi-transaction symbolic execution: storage stays symbolic across `depth` transactions, so a
     value chosen in tx1 (e.g. a deposit amount) is solved jointly with the guard in tx3. Returns
-    ({label: [(sig, args), ...]}, stats)."""
+    ({label: [(sig, args), ...]}, stats).
+
+    Pass exactly one of:
+      watch:      {slot -> label} (Daedaluzz-style: label found once that slot is written non-zero)
+      invariants: (symbols, preds) from `invariants.load_invariants` — the general case, usable on any
+                  contract: label found once some invariant's predicate is reachably false.
+    """
     import random
+    assert (watch is None) != (invariants is None), "pass exactly one of watch=, invariants="
     t0, rnd = time.time(), random.Random(0)
     sels = {s: selector(s) for s in widths}
     found, stats = {}, dict(paths=0, giveup=0, sat=0, calls=0)
     layer = [(Path(init_store), [])]  # (path after k txs, [(sig, arg exprs)])
-    wl = set(watch)
+    all_labels = set(watch.values()) if watch is not None else {name for name, _ in invariants[1]}
     for t in range(depth):
         nxt = []
         for base, trail in layer:
@@ -413,19 +438,28 @@ def explore_sym(code, widths, init_store, watch, depth=3, max_paths=300, budget_
             if s_.check() == z3.sat:
                 stats["sat"] += 1; keep.append((p, tr))
                 if len(keep) >= max_paths: break
-        # watched writes: can any write hit a watched slot with a non-zero value on this path?
         for p, tr in keep:
-            hit = [z3.And(k == BV(h), v != 0) for k, v in p.wlog for h in wl]
-            if not hit: continue
-            for label_h in list(wl):
-                lab = watch[label_h]
-                if lab in found: continue
-                c = [z3.And(k == BV(label_h), v != 0) for k, v in p.wlog]
-                s_ = z3.Solver(); s_.set("timeout", 10000); s_.add(*p.cons); s_.add(z3.Or(*c))
+            if watch is not None:
+                wl = set(watch)
+                hit = [z3.And(k == BV(h), v != 0) for k, v in p.wlog for h in wl]
+                if not hit: continue
+                checks = []
+                for label_h in list(wl):
+                    lab = watch[label_h]
+                    if lab in found: continue
+                    c = [z3.And(k == BV(label_h), v != 0) for k, v in p.wlog]
+                    checks.append((lab, z3.Or(*c) if c else z3.BoolVal(False)))
+            else:
+                import invariants as invariants_mod  # local: invariants.py imports from this module
+                symbols, preds = invariants
+                checks = [(name, cond) for name, cond in invariants_mod.violations_at(p, symbols, preds)
+                          if name not in found]
+            for lab, cond in checks:
+                s_ = z3.Solver(); s_.set("timeout", 10000); s_.add(*p.cons); s_.add(cond)
                 if s_.check() == z3.sat:
                     m = s_.model()
                     found[lab] = [(sg, [m.eval(w, model_completion=True).as_long() for w in Wt]) for sg, Wt in tr]
         layer = keep
         log(f"sym depth {t+1}: layer={len(layer)} found={len(found)} {stats} t={time.time()-t0:.0f}s")
-        if len(found) == len(set(watch.values())) or time.time() - t0 > budget_s: break
+        if len(found) == len(all_labels) or time.time() - t0 > budget_s: break
     return found, stats
