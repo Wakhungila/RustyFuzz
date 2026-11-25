@@ -296,11 +296,8 @@ impl Drop for RunSetupTerminalGuard {
 
 pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyhow::Result<()> {
     ensure_evm_chain(config)?;
-    anyhow::ensure!(
-        matches!(options.chain.as_str(), "evm" | "eth" | "ethereum" | "bsc"),
-        "unsupported --chain `{}`; expected evm, eth, ethereum, or bsc",
-        options.chain
-    );
+    rustyfuzz_evm::chain_profile::ChainProfile::id_for_cli_name(&options.chain)
+        .map_err(anyhow::Error::msg)?;
 
     validate_job_bounds(options.max_execs, Some(options.duration_secs))
         .map_err(anyhow::Error::msg)?;
@@ -340,7 +337,7 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
             let explorer_url = options
                 .explorer_url
                 .clone()
-                .unwrap_or_else(|| default_explorer_api_url(&options.chain).to_string());
+                .unwrap_or_else(|| default_explorer_api_url(&options.chain));
             EtherscanAbiFetcher::new(api_key, explorer_url).map_err(anyhow::Error::msg)
         })
         .transpose()?;
@@ -567,6 +564,8 @@ pub async fn run_prove_live(config: &Config, options: ProveLiveOptions) -> anyho
         in_memory_bytecode: None,
         attacker_harness: false,
         fixture_path: None,
+        seed_inputs_dir: None,
+        foundry_bootstrap: None,
         compact_fork_state: false,
         cores: None,
         require_seed_bundle,
@@ -766,11 +765,12 @@ fn sanitize_rpc_for_display(raw: &str) -> String {
     }
 }
 
-fn default_explorer_api_url(chain: &str) -> &'static str {
-    match chain {
-        "bsc" => "https://api.etherscan.io/v2/api?chainid=56",
-        _ => "https://api.etherscan.io/v2/api?chainid=1",
-    }
+fn default_explorer_api_url(chain: &str) -> String {
+    let id = rustyfuzz_evm::chain_profile::ChainProfile::id_for_cli_name(chain)
+        .ok()
+        .flatten()
+        .unwrap_or(1);
+    format!("https://api.etherscan.io/v2/api?chainid={id}")
 }
 
 pub async fn campaign_block_env(config: &Config) -> anyhow::Result<revm::context::BlockEnv> {
@@ -904,6 +904,8 @@ mod tests {
             in_memory_bytecode: None,
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,

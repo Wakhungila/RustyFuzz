@@ -32,6 +32,13 @@ pub enum ForkSchedule {
     /// A single fixed spec for every block. Used for chains whose ruleset is stable
     /// within the range a campaign explores, and for test fixtures.
     Fixed(SpecId),
+    /// Ascending `(activation_unix_timestamp, spec)` table. The spec of the last
+    /// entry whose activation is `<= timestamp` applies; before the first entry the
+    /// profile does not describe the chain (see [`ChainProfile::min_timestamp`]).
+    ByTimestamp(&'static [(u64, SpecId)]),
+    /// Ascending `(activation_block_number, spec)` table, for chains whose client
+    /// keys forks by block height (Polygon PoS / Bor).
+    ByBlock(&'static [(u64, SpecId)]),
 }
 
 /// Whether and how the chain prices blobs (EIP-4844).
@@ -70,6 +77,14 @@ pub struct ChainProfile {
     /// activation) must refuse the range it cannot describe rather than apply
     /// the wrong rules to it. `0` means "every block".
     pub min_block: u64,
+    /// Lowest block timestamp (unix seconds) this profile is valid for. Checked
+    /// once the block header is known, because several clients key their forks by
+    /// time rather than height. `0` means "every timestamp".
+    pub min_timestamp: u64,
+    /// Known semantic gaps a reader must be told about before trusting a finding
+    /// on this chain (chain-specific precompiles, system contracts). Empty when
+    /// the chain is plain-EVM equivalent over the covered range.
+    pub caveats: &'static str,
 }
 
 impl ChainProfile {
@@ -86,6 +101,8 @@ impl ChainProfile {
             excess_blob_gas: true,
         },
         min_block: 0,
+        min_timestamp: 0,
+        caveats: "",
     };
 
     /// Arbitrum One (Arbitrum Nitro).
@@ -112,6 +129,8 @@ impl ChainProfile {
             excess_blob_gas: false,
         },
         min_block: 400_000_000,
+        min_timestamp: 0,
+        caveats: "ArbOS precompiles (ArbSys, ArbInfo, ...) and L1-pricing semantics are not modeled",
     };
 
     /// A local development chain (the anvil / hardhat default chain id).
@@ -131,7 +150,156 @@ impl ChainProfile {
             excess_blob_gas: false,
         },
         min_block: 0,
+        min_timestamp: 0,
+        caveats: "",
     };
+
+    /// BNB Smart Chain (chain id 56).
+    ///
+    /// Activation times are `BSCChainConfig` from bnb-chain/bsc `params/config.go`.
+    /// Shanghai (and Kepler) activate together, Cancun with Haber, Prague with
+    /// Pascal, and Osaka with Mendel. The covered range starts at Shanghai because
+    /// earlier BSC blocks predate `PUSH0` and are not described by any table here.
+    /// BSC has no beacon randomness (`difficulty`/`mixHash` are not `PREVRANDAO`)
+    /// and its headers carry no blob fields.
+    pub const BSC: ChainProfile = ChainProfile {
+        chain_id: 56,
+        name: "bsc",
+        schedule: ForkSchedule::ByTimestamp(&[
+            (1_705_996_800, SpecId::SHANGHAI),
+            (1_718_863_500, SpecId::CANCUN),
+            (1_742_436_600, SpecId::PRAGUE),
+            (1_777_343_400, SpecId::OSAKA),
+        ]),
+        blobs: BlobPricing::Absent,
+        header: HeaderRequirements {
+            prevrandao: false,
+            excess_blob_gas: false,
+        },
+        min_block: 0,
+        min_timestamp: 1_705_996_800,
+        caveats: "BSC-specific precompiles (tendermint/iavl/cometbft light-client verification, \
+                  double-sign evidence) and the system-contract hooks are not modeled; \
+                  contracts depending on them will revert",
+    };
+
+    /// Polygon PoS (chain id 137).
+    ///
+    /// Block heights are `BorMainnetChainConfig` from 0xPolygon/bor
+    /// `params/config.go`: Shanghai 50_523_000, Cancun 54_876_000, Prague
+    /// 73_440_256 (Bhilai). Bor has no beacon randomness.
+    pub const POLYGON_POS: ChainProfile = ChainProfile {
+        chain_id: 137,
+        name: "polygon-pos",
+        schedule: ForkSchedule::ByBlock(&[
+            (50_523_000, SpecId::SHANGHAI),
+            (54_876_000, SpecId::CANCUN),
+            (73_440_256, SpecId::PRAGUE),
+        ]),
+        blobs: BlobPricing::Absent,
+        header: HeaderRequirements {
+            prevrandao: false,
+            excess_blob_gas: false,
+        },
+        min_block: 50_523_000,
+        min_timestamp: 0,
+        caveats: "Bor state-sync, the MATIC/POL system contracts and Polygon-specific \
+                  precompiles are not modeled",
+    };
+
+    /// OP Mainnet (chain id 10). Superchain-wide activation timestamps from the
+    /// Optimism network-upgrades registry: Ecotone (Cancun) 1710374401.
+    /// Isthmus (Prague) is deliberately not modeled: it adds precompiles and
+    /// EIP-7702 but no opcodes, and treating it as Cancun is the conservative error.
+    pub const OP_MAINNET: ChainProfile = ChainProfile {
+        chain_id: 10,
+        name: "op-mainnet",
+        schedule: ForkSchedule::ByTimestamp(&[(1_710_374_401, SpecId::CANCUN)]),
+        blobs: BlobPricing::Absent,
+        header: HeaderRequirements {
+            prevrandao: true,
+            excess_blob_gas: false,
+        },
+        min_block: 0,
+        min_timestamp: 1_710_374_401,
+        caveats: "OP Stack L1-fee accounting, the L1Block/GasPriceOracle predeploys and \
+                  deposit transactions are not modeled; Isthmus precompiles (BLS12-381, \
+                  EIP-7702) are not enabled",
+    };
+
+    /// Base (chain id 8453). Ecotone (Cancun) activated at 1710374401, per the
+    /// Base upgrade documentation. Same caveats as OP Mainnet.
+    pub const BASE: ChainProfile = ChainProfile {
+        chain_id: 8_453,
+        name: "base",
+        schedule: ForkSchedule::ByTimestamp(&[(1_710_374_401, SpecId::CANCUN)]),
+        blobs: BlobPricing::Absent,
+        header: HeaderRequirements {
+            prevrandao: true,
+            excess_blob_gas: false,
+        },
+        min_block: 0,
+        min_timestamp: 1_710_374_401,
+        caveats: "OP Stack L1-fee accounting, the L1Block/GasPriceOracle predeploys and \
+                  deposit transactions are not modeled; Isthmus precompiles (BLS12-381, \
+                  EIP-7702) are not enabled",
+    };
+
+    /// Avalanche C-Chain (chain id 43114). Activation times from avalanchego
+    /// `upgrade/upgrade.go`: Durango (Shanghai) 1709740800, Etna (the Cancun EIPs
+    /// of ACP-131, without blob transactions) 1734368400. No beacon randomness.
+    pub const AVALANCHE_C: ChainProfile = ChainProfile {
+        chain_id: 43_114,
+        name: "avalanche-c",
+        schedule: ForkSchedule::ByTimestamp(&[
+            (1_709_740_800, SpecId::SHANGHAI),
+            (1_734_368_400, SpecId::CANCUN),
+        ]),
+        blobs: BlobPricing::Absent,
+        header: HeaderRequirements {
+            prevrandao: false,
+            excess_blob_gas: false,
+        },
+        min_block: 0,
+        min_timestamp: 1_709_740_800,
+        caveats: "Warp messaging and the deprecated native-asset-call precompiles are not \
+                  modeled",
+    };
+
+    /// Every profile this build can execute.
+    pub const ALL: [ChainProfile; 8] = [
+        Self::ETHEREUM_MAINNET,
+        Self::BSC,
+        Self::POLYGON_POS,
+        Self::OP_MAINNET,
+        Self::BASE,
+        Self::AVALANCHE_C,
+        Self::ARBITRUM_ONE,
+        Self::ANVIL_LOCAL,
+    ];
+
+    /// Resolves a CLI `--chain` name (`evm`, `bsc`, `polygon`, `base`, ...) to a
+    /// chain id. `evm` and the empty name mean "decided by the RPC", returned as
+    /// `Ok(None)`. Unknown names are refused with the list of accepted ones.
+    pub fn id_for_cli_name(name: &str) -> Result<Option<u64>, String> {
+        let id = match name.trim().to_ascii_lowercase().as_str() {
+            "evm" | "" => return Ok(None),
+            "eth" | "ethereum" | "mainnet" => 1,
+            "bsc" | "bnb" | "bnb-chain" => 56,
+            "polygon" | "polygon-pos" | "matic" => 137,
+            "optimism" | "op" | "op-mainnet" => 10,
+            "base" => 8_453,
+            "avalanche" | "avax" | "avalanche-c" => 43_114,
+            "arbitrum" | "arbitrum-one" | "arb" => 42_161,
+            other => {
+                return Err(format!(
+                    "unsupported --chain `{other}`; expected evm, eth, bsc, polygon, optimism, \
+                     base, avalanche or arbitrum"
+                ))
+            }
+        };
+        Ok(Some(id))
+    }
 
     /// Resolves a profile for `chain_id`, or explains why there is none.
     ///
@@ -139,16 +307,17 @@ impl ChainProfile {
     /// The previous behaviour — failing later on a missing header field — made the real
     /// problem (no profile) invisible.
     pub fn for_chain(chain_id: u64) -> Result<Self, String> {
-        match chain_id {
-            1 => Ok(Self::ETHEREUM_MAINNET),
-            42_161 => Ok(Self::ARBITRUM_ONE),
-            31_337 => Ok(Self::ANVIL_LOCAL),
-            other => Err(format!(
+        match Self::ALL.iter().find(|profile| profile.chain_id == chain_id) {
+            Some(profile) => Ok(*profile),
+            None => {
+                let other = chain_id;
+                Err(format!(
                 "chain {other} has no execution profile: hardfork schedule, blob pricing \
                  and required header fields are unknown. Executing it with Ethereum \
                  mainnet rules would produce silently wrong semantics. Add a profile in \
                  crates/rustyfuzz-evm/src/chain_profile.rs before forking this chain."
-            )),
+                ))
+            }
         }
     }
 
@@ -157,11 +326,20 @@ impl ChainProfile {
         number >= self.min_block
     }
 
+    /// Whether this profile describes the rules at a block timestamp. Chains whose
+    /// forks are keyed by time cannot be checked from the block number alone, so
+    /// this is evaluated once the header is known.
+    pub fn covers_timestamp(&self, timestamp: u64) -> bool {
+        timestamp >= self.min_timestamp
+    }
+
     /// The hardfork spec for a block, per this chain's schedule.
     pub fn spec_for(&self, number: u64, timestamp: u64) -> SpecId {
         match self.schedule {
             ForkSchedule::EthereumMainnet => crate::environment::mainnet_spec(number, timestamp),
             ForkSchedule::Fixed(spec) => spec,
+            ForkSchedule::ByTimestamp(table) => spec_from_table(table, timestamp),
+            ForkSchedule::ByBlock(table) => spec_from_table(table, number),
         }
     }
 
@@ -174,6 +352,19 @@ impl ChainProfile {
             BlobPricing::Absent => None,
         }
     }
+}
+
+/// The spec of the last table entry whose activation key is `<= key`. A key before
+/// the first entry resolves to that first entry: the profile's `min_block` /
+/// `min_timestamp` is what refuses such inputs, so the table never has to guess.
+fn spec_from_table(table: &[(u64, SpecId)], key: u64) -> SpecId {
+    table
+        .iter()
+        .rev()
+        .find(|(activation, _)| key >= *activation)
+        .or_else(|| table.first())
+        .map(|(_, spec)| *spec)
+        .expect("a fork table has at least one entry")
 }
 
 #[cfg(test)]
@@ -260,6 +451,8 @@ mod tests {
                 excess_blob_gas: false,
             },
             min_block: 0,
+            min_timestamp: 0,
+            caveats: "",
         };
         assert_eq!(profile.spec_for(1, 0), SpecId::PRAGUE);
         assert_eq!(profile.spec_for(999_999_999, 0), SpecId::PRAGUE);
@@ -277,6 +470,8 @@ mod tests {
                 excess_blob_gas: false,
             },
             min_block: 0,
+            min_timestamp: 0,
+            caveats: "",
         };
         // Mainnet would return a fraction at this timestamp; this chain must not, or the
         // executor would demand an `excessBlobGas` field the header never carries.
@@ -348,5 +543,90 @@ mod tests {
         assert!(ChainProfile::ETHEREUM_MAINNET.header.excess_blob_gas);
         assert!(!ChainProfile::ARBITRUM_ONE.header.excess_blob_gas);
         assert!(!ChainProfile::ANVIL_LOCAL.header.excess_blob_gas);
+    }
+
+    #[test]
+    fn every_profile_is_resolvable_by_its_own_chain_id() {
+        for profile in ChainProfile::ALL {
+            let resolved = ChainProfile::for_chain(profile.chain_id).expect("listed profile");
+            assert_eq!(resolved, profile);
+        }
+        let mut ids: Vec<u64> = ChainProfile::ALL.iter().map(|p| p.chain_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), ChainProfile::ALL.len(), "duplicate chain id in ALL");
+    }
+
+    #[test]
+    fn bsc_follows_its_timestamp_table_and_has_no_prevrandao_or_blobs() {
+        let p = ChainProfile::for_chain(56).unwrap();
+        assert!(!p.header.prevrandao && !p.header.excess_blob_gas);
+        assert_eq!(p.blob_fraction(1_718_863_500), None);
+        assert!(!p.covers_timestamp(1_705_996_799));
+        assert!(p.covers_timestamp(1_705_996_800));
+        assert_eq!(p.spec_for(40_000_000, 1_705_996_800), SpecId::SHANGHAI);
+        assert_eq!(p.spec_for(40_000_000, 1_718_863_499), SpecId::SHANGHAI);
+        assert_eq!(p.spec_for(40_000_000, 1_718_863_500), SpecId::CANCUN);
+        assert_eq!(p.spec_for(50_000_000, 1_742_436_600), SpecId::PRAGUE);
+        assert_eq!(p.spec_for(60_000_000, 1_777_343_400), SpecId::OSAKA);
+        assert!(!p.caveats.is_empty(), "BSC precompile gap must be disclosed");
+    }
+
+    #[test]
+    fn polygon_is_keyed_by_block_height() {
+        let p = ChainProfile::for_chain(137).unwrap();
+        assert!(!p.covers_block(50_522_999));
+        assert!(p.covers_block(50_523_000));
+        assert_eq!(p.spec_for(50_523_000, 0), SpecId::SHANGHAI);
+        assert_eq!(p.spec_for(54_875_999, 0), SpecId::SHANGHAI);
+        assert_eq!(p.spec_for(54_876_000, 0), SpecId::CANCUN);
+        assert_eq!(p.spec_for(73_440_255, 0), SpecId::CANCUN);
+        assert_eq!(p.spec_for(73_440_256, 0), SpecId::PRAGUE);
+        // Timestamps are irrelevant to a height-keyed chain.
+        assert_eq!(p.spec_for(54_876_000, u64::MAX), SpecId::CANCUN);
+    }
+
+    #[test]
+    fn op_stack_chains_share_ecotone_and_stay_conservative_on_isthmus() {
+        for id in [10, 8_453] {
+            let p = ChainProfile::for_chain(id).unwrap();
+            assert!(p.header.prevrandao && !p.header.excess_blob_gas);
+            assert!(!p.covers_timestamp(1_710_374_400));
+            assert!(p.covers_timestamp(1_710_374_401));
+            assert_eq!(p.spec_for(1, 1_710_374_401), SpecId::CANCUN);
+            // Isthmus (1_746_806_401) adds no opcodes; Cancun stays the modeled spec.
+            assert_eq!(p.spec_for(1, 1_800_000_000), SpecId::CANCUN);
+        }
+    }
+
+    #[test]
+    fn avalanche_c_chain_gains_cancun_with_etna() {
+        let p = ChainProfile::for_chain(43_114).unwrap();
+        assert!(!p.header.prevrandao);
+        assert!(!p.covers_timestamp(1_709_740_799));
+        assert_eq!(p.spec_for(1, 1_709_740_800), SpecId::SHANGHAI);
+        assert_eq!(p.spec_for(1, 1_734_368_399), SpecId::SHANGHAI);
+        assert_eq!(p.spec_for(1, 1_734_368_400), SpecId::CANCUN);
+    }
+
+    #[test]
+    fn cli_names_map_to_chain_ids_and_unknown_names_list_the_accepted_ones() {
+        assert_eq!(ChainProfile::id_for_cli_name("evm"), Ok(None));
+        assert_eq!(ChainProfile::id_for_cli_name("BSC"), Ok(Some(56)));
+        assert_eq!(ChainProfile::id_for_cli_name("matic"), Ok(Some(137)));
+        assert_eq!(ChainProfile::id_for_cli_name("op"), Ok(Some(10)));
+        assert_eq!(ChainProfile::id_for_cli_name("base"), Ok(Some(8_453)));
+        assert_eq!(ChainProfile::id_for_cli_name("avax"), Ok(Some(43_114)));
+        let error = ChainProfile::id_for_cli_name("solana").unwrap_err();
+        assert!(error.contains("solana") && error.contains("polygon"), "{error}");
+    }
+
+    #[test]
+    fn a_table_never_resolves_below_its_first_entry_to_something_invented() {
+        // Refusal is the job of min_block / min_timestamp; the table itself must
+        // not pick a spec the profile never described.
+        let p = ChainProfile::for_chain(56).unwrap();
+        assert_eq!(p.spec_for(1, 0), SpecId::SHANGHAI);
+        assert!(!p.covers_timestamp(0));
     }
 }

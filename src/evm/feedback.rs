@@ -306,11 +306,21 @@ impl EvmCoverageFeedback {
         }
 
         let mut interesting = false;
-        for (seen, hit) in self.virgin.iter_mut().zip(coverage.iter().copied()) {
-            let bucket = bucket_hitcount(hit);
-            if bucket > *seen {
-                *seen = bucket;
-                interesting = true;
+        // The map is almost entirely zero; skip 8-byte chunks with no hits.
+        for (seen_chunk, hit_chunk) in self
+            .virgin
+            .chunks_mut(8)
+            .zip(coverage.chunks(8))
+        {
+            if hit_chunk.len() == 8 && u64::from_ne_bytes(hit_chunk.try_into().unwrap()) == 0 {
+                continue;
+            }
+            for (seen, hit) in seen_chunk.iter_mut().zip(hit_chunk.iter().copied()) {
+                let bucket = bucket_hitcount(hit);
+                if bucket > *seen {
+                    *seen = bucket;
+                    interesting = true;
+                }
             }
         }
         interesting

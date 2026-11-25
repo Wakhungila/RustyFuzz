@@ -104,6 +104,7 @@ fn snapshot_campaign_worker() {
         in_memory_bytecode: Some(CODE.to_vec()),
         attacker_harness: false,
         fixture_path: None,
+        foundry_bootstrap: None,
         compact_fork_state: false,
         cores: None,
         require_seed_bundle: false,

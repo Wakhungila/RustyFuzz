@@ -21,6 +21,35 @@ thread_local! {
     /// Thread-local because each fuzzing worker owns its own coverage map and
     /// never shares it; there is no cross-thread state to synchronize.
     static TOUCHED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    /// Indices written since the last [`begin_sequence`], across transactions.
+    static SEQ_TOUCHED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    /// Lean mode: the inspector skips taint/symbolic tracking (see inspector).
+    static LEAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enables or disables lean execution on this thread.
+pub fn set_lean(lean: bool) {
+    LEAN.with(|flag| flag.set(lean));
+}
+
+/// Whether lean execution is active on this thread.
+#[inline(always)]
+pub fn is_lean() -> bool {
+    LEAN.with(|flag| flag.get())
+}
+
+/// Starts a new per-sequence touched log.
+pub fn begin_sequence() {
+    SEQ_TOUCHED.with(|touched| touched.borrow_mut().clear());
+}
+
+/// Visits every index touched since [`begin_sequence`] (duplicates possible).
+pub fn for_each_sequence_touched(mut visit: impl FnMut(usize)) {
+    SEQ_TOUCHED.with(|touched| {
+        for index in touched.borrow().iter() {
+            visit(*index as usize);
+        }
+    });
 }
 
 #[inline]
@@ -71,6 +100,7 @@ pub fn begin_transaction() {
 #[inline(always)]
 pub fn record_touched(index: usize) {
     TOUCHED.with(|touched| touched.borrow_mut().push(index as u32));
+    SEQ_TOUCHED.with(|touched| touched.borrow_mut().push(index as u32));
 }
 
 /// Path hash for the current transaction, computed over touched indices only.

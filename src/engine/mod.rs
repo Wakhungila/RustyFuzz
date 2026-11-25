@@ -1,6 +1,8 @@
 pub mod abi_ingest;
 pub mod actors;
 pub mod attacker_harness;
+pub mod amm_probe;
+pub mod sim_defi;
 pub mod benchmark;
 pub mod bounded_search;
 pub mod bytecode_analysis;
@@ -16,6 +18,7 @@ pub mod flashloan;
 pub mod fork_setup;
 pub mod formal_spec;
 pub mod foundry_ingest;
+pub mod foundry_project;
 pub mod fuzz_engine;
 pub mod invariant_file;
 pub mod invariant_manifest;

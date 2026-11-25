@@ -46,7 +46,7 @@ use revm::database::CacheDB;
 use revm::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::num::NonZeroUsize;
@@ -409,6 +409,32 @@ fn log_bounded_campaign_progress(
     *last_report = Instant::now();
 }
 
+/// Load every root-based `EvmInput` JSON in `dir` (sorted, `.meta.json` skipped).
+/// Unparseable files and snapshot-based inputs are rejected loudly: a silently
+/// ignored seed would make a "seeded" campaign indistinguishable from an unseeded one.
+pub fn load_seed_inputs_dir(dir: &std::path::Path) -> anyhow::Result<Vec<EvmInput>> {
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading seed input dir {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json") && !p.to_string_lossy().ends_with(".meta.json"))
+        .collect();
+    paths.sort();
+    let mut out = Vec::new();
+    for p in paths {
+        let input: EvmInput = serde_json::from_slice(&std::fs::read(&p)?)
+            .with_context(|| format!("parsing seed input {}", p.display()))?;
+        anyhow::ensure!(
+            input.base_snapshot_id == 0,
+            "seed input {} is snapshot-based (base_snapshot_id={}); only root-based inputs can be imported",
+            p.display(),
+            input.base_snapshot_id
+        );
+        anyhow::ensure!(!input.txs.is_empty(), "seed input {} has no transactions", p.display());
+        out.push(input);
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub rpc_url: String,
@@ -432,6 +458,15 @@ pub struct Config {
     /// fork branch loads the fixture's accounts (bytecode + storage + balance)
     /// so the fuzzer can target offline known-vulnerable fixtures without RPC.
     pub fixture_path: Option<String>,
+    /// Directory of replay-format `EvmInput` JSON files (e.g. produced by the
+    /// symbolic executor) added to the initial corpus. Only used when the
+    /// campaign starts with an empty corpus.
+    pub seed_inputs_dir: Option<String>,
+    /// A bootstrapped Foundry project (`--foundry-project`): the state after the
+    /// test contract's constructor and `setUp()` ran, plus the `invariant_*`
+    /// functions to evaluate after every fuzzed transaction. Takes the place of
+    /// `fixture_path` as the campaign's starting state.
+    pub foundry_bootstrap: Option<Arc<crate::engine::foundry_project::FoundryBootstrap>>,
     /// When true, the campaign compacts the warm fork state into the ForkDb
     /// backend (Arc-shared) once per snapshot, then per-input clones the
     /// compacted CacheDB (empty cache + Arc) instead of deep-cloning the warm
@@ -1099,6 +1134,9 @@ async fn run_fuzz_campaign_with_cancellation_inner(
     cancellation: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
+    // Per-execution artifact/provenance writes stay atomic (temp + rename) but skip fsync;
+    // set RUSTYFUZZ_STRICT_FSYNC=1 to restore power-loss durability at a large throughput cost.
+    rustyfuzz_artifacts::fsutil::set_relaxed_fsync(std::env::var_os("RUSTYFUZZ_STRICT_FSYNC").is_none());
     let config = config.with_isolated_paths();
     config.ensure_state_isolation()?;
     let run_nonce = Uuid::new_v4().to_string();
@@ -1121,6 +1159,12 @@ async fn run_fuzz_campaign_with_cancellation_inner(
         let restored_provenance = restored_db.db.provenance();
         let restored_is_synthetic = !valid_fork_provenance(&restored_provenance, config.fork_block);
         (restored_db, saved.block_env.clone(), restored_is_synthetic)
+    } else if let Some(bootstrap) = config.foundry_bootstrap.as_ref() {
+        (
+            crate::evm::fork::create_in_memory_fork_db_from_fixture(&bootstrap.state),
+            bootstrap.block_env.clone(),
+            true,
+        )
     } else if let Some(fixture_path) = config.fixture_path.as_ref() {
         let state = crate::engine::executable_fixture::ExecutableFixture::load_for_fuzz(
             std::path::Path::new(fixture_path),
@@ -1231,6 +1275,29 @@ async fn run_fuzz_campaign_with_cancellation_inner(
             .map_err(|e| anyhow::anyhow!("attacker harness deploy failed: {e}"))?;
         log::info!(target: "rustyfuzz.attacker", "reentrancy attacker harness deployed at campaign setup");
     }
+    // Real atomic flash-loan attacker (virtual balances, repay+fee+profit gate).
+    let flashloan_env = if config.attacker_harness {
+        let env = crate::engine::sim_defi::setup_flashloan(
+            &mut initial_db,
+            crate::engine::sim_defi::DEFAULT_FEE_BPS,
+        )
+        .map_err(|e| anyhow::anyhow!("flash-loan attacker setup failed: {e}"))?;
+        log::info!(
+            target: "rustyfuzz.attacker",
+            "atomic flash-loan attacker at {} with virtual balances in {} token(s) (ETH + {} ERC-20)",
+            env.attacker,
+            env.tokens.len(),
+            env.tokens.len() - 1
+        );
+        Some(env)
+    } else {
+        None
+    };
+    let _ = &flashloan_env;
+    let amm_pools: Vec<Address> = {
+        let mut probe_db = initial_db.clone();
+        crate::engine::amm_probe::discover_pools(&mut probe_db, &initial_env)
+    };
     let fork_setup_status = if synthetic_fork_mode {
         "synthetic"
     } else {
@@ -1252,7 +1319,13 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                 fuzzer_address,
                 ..ActorModelConfig::default()
             })
-            .generate([]);
+            .generate(
+                config
+                    .foundry_bootstrap
+                    .as_ref()
+                    .map(|b| b.actors.clone())
+                    .unwrap_or_default(),
+            );
             log::info!(
                 "Hardened DeFi actor model active: {} actors available for exploration",
                 actor_set.actors.len()
@@ -1360,6 +1433,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
             launcher_fallback_env,
             launcher_fallback_actor_set,
             launcher_fallback_synthetic_fork_mode,
+            flashloan_env.clone(),
             fork_setup_status,
             target_bytecode_loaded,
             InitialBytecode {
@@ -1463,6 +1537,22 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         }
                     };
 
+                // Foundry `invariant_*` functions, evaluated after every transaction
+                // against a throwaway view of the state (see `foundry_project`).
+                let foundry_invariants: Option<Arc<crate::engine::foundry_project::FoundryInvariantSet>> =
+                    config
+                        .foundry_bootstrap
+                        .as_ref()
+                        .map(|bootstrap| Arc::new(bootstrap.invariants.clone()));
+                if let Some(set) = foundry_invariants.as_deref() {
+                    log::info!(
+                        "checking {} Foundry invariant(s) after every transaction on test contract {}: {:?}",
+                        set.functions.len(),
+                        set.test_contract,
+                        set.functions.iter().map(|f| f.name.as_str()).collect::<Vec<_>>()
+                    );
+                }
+
                 let dataflow_registry = Arc::new(RwLock::new(DataflowRegistry::new()));
                 let state_novelty_feedback =
                     Arc::new(RwLock::new(EvmStateNoveltyFeedback::new()));
@@ -1506,6 +1596,20 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                                 "failed to load required ABI `{path}`: {err:#}"
                             )));
                         }
+                    }
+                }
+
+                if let Some(bootstrap) = config.foundry_bootstrap.as_ref() {
+                    for (address, abi) in &bootstrap.abis {
+                        let (registry, report) =
+                            crate::engine::abi_ingest::ingest_abi(abi, Some(*address), None);
+                        merge_abi_registry(&mut initial_abi, &registry);
+                        abi_loaded = true;
+                        log::info!(
+                            "Foundry ABI for {address}: functions={}, classified_selectors={}",
+                            report.function_count,
+                            report.classified_selectors
+                        );
                     }
                 }
 
@@ -1564,6 +1668,12 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             hardened_seed_candidates.extend(bytecode_candidates);
                         }
                     }
+                }
+                if let Some(bootstrap) = config.foundry_bootstrap.as_ref() {
+                    let seeds = bootstrap.actor_function_seeds();
+                    log::info!("Foundry project: {} actor x function seed(s)", seeds.len());
+                    abi_seed_candidate_count += seeds.len();
+                    hardened_seed_candidates.extend(seeds);
                 }
                 if config.hardened_defi.enabled {
                     if let Some(seed_file) = &config.hardened_defi.historical_seed_file {
@@ -1811,7 +1921,23 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     telemetry.concolic_hint_stats.clone(),
                     testcase_metadata_store.clone(),
                 )
-                    .with_attacker_harness(config.attacker_harness);
+                    .with_attacker_harness(config.attacker_harness)
+                    .with_flashloan_env(flashloan_env.clone())
+                    .with_abi_target(config.target_contract)
+                    .with_value_dictionary({
+                        let mut d = crate::evm::fuzz::value_dictionary_from_state(&initial_db, 96);
+                        if let Some(path) = config.predicate_invariants.as_deref() {
+                            if let Ok(f) = crate::engine::invariant_file::InvariantFile::load(std::path::Path::new(path)) {
+                                d.extend(f.dictionary_words());
+                            }
+                        }
+                        d
+                    })
+                    .with_caller_pool(config
+                        .foundry_bootstrap
+                        .as_ref()
+                        .map(|b| b.actors.clone())
+                        .unwrap_or_default());
                 let mut stages = tuple_list!(StdMutationalStage::with_max_iterations(
                     mutator,
                     mutational_stage_iterations(&config),
@@ -1870,10 +1996,25 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                 // is enabled, the warm fork state is compacted into the ForkDb backend
                 // (Arc-shared) once per snapshot, then per-input clones are cheap.
                 let mut compacted_snapshot: Option<(u64, rustyfuzz_evm::execution::ChainState)> = None;
-                let mut harness = |input: &EvmInput| {
-                    if !budget.reserve_execution() {
+                // Lean execution, as in the single-process path (see `run_single_process_campaign`).
+                let lean_enabled = std::env::var("RUSTYFUZZ_LEAN_EXEC").map(|v| v != "0").unwrap_or(true);
+                let lean_sample_every: u64 = std::env::var("RUSTYFUZZ_LEAN_SAMPLE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|n| *n > 0)
+                    .unwrap_or(32);
+                const LEAN_FLAG_RERUN_QUOTA: u32 = 25;
+                let mut lean_seen = vec![0u8; MAP_SIZE];
+                let mut lean_counter: u64 = 0;
+                let mut lean_flag_reruns = [0u32; 4];
+                let lean_rerun = std::cell::Cell::new(false);
+                let mut harness_pass = |input: &EvmInput, lean: bool, rerun: bool| {
+                    if !rerun && !budget.reserve_execution() {
                         return ExitKind::Ok;
                     }
+                    rustyfuzz_evm::coverage::begin_sequence();
+        rustyfuzz_evm::cmplog::clear_thread_buffer();
+                    rustyfuzz_evm::coverage::set_lean(lean);
                     let snap_id = input.base_snapshot_id;
                     if snap_id != 0 {
                         log::error!("brokered inputs must use portable root state, not worker-local snapshots");
@@ -1902,7 +2043,10 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             let mut compacted = ChainState::Evm(snapshot_base_db.clone());
                             let ChainState::Evm(db) = &mut compacted;
                             let accts = std::mem::take(&mut db.cache.accounts);
-                            db.db.absorb_warm_accounts(&accts);
+                            if snap_id != 0 {
+                    db.db = db.db.detached_clone();
+                }
+                db.db.absorb_warm_accounts(&accts);
                             let current = compacted.clone();
                             compacted_snapshot = Some((snap_id, compacted));
                             current
@@ -1915,6 +2059,12 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     let mut tx_results = Vec::with_capacity(input.txs.len());
                     let mut invariant_checker =
                         crate::engine::invariant_runtime::IncrementalChecker::new();
+                    let mut foundry_violation: Option<(
+                        usize,
+                        crate::engine::foundry_project::FoundryInvariantViolation,
+                    )> = None;
+                    let mut flashloan_hit: Option<(usize, String)> = None;
+        let mut kinv_hit: Option<(usize, Address, String)> = None;
                     *dataflow_registry.write() = DataflowRegistry::new();
 
                     for (tx_idx, tx) in input.txs.iter().enumerate() {
@@ -1925,6 +2075,24 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                         let mut current_env = initial_env.clone();
                         time_warp.apply(&mut current_env, tx_idx);
                         let mut waypoints = Vec::new();
+                        let amm_before: Vec<(Address, Vec<u8>)> = if !amm_pools.is_empty()
+                            && crate::engine::amm_probe::tx_mentions_v2_swap(&tx.input)
+                        {
+                            let ChainState::Evm(db) = &mut current_state;
+                            amm_pools
+                                .iter()
+                                .filter_map(|pool| crate::engine::amm_probe::probe_reserves(db, &current_env, *pool).map(|out| (*pool, out)))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let flashloan_before = flashloan_env
+                            .as_ref()
+                            .filter(|env| tx.to == env.attacker && crate::engine::sim_defi::is_run_call(&tx.input))
+                            .map(|env| {
+                                let ChainState::Evm(db) = &current_state;
+                                crate::engine::sim_defi::attacker_balances(db, &env.tokens)
+                            });
                         let mut df = dataflow_registry.write();
 
                         let exec_result = ForkDb::with_thread_rpc_budget(
@@ -1971,6 +2139,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             telemetry.concolic_hint_stats.as_ref(),
                             tx_idx,
                             &waypoints,
+                            None,
                         );
 
                         // Check invariants after this transaction, before the next one
@@ -1992,9 +2161,140 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             );
                         }
 
+                        // Foundry invariants: only the first violation per sequence is
+                        // kept, and a probe that cannot run is an infrastructure error,
+                        // never a finding.
+                        if log::log_enabled!(target: "rustyfuzz.trace", log::Level::Debug) {
+                            let word = |n: usize| tx.input.get(4 + 32 * n..36 + 32 * n).map(|w| revm::primitives::U256::from_be_slice(w).to_string()).unwrap_or_default();
+                            log::debug!(target: "rustyfuzz.trace", "to={} caller={} sel={} w0={} w1={} status={:?}", tx.to, tx.caller, hex::encode(tx.input.get(..4).unwrap_or(&[])), word(0), word(1), result.status);
+                        }
+                        if let (Some(env), Some(before)) = (flashloan_env.as_ref(), flashloan_before.as_ref()) {
+                            // `run` reverts unless every borrowed token is repaid with the fee
+                            // and one ended strictly ahead, so success IS the proof of profit.
+                            if flashloan_hit.is_none() && matches!(result.status, rustyfuzz_core::execution::ExecutionStatus::Success) {
+                                let ChainState::Evm(db) = &current_state;
+                                let after = crate::engine::sim_defi::attacker_balances(db, &env.tokens);
+                                flashloan_hit = Some((tx_idx, crate::engine::sim_defi::profit_summary(env, before, &after)));
+                            }
+                        }
+                        if foundry_violation.is_none() {
+                            if let Some(set) = foundry_invariants.as_deref() {
+                                let ChainState::Evm(probe_db) = &mut current_state;
+                                match set.check(probe_db, &current_env) {
+                                    Ok(Some(violation)) => {
+                                        foundry_violation = Some((tx_idx, violation));
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        static WARNED: std::sync::atomic::AtomicBool =
+                                            std::sync::atomic::AtomicBool::new(false);
+                                        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                            log::error!(
+                                                "Foundry invariant probe could not run (no finding reported): {error:#}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let mut result = result;
+
+                        if !amm_before.is_empty() {
+
+                            let reads = amm_before
+
+                                .iter()
+
+                                .map(|(pool, pre)| {
+
+                                    let ChainState::Evm(db) = &mut current_state;
+
+                                    (*pool, pre.clone(), crate::engine::amm_probe::probe_reserves(db, &current_env, *pool))
+
+                                })
+
+                                .collect();
+                if matches!(result.status, rustyfuzz_core::execution::ExecutionStatus::Success) && kinv_hit.is_none() {
+                    let reads_ref: &Vec<(Address, Vec<u8>, Option<Vec<u8>>)> = &reads;
+                    for (pool, pre, post) in reads_ref {
+                        log::debug!(target: "rustyfuzz.trace", "amm pool={pool} pre={} post={:?}", alloy_primitives::hex::encode(pre), post.as_ref().map(alloy_primitives::hex::encode));
+                        if let Some(post) = post {
+                            if let Some((kb, ka)) = crate::engine::amm_probe::k_regression(pre, post) {
+                                kinv_hit = Some((tx_idx, *pool, format!("V2 K-invariant violated by swap in tx {tx_idx}: reserve product {kb} -> {ka} (pool {pool}); a swap must never reduce k")));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                            crate::engine::amm_probe::bracket_trace(&mut result.call_trace, tx_idx, reads);
+
+                        }
+
                         tx_results.push(result);
                     }
 
+                    rustyfuzz_evm::coverage::set_lean(false);
+
+                    rustyfuzz_evm::cmplog::drain_into_table();
+                    if lean {
+                        let mut flagged = false;
+                        for (idx, hit) in [
+                            flashloan_hit.is_some(),
+                            kinv_hit.is_some(),
+                            foundry_violation.is_some(),
+                            invariant_checker.violation().is_some(),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            if hit && lean_flag_reruns[idx] < LEAN_FLAG_RERUN_QUOTA {
+                                lean_flag_reruns[idx] += 1;
+                                flagged = true;
+                            }
+                        }
+                        let mut novel = false;
+                        // SAFETY: the shared-memory allocation is readable and exactly `MAP_SIZE` bytes for the harness lifetime.
+                        let map_slice = unsafe { std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE) };
+                        rustyfuzz_evm::coverage::for_each_sequence_touched(|i| {
+                            let count = map_slice[i];
+                            if count != 0 {
+                                let bit = 1u8 << (8 - count.leading_zeros() as u8 - 1);
+                                if lean_seen[i] & bit == 0 {
+                                    lean_seen[i] |= bit;
+                                    novel = true;
+                                }
+                            }
+                        });
+                        lean_counter += 1;
+                        if novel || flagged || lean_counter % lean_sample_every == 0 {
+                            lean_rerun.set(true);
+                        } else {
+                            let testcase_provenance = testcase_metadata_store
+                                .get_or_default(input)
+                                .mutation_provenance;
+                            let strategies = mutation_strategies(&testcase_provenance);
+                            record_successful_concolic_mutation(
+                                telemetry.concolic_hint_stats.as_ref(),
+                                &strategies,
+                                0,
+                                false,
+                                0,
+                            );
+                            telemetry.record_execution(ExecutionTelemetryRecord {
+                                core_id: core_id.0,
+                                tx_count: input.txs.len(),
+                                findings: 0,
+                                campaign_score: 0,
+                                corpus_size: 0,
+                                coverage_edges: 0,
+                                state_novelty_score: 0,
+                                mutation_strategies: &strategies,
+                            });
+                        }
+                        return ExitKind::Ok;
+                    }
                     let execution = sequence_result_from_tx_results(tx_results);
 
                     let report = state_novelty_feedback
@@ -2038,7 +2338,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     // hit, so it is promoted, reported and confirmed by the same code.
                     // Inventing a parallel output path would mean two places to get
                     // promotion wrong.
-                    if let Some(violation) = invariant_checker.violation() {
+                    for violation in invariant_checker.violations() {
                         let target = target_contract;
                         // `Bridge` is the only existing pack whose spec does not claim a
                         // narrower trigger (a specific reentrancy shape, a specific
@@ -2055,6 +2355,42 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             tx_index: Some(violation.tx_index),
                             target: Some(target),
                             evidence: violation.evidence.summary_line(),
+                        });
+                    }
+                    if let Some((tx_index, pool, evidence)) = kinv_hit.take() {
+                        findings.push(crate::common::oracle::ProtocolFinding {
+                            pack: crate::common::oracle::ProtocolOraclePackKind::Amm,
+                            vuln: crate::common::oracle::VulnType::InvariantViolation("v2_k_invariant".to_string()),
+                            severity: crate::common::oracle::ProtocolSeverity::High,
+                            tx_index: Some(tx_index),
+                            target: Some(pool),
+                            evidence,
+                        });
+                    }
+                    if let Some((tx_index, evidence)) = flashloan_hit.take() {
+                        findings.push(crate::common::oracle::ProtocolFinding {
+                            pack: crate::common::oracle::ProtocolOraclePackKind::Amm,
+                            vuln: crate::common::oracle::VulnType::FlashLoanProfit,
+                            severity: crate::common::oracle::ProtocolSeverity::High,
+                            tx_index: Some(tx_index),
+                            target: Some(target_contract),
+                            evidence,
+                        });
+                    }
+                    if let Some((tx_index, violation)) = foundry_violation.take() {
+                        findings.push(crate::common::oracle::ProtocolFinding {
+                            pack: crate::common::oracle::ProtocolOraclePackKind::Bridge,
+                            vuln: crate::common::oracle::VulnType::InvariantViolation(format!(
+                                "foundry:{}",
+                                violation.invariant
+                            )),
+                            severity: crate::common::oracle::ProtocolSeverity::High,
+                            tx_index: Some(tx_index),
+                            target: Some(target_contract),
+                            evidence: format!(
+                                "Foundry invariant {} violated after tx {}: {}",
+                                violation.invariant, tx_index, violation.detail
+                            ),
                         });
                     }
                     apply_min_finding_confidence(&mut findings, config.min_finding_confidence);
@@ -2175,6 +2511,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     if let Err(error) = super::provenance::persist(
                         config.corpus_dir.as_ref(),
                         super::provenance::PersistRequest {
+                interesting: report.interesting,
                             execution_index: telemetry.execution_count(),
                             budget_consumed: budget.reserved(),
                             input,
@@ -2259,7 +2596,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                             config.artifact_limit
                         );
                     } else if let Some(reason) = campaign_artifact_reason(
-                        synthetic_fork_mode,
+                        synthetic_fork_mode && config.foundry_bootstrap.is_none() && config.fixture_path.is_none(),
                         &campaign_score,
                         &findings,
                         exploit_candidate.as_ref(),
@@ -2330,6 +2667,20 @@ async fn run_fuzz_campaign_with_cancellation_inner(
 
                      ExitKind::Ok
                  };
+                let mut harness = |input: &EvmInput| {
+                    if !lean_enabled {
+                        return harness_pass(input, false, false);
+                    }
+                    lean_rerun.set(false);
+                    let kind = harness_pass(input, true, false);
+                    rustyfuzz_evm::coverage::set_lean(false);
+                    if !lean_rerun.get() {
+                        return kind;
+                    }
+                    // SAFETY: the shared-memory allocation is writable and exactly `MAP_SIZE` bytes for the harness lifetime.
+                    unsafe { std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE).fill(0) };
+                    harness_pass(input, false, true)
+                };
 
                  for input in &required_replay_inputs {
                      let reserved_before = budget.reserved();
@@ -2470,6 +2821,7 @@ async fn run_fuzz_campaign_with_cancellation_inner(
                     launcher_fallback_env,
                     launcher_fallback_actor_set,
                     launcher_fallback_synthetic_fork_mode,
+                    flashloan_env.clone(),
                     fork_setup_status,
                     target_bytecode_loaded,
                     InitialBytecode {
@@ -2537,6 +2889,7 @@ async fn run_single_process_campaign(
     initial_env: revm::context::BlockEnv,
     hardened_actor_set: Option<ActorSet>,
     synthetic_fork_mode: bool,
+    flashloan_env: Option<crate::engine::sim_defi::FlashloanEnv>,
     fork_setup_status: &'static str,
     target_bytecode_loaded: bool,
     bytecode: InitialBytecode,
@@ -2553,6 +2906,13 @@ async fn run_single_process_campaign(
     } = bytecode;
     anyhow::ensure!(checkpoint_session.is_none() || synthetic_fork_mode,
         "live-RPC checkpointing is not implemented; refusing to checkpoint an online fork as offline");
+    let amm_pools: Vec<Address> = {
+        let mut probe_db = initial_db.clone();
+        crate::engine::amm_probe::discover_pools(&mut probe_db, &initial_env)
+    };
+    if !amm_pools.is_empty() {
+        log::info!("engine reserve probes active for {} V2-style pool(s): {:?}", amm_pools.len(), amm_pools);
+    }
     let start_time = Instant::now();
     let execution_timeout = campaign_execution_timeout();
     // Deterministic per-transaction time advance, derived from configuration so
@@ -2612,6 +2972,20 @@ async fn run_single_process_campaign(
             }
         };
 
+    let foundry_invariants: Option<Arc<crate::engine::foundry_project::FoundryInvariantSet>> =
+        config
+            .foundry_bootstrap
+            .as_ref()
+            .map(|bootstrap| Arc::new(bootstrap.invariants.clone()));
+    if let Some(set) = foundry_invariants.as_deref() {
+        log::info!(
+            "checking {} Foundry invariant(s) after every transaction on test contract {}: {:?}",
+            set.functions.len(),
+            set.test_contract,
+            set.functions.iter().map(|f| f.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
     let dataflow_registry = Arc::new(RwLock::new(DataflowRegistry::new()));
     let state_novelty_feedback = Arc::new(RwLock::new(EvmStateNoveltyFeedback::new()));
     let telemetry = Arc::new(CampaignTelemetry::new());
@@ -2648,6 +3022,20 @@ async fn run_single_process_campaign(
                 abi_report = Some(report);
             }
             Err(err) => anyhow::bail!("failed to load required ABI `{}`: {err:#}", path),
+        }
+    }
+
+    if let Some(bootstrap) = config.foundry_bootstrap.as_ref() {
+        for (address, abi) in &bootstrap.abis {
+            let (registry, report) =
+                crate::engine::abi_ingest::ingest_abi(abi, Some(*address), None);
+            merge_abi_registry(&mut initial_abi, &registry);
+            abi_loaded = true;
+            log::info!(
+                "Foundry ABI for {address}: functions={}, classified_selectors={}",
+                report.function_count,
+                report.classified_selectors
+            );
         }
     }
 
@@ -2706,6 +3094,12 @@ async fn run_single_process_campaign(
                 hardened_seed_candidates.extend(bytecode_candidates);
             }
         }
+    }
+    if let Some(bootstrap) = config.foundry_bootstrap.as_ref() {
+        let seeds = bootstrap.actor_function_seeds();
+        log::info!("Foundry project: {} actor x function seed(s)", seeds.len());
+        abi_seed_candidate_count += seeds.len();
+        hardened_seed_candidates.extend(seeds);
     }
     if config.hardened_defi.enabled {
         if let Some(seed_file) = &config.hardened_defi.historical_seed_file {
@@ -2785,6 +3179,7 @@ async fn run_single_process_campaign(
     let resumed = restored_checkpoint.is_some();
     let mut direct_seed_inputs = Vec::new();
     let mut required_replay_inputs = Vec::new();
+    let mut imported_seed_inputs: Vec<EvmInput> = Vec::new();
     if state.corpus().count() == 0 {
         let mut inserted_seed_count = 0usize;
         let mut mainnet_seed_count = 0usize;
@@ -2819,6 +3214,17 @@ async fn run_single_process_campaign(
                         inserted_seed_count
                     );
                 }
+            }
+        }
+
+        if let Some(dir) = &config.seed_inputs_dir {
+            let loaded = load_seed_inputs_dir(std::path::Path::new(dir))?;
+            log::info!("Imported {} seed input(s) from `{}`", loaded.len(), dir);
+            for input in loaded {
+                imported_seed_inputs.push(input.clone());
+                direct_seed_inputs.push(input.clone());
+                state.corpus_mut().add(Testcase::new(input))?;
+                inserted_seed_count += 1;
             }
         }
 
@@ -2998,8 +3404,25 @@ async fn run_single_process_campaign(
         telemetry.concolic_hint_stats.clone(),
         testcase_metadata_store.clone(),
     )
-    .with_attacker_harness(config.attacker_harness);
+    .with_attacker_harness(config.attacker_harness)
+    .with_flashloan_env(flashloan_env.clone())
+                    .with_abi_target(config.target_contract)
+                    .with_value_dictionary({
+                        let mut d = crate::evm::fuzz::value_dictionary_from_state(&initial_db, 96);
+                        if let Some(path) = config.predicate_invariants.as_deref() {
+                            if let Ok(f) = crate::engine::invariant_file::InvariantFile::load(std::path::Path::new(path)) {
+                                d.extend(f.dictionary_words());
+                            }
+                        }
+                        d
+                    })
+    .with_caller_pool(config
+                        .foundry_bootstrap
+                        .as_ref()
+                        .map(|b| b.actors.clone())
+                        .unwrap_or_default());
     let mutator = mutator.with_snapshot_corpus(snapshot_corpus.clone());
+    let targeted_hints = mutator.targeted_hints.clone();
     let strategy_counters = mutator.strategy_counters.clone();
     if let Some(saved) = restored_strategies {
         strategy_counters.restore(saved);
@@ -3037,16 +3460,39 @@ async fn run_single_process_campaign(
         rustyfuzz_evm::environment::EnvironmentPolicy::resolve(&initial_db.db, &initial_env)?;
     // Worker-local cache of the compacted snapshot (see the brokered path above).
     let mut compacted_snapshot: Option<(u64, rustyfuzz_evm::execution::ChainState)> = None;
-    let mut harness = |input: &EvmInput| {
-        if !budget.reserve_execution() {
+    // Lean execution (throughput item 1): run each input with the cheap inspector first and
+    // re-execute with full taint/comparison tracking only when the input is novel (new edge or
+    // hitcount class), flagged by an in-loop oracle, or sampled. Disable with RUSTYFUZZ_LEAN_EXEC=0.
+    let lean_enabled = std::env::var("RUSTYFUZZ_LEAN_EXEC").map(|v| v != "0").unwrap_or(true);
+    let lean_sample_every: u64 = std::env::var("RUSTYFUZZ_LEAN_SAMPLE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(32);
+    let mut lean_seen = vec![0u8; MAP_SIZE];
+    let mut lean_counter: u64 = 0;
+    let mut lean_stats: (u64, u64) = (0, 0);
+    const LEAN_FLAG_RERUN_QUOTA: u32 = 25;
+    let mut lean_flag_reruns = [0u32; 4];
+    let lean_rerun = std::cell::Cell::new(false);
+    let mut harness_pass = |input: &EvmInput, lean: bool, rerun: bool| {
+        if !rerun && !budget.reserve_execution() {
             return ExitKind::Ok;
         }
+        rustyfuzz_evm::coverage::begin_sequence();
+        rustyfuzz_evm::cmplog::clear_thread_buffer();
+        rustyfuzz_evm::coverage::set_lean(lean);
         let snap_id = input.base_snapshot_id;
         let mut snapshot_corpus_guard = snapshot_corpus.write();
-        let Some(root_replay_input) = snapshot_corpus_guard.root_replay_input(input) else {
+        // The full root replay input (cloning every ancestor's transactions) is only needed when
+        // an artifact is persisted; here only the lineage validity and length are checked.
+        if !snapshot_corpus_guard
+            .lineage_tx_len(snap_id)
+            .is_some_and(|prefix| prefix.saturating_add(input.txs.len()) <= crate::evm::fuzz::MAX_SEQUENCE_LENGTH)
+        {
             log::error!("Input has incomplete or oversized snapshot lineage");
             return ExitKind::Crash;
-        };
+        }
         if !snapshot_corpus_guard.pin_snapshot(snap_id) {
             return ExitKind::Crash;
         }
@@ -3066,6 +3512,9 @@ async fn run_single_process_campaign(
                 let mut compacted = ChainState::Evm(snapshot_base_db.clone());
                 let ChainState::Evm(db) = &mut compacted;
                 let accts = std::mem::take(&mut db.cache.accounts);
+                if snap_id != 0 {
+                    db.db = db.db.detached_clone();
+                }
                 db.db.absorb_warm_accounts(&accts);
                 let current = compacted.clone();
                 compacted_snapshot = Some((snap_id, compacted));
@@ -3077,6 +3526,12 @@ async fn run_single_process_campaign(
         drop(snapshot_corpus_guard);
         let mut tx_results = Vec::with_capacity(input.txs.len());
         let mut invariant_checker = crate::engine::invariant_runtime::IncrementalChecker::new();
+        let mut foundry_violation: Option<(
+            usize,
+            crate::engine::foundry_project::FoundryInvariantViolation,
+        )> = None;
+        let mut flashloan_hit: Option<(usize, String)> = None;
+        let mut kinv_hit: Option<(usize, Address, String)> = None;
         *dataflow_registry.write() = DataflowRegistry::new();
 
         for (tx_idx, tx) in input.txs.iter().enumerate() {
@@ -3084,6 +3539,24 @@ async fn run_single_process_campaign(
             let mut current_env = initial_env.clone();
             time_warp.apply(&mut current_env, tx_idx);
             let mut waypoints = Vec::new();
+            let amm_before: Vec<(Address, Vec<u8>)> = if !amm_pools.is_empty()
+                && crate::engine::amm_probe::tx_mentions_v2_swap(&tx.input)
+            {
+                let ChainState::Evm(db) = &mut current_state;
+                amm_pools
+                    .iter()
+                    .filter_map(|pool| crate::engine::amm_probe::probe_reserves(db, &current_env, *pool).map(|out| (*pool, out)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let flashloan_before = flashloan_env
+                .as_ref()
+                .filter(|env| tx.to == env.attacker && crate::engine::sim_defi::is_run_call(&tx.input))
+                .map(|env| {
+                    let ChainState::Evm(db) = &current_state;
+                    crate::engine::sim_defi::attacker_balances(db, &env.tokens)
+                });
             let mut df = dataflow_registry.write();
             let exec_result = ForkDb::with_thread_rpc_budget(
                 Some(execution_rpc_budget()),
@@ -3128,6 +3601,7 @@ async fn run_single_process_campaign(
                 telemetry.concolic_hint_stats.as_ref(),
                 tx_idx,
                 &waypoints,
+                Some((&targeted_hints, input)),
             );
             // Per-transaction invariant check. Placed before the result is pushed so the
             // check sees exactly the state the transaction left behind.
@@ -3145,9 +3619,165 @@ async fn run_single_process_campaign(
                 );
             }
 
+            if log::log_enabled!(target: "rustyfuzz.trace", log::Level::Debug) {
+
+                let word = |n: usize| tx.input.get(4 + 32 * n..36 + 32 * n).map(|w| revm::primitives::U256::from_be_slice(w).to_string()).unwrap_or_default();
+
+                log::debug!(target: "rustyfuzz.trace", "to={} caller={} sel={} w0={} w1={} status={:?}", tx.to, tx.caller, hex::encode(tx.input.get(..4).unwrap_or(&[])), word(0), word(1), result.status);
+
+            }
+
+            if let (Some(env), Some(before)) = (flashloan_env.as_ref(), flashloan_before.as_ref()) {
+
+                // `run` reverts unless every borrowed token is repaid with the fee
+
+                // and one ended strictly ahead, so success IS the proof of profit.
+
+                if flashloan_hit.is_none() && matches!(result.status, rustyfuzz_core::execution::ExecutionStatus::Success) {
+
+                    let ChainState::Evm(db) = &current_state;
+
+                    let after = crate::engine::sim_defi::attacker_balances(db, &env.tokens);
+
+                    flashloan_hit = Some((tx_idx, crate::engine::sim_defi::profit_summary(env, before, &after)));
+
+                }
+
+            }
+
+            if foundry_violation.is_none() {
+                if let Some(set) = foundry_invariants.as_deref() {
+                    let ChainState::Evm(probe_db) = &mut current_state;
+                    match set.check(probe_db, &current_env) {
+                        Ok(Some(violation)) => {
+                            log::debug!("foundry invariant violated at tx {tx_idx}: {}", violation.detail);
+                            foundry_violation = Some((tx_idx, violation))
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            static WARNED: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                log::error!(
+                                    "Foundry invariant probe could not run (no finding reported): {error:#}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut result = result;
+
+            if !amm_before.is_empty() {
+
+                let reads = amm_before
+
+                    .iter()
+
+                    .map(|(pool, pre)| {
+
+                        let ChainState::Evm(db) = &mut current_state;
+
+                        (*pool, pre.clone(), crate::engine::amm_probe::probe_reserves(db, &current_env, *pool))
+
+                    })
+
+                    .collect();
+                if matches!(result.status, rustyfuzz_core::execution::ExecutionStatus::Success) && kinv_hit.is_none() {
+                    let reads_ref: &Vec<(Address, Vec<u8>, Option<Vec<u8>>)> = &reads;
+                    for (pool, pre, post) in reads_ref {
+                        log::debug!(target: "rustyfuzz.trace", "amm pool={pool} pre={} post={:?}", alloy_primitives::hex::encode(pre), post.as_ref().map(alloy_primitives::hex::encode));
+                        if let Some(post) = post {
+                            if let Some((kb, ka)) = crate::engine::amm_probe::k_regression(pre, post) {
+                                kinv_hit = Some((tx_idx, *pool, format!("V2 K-invariant violated by swap in tx {tx_idx}: reserve product {kb} -> {ka} (pool {pool}); a swap must never reduce k")));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                crate::engine::amm_probe::bracket_trace(&mut result.call_trace, tx_idx, reads);
+
+            }
+
             tx_results.push(result);
         }
 
+        rustyfuzz_evm::coverage::set_lean(false);
+
+        rustyfuzz_evm::cmplog::drain_into_table();
+        if lean {
+            // Each flag kind forces a full re-run only while its artifact quota would still be open;
+            // afterwards the same hit repeats thousands of times and sampling is enough.
+            let mut flagged = false;
+            for (idx, hit) in [
+                flashloan_hit.is_some(),
+                kinv_hit.is_some(),
+                foundry_violation.is_some(),
+                invariant_checker.violation().is_some(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if hit && lean_flag_reruns[idx] < LEAN_FLAG_RERUN_QUOTA {
+                    lean_flag_reruns[idx] += 1;
+                    flagged = true;
+                }
+            }
+            let mut novel = false;
+            // SAFETY: the shared-memory allocation is readable and exactly `MAP_SIZE` bytes for the harness lifetime.
+            let map_slice = unsafe { std::slice::from_raw_parts(coverage_map_ptr, MAP_SIZE) };
+            rustyfuzz_evm::coverage::for_each_sequence_touched(|i| {
+                let count = map_slice[i];
+                if count != 0 {
+                    let bit = 1u8 << (8 - count.leading_zeros() as u8 - 1);
+                    if lean_seen[i] & bit == 0 {
+                        lean_seen[i] |= bit;
+                        novel = true;
+                    }
+                }
+            });
+            lean_counter += 1;
+            if novel || flagged || lean_counter % lean_sample_every == 0 {
+                lean_rerun.set(true);
+                lean_stats.0 += novel as u64;
+                lean_stats.1 += flagged as u64;
+            }
+            if lean_counter % 5000 == 0 {
+                log::info!(
+                    "lean stats: execs={lean_counter} novel_reruns={} flagged_reruns={} concolic={:?}",
+                    lean_stats.0,
+                    lean_stats.1,
+                    telemetry.concolic_hint_stats.snapshot()
+                );
+            }
+            if !lean_rerun.get() {
+                // Lean-only execution: still an execution for telemetry and strategy accounting.
+                let testcase_provenance = testcase_metadata_store
+                    .get_or_default(input)
+                    .mutation_provenance;
+                let strategies = mutation_strategies(&testcase_provenance);
+                record_successful_concolic_mutation(
+                    telemetry.concolic_hint_stats.as_ref(),
+                    &strategies,
+                    0,
+                    false,
+                    0,
+                );
+                telemetry.record_execution(ExecutionTelemetryRecord {
+                    core_id,
+                    tx_count: input.txs.len(),
+                    findings: 0,
+                    campaign_score: 0,
+                    corpus_size: 0,
+                    coverage_edges: 0,
+                    state_novelty_score: 0,
+                    mutation_strategies: &strategies,
+                });
+            }
+            return ExitKind::Ok;
+        }
         let execution = sequence_result_from_tx_results(tx_results);
         let report = state_novelty_feedback.write().observe_execution(&execution);
         // SAFETY: the shared-memory allocation is readable and exactly `MAP_SIZE` bytes for the harness lifetime.
@@ -3185,7 +3815,7 @@ async fn run_single_process_campaign(
         ));
         // Same promotion as the multi-worker path: a predicate violation is a finding like
         // any other once it fires, so it travels the existing pipeline.
-        if let Some(violation) = invariant_checker.violation() {
+        for violation in invariant_checker.violations() {
             findings.push(crate::common::oracle::ProtocolFinding {
                 pack: crate::common::oracle::ProtocolOraclePackKind::Bridge,
                 vuln: crate::common::oracle::VulnType::InvariantViolation(
@@ -3195,6 +3825,42 @@ async fn run_single_process_campaign(
                 tx_index: Some(violation.tx_index),
                 target: Some(target_contract),
                 evidence: violation.evidence.summary_line(),
+            });
+        }
+        if let Some((tx_index, pool, evidence)) = kinv_hit.take() {
+            findings.push(crate::common::oracle::ProtocolFinding {
+                pack: crate::common::oracle::ProtocolOraclePackKind::Amm,
+                vuln: crate::common::oracle::VulnType::InvariantViolation("v2_k_invariant".to_string()),
+                severity: crate::common::oracle::ProtocolSeverity::High,
+                tx_index: Some(tx_index),
+                target: Some(pool),
+                evidence,
+            });
+        }
+        if let Some((tx_index, evidence)) = flashloan_hit.take() {
+            findings.push(crate::common::oracle::ProtocolFinding {
+                pack: crate::common::oracle::ProtocolOraclePackKind::Amm,
+                vuln: crate::common::oracle::VulnType::FlashLoanProfit,
+                severity: crate::common::oracle::ProtocolSeverity::High,
+                tx_index: Some(tx_index),
+                target: Some(target_contract),
+                evidence,
+            });
+        }
+        if let Some((tx_index, violation)) = foundry_violation.take() {
+            findings.push(crate::common::oracle::ProtocolFinding {
+                pack: crate::common::oracle::ProtocolOraclePackKind::Bridge,
+                vuln: crate::common::oracle::VulnType::InvariantViolation(format!(
+                    "foundry:{}",
+                    violation.invariant
+                )),
+                severity: crate::common::oracle::ProtocolSeverity::High,
+                tx_index: Some(tx_index),
+                target: Some(target_contract),
+                evidence: format!(
+                    "Foundry invariant {} violated after tx {}: {}",
+                    violation.invariant, tx_index, violation.detail
+                ),
             });
         }
         apply_min_finding_confidence(&mut findings, config.min_finding_confidence);
@@ -3300,9 +3966,22 @@ async fn run_single_process_campaign(
             state_novelty_score: report.novelty_score(),
             mutation_strategies: &mutation_strategies,
         });
+        // provenance::persist skips everything that is not interesting, a finding, or forced by
+        // RUSTYFUZZ_PROVENANCE_ALL; only those need the (clone-heavy) root replay input.
+        let root_replay_input = if report.interesting
+            || !findings.is_empty()
+            || std::env::var_os("RUSTYFUZZ_PROVENANCE_ALL").is_some()
+        {
+            snapshot_corpus.read()
+                .root_replay_input(input)
+                .unwrap_or_else(|| input.clone())
+        } else {
+            input.clone()
+        };
         if let Err(error) = super::provenance::persist(
             config.corpus_dir.as_ref(),
             super::provenance::PersistRequest {
+                interesting: report.interesting,
                 execution_index: telemetry.execution_count(),
                 budget_consumed: budget.reserved(),
                 input,
@@ -3350,7 +4029,7 @@ async fn run_single_process_campaign(
                 config.artifact_limit
             );
         } else if let Some(reason) = campaign_artifact_reason(
-            synthetic_fork_mode,
+            synthetic_fork_mode && config.foundry_bootstrap.is_none() && config.fixture_path.is_none(),
             &campaign_score,
             &findings,
             exploit_candidate.as_ref(),
@@ -3375,6 +4054,7 @@ async fn run_single_process_campaign(
                     &snapshot_corpus.read(),
                     &initial_db,
                     &initial_env,
+                    predicate_registry.as_deref().map(|r| (r, time_warp)),
                 )
             };
 
@@ -3413,6 +4093,21 @@ async fn run_single_process_campaign(
 
         ExitKind::Ok
     };
+    let mut harness = |input: &EvmInput| {
+        if !lean_enabled {
+            return harness_pass(input, false, false);
+        }
+        lean_rerun.set(false);
+        let kind = harness_pass(input, true, false);
+        rustyfuzz_evm::coverage::set_lean(false);
+        if !lean_rerun.get() {
+            return kind;
+        }
+        // Novel, flagged or sampled: discard the lean coverage and re-execute in full.
+        // SAFETY: the shared-memory allocation is writable and exactly `MAP_SIZE` bytes for the harness lifetime.
+        unsafe { std::slice::from_raw_parts_mut(coverage_map_ptr, MAP_SIZE).fill(0) };
+        harness_pass(input, false, true)
+    };
 
     for input in &required_replay_inputs {
         let reserved_before = budget.reserved();
@@ -3424,6 +4119,15 @@ async fn run_single_process_campaign(
             input,
             budget.reserved() > reserved_before,
         )?;
+    }
+
+    // Imported seeds (e.g. solved symbolic-execution sequences) are executed once up
+    // front through the full harness so oracles and coverage see them immediately,
+    // rather than waiting for the scheduler to pick them as mutation parents.
+    for input in &imported_seed_inputs {
+        if !matches!(harness(input), ExitKind::Ok) {
+            log::warn!("imported seed input did not execute cleanly; it stays in the corpus");
+        }
     }
 
     let capture = |state: &EvmCampaignState,
@@ -3902,6 +4606,42 @@ fn log_seed_bundle_status(
     Ok(())
 }
 
+static FINDING_QUOTA: std::sync::LazyLock<std::sync::Mutex<HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn finding_quota_cap() -> usize {
+    std::env::var("RUSTYFUZZ_MAX_ARTIFACTS_PER_FINDING_KIND")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25)
+}
+
+fn finding_kind_key(finding: &crate::common::oracle::ProtocolFinding) -> String {
+    format!("{:?}|{:?}|{:?}", finding.pack, finding.vuln, finding.target)
+}
+
+/// Heuristic oracles can fire on most executions of a contract. Persisting an artifact plus a
+/// ~1 MB provenance record each time cost ~40% of throughput and gigabytes of disk. Cap the
+/// number kept per (pack, vulnerability, target); `consume` records one against the quota.
+pub(crate) fn finding_quota_open(
+    findings: &[crate::common::oracle::ProtocolFinding],
+    consume: bool,
+) -> bool {
+    let cap = finding_quota_cap();
+    let mut quota = FINDING_QUOTA.lock().unwrap_or_else(|e| e.into_inner());
+    let mut open = false;
+    for finding in findings {
+        let used = quota.entry(finding_kind_key(finding)).or_insert(0);
+        if *used < cap {
+            open = true;
+            if consume {
+                *used += 1;
+            }
+        }
+    }
+    open
+}
+
 fn campaign_artifact_reason(
     synthetic_fork_mode: bool,
     campaign_score: &CampaignScore,
@@ -3925,7 +4665,7 @@ fn campaign_artifact_reason(
         return Some("replayable-minimized-path");
     }
 
-    if !findings.is_empty() {
+    if !findings.is_empty() && finding_quota_open(findings, true) {
         return Some("protocol-oracle-finding");
     }
 
@@ -3976,6 +4716,7 @@ fn enqueue_concolic_hints(
     stats: &ConcolicHintStats,
     tx_idx: usize,
     waypoints: &[crate::common::types::Waypoint],
+    targeted: Option<(&Arc<Mutex<crate::evm::fuzz::TargetedHints>>, &EvmInput)>,
 ) {
     const MAX_PENDING_CONCOLIC_HINTS: usize = 1024;
 
@@ -3988,11 +4729,27 @@ fn enqueue_concolic_hints(
         return;
     }
     stats.record_generated(new_hints.len() as u64);
-    new_hints.sort_by_key(|hint| concolic_hint_priority(hint, waypoints));
+    let prio = HintPriorityCtx::new(waypoints);
+    new_hints.sort_by_cached_key(|hint| prio.priority(hint));
+    if let Some((targeted, origin)) = targeted {
+        if std::env::var_os("RUSTYFUZZ_TARGETED_SINGLES").is_some() {
+            let ordered: Vec<_> = new_hints.to_vec();
+            targeted.lock().push(origin, &ordered);
+        }
+        #[cfg(feature = "smt")]
+        if std::env::var_os("RUSTYFUZZ_PREFIX_SOLVE").is_some() {
+            let groups = crate::engine::concolic::prefix_flip_groups(tx_idx, waypoints);
+            stats.record_generated(groups.len() as u64);
+            let mut guard = targeted.lock();
+            for group in groups.into_iter().rev() {
+                guard.push_group(origin, group);
+            }
+        }
+    }
 
     let mut queue = hint_queue.lock();
     queue.extend(new_hints);
-    queue.sort_by_key(|hint| concolic_hint_priority(hint, waypoints));
+    queue.sort_by_cached_key(|hint| prio.priority(hint));
     let before_dedup = queue.len();
     let mut seen = HashSet::new();
     queue.retain(|hint| seen.insert((hint.tx_index, hint.calldata_offset, hint.word)));
@@ -4002,6 +4759,67 @@ fn enqueue_concolic_hints(
     }
     if deduplicated > 0 {
         stats.record_deduplicated(deduplicated as u64);
+    }
+}
+
+/// Per-call index over a tx's waypoints so each queued hint's priority is O(log W)
+/// instead of an O(W) scan (the scan ran N log N times per tx and was ~14% of a campaign).
+struct HintPriorityCtx {
+    branch_distance: HashMap<usize, u64>,
+    storage_pcs: Vec<usize>,
+    influenced_dataflow: bool,
+}
+
+impl HintPriorityCtx {
+    fn new(waypoints: &[crate::common::types::Waypoint]) -> Self {
+        use crate::common::types::Waypoint as W;
+        let mut branch_distance: HashMap<usize, u64> = HashMap::new();
+        let mut storage_pcs = Vec::new();
+        let mut influenced_dataflow = false;
+        let mut note = |pc: usize, d: Option<u64>| {
+            if let Some(d) = d {
+                branch_distance.entry(pc).and_modify(|e| *e = (*e).min(d)).or_insert(d);
+            }
+        };
+        for w in waypoints {
+            match w {
+                W::Comparison { pc, branch_distance: d, .. } => {
+                    note(*pc, d.map(|x| x.saturating_to::<u64>()))
+                }
+                W::BranchPath { pc, constraint, .. } => {
+                    if let W::Comparison { branch_distance: d, .. } = constraint.as_ref() {
+                        note(*pc, d.map(|x| x.saturating_to::<u64>()));
+                    }
+                }
+                W::StorageRead { pc, .. }
+                | W::StorageWrite { pc, .. }
+                | W::TransientStorageRead { pc, .. }
+                | W::TransientStorageWrite { pc, .. } => storage_pcs.push(*pc),
+                W::Dataflow { influenced: true, .. } => influenced_dataflow = true,
+                _ => {}
+            }
+        }
+        storage_pcs.sort_unstable();
+        Self { branch_distance, storage_pcs, influenced_dataflow }
+    }
+
+    fn priority(&self, hint: &ConcolicHint) -> (u64, usize, usize, usize) {
+        let mut priority: u64 = match &hint.strategy {
+            ConcolicStrategy::FlipBranch { .. } => 0,
+            ConcolicStrategy::FlipComparison { .. } => 1_000,
+            ConcolicStrategy::ArithmeticBoundary { .. } => 2_000,
+        };
+        priority = priority.saturating_add(
+            self.branch_distance.get(&hint.pc).copied().unwrap_or(0).min(10_000),
+        );
+        let near = self.influenced_dataflow || {
+            let i = self.storage_pcs.partition_point(|p| *p < hint.pc.saturating_sub(16));
+            self.storage_pcs.get(i).is_some_and(|p| *p <= hint.pc + 16)
+        };
+        if near {
+            priority = priority.saturating_sub(500);
+        }
+        (priority, hint.tx_index, hint.calldata_offset, hint.pc)
     }
 }
 
@@ -5383,6 +6201,8 @@ mod tests {
             in_memory_bytecode: Some(hex::decode("60003560005500").unwrap()),
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
@@ -5530,6 +6350,8 @@ mod tests {
             in_memory_bytecode: None,
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
@@ -5627,6 +6449,8 @@ mod tests {
             in_memory_bytecode: None,
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
@@ -5744,6 +6568,8 @@ mod tests {
             in_memory_bytecode: None,
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
@@ -5812,6 +6638,8 @@ mod tests {
             in_memory_bytecode: Some(vec![0x60, 0x00]),
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
@@ -5940,6 +6768,8 @@ mod tests {
             in_memory_bytecode: None,
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
@@ -6088,6 +6918,8 @@ mod tests {
             in_memory_bytecode: None,
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
@@ -6249,6 +7081,8 @@ mod tests {
             in_memory_bytecode: Some(vec![0x60, 0x00]),
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,
@@ -6305,6 +7139,8 @@ mod tests {
             in_memory_bytecode: Some(vec![0x60, 0x00]),
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,

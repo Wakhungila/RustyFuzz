@@ -109,15 +109,43 @@ pub enum Provenance {
     CallOutput,
 }
 
+/// Up to 32 bytes that render as lowercase hex only when displayed.
+///
+/// Error values for absent mapping entries are built for every unobserved key of a `sum(...)`
+/// and then discarded, so they must not allocate or format eagerly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HexBuf {
+    bytes: [u8; 32],
+    len: u8,
+}
+
+impl HexBuf {
+    pub fn new(bytes: &[u8]) -> Self {
+        let len = bytes.len().min(32);
+        let mut buf = [0u8; 32];
+        buf[..len].copy_from_slice(&bytes[..len]);
+        Self { bytes: buf, len: len as u8 }
+    }
+}
+
+impl std::fmt::Display for HexBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in &self.bytes[..self.len as usize] {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Why a symbol could not be resolved.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Unresolved {
     #[error("symbol `{symbol}` is not bound in the manifest")]
     Unbound { symbol: String },
     #[error("no read or write of {address}[{slot}] and the re-read failed")]
-    NoEvidence { address: String, slot: String },
+    NoEvidence { address: HexBuf, slot: HexBuf },
     #[error("only stale evidence for {address}[{slot}] and the re-read failed")]
-    StaleOnly { address: String, slot: String },
+    StaleOnly { address: HexBuf, slot: HexBuf },
     #[error("no write at transaction {tx_index}, so old()/delta() is undefined")]
     NoWriteAtTx { tx_index: usize },
     #[error("{observed} of {total} mapping keys were observed; the rest were not")]
@@ -405,13 +433,13 @@ impl<'a> Resolver<'a> {
             .any(|r| r.address == address && r.slot == slot && r.tx_index <= self.tx_index)
         {
             return Err(Unresolved::StaleOnly {
-                address: crate::binding::hex(&address),
-                slot: crate::binding::hex(&slot),
+                address: HexBuf::new(address.as_ref()),
+                slot: HexBuf::new(slot.as_ref()),
             });
         }
         Err(Unresolved::NoEvidence {
-            address: crate::binding::hex(&address),
-            slot: crate::binding::hex(&slot),
+            address: HexBuf::new(address.as_ref()),
+            slot: HexBuf::new(slot.as_ref()),
         })
     }
 
@@ -550,8 +578,8 @@ impl<'a> Resolver<'a> {
             return Err(Unresolved::ReReadBudgetExhausted);
         }
         Err(Unresolved::NoEvidence {
-            address: crate::binding::hex(&binding.address),
-            slot: crate::binding::hex(slot),
+            address: HexBuf::new(binding.address.as_ref()),
+            slot: HexBuf::new(slot.as_ref()),
         })
     }
 

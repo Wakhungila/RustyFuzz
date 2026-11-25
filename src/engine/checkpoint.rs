@@ -299,6 +299,10 @@ impl SavedSnapshots {
             pinned: self.pinned,
             global_read_hotspots: self.hotspots.into_iter().collect(),
             priority_gap_map: self.priority.into_iter().collect(),
+            known_slots_cache: Default::default(),
+            edge_freq: Vec::new(),
+            known_selectors_cache: Default::default(),
+            novelty_caches_ready: false,
         })
     }
 }
@@ -578,6 +582,8 @@ mod tests {
             in_memory_bytecode: Some(vec![0x60, 0x00]),
             attacker_harness: false,
             fixture_path: None,
+            seed_inputs_dir: None,
+            foundry_bootstrap: None,
             compact_fork_state: false,
             cores: None,
             require_seed_bundle: false,

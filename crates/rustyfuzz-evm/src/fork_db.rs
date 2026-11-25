@@ -475,6 +475,28 @@ impl ForkDb {
         }
     }
 
+    /// Deep copy with its own backend maps.
+    ///
+    /// `Clone` shares the Arc'd backend, so absorbing a snapshot's warm accounts into a
+    /// clone would write that snapshot's storage into every other snapshot (and the
+    /// root). Compaction of a non-root snapshot must detach first.
+    pub fn detached_clone(&self) -> Self {
+        let i = &self.inner;
+        Self {
+            inner: Arc::new(ForkDbInner {
+                rpc_url: i.rpc_url.clone(),
+                block_tag: i.block_tag.clone(),
+                allow_loopback: i.allow_loopback,
+                rpc_options: i.rpc_options,
+                provenance: Mutex::new(i.provenance.lock().clone()),
+                accounts: Mutex::new(i.accounts.lock().clone()),
+                code_by_hash: Mutex::new(i.code_by_hash.lock().clone()),
+                storage: Mutex::new(i.storage.lock().clone()),
+                block_hashes: Mutex::new(i.block_hashes.lock().clone()),
+            }),
+        }
+    }
+
     /// Absorb a warm-state `CacheDB` account cache into the `ForkDb` backend
     /// (behind the `Arc<Mutex>` inner). After this + clearing the `CacheDB`
     /// cache, per-input `CacheDB::clone()` is cheap (empty cache + Arc-shared
@@ -1382,6 +1404,20 @@ pub fn validate_block_hash(value: &str) -> Result<B256, ForkDbError> {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
+
+    #[test]
+    fn detached_clone_does_not_leak_writes_into_the_shared_backend() {
+        let root = ForkDb::new_offline("0");
+        let shared_view = root.clone();
+        let detached = root.detached_clone();
+        let (addr, slot) = (Address::repeat_byte(7), StorageKey::from(3u64));
+        detached.cache_storage(addr, slot, StorageValue::from(1u64));
+        assert!(root.inner.storage.lock().get(&(addr, slot)).is_none());
+        assert!(shared_view.inner.storage.lock().get(&(addr, slot)).is_none());
+        // A plain clone shares the backend: this is why compaction must detach.
+        shared_view.cache_storage(addr, slot, StorageValue::from(2u64));
+        assert_eq!(root.inner.storage.lock().get(&(addr, slot)), Some(&StorageValue::from(2u64)));
+    }
 
     #[test]
     fn live_rpc_null_is_an_archive_gap_within_the_known_historical_range() {

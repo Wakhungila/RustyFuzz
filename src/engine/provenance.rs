@@ -81,6 +81,9 @@ pub struct ExecutionProvenanceRecord {
 }
 
 pub struct PersistRequest<'a> {
+    /// Whether this execution was novel/interesting. Provenance for ordinary executions is
+    /// skipped unless `RUSTYFUZZ_PROVENANCE_ALL` is set (it is ~4 MB per execution).
+    pub interesting: bool,
     pub execution_index: u64,
     pub budget_consumed: u64,
     pub input: &'a EvmInput,
@@ -103,6 +106,13 @@ pub struct PersistRequest<'a> {
 }
 
 pub fn persist(root: &Path, request: PersistRequest<'_>) -> anyhow::Result<()> {
+    if !request.interesting
+        && !(!request.findings.is_empty()
+            && crate::engine::fuzz_engine::finding_quota_open(request.findings, false))
+        && std::env::var_os("RUSTYFUZZ_PROVENANCE_ALL").is_none()
+    {
+        return Ok(());
+    }
     let directory = root.join("execution_provenance");
     std::fs::create_dir_all(&directory)?;
     let path = execution_provenance_path(

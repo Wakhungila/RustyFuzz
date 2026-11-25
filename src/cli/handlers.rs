@@ -75,6 +75,9 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             allow_synthetic_fallback: false,
             attacker_harness: false,
             fixture: None,
+            seed_inputs: None,
+            foundry_project: None,
+            foundry_test: None,
             compact_fork_state: false,
             abi: None,
             max_execs,
@@ -124,6 +127,9 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             allow_synthetic_fallback,
             attacker_harness,
             fixture,
+            seed_inputs,
+            foundry_project,
+            foundry_test,
             compact_fork_state,
             abi,
             max_execs,
@@ -200,8 +206,37 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 })?;
             // If --fixture is set without --contract, derive the target from the
             // fixture so the campaign knows which contract to fuzz.
+            let foundry_bootstrap = match foundry_project.as_deref() {
+                Some(root) => {
+                    let bootstrap = rusty_fuzz::engine::foundry_project::bootstrap(
+                        root,
+                        foundry_test.as_deref(),
+                    )?;
+                    println!(
+                        "Foundry project: test contract {} at {:?}; {} contract(s) created by setUp; \
+                         invariants: {:?}; default target {:?}",
+                        bootstrap.test_contract_name,
+                        bootstrap.test_contract,
+                        bootstrap.deployed.len().saturating_sub(1),
+                        bootstrap
+                            .invariants
+                            .functions
+                            .iter()
+                            .map(|f| f.name.as_str())
+                            .collect::<Vec<_>>(),
+                        bootstrap.state.target,
+                    );
+                    for (address, name) in &bootstrap.identified {
+                        println!("  {address:?} = {name}");
+                    }
+                    Some(std::sync::Arc::new(bootstrap))
+                }
+                None => None,
+            };
             let target_contract = if target_contract.is_none() {
-                if let Some(fixture_path) = fixture.as_deref() {
+                if let Some(bootstrap) = foundry_bootstrap.as_ref() {
+                    Some(bootstrap.state.target)
+                } else if let Some(fixture_path) = fixture.as_deref() {
                     let state = rusty_fuzz::engine::executable_fixture::ExecutableFixture::load_for_fuzz(
                         std::path::Path::new(fixture_path),
                     )?;
@@ -315,6 +350,8 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 in_memory_bytecode: None,
                 attacker_harness,
                 fixture_path: fixture.clone(),
+                seed_inputs_dir: seed_inputs.clone(),
+                foundry_bootstrap,
                 compact_fork_state,
                 cores,
                 require_seed_bundle: config.require_seed_bundle || require_seed_bundle,
@@ -682,13 +719,9 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     .ingest_bundle_from_target(&seed_config, &fork_db)
                     .await?;
                 if let Some(scan) = bundle.scan.as_mut() {
-                    scan.chain_id = match chain.as_str() {
-                        "bsc" => Some(56),
-                        "evm" => None,
-                        other => {
-                            anyhow::bail!("unsupported --chain `{other}`; expected evm or bsc")
-                        }
-                    };
+                    scan.chain_id =
+                        rustyfuzz_evm::chain_profile::ChainProfile::id_for_cli_name(&chain)
+                            .map_err(anyhow::Error::msg)?;
                 }
                 std::fs::create_dir_all(output)?;
                 let manifest_path = std::path::Path::new(output).join("manifest.json");
@@ -1080,6 +1113,8 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                     in_memory_bytecode: None,
                     attacker_harness: false,
                     fixture_path: None,
+                    seed_inputs_dir: None,
+                    foundry_bootstrap: None,
                     compact_fork_state: false,
                     cores: None,
                     require_seed_bundle: config.require_seed_bundle || require_seed_bundle,

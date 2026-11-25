@@ -138,7 +138,31 @@ impl Binding {
 }
 
 /// `keccak256(key_word || base_slot)` — the Solidity mapping slot formula.
+///
+/// Memoised per thread: a `sum(m[k0..kN])` invariant derives the same slots after every
+/// transaction, and software keccak dominated the profile.
 pub fn mapping_slot(key: &[u8; 32], base_slot: &[u8; 32]) -> [u8; 32] {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    type Memo = HashMap<([u8; 32], [u8; 32]), [u8; 32]>;
+    thread_local! {
+        static MEMO: RefCell<Memo> = RefCell::new(HashMap::new());
+    }
+    MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if let Some(hit) = memo.get(&(*key, *base_slot)) {
+            return *hit;
+        }
+        let out = mapping_slot_uncached(key, base_slot);
+        if memo.len() >= 1 << 16 {
+            memo.clear();
+        }
+        memo.insert((*key, *base_slot), out);
+        out
+    })
+}
+
+fn mapping_slot_uncached(key: &[u8; 32], base_slot: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Keccak256::new();
     hasher.update(key);
     hasher.update(base_slot);
@@ -159,6 +183,18 @@ pub fn extract_bits(word: &[u8; 32], offset_bits: u16, width_bits: u16) -> Optio
     if u32::from(offset_bits) + u32::from(width_bits) > u32::from(SLOT_BITS) {
         return None;
     }
+    if offset_bits % 8 == 0 && width_bits % 8 == 0 {
+        // Byte-aligned (the common case): copy the bytes instead of walking bits.
+        let width = usize::from(width_bits / 8);
+        let from = 32 - usize::from(offset_bits / 8) - width;
+        let mut bytes = [0u8; 32];
+        bytes[32 - width..].copy_from_slice(&word[from..from + width]);
+        return Some(Int256(bytes));
+    }
+    extract_bits_slow(word, offset_bits, width_bits)
+}
+
+fn extract_bits_slow(word: &[u8; 32], offset_bits: u16, width_bits: u16) -> Option<Int256> {
     // Big-endian word: bit 0 is byte 31, bit 255 is byte 0 bit 7.
     let mut value = Int256::ZERO;
     for bit in 0..width_bits {
@@ -789,5 +825,38 @@ mod tests {
         .resolve()
         .expect("must resolve");
         assert_eq!(short["x"].slot, long["x"].slot);
+    }
+}
+
+#[cfg(test)]
+mod extract_fast_path_tests {
+    use super::*;
+
+    #[test]
+    fn byte_aligned_fast_path_matches_bitwise_reference() {
+        let mut word = [0u8; 32];
+        for (i, b) in word.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        for offset in (0..256u16).step_by(8) {
+            for width in (8..=256u16).step_by(8) {
+                if u32::from(offset) + u32::from(width) > 256 {
+                    continue;
+                }
+                assert_eq!(
+                    extract_bits(&word, offset, width),
+                    extract_bits_slow(&word, offset, width),
+                    "offset={offset} width={width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mapping_slot_memo_is_consistent() {
+        let key = [7u8; 32];
+        let base = [3u8; 32];
+        assert_eq!(mapping_slot(&key, &base), mapping_slot_uncached(&key, &base));
+        assert_eq!(mapping_slot(&key, &base), mapping_slot_uncached(&key, &base));
     }
 }

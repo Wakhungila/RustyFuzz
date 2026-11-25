@@ -98,7 +98,11 @@ impl ProtocolInvariantEvaluator {
             findings.push(ProtocolInvariantFinding {
                 family: ProtocolInvariantFamily::GenericAccounting,
                 severity_hint: ProtocolSeverity::Medium,
-                confidence: 74,
+                // Informational only (below `min_persistable_confidence`): many large writes to a
+                // contract say nothing about accounting; with fuzzed uint arguments any stateful
+                // contract (e.g. a Daedaluzz maze) trips this. It must be corroborated by a
+                // semantic oracle (ERC20/4626 family, predicate invariant) to become a finding.
+                confidence: 40,
                 affected_contracts: vec![target],
                 evidence: format!(
                     "large aggregate accounting movement across {writes} storage slots"
@@ -704,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn detects_generic_accounting_invariant_case() {
+    fn generic_accounting_is_informational_not_persistable() {
         let target = Address::repeat_byte(0xdd);
         let execution = execution_with_call_and_writes(
             target,
@@ -714,9 +718,17 @@ mod tests {
             U256::from(10u128.pow(18)),
         );
 
+        // Default evaluation must not surface it: many large writes alone are not a bug.
         let findings = ProtocolInvariantEvaluator::default().evaluate(&execution);
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.family == ProtocolInvariantFamily::GenericAccounting));
 
-        assert!(findings
+        // The signal is still computed for triage when the threshold is lowered explicitly.
+        let mut lenient = ProtocolInvariantEvaluator::default();
+        lenient.min_persistable_confidence = 30;
+        assert!(lenient
+            .evaluate(&execution)
             .iter()
             .any(|finding| finding.family == ProtocolInvariantFamily::GenericAccounting));
     }

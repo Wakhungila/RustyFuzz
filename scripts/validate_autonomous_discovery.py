@@ -29,6 +29,8 @@ parser.add_argument('--binary', default='target/release/rusty-fuzz')
 parser.add_argument('--output', type=Path, default=REPO_ROOT / 'benchmarks/results/autonomous-rediscovery')
 parser.add_argument('--max-execs', type=int, default=2000)
 parser.add_argument('--duration-secs', type=int, default=30)
+parser.add_argument('--min-rediscovered', type=int, default=0,
+                    help='fail the gate if fewer fixtures are rediscovered (the ratchet)')
 parser.add_argument('--attacker-harness', action='store_true', default=True,
                     help='enable --attacker-harness (default on; the reentrancy probes need it)')
 args = parser.parse_args()
@@ -86,6 +88,9 @@ allow_synthetic_fallback = true
             'known-bridge-nonce-replay': 'abi/ReplayBridge.abi.json',
             'known-read-only-reentrancy': 'abi/ReentrantAttacker.abi.json',
         }
+        inv = REPO_ROOT / 'benchmarks/historical/known_vulnerable' / f'{case_id}.invariants.json'
+        if inv.exists() and case_id != 'known-read-only-reentrancy':  # its invariant target (vault) != --contract (attacker)
+            cmd.extend(['--invariants', str(inv)])
         abi_rel = abi_map.get(case_id)
         if abi_rel:
             abi_path = REPO_ROOT / 'benchmarks/historical/known_vulnerable' / abi_rel
@@ -111,20 +116,34 @@ allow_synthetic_fallback = true
             exit_status = 'timeout'
             proc = None
 
+        # Campaign artifacts are persisted under <cwd>/.rustyfuzz/runs/*/inputs/campaign_artifacts
+        # (the config-file report_dir is not what the run writes to), so scan there.
+        fixture_json = json.loads(fixture.read_text())
+        fixture_target = str(fixture_json.get('target', '')).lower()
+        # What counts as the *intended* bug per fixture. A finding on some other
+        # contract (e.g. a generic reentrancy heuristic on a mock token) is noise.
+        # Generic `Reentrancy` heuristics fire on nearly every contract (mock tokens included),
+        # so they only count for the fixture that IS a reentrancy bug.
+        expected = ('InvariantViolation', 'v2_k_invariant', 'FlashLoanProfit',
+                    'UniswapV3LiquidityAsymmetry', 'ProxyUpgradeabilityViolation',
+                    'PrivilegeEscalation')
+        if case_id == 'known-read-only-reentrancy':
+            expected += ('Reentrancy',)
         finding_count = 0
-        report_files = []
-        report_dir = case_dir / 'reports'
-        if report_dir.exists():
-            report_files = list(report_dir.rglob('*.json'))
-            for rf in report_files:
-                try:
-                    data = json.loads(rf.read_text())
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(data, dict):
-                    findings = data.get('findings') or data.get('artifacts') or []
-                    if isinstance(findings, list):
-                        finding_count += len(findings)
+        total_findings = 0
+        kinds = {}
+        for artifact in case_dir.glob('.rustyfuzz/runs/*/inputs/campaign_artifacts/*.json'):
+            try:
+                data = json.loads(artifact.read_text())
+            except json.JSONDecodeError:
+                continue
+            for fi in (data.get('findings') or []) if isinstance(data, dict) else []:
+                total_findings += 1
+                vuln = str(fi.get('vuln'))
+                tgt = str(fi.get('target') or '').lower()
+                kinds[f'{vuln}@{tgt}'] = kinds.get(f'{vuln}@{tgt}', 0) + 1
+                if tgt == fixture_target and any(e in vuln for e in expected):
+                    finding_count += 1
 
         rediscovered = finding_count > 0
         results.append({
@@ -133,6 +152,8 @@ allow_synthetic_fallback = true
             'exit_status': exit_status,
             'elapsed_secs': round(elapsed, 1),
             'finding_count': finding_count,
+            'total_findings_any_target': total_findings,
+            'finding_kinds': kinds,
             'rediscovered': rediscovered,
         })
         print(f"  {case_id}: exit={exit_status} findings={finding_count} rediscovered={rediscovered}")
@@ -164,6 +185,9 @@ if failures:
 crashed = [r['case_id'] for r in results if r['exit_status'] not in (0, 'timeout')]
 if crashed:
     print(f'GATE FAILURE: campaigns crashed for: {crashed}')
+    raise SystemExit(1)
+if rediscovered_count < args.min_rediscovered:
+    print(f'GATE FAILURE: rediscovered {rediscovered_count}/{total}, ratchet requires >= {args.min_rediscovered}')
     raise SystemExit(1)
 print(f'Gate passed: all {total} campaigns ran. Autonomous rediscovery rate: {rediscovered_count}/{total} '
       f'(honest baseline; ratchet only tightens).')
