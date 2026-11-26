@@ -276,28 +276,88 @@ This is what let `symseed.py` be checked against **real vulnerability classes**,
 the repo's own `benchmarks/historical/known_vulnerable/` fixtures (five small, realistic, known-vulnerable
 contracts, each with real ABI/bytecode/invariants, already used by other validation scripts).
 
+### Dynamic ABI types + real external-call dispatch (4/5 fixtures now judge-confirmed)
+
+Two follow-on capabilities closed most of the remaining gap:
+
+- **Dynamic ABI types** (`abi_dynamic.py`): `bytes`/`string`/single-level `T[]` parameters are no longer
+  skipped. Each dynamic parameter's *length* is tried concretely from a small fixed set (0/1/32); only its
+  *content* stays symbolic — enough to reach code that branches on "is this calldata empty" without needing
+  a length-indexed induction the executor can't do soundly. Byte-exact validated against `eth_abi` before
+  ever running it against a real fixture (caught one padding-direction bug — `ZeroExt` pads the wrong side for
+  a big-endian EVM word — this way, rather than via a judge false result).
+- **Real external-call dispatch** (`Exec.dispatch_call`): a `CALL`/`STATICCALL` whose target and 4-byte
+  selector are concrete, and whose target is another account in the fixture with real bytecode, now actually
+  executes that callee's code (real storage reads/writes, real success/revert, real return data) instead of
+  havocing it. `symseed.py` builds `code_map`/`callee_storage` from every non-target account in the fixture
+  that has bytecode. One real hop deep by default; a callee's own further calls still havoc unless the
+  recursion cap is raised. `STATICCALL`'s no-write rule is modeled (a callee path that writes storage during
+  a static call reverts the whole call, matching the real EVM).
+
 | fixture | class | symseed result |
 |---|---|---|
 | known-erc20-bad-mint-inflation | unauthorized mint | both invariants found + judge-confirmed (depth 2) |
 | known-uninitialized-proxy-takeover | uninitialized proxy | found + judge-confirmed (depth 1); also reproduced by a **seeded live fuzz campaign** (`Bridge`/`InvariantViolation` + the engine's own `ProxyUpgradeability` oracle both fire) |
 | known-bridge-nonce-replay | replay / double-release | found + judge-confirmed (depth 2) |
-| known-flashloan-price-manipulation | price manipulation | not reached: its only mutator function (`swap`) takes a dynamic-type parameter, which `symseed.py` currently skips entirely |
-| known-read-only-reentrancy | read-only reentrancy | not reached: its invariant needs a `return_value`-kind symbol (the real return value of an **actual external call** to a named contract), and external calls are havoced (free success bit, free bytes), not dispatched into the callee's real bytecode |
+| known-flashloan-price-manipulation | price manipulation | **now found + judge-confirmed** (depth 1): `swap(uint256,uint256,address,bytes)` needed dynamic-type support for its `bytes` param, and the invariant (`reserve0*reserve1 >= threshold`) needs real dispatch into `token0`/`token1`'s `balanceOf`/`transfer`, previously havoced. Confirmed witness: `swap(876584, 0, 0x0, "")` drains token0 to the zero address with no payment check, dropping the reserve product from 1e12 to ~1.23e11 — a real, judge-replayed exploit, not a model artifact. |
+| known-read-only-reentrancy | read-only reentrancy | still not reached — see below; this needed more than dispatch alone |
 
-**A genuine soundness bug found and fixed along the way:** the first attempt judge-rejected both of this
-fixture's invariants as false positives. Cause: `explore_sym`'s multi-tx mode keeps storage *and* keys
-symbolic across transactions, and the keccak model is an uninterpreted function tied to real hashes only
-through axioms over preimages *seen during execution*. A storage slot the **invariants file** names (e.g. the
-attacker's `balances` entry) is never such a preimage unless some transaction happens to pass that exact value
-concretely, so z3 was free to satisfy "a write lands on slot X" by setting the UF's output equal to X for an
-otherwise-unconstrained symbolic input, without that input actually equaling X's real preimage — a
-true counterexample in the model, not in the EVM. Fix: `register_known_hash()` seeds the axiom set with every
-mapping key the invariants/watch tables name, before exploring, so a watched slot can only be reached by a
-key that genuinely hashes to it. Confirmed by the judge going from 1/2 to 2/2 immediately after the fix, with
-no change to the maze pipeline (`explore()` is unaffected; it never carries a symbolic key across a SHA3).
+**Two more genuine soundness bugs found and fixed while validating this (beyond the keccak-axiom bug below,
+found in the prior pass):**
 
-**Scope for "real contract" claims:** these are small single-contract fixtures built for this benchmark, not
-mainnet protocols (`benchmarks/historical/fixtures/` has real mainnet-fork exploits like Audius, but with only
-a handful of explicitly-recorded storage slots and no full state, so they need real external-call dispatch
-first — see below). They do exercise real patterns (ERC-20 accounting, mapping-keyed balances, an external
-price call, `&&`-combined proxy-slot predicates) that the maze suite does not.
+1. **Missing floor axiom on the keccak UF.** `read_storage`'s symbolic-key fallback has to ask, for every
+   slot it has ever seen in an account's storage, "could this computed (mapping/array) key equal that slot?" —
+   including plain, sequentially-assigned declared-variable slots (`totalSupply` at slot 2, say) sitting right
+   next to real hash-derived mapping slots in the same account. With nothing ruling it out, z3 was free to
+   satisfy a `balanceOf[...]` read by setting the otherwise-unconstrained hash output equal to a totally
+   unrelated plain slot a few bytes away — a counterexample that exists only in the model (no real preimage
+   hashes to a value that small). Caught via the flashloan fixture: the first symseed run "found" the bug by
+   proving `reserve0 == reserve1 == 0`, which the judge correctly rejected (0 confirmed) because on the real
+   EVM nothing of the kind happened. **Fix:** every keccak UF gets a floor axiom (`output >= 2**160`) the
+   moment it's created — sound, since a real keccak256 output landing below that bound is cryptographically
+   negligible, and it can only turn spurious SAT results UNSAT, never the reverse. Re-confirmed zero change to
+   the maze pipeline (`explore()` never carries a symbolic key across a SHA3 to begin with) and to the other
+   three known_vulnerable fixtures.
+2. **`dispatch_call`'s child path forgot in-flight state from outer calls.** A callee's own `Path` was built
+   with a fresh, empty `other` dict, so a 2+-hop call chain (A calls B calls C) would have C silently see
+   every other account's *pristine initial* storage instead of whatever the chain had already done to it —
+   including, on a reentrant callback, this same call's own earlier writes. Fixed by propagating the caller's
+   `other` dict (minus the callee's own slot, which is threaded separately) into the child path, and bubbling
+   a callee's own further dispatches back up into the caller's `other` on return (discarded on revert, matching
+   real EVM rollback semantics). Not yet exercised by any committed fixture at 2+ hops (none of the five needs
+   it with dispatch capped at depth 1), so this is a forward-looking correctness fix rather than one with its
+   own confirmed before/after — found by code review while scoping read-only-reentrancy's needs, not by a
+   judge rejection.
+
+### Why `known-read-only-reentrancy` is still out of reach
+
+Dispatch alone does not unblock it, and getting it working is a materially bigger piece of work than
+"dispatch into a known callee," for two compounding reasons specific to this fixture:
+
+1. **The exploit's attacker-side transactions cannot be driven through the target contract at all.** The
+   vault's `withdraw()` only triggers the token's ERC-777-style transfer hook (and so the reentrant callback)
+   when the *recipient* is a contract; an EOA calling the vault directly never gets the hook. The real exploit
+   therefore has to be driven through a *separate* attacker contract (`enterDeposit`/`enterWithdraw`), which
+   then calls the vault — i.e. the top-level transaction's target varies per step, and is sometimes a contract
+   other than the one under test. `symseed.py`/`explore_sym` currently hard-code "the fixture's `target`
+   account's bytecode is the one thing every modeled transaction calls into"; supporting an attacker-contract
+   entry point means generalizing that to a *set* of candidate top-level targets, each able to dispatch into
+   the others (including back into the real target), and reconciling whose storage is "the" canonical thread
+   feeding the next transaction when the entry point changes between steps.
+2. **The callback chain reenters the target's own contract mid-execution.** `withdraw` → token `transfer` →
+   attacker `onReceive` → vault `balanceOf`/`mintProfit` calls back into the *same* vault address while its
+   outer `withdraw` call is still on the stack (that's the entire point of the read-only-reentrancy bug: the
+   nested call sees the vault's stale, pre-decrement storage). The dispatch model as it stands treats a
+   dispatch target as a fresh call into a *different* contract's state; genuine same-address reentrancy —
+   where a nested dispatch must read and write the very storage an outer, not-yet-returned dispatch into that
+   address is also live-mutating — isn't something it's been built or tested for yet.
+3. Its invariant also needs a `return_value`-kind symbol (the real return value of calling
+   `token.balanceOf(vault)`), which the predicate engine doesn't evaluate yet — a smaller, well-scoped addition
+   on top of (1) and (2), not a blocker on its own.
+
+**Scope for "real contract" claims:** these are small single-contract (now: mostly-single-contract, with real
+callees) fixtures built for this benchmark, not mainnet protocols (`benchmarks/historical/fixtures/` has real
+mainnet-fork exploits like Audius, but with only a handful of explicitly-recorded storage slots and no full
+state, so they need the same dispatch machinery plus fuller state capture first). They do exercise real
+patterns (ERC-20 accounting, mapping-keyed balances, dynamic-type calldata, cross-contract `balanceOf`/
+`transfer` calls, `&&`-combined proxy-slot predicates) that the maze suite does not.
