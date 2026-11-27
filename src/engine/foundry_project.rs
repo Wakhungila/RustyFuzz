@@ -84,7 +84,10 @@ fn hex_code(object: Option<&Value>) -> anyhow::Result<(Vec<u8>, bool)> {
     if text.contains("__$") {
         return Ok((Vec::new(), true));
     }
-    Ok((hex::decode(text).context("artifact bytecode is not valid hex")?, false))
+    Ok((
+        hex::decode(text).context("artifact bytecode is not valid hex")?,
+        false,
+    ))
 }
 
 fn parse_artifact(name: &str, json: &Value) -> anyhow::Result<Option<FoundryArtifact>> {
@@ -120,8 +123,8 @@ fn parse_artifact(name: &str, json: &Value) -> anyhow::Result<Option<FoundryArti
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let returns_bool = outputs.len() == 1
-            && outputs[0].get("type").and_then(Value::as_str) == Some("bool");
+        let returns_bool =
+            outputs.len() == 1 && outputs[0].get("type").and_then(Value::as_str) == Some("bool");
         functions.push(AbiFunction {
             name: fname.to_string(),
             selector,
@@ -146,7 +149,10 @@ fn parse_artifact(name: &str, json: &Value) -> anyhow::Result<Option<FoundryArti
 }
 
 fn collect_json(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
-    ensure!(depth <= MAX_WALK_DEPTH, "artifact directory nesting exceeds {MAX_WALK_DEPTH}");
+    ensure!(
+        depth <= MAX_WALK_DEPTH,
+        "artifact directory nesting exceeds {MAX_WALK_DEPTH}"
+    );
     for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let file_type = entry.file_type()?;
@@ -167,7 +173,10 @@ fn collect_json(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> anyhow::Res
                 .is_some_and(|n| n.ends_with(".dbg.json"))
         {
             out.push(path);
-            ensure!(out.len() <= MAX_ARTIFACT_FILES, "more than {MAX_ARTIFACT_FILES} artifacts");
+            ensure!(
+                out.len() <= MAX_ARTIFACT_FILES,
+                "more than {MAX_ARTIFACT_FILES} artifacts"
+            );
         }
     }
     Ok(())
@@ -201,13 +210,17 @@ pub fn load_artifacts(project_root: &Path) -> anyhow::Result<Vec<FoundryArtifact
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default();
-        if let Some(artifact) = parse_artifact(name, &json)
-            .with_context(|| format!("parsing {}", file.display()))?
+        if let Some(artifact) =
+            parse_artifact(name, &json).with_context(|| format!("parsing {}", file.display()))?
         {
             artifacts.push(artifact);
         }
     }
-    ensure!(!artifacts.is_empty(), "no contract artifacts found under {}", out_dir.display());
+    ensure!(
+        !artifacts.is_empty(),
+        "no contract artifacts found under {}",
+        out_dir.display()
+    );
     Ok(artifacts)
 }
 
@@ -236,7 +249,10 @@ pub fn select_test_contract<'a>(
         [] => bail!("no artifact declares an `invariant_*` or `echidna_*` function"),
         many => bail!(
             "several contracts declare invariants ({}); pick one with --foundry-test",
-            many.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+            many.iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     }
 }
@@ -280,7 +296,9 @@ impl FoundryInvariantSet {
                 .accounts
                 .get(&self.test_contract)
                 .map(|a| a.info.balance);
-            log::info!("foundry invariant probes so far: {n} (test contract cached balance {vault_bal:?})");
+            log::info!(
+                "foundry invariant probes so far: {n} (test contract cached balance {vault_bal:?})"
+            );
         }
         for function in &self.functions {
             let run = execute_with_cheatcodes(
@@ -416,8 +434,8 @@ pub fn bootstrap(project_root: &Path, test_name: Option<&str>) -> anyhow::Result
         test.name
     );
 
-    let mut db: EvmCacheDb = crate::evm::fork::create_in_memory_fork_db_from_fixture(
-        &FuzzFixtureState {
+    let mut db: EvmCacheDb =
+        crate::evm::fork::create_in_memory_fork_db_from_fixture(&FuzzFixtureState {
             target: Address::ZERO,
             accounts: vec![
                 FuzzFixtureAccount {
@@ -440,8 +458,7 @@ pub fn bootstrap(project_root: &Path, test_name: Option<&str>) -> anyhow::Result
                     storage: Vec::new(),
                 },
             ],
-        },
-    );
+        });
     // Foundry's defaults: block.number 1, block.timestamp 1.
     let mut block_env = crate::evm::fork::create_offline_fallback_block_env(1);
     block_env.timestamp = U256::from(1u64);
@@ -629,15 +646,21 @@ fn describe_failure(result: &ExecutionResult, unsupported: &[[u8; 4]]) -> String
     }
 }
 
-
 fn zero_value(ty: &alloy_dyn_abi::DynSolType) -> alloy_dyn_abi::DynSolValue {
     use alloy_dyn_abi::{DynSolType as T, DynSolValue as V};
     match ty {
         T::Bool => V::Bool(false),
         T::Int(bits) => V::Int(revm::primitives::I256::ZERO, *bits),
-        T::Uint(bits) => V::Uint(U256::from(10u64).pow(U256::from(18u64)).min(
-            if *bits >= 256 { U256::MAX } else { (U256::from(1u8) << *bits) - U256::from(1u8) },
-        ), *bits),
+        T::Uint(bits) => V::Uint(
+            U256::from(10u64)
+                .pow(U256::from(18u64))
+                .min(if *bits >= 256 {
+                    U256::MAX
+                } else {
+                    (U256::from(1u8) << *bits) - U256::from(1u8)
+                }),
+            *bits,
+        ),
         T::FixedBytes(n) => V::FixedBytes(revm::primitives::B256::ZERO, *n),
         T::Address => V::Address(Address::ZERO),
         T::Function => V::Function(alloy_primitives::Function::ZERO),
@@ -732,8 +755,14 @@ mod tests {
             {"type":"function","name":"echidna_ok","inputs":[],"outputs":[{"type":"bool"}]},
             {"type":"event","name":"Log"}
         ]);
-        let parsed = parse_artifact("T", &artifact("T", abi, "0x6000")).unwrap().unwrap();
-        let names: Vec<_> = parsed.invariant_functions().iter().map(|f| f.name.clone()).collect();
+        let parsed = parse_artifact("T", &artifact("T", abi, "0x6000"))
+            .unwrap()
+            .unwrap();
+        let names: Vec<_> = parsed
+            .invariant_functions()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
         assert_eq!(names, ["invariant_solvent", "echidna_ok"]);
         assert!(parsed.function("echidna_ok").unwrap().returns_bool);
         assert!(!parsed.function("invariant_solvent").unwrap().returns_bool);
@@ -743,7 +772,9 @@ mod tests {
     #[test]
     fn interfaces_without_bytecode_are_skipped_and_unlinked_libraries_flagged() {
         let abi = json!([{"type":"function","name":"f","inputs":[],"outputs":[]}]);
-        assert!(parse_artifact("I", &artifact("I", abi.clone(), "0x")).unwrap().is_none());
+        assert!(parse_artifact("I", &artifact("I", abi.clone(), "0x"))
+            .unwrap()
+            .is_none());
         let linked = parse_artifact("L", &artifact("L", abi, "0x60__$abcd$__00"))
             .unwrap()
             .unwrap();
@@ -772,7 +803,10 @@ mod tests {
         let one = [mk("A", true), mk("B", false)];
         assert_eq!(select_test_contract(&one, None).unwrap().name, "A");
         let two = [mk("A", true), mk("B", true)];
-        assert!(select_test_contract(&two, None).unwrap_err().to_string().contains("A, B"));
+        assert!(select_test_contract(&two, None)
+            .unwrap_err()
+            .to_string()
+            .contains("A, B"));
         assert_eq!(select_test_contract(&two, Some("B")).unwrap().name, "B");
         assert!(select_test_contract(&two, Some("C")).is_err());
         let none = [mk("A", false)];
@@ -792,7 +826,9 @@ mod tests {
     }
 
     fn fixture(variant: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/foundry_vault").join(variant)
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/foundry_vault")
+            .join(variant)
     }
 
     /// Calls `withdrawAll()` as each setUp actor against a fresh copy of the
@@ -801,7 +837,10 @@ mod tests {
         let boot = bootstrap(&fixture(variant), None).unwrap();
         let mut db = crate::evm::fork::create_in_memory_fork_db_from_fixture(&boot.state);
         assert!(
-            boot.invariants.check(&mut db, &boot.block_env).unwrap().is_none(),
+            boot.invariants
+                .check(&mut db, &boot.block_env)
+                .unwrap()
+                .is_none(),
             "invariant must hold in the post-setUp state"
         );
         let selector = keccak256(b"withdrawAll()").0[..4].to_vec();
@@ -819,7 +858,12 @@ mod tests {
                 true,
             )
             .unwrap();
-            if boot.invariants.check(&mut copy, &boot.block_env).unwrap().is_some() {
+            if boot
+                .invariants
+                .check(&mut copy, &boot.block_env)
+                .unwrap()
+                .is_some()
+            {
                 broken.push(*actor);
             }
         }
@@ -844,7 +888,12 @@ mod tests {
         let (boot, broken) = violators_after_withdraw_all("buggy");
         // Exactly the account that deposited in setUp can expose the bug: a
         // caller with no deposit withdraws nothing and leaves the books intact.
-        assert_eq!(broken.len(), 1, "broken for {broken:?} of {:?}", boot.actors);
+        assert_eq!(
+            broken.len(),
+            1,
+            "broken for {broken:?} of {:?}",
+            boot.actors
+        );
     }
 
     #[test]

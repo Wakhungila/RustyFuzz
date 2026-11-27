@@ -1413,10 +1413,18 @@ mod tests {
         let (addr, slot) = (Address::repeat_byte(7), StorageKey::from(3u64));
         detached.cache_storage(addr, slot, StorageValue::from(1u64));
         assert!(root.inner.storage.lock().get(&(addr, slot)).is_none());
-        assert!(shared_view.inner.storage.lock().get(&(addr, slot)).is_none());
+        assert!(shared_view
+            .inner
+            .storage
+            .lock()
+            .get(&(addr, slot))
+            .is_none());
         // A plain clone shares the backend: this is why compaction must detach.
         shared_view.cache_storage(addr, slot, StorageValue::from(2u64));
-        assert_eq!(root.inner.storage.lock().get(&(addr, slot)), Some(&StorageValue::from(2u64)));
+        assert_eq!(
+            root.inner.storage.lock().get(&(addr, slot)),
+            Some(&StorageValue::from(2u64))
+        );
     }
 
     #[test]

@@ -142,7 +142,10 @@ fn missing_pinned_fields_and_unknown_chains_fail_closed() {
     let error = EnvironmentPolicy::resolve(&backend, &env)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("chain 99999"), "must name the chain: {error}");
+    assert!(
+        error.contains("chain 99999"),
+        "must name the chain: {error}"
+    );
     assert!(
         error.contains("no execution profile"),
         "must say a profile is missing: {error}"

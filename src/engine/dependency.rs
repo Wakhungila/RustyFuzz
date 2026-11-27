@@ -259,7 +259,16 @@ fn classify_selector_edge(
     });
     let k = &*KNOWN;
     let (approve, transfer_from, deposit, withdraw, mint, redeem, propose, vote, queue, execute) = (
-        k.approve, k.transfer_from, k.deposit, k.withdraw, k.mint, k.redeem, k.propose, k.vote, k.queue, k.execute,
+        k.approve,
+        k.transfer_from,
+        k.deposit,
+        k.withdraw,
+        k.mint,
+        k.redeem,
+        k.propose,
+        k.vote,
+        k.queue,
+        k.execute,
     );
 
     if left == approve && right == transfer_from {

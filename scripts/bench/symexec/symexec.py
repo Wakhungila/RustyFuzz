@@ -52,16 +52,20 @@ def disasm_jumpdests(code):
 
 
 class Path:
-    __slots__ = ("pc", "stack", "mem", "init", "wlog", "cons", "steps", "giveup_reason", "calls", "rd", "nfresh")
+    __slots__ = ("pc", "stack", "mem", "init", "wlog", "cons", "steps", "giveup_reason", "calls", "rd", "nfresh",
+                 "other", "ret")
 
     def __init__(self, store):
         self.pc, self.stack, self.mem, self.cons, self.steps = 0, [], {}, [], 0
         self.init, self.wlog, self.calls, self.rd, self.nfresh = dict(store), [], [], [], 0
+        self.other, self.ret = {}, []  # other: {addr: (init_dict, wlog_list)} for dispatched callees
 
     def fork(self):
         p = Path.__new__(Path)
         p.pc, p.stack, p.mem, p.cons, p.steps = self.pc, list(self.stack), dict(self.mem), list(self.cons), self.steps
         p.init, p.wlog, p.calls, p.rd, p.nfresh = self.init, list(self.wlog), list(self.calls), list(self.rd), self.nfresh
+        p.other = {a: (d, list(w)) for a, (d, w) in self.other.items()}
+        p.ret = list(self.ret)
         return p
 
     @property
@@ -96,23 +100,83 @@ def read_storage(p, k):
 
 
 class Exec:
-    def __init__(self, code, calldata_words, selector, caller=int('13' * 20, 16), timeout_ms=3000, max_steps=200000):
+    def __init__(self, code, calldata_words, selector, caller=int('13' * 20, 16), timeout_ms=3000, max_steps=200000,
+                 calldata_bytes=None, code_map=None, callee_storage=None, self_addr=None, call_depth=0,
+                 call_depth_cap=1):
         self.code, self.jd = code, disasm_jumpdests(code)
         self.sel = selector
         self.W = calldata_words
-        self.cdsize = 4 + 32 * len(calldata_words)
+        self.cdbytes = calldata_bytes  # raw byte list (dispatched callee); overrides sel/W when set
+        self.cdsize = len(calldata_bytes) if calldata_bytes is not None else 4 + 32 * len(calldata_words)
         self.caller = caller
         self.timeout, self.max_steps = timeout_ms, max_steps
+        # Real external-call dispatch (see the CALL/STATICCALL case): code_map gives the bytecode of
+        # OTHER accounts this execution is allowed to actually call into (vs. the default of havocing
+        # an unknown callee with a free success bit and free return bytes). self_addr is this
+        # execution's own address, needed so the dispatched callee's CALLER() resolves correctly.
+        # call_depth/call_depth_cap bound the recursion (a callee's own calls are still havoced once
+        # the cap is hit, so reentrancy beyond one hop falls back to the old approximation).
+        self.code_map, self.self_addr = code_map or {}, self_addr
+        self.callee_storage = callee_storage or {}  # {addr: {slot: value}}, each callee's fixture-initial storage
+        self.call_depth, self.call_depth_cap = call_depth, call_depth_cap
+
+    def dispatch_call(self, p, addr_c, data, osv, static):
+        """Actually executes a known callee's bytecode for a CALL/STATICCALL whose target and 4-byte
+        selector are concrete (argument bytes past the selector may still be symbolic). One real
+        dispatch can itself branch (the callee has its own JUMPIs), so this returns a list of outcome
+        dicts — one per callee execution path that reached RETURN/REVERT/a bare STOP — for the caller
+        to turn into sibling forks, the same way a JUMPI fork works. An empty list (every callee path
+        gave up) tells the caller to fall back to havocing the whole call, so a callee this can't
+        fully handle never kills the parent path outright."""
+        callee_code = self.code_map[addr_c]
+        init0, wlog0 = p.other.get(addr_c, (dict(self.callee_storage.get(addr_c, {})), []))
+        child = Path({})
+        child.init, child.wlog = init0, list(wlog0)
+        child.cons, child.nfresh = list(p.cons), p.nfresh
+        # The callee may itself dispatch further (A calls B calls C): without this, the callee's own
+        # Path would start with an EMPTY `other`, forgetting every account this whole call chain has
+        # already touched (including, on a reentrant callback, THIS SAME path's other in-flight
+        # state) — so a 2+-hop chain would silently fall back to each account's pristine initial
+        # storage instead of its real current state.
+        child.other = {a: (d, list(w)) for a, (d, w) in p.other.items() if a != addr_c}
+        callee_exec = Exec(callee_code, [], b"", caller=(self.self_addr if self.self_addr is not None else self.caller),
+                            timeout_ms=self.timeout, max_steps=self.max_steps, calldata_bytes=data,
+                            code_map=self.code_map, callee_storage=self.callee_storage, self_addr=addr_c,
+                            call_depth=self.call_depth + 1, call_depth_cap=self.call_depth_cap)
+        outcomes = []
+        for sub_p, res in callee_exec.run({}, base=child):
+            # STATICCALL forbids the callee from writing its own storage; the real EVM reverts the
+            # whole call if it tries, so a path that wrote something is a revert here, not a return.
+            wrote = len(sub_p.wlog) > len(wlog0)
+            # other_extra: any THIRD-party account this callee itself dispatched into (nested calls),
+            # to merge into the caller's own `other`. A revert (or a static-call's forbidden write)
+            # undoes everything this call did, nested dispatches included, so those cases contribute
+            # none; a successful return/stop keeps them (minus addr_c itself, already in other_entry).
+            no_extra = {}
+            extra = {a: v for a, v in sub_p.other.items() if a != addr_c}
+            if static and wrote:
+                outcomes.append(dict(ok=BV(0), ret=[], cons=sub_p.cons, other_entry=(init0, wlog0), other_extra=no_extra))
+            elif res == "return":
+                outcomes.append(dict(ok=BV(1), ret=sub_p.ret, cons=sub_p.cons, other_entry=(sub_p.init, sub_p.wlog), other_extra=extra))
+            elif res == "revert":
+                outcomes.append(dict(ok=BV(0), ret=[], cons=sub_p.cons, other_entry=(init0, wlog0), other_extra=no_extra))
+            elif res == "stop":
+                # A bare STOP returns no data but is still success, same as a real EVM call.
+                outcomes.append(dict(ok=BV(1), ret=[], cons=sub_p.cons, other_entry=(sub_p.init, sub_p.wlog), other_extra=extra))
+            # "giveup"/"invalid": dropped. If every outcome is dropped, the caller falls back to havoc.
+        return outcomes
 
     # ---- calldata ----
     def cdbyte(self, i):
+        if self.cdbytes is not None:
+            return self.cdbytes[i] if i < self.cdsize else z3.BitVecVal(0, 8)
         if i < 4: return z3.BitVecVal(self.sel[i], 8)
         if i >= self.cdsize: return z3.BitVecVal(0, 8)
         w, o = divmod(i - 4, 32)
         return z3.Extract(255 - 8 * o, 248 - 8 * o, self.W[w])
 
     def cdload(self, off):
-        if (off - 4) % 32 == 0 and 4 <= off < self.cdsize: return self.W[(off - 4) // 32]
+        if self.cdbytes is None and (off - 4) % 32 == 0 and 4 <= off < self.cdsize: return self.W[(off - 4) // 32]
         return z3.Concat(*[self.cdbyte(off + j) for j in range(32)])
 
     # ---- memory ----
@@ -143,6 +207,9 @@ class Exec:
         p0 = Path(store)
         if base is not None:
             p0.init, p0.wlog, p0.cons, p0.calls, p0.nfresh = base.init, list(base.wlog), list(base.cons), list(base.calls), base.nfresh
+            # Carry dispatched-callee state across transactions too, the same as the target's own
+            # storage: a callee's balance/allowance set in tx1 must still hold in tx3's dispatch.
+            p0.other = {a: (d, list(w)) for a, (d, w) in base.other.items()}
         done, work = [], [p0]
         while work:
             p = work.pop()
@@ -219,6 +286,18 @@ class Exec:
                     # Axioms: for every known real preimage, UF(x)==hash  <=>  x==preimage.
                     for h, pre in list(KNOWN_HASHES.get(nv, {}).items())[:64]:
                         p.cons.append((x == z3.BitVecVal(int.from_bytes(pre, "big"), 8 * nv)) == (f(x) == BV(h)))
+                    # Floor axiom: a real keccak256 output is, for cryptographic purposes, never a
+                    # "small" number — in particular never one of Solidity's own sequentially
+                    # assigned plain storage slots (0, 1, 2, ...). Without this, `read_storage`'s
+                    # generic symbolic-key fallback (which has to consider "could this computed key
+                    # equal THAT slot" for every slot it has seen) is free to satisfy a mapping/array
+                    # read by colliding an otherwise-unconstrained hash output with an unrelated plain
+                    # slot (e.g. `totalSupply`) a few bytes away in the very same account's storage —
+                    # a counterexample that exists only in the model, not on the real EVM, since no
+                    # real preimage hashes to a value that small. (Caught on known-flashloan-price-
+                    # manipulation: without this, the solver "proved" `reserve0=reserve1=0` by setting
+                    # a `balanceOf` mapping slot equal to token0's own `totalSupply` slot.)
+                    p.cons.append(z3.UGE(f(x), BV(1 << 160)))
                     st.append(f(x))
             elif op == 0x30: st.append(BV(0x6200000000000000000000000000000000000001))
             elif op == 0x32 or op == 0x33: st.append(BV(self.caller))
@@ -250,13 +329,39 @@ class Exec:
                 val = st.pop() if op in (0xF1, 0xF2) else BV(0)
                 io, isz, oo, osz = st.pop(), st.pop(), st.pop(), st.pop()
                 iov, isv, oov, osv = need(io, "call in"), need(isz, "call insize"), need(oo, "call out"), need(osz, "call outsize")
+                data = [p.mem.get(iov + j, z3.BitVecVal(0, 8)) for j in range(isv)]
+                addr_c = conc(to)
+                # Real dispatch only for CALL/STATICCALL (DELEGATECALL/CALLCODE keep storage in the
+                # caller's own account, a different model this doesn't attempt), a concrete target
+                # with known bytecode, a concrete 4-byte selector (so which function runs is fixed,
+                # even if its argument bytes are symbolic), and under the recursion-depth cap.
+                outcomes = None
+                if op in (0xF1, 0xFA) and addr_c is not None and addr_c in self.code_map and self.call_depth < self.call_depth_cap:
+                    if len(data) >= 4 and all(conc(b) is not None for b in data[:4]):
+                        outcomes = self.dispatch_call(p, addr_c, data, osv, static=(op == 0xFA)) or None
+                if outcomes:
+                    base_snap = p.fork()  # state right after popping this call's own args
+                    for i, outcome in enumerate(outcomes):
+                        tgt = p if i == 0 else base_snap.fork()
+                        tgt.other[addr_c] = outcome["other_entry"]
+                        tgt.other.update(outcome["other_extra"])
+                        tgt.cons = outcome["cons"]
+                        tgt.rd = outcome["ret"]
+                        for j in range(osv):
+                            tgt.mem[oov + j] = outcome["ret"][j] if j < len(outcome["ret"]) else z3.BitVecVal(0, 8)
+                        tgt.calls.append(dict(kind=op, to=BV(addr_c), value=z3.simplify(val), data=data,
+                                               ok=outcome["ok"], dispatched=True))
+                        tgt.stack.append(outcome["ok"])
+                        if i > 0: work.append(tgt)
+                    continue
                 p.nfresh += 1; n = p.nfresh
                 ok = z3.BitVec(f"callok{n}", 256)
                 p.cons.append(z3.Or(ok == 0, ok == 1))
-                data = [p.mem.get(iov + j, z3.BitVecVal(0, 8)) for j in range(isv)]
                 p.calls.append(dict(kind=op, to=z3.simplify(to), value=z3.simplify(val), data=data, ok=ok))
                 # Havoc the callee: success is a free bit, returned bytes are free (the callee's
-                # own state effects, e.g. re-entry, are NOT modeled).
+                # own state effects, e.g. re-entry, are NOT modeled). The fallback for anything
+                # dispatch doesn't cover: DELEGATECALL/CALLCODE, an unknown or symbolic target, a
+                # symbolic selector, the depth cap, or a callee whose every path gave up.
                 p.rd = [z3.BitVec(f"rd{n}_{j}", 8) for j in range(osv)]
                 for j in range(osv): p.mem[oov + j] = p.rd[j]
                 st.append(ok)
@@ -301,8 +406,14 @@ class Exec:
             elif op == 0x5F: st.append(BV(0))
             elif 0xA0 <= op <= 0xA4:
                 for _ in range(2 + op - 0xA0): st.pop()
-            elif op == 0xF3: return "return"
-            elif op == 0xFD: return "revert"
+            elif op == 0xF3:
+                o, sz = st.pop(), st.pop()
+                ov, szv = need(o, "return off"), need(sz, "return size")
+                p.ret = [p.mem.get(ov + j, z3.BitVecVal(0, 8)) for j in range(szv)]
+                return "return"
+            elif op == 0xFD:
+                st.pop(), st.pop()  # offset, size (revert reason data; unused — only ok=0 matters to the caller)
+                return "revert"
             elif op == 0xFE: return "invalid"
             else:
                 raise Giveup(f"opcode 0x{op:02x} at {p.pc - 1}")
@@ -401,10 +512,23 @@ def explore(code, sigs, nargs, init_store, watch, max_states=100000, max_frontie
 
 
 def explore_sym(code, widths, init_store, watch=None, invariants=None, depth=3, max_paths=300,
-                 budget_s=600, caller=int('13' * 20, 16), log=print):
+                 budget_s=600, caller=int('13' * 20, 16), log=print,
+                 code_map=None, callee_storage=None, self_addr=None):
     """Multi-transaction symbolic execution: storage stays symbolic across `depth` transactions, so a
     value chosen in tx1 (e.g. a deposit amount) is solved jointly with the guard in tx3. Returns
-    ({label: [(sig, args), ...]}, stats).
+    ({label: [(sig, words), ...]}, stats) — `words` is every calldata word after the selector, in
+    order, which `symseed.dump()` just concatenates; it isn't necessarily one word per ABI argument
+    (see `widths` below), but turning it back into calldata bytes doesn't need to know the ABI.
+
+    `widths`: {dict-key -> spec}. dict-key is also used as the real function-signature text to hash
+    for the selector *unless* spec is a `(sig_text, words_factory)` tuple — needed so dynamic-type
+    functions can appear more than once (one key per tried length/shape), all hashing to the same
+    real selector. spec is one of:
+      int                       — nargs static head words, auto-named (the original behavior)
+      (sig_text, int)           — nargs head words, named/hashed under sig_text instead of the key
+      (sig_text, factory)       — factory(prefix) -> list[z3 256-bit word expr]; for dynamic types
+                                  (see `abi_dynamic.build_words`), where the word count and layout
+                                  depend on a chosen length, not just the type list.
 
     Pass exactly one of:
       watch:      {slot -> label} (Daedaluzz-style: label found once that slot is written non-zero)
@@ -414,17 +538,24 @@ def explore_sym(code, widths, init_store, watch=None, invariants=None, depth=3, 
     import random
     assert (watch is None) != (invariants is None), "pass exactly one of watch=, invariants="
     t0, rnd = time.time(), random.Random(0)
-    sels = {s: selector(s) for s in widths}
+    specs = {}  # key -> (sig_text, nargs_or_factory)
+    for key, spec in widths.items():
+        specs[key] = spec if isinstance(spec, tuple) else (key, spec)
+    sels = {key: selector(sig) for key, (sig, _) in specs.items()}
     found, stats = {}, dict(paths=0, giveup=0, sat=0, calls=0)
-    layer = [(Path(init_store), [])]  # (path after k txs, [(sig, arg exprs)])
+    layer = [(Path(init_store), [])]  # (path after k txs, [(sig, word exprs)])
     all_labels = set(watch.values()) if watch is not None else {name for name, _ in invariants[1]}
     for t in range(depth):
         nxt = []
         for base, trail in layer:
-            for sig, sel in sels.items():
+            for key, sel in sels.items():
                 if time.time() - t0 > budget_s: break
-                W = [z3.BitVec(f"a{t}_{i}", 256) for i in range(widths[sig])]
-                for p, res in Exec(code, W, sel, caller=caller).run(init_store, base=base):
+                sig, nargs_or_factory = specs[key]
+                W = (nargs_or_factory(f"a{t}_{key}_") if callable(nargs_or_factory) else
+                     [z3.BitVec(f"a{t}_{key}_{i}", 256) for i in range(nargs_or_factory)])
+                ex = Exec(code, W, sel, caller=caller, code_map=code_map, callee_storage=callee_storage,
+                          self_addr=self_addr, call_depth_cap=1)
+                for p, res in ex.run(init_store, base=base):
                     stats["paths"] += 1; stats["calls"] += len(p.calls)
                     if res == "giveup": stats["giveup"] += 1; continue
                     if res not in ("stop", "return"): continue

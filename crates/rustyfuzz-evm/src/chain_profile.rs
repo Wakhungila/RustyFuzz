@@ -130,7 +130,8 @@ impl ChainProfile {
         },
         min_block: 400_000_000,
         min_timestamp: 0,
-        caveats: "ArbOS precompiles (ArbSys, ArbInfo, ...) and L1-pricing semantics are not modeled",
+        caveats:
+            "ArbOS precompiles (ArbSys, ArbInfo, ...) and L1-pricing semantics are not modeled",
     };
 
     /// A local development chain (the anvil / hardhat default chain id).
@@ -307,12 +308,15 @@ impl ChainProfile {
     /// The previous behaviour — failing later on a missing header field — made the real
     /// problem (no profile) invisible.
     pub fn for_chain(chain_id: u64) -> Result<Self, String> {
-        match Self::ALL.iter().find(|profile| profile.chain_id == chain_id) {
+        match Self::ALL
+            .iter()
+            .find(|profile| profile.chain_id == chain_id)
+        {
             Some(profile) => Ok(*profile),
             None => {
                 let other = chain_id;
                 Err(format!(
-                "chain {other} has no execution profile: hardfork schedule, blob pricing \
+                    "chain {other} has no execution profile: hardfork schedule, blob pricing \
                  and required header fields are unknown. Executing it with Ethereum \
                  mainnet rules would produce silently wrong semantics. Add a profile in \
                  crates/rustyfuzz-evm/src/chain_profile.rs before forking this chain."
@@ -554,7 +558,11 @@ mod tests {
         let mut ids: Vec<u64> = ChainProfile::ALL.iter().map(|p| p.chain_id).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), ChainProfile::ALL.len(), "duplicate chain id in ALL");
+        assert_eq!(
+            ids.len(),
+            ChainProfile::ALL.len(),
+            "duplicate chain id in ALL"
+        );
     }
 
     #[test]
@@ -569,7 +577,10 @@ mod tests {
         assert_eq!(p.spec_for(40_000_000, 1_718_863_500), SpecId::CANCUN);
         assert_eq!(p.spec_for(50_000_000, 1_742_436_600), SpecId::PRAGUE);
         assert_eq!(p.spec_for(60_000_000, 1_777_343_400), SpecId::OSAKA);
-        assert!(!p.caveats.is_empty(), "BSC precompile gap must be disclosed");
+        assert!(
+            !p.caveats.is_empty(),
+            "BSC precompile gap must be disclosed"
+        );
     }
 
     #[test]
@@ -618,7 +629,10 @@ mod tests {
         assert_eq!(ChainProfile::id_for_cli_name("base"), Ok(Some(8_453)));
         assert_eq!(ChainProfile::id_for_cli_name("avax"), Ok(Some(43_114)));
         let error = ChainProfile::id_for_cli_name("solana").unwrap_err();
-        assert!(error.contains("solana") && error.contains("polygon"), "{error}");
+        assert!(
+            error.contains("solana") && error.contains("polygon"),
+            "{error}"
+        );
     }
 
     #[test]

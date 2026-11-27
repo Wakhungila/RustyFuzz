@@ -48,7 +48,15 @@ with tempfile.TemporaryDirectory(prefix='rustyfuzz-oracle-') as temp_dir:
             runtime = row['runtime']
             assert bool(runtime['matching_signals']) == expected_found, row
             assert runtime['transactions'] and all(t['coverage_edges'] > 0 for t in runtime['transactions']), row
-            assert row['proof'] is None and row['proof_status'] is None and row['artifact_path'] is None, row
+            if expected_found:
+                # A true positive is now expected to come back with a confirmed, replayed proof
+                # (the validator's proof-confirmation step runs on every match, not just signal
+                # detection) — a negative control must still produce none, since there is nothing
+                # to prove.
+                assert row['proof'] is not None and row['proof_status'] == 'ConcretelyReplayed', row
+                assert row['artifact_path'] is None, row
+            else:
+                assert row['proof'] is None and row['proof_status'] is None and row['artifact_path'] is None, row
             assert not row['foundry_poc_generated'], row
             families.setdefault(row['class'], []).append(row)
         assert len(families) == 5 and all(len(v) == (2 if not expected_found else 1) for v in families.values())

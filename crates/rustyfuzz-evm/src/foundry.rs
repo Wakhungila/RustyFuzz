@@ -80,7 +80,10 @@ fn cheat_table() -> HashMap<[u8; 4], CheatSpec> {
     let mut table = HashMap::new();
     let mut add = |signature: &str, cheat: Cheat, signed: bool| {
         let hash = keccak256(signature.as_bytes());
-        table.insert([hash[0], hash[1], hash[2], hash[3]], CheatSpec { cheat, signed });
+        table.insert(
+            [hash[0], hash[1], hash[2], hash[3]],
+            CheatSpec { cheat, signed },
+        );
     };
     add("deal(address,uint256)", Deal, false);
     add("etch(address,bytes)", Etch, false);
@@ -110,10 +113,7 @@ fn cheat_table() -> HashMap<[u8; 4], CheatSpec> {
         ("bool", false),
         ("bytes32", false),
     ] {
-        for (name, cheat) in [
-            ("assertEq", AssertEq),
-            ("assertNotEq", AssertNotEq),
-        ] {
+        for (name, cheat) in [("assertEq", AssertEq), ("assertNotEq", AssertNotEq)] {
             add(&format!("{name}({ty},{ty})"), cheat, signed);
             add(&format!("{name}({ty},{ty},string)"), cheat, signed);
         }
@@ -373,11 +373,8 @@ impl<CTX: ContextTr> Inspector<CTX> for CheatcodeInspector {
                     if journal.load_account(who).is_err() {
                         return Some(revert(inputs, "vm.store: database error"));
                     }
-                    match journal.sstore(
-                        who,
-                        U256::from_be_bytes(slot),
-                        U256::from_be_bytes(value),
-                    ) {
+                    match journal.sstore(who, U256::from_be_bytes(slot), U256::from_be_bytes(value))
+                    {
                         Ok(_) => ok(Bytes::new()),
                         Err(_) => Some(revert(inputs, "vm.store: database error")),
                     }
@@ -508,11 +505,7 @@ pub fn execute_with_cheatcodes(
     })
 }
 
-fn restore(
-    db: &mut CacheDB<ForkDb>,
-    caller: Address,
-    previous: Option<revm::database::DbAccount>,
-) {
+fn restore(db: &mut CacheDB<ForkDb>, caller: Address, previous: Option<revm::database::DbAccount>) {
     match previous {
         Some(account) => {
             db.cache.accounts.insert(caller, account);
@@ -555,7 +548,11 @@ mod tests {
             ("b4d6c782", Cheat::Etch),
         ] {
             let bytes: [u8; 4] = hex::decode(selector).unwrap().try_into().unwrap();
-            assert_eq!(table.get(&bytes).map(|s| s.cheat), Some(cheat), "{selector}");
+            assert_eq!(
+                table.get(&bytes).map(|s| s.cheat),
+                Some(cheat),
+                "{selector}"
+            );
         }
     }
 

@@ -7,15 +7,24 @@
 Explores the target's state machine with z3 (see symexec.py), writes the shortest tx sequence that
 violates each watched mapping invariant (`bug<id>.json`) and, with --emit-states N, the sequences
 reaching the N shallowest distinct storage states (`state<i>.json`) as general-purpose seeds.
-Supported: functions with static word-sized params, concrete/symbolic storage keys, mappings via
-keccak, external calls (havoced: free success bit and return bytes, callee effects not modeled).
-Not supported (path is dropped and counted as a giveup): dynamic params, CREATE, loops past the step
-cap, symbolic memory offsets/lengths.
+Supported: functions with static word-sized params; in --symbolic-depth mode, also `bytes`/`string`
+and single-level `T[]` params with a concretely-chosen length and symbolic content (abi_dynamic.py) —
+one variant per tried length, so e.g. a `bytes calldata` param is tried both empty and non-empty.
+Concrete/symbolic storage keys, mappings via keccak. In --symbolic-depth mode, a CALL/STATICCALL
+whose target and 4-byte selector are concrete and whose target is another account IN THE FIXTURE
+with real bytecode is actually dispatched into that callee's code (real effects, real success/
+revert, real return data) rather than havoced; depth is capped at one real hop (a callee's own
+calls are still havoced), and anything outside that (an unknown/symbolic target, DELEGATECALL/
+CALLCODE, a call back into the target's OWN address, or a callee path this can't finish) still
+falls back to the old havoc model (free success bit, free return bytes, callee effects not
+modeled). Not supported (path is dropped and counted as a giveup): tuple/nested-array/more-than-
+two-dynamic-param functions, CREATE, loops past the step cap, symbolic memory offsets/lengths.
 """
 import argparse, json, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from symexec import *
 from invariants import load_invariants
+import abi_dynamic
 
 STATIC = re.compile(r"^(u?int\d*|address|bool|bytes\d+)$")
 
@@ -31,12 +40,31 @@ def main():
     acct = next(x for x in fx["accounts"] if x["address"].lower() == tgt)
     code = bytes.fromhex(acct["runtime_bytecode"][2:])
     init = {int(s["slot"], 16): int(s["value"], 16) for s in acct.get("storage", [])}
-    widths, skipped = {}, []
+    # Real external-call dispatch (symexec.Exec.dispatch_call, --symbolic-depth only): every OTHER
+    # account in the fixture that actually has bytecode is a callee the target's own CALL/
+    # STATICCALLs can be run into for real, instead of havoced. Accounts with no code (EOAs) are
+    # left out, so a call to one still falls back to the old havoc path (correctly — a real "call"
+    # to an EOA always just succeeds with empty returndata, which havoc already approximates fine).
+    code_map, callee_storage = {}, {}
+    for acc in fx["accounts"]:
+        if acc["address"].lower() == tgt: continue
+        rb = acc.get("runtime_bytecode", "0x")
+        if len(rb) <= 2: continue
+        addr_i = int(acc["address"], 16)
+        code_map[addr_i] = bytes.fromhex(rb[2:])
+        callee_storage[addr_i] = {int(s["slot"], 16): int(s["value"], 16) for s in acc.get("storage", [])}
+    widths, skipped, dyn_variants = {}, [], 0
     for f in abi:
         if f.get("type") != "function" or f.get("stateMutability") in ("view", "pure"): continue
-        if all(STATIC.match(i["type"]) for i in f["inputs"]):
-            widths[f"{f['name']}({','.join(i['type'] for i in f['inputs'])})"] = len(f["inputs"])
-        else: skipped.append(f["name"])
+        types = [i["type"] for i in f["inputs"]]
+        if all(STATIC.match(t) for t in types):
+            widths[f"{f['name']}({','.join(types)})"] = len(types)
+        elif a.symbolic_depth and all(abi_dynamic.supported(t) for t in types):
+            for label, spec in abi_dynamic.variants_for(f["name"], types):
+                widths[label] = spec
+            dyn_variants += 1
+        else:
+            skipped.append(f["name"])
     # Legacy watch-dict: every mapping-kind symbol's enumerated keys, used by `explore()` (the
     # concrete-state BFS, validated on Daedaluzz) and as `explore_sym`'s fallback when the invariants
     # file has no `invariants` predicate list (just bare `symbols`, as Daedaluzz's do).
@@ -55,7 +83,8 @@ def main():
                 h = int.from_bytes(k256(preimage), "big")
                 watch[h] = name
     caller = int(fx["attacker"], 16)
-    print(f"target={tgt} funcs={len(widths)} skipped(dynamic params)={skipped} watched={len(watch)}")
+    print(f"target={tgt} funcs/variants={len(widths)} (dynamic-type functions expanded: {dyn_variants}) "
+          f"skipped(unsupported params)={skipped} watched={len(watch)}")
     if a.symbolic_depth:
         # General invariant predicates (any comparison over `sum(mapping)` / masked `slot` symbols,
         # not just "some mapping entry became non-zero") are only usable in the symbolic-depth mode,
@@ -63,10 +92,12 @@ def main():
         if inv_doc and inv_doc.get("invariants"):
             symbols, preds = load_invariants(inv_doc)
             found, stats = explore_sym(code, widths, init, invariants=(symbols, preds),
-                                        depth=a.symbolic_depth, budget_s=a.budget, caller=caller)
+                                        depth=a.symbolic_depth, budget_s=a.budget, caller=caller,
+                                        code_map=code_map, callee_storage=callee_storage, self_addr=int(tgt, 16))
         else:
             found, stats = explore_sym(code, widths, init, watch=watch, depth=a.symbolic_depth,
-                                        budget_s=a.budget, caller=caller)
+                                        budget_s=a.budget, caller=caller,
+                                        code_map=code_map, callee_storage=callee_storage, self_addr=int(tgt, 16))
         seen = {}
     else:
         found, seen, stats = explore(code, widths, 0, init, watch, budget_s=a.budget, caller=caller)

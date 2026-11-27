@@ -646,13 +646,22 @@ impl PersistentCorpus {
         snapshots: &SnapshotCorpus,
         original: &EvmCacheDb,
         environment: &revm::context::BlockEnv,
-        invariants: Option<(&rustyfuzz_predicate::InvariantRegistry, rustyfuzz_evm::time_warp::TimeWarp)>,
+        invariants: Option<(
+            &rustyfuzz_predicate::InvariantRegistry,
+            rustyfuzz_evm::time_warp::TimeWarp,
+        )>,
     ) -> anyhow::Result<CampaignArtifactOutcome> {
         if request.input.base_snapshot_id == 0 {
             // Root-based inputs are verified too: a finding that does not reproduce from the
             // pristine state (leaked state, nondeterminism) must never become an artifact.
             anyhow::ensure!(
-                findings_reproduce(request.findings, request.input, original, environment, invariants),
+                findings_reproduce(
+                    request.findings,
+                    request.input,
+                    original,
+                    environment,
+                    invariants
+                ),
                 "root-based finding did not reproduce from original state"
             );
             return self.persist_campaign_artifact(CampaignArtifactRequest {
@@ -670,15 +679,25 @@ impl PersistentCorpus {
             execution == verifier.replay(&base, environment, &input)?,
             "complete root replay is nondeterministic"
         );
-        let mut findings = crate::common::oracle::ProtocolOraclePack::default().evaluate(&execution);
+        let mut findings =
+            crate::common::oracle::ProtocolOraclePack::default().evaluate(&execution);
         anyhow::ensure!(
             findings_reproduce(request.findings, &input, original, environment, invariants),
             "snapshot signal did not survive complete replay from original state"
         );
         // Persist the findings the replay itself established, not the live run's claims.
-        findings.extend(request.findings.iter().filter(|f| {
-            matches!(f.vuln, crate::common::oracle::VulnType::InvariantViolation(_))
-        }).cloned());
+        findings.extend(
+            request
+                .findings
+                .iter()
+                .filter(|f| {
+                    matches!(
+                        f.vuln,
+                        crate::common::oracle::VulnType::InvariantViolation(_)
+                    )
+                })
+                .cloned(),
+        );
         self.persist_campaign_artifact(CampaignArtifactRequest {
             input: &input,
             execution: &execution,
@@ -3557,7 +3576,11 @@ fn bump_edge_freq(freq: &mut [u32], coverage: &BitVec<u8, Lsb0>, delta: i32) {
 /// Rarity weighting is on unless `RUSTYFUZZ_RARITY=0`.
 fn rarity_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RUSTYFUZZ_RARITY").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| {
+        std::env::var("RUSTYFUZZ_RARITY")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 impl SnapshotCorpus {
@@ -3860,7 +3883,8 @@ impl SnapshotCorpus {
         } else if let Some(snapshot) = self.snapshots.get(&id) {
             if let Some(input) = snapshot.read().producing_input.as_ref() {
                 for tx in &input.txs {
-                    if let Some(sel) = tx.input.get(0..4).and_then(|b| <[u8; 4]>::try_from(b).ok()) {
+                    if let Some(sel) = tx.input.get(0..4).and_then(|b| <[u8; 4]>::try_from(b).ok())
+                    {
                         self.known_selectors_cache.insert(sel);
                     }
                 }
@@ -3888,7 +3912,8 @@ impl SnapshotCorpus {
                 .saturating_add(execution.call_trace.len())
                 .saturating_add(execution.oracle_observations.len() * 10);
             metadata.score = score;
-            self.known_slots_cache.extend(metadata.write_set.iter().copied());
+            self.known_slots_cache
+                .extend(metadata.write_set.iter().copied());
         }
         for read in &execution.storage_reads {
             *self
@@ -3965,7 +3990,8 @@ impl SnapshotCorpus {
                     let stale = self
                         .metadata
                         .get(id)
-                        .map_or(0, |m| m.executions_since_novelty.min(4096)) as u128;
+                        .map_or(0, |m| m.executions_since_novelty.min(4096))
+                        as u128;
                     energy = energy.saturating_mul(256) / (256 + stale);
                 }
                 weighted_ids.push((*id, energy));
@@ -4205,7 +4231,10 @@ fn findings_reproduce(
     input: &EvmInput,
     original: &EvmCacheDb,
     environment: &revm::context::BlockEnv,
-    invariants: Option<(&rustyfuzz_predicate::InvariantRegistry, rustyfuzz_evm::time_warp::TimeWarp)>,
+    invariants: Option<(
+        &rustyfuzz_predicate::InvariantRegistry,
+        rustyfuzz_evm::time_warp::TimeWarp,
+    )>,
 ) -> bool {
     use crate::common::oracle::VulnType;
     let verifier = crate::common::verifier::ReplayVerifier::new(MAP_SIZE);
@@ -4214,7 +4243,9 @@ fn findings_reproduce(
         return false;
     };
     let pack = crate::common::oracle::ProtocolOraclePack::default().evaluate(&execution);
-    let needs_invariant = expected.iter().any(|f| matches!(f.vuln, VulnType::InvariantViolation(_)));
+    let needs_invariant = expected
+        .iter()
+        .any(|f| matches!(f.vuln, VulnType::InvariantViolation(_)));
     let violation = match (needs_invariant, invariants) {
         (true, Some((registry, warp))) => {
             let executor = rustyfuzz_evm::executor::EvmExecutor::new();
@@ -4227,7 +4258,13 @@ fn findings_reproduce(
                 warp.apply(&mut env, idx);
                 let mut waypoints = Vec::new();
                 let Ok(result) = executor.execute_with_result(
-                    &mut state, &mut env, tx, &mut coverage, &mut dataflow, &mut waypoints, idx,
+                    &mut state,
+                    &mut env,
+                    tx,
+                    &mut coverage,
+                    &mut dataflow,
+                    &mut waypoints,
+                    idx,
                 ) else {
                     break;
                 };
