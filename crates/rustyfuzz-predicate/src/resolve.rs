@@ -124,7 +124,10 @@ impl HexBuf {
         let len = bytes.len().min(32);
         let mut buf = [0u8; 32];
         buf[..len].copy_from_slice(&bytes[..len]);
-        Self { bytes: buf, len: len as u8 }
+        Self {
+            bytes: buf,
+            len: len as u8,
+        }
     }
 }
 

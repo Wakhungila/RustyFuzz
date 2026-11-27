@@ -1,8 +1,7 @@
 pub mod abi_ingest;
 pub mod actors;
-pub mod attacker_harness;
 pub mod amm_probe;
-pub mod sim_defi;
+pub mod attacker_harness;
 pub mod benchmark;
 pub mod bounded_search;
 pub mod bytecode_analysis;
@@ -24,6 +23,7 @@ pub mod invariant_file;
 pub mod invariant_manifest;
 pub mod invariant_runtime;
 pub mod minimizer;
+pub mod sim_defi;
 // OrderingConstraintMutator is regression-tested but not exposed until formal
 // specs are deliberately routed into the active mutation pipeline.
 pub mod checkpoint;

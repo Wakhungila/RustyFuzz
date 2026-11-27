@@ -282,8 +282,12 @@ impl PredicateOracle {
         // caller's budget multiplied by the binding count, which keeps the work finite
         // while letting complete evidence be recorded (§5 item 9b).
         let per_symbol = budget.remaining().max(1);
-        let touched: std::collections::BTreeSet<String> =
-            self.checked.symbols().iter().map(|s| s.0.join(".")).collect();
+        let touched: std::collections::BTreeSet<String> = self
+            .checked
+            .symbols()
+            .iter()
+            .map(|s| s.0.join("."))
+            .collect();
         for (name, binding) in &self.bindings {
             // Only symbols the predicate mentions: a shared manifest binds every symbol of every
             // invariant, and re-resolving all of them per violation made evidence cost O(bindings).

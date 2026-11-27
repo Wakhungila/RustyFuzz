@@ -115,6 +115,13 @@ impl ExternalContainment {
             },
             #[cfg(test)]
             Self::Launcher => Ok(()),
+            // On a non-Linux, non-test build every real variant above is `cfg`-gated away, leaving
+            // this enum with zero constructible variants (`prepare()` always returns `Err` before
+            // ever building a `Self` in that configuration) — but rustc still treats `&mut Self` as
+            // inhabited and requires an exhaustive match regardless, so this arm is unreachable on
+            // every platform that actually builds the other arms and is the *only* arm on the rest.
+            #[allow(unreachable_patterns)]
+            _ => Ok(()),
         }
     }
 }

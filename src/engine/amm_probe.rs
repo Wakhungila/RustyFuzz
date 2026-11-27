@@ -39,7 +39,9 @@ pub fn probe_reserves(db: &mut Db, block: &BlockEnv, pool: Address) -> Option<Ve
     )
     .ok()?;
     match run.result {
-        revm::context::result::ExecutionResult::Success { output, .. } if output.data().len() >= 64 => {
+        revm::context::result::ExecutionResult::Success { output, .. }
+            if output.data().len() >= 64 =>
+        {
             Some(output.data().to_vec())
         }
         _ => None,
@@ -116,7 +118,9 @@ pub fn bracket_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::sim_defi::{deploy_mock_token, deploy_v2_pair, transact, encode_call, deploy_atomic_attacker};
+    use crate::engine::sim_defi::{
+        deploy_atomic_attacker, deploy_mock_token, deploy_v2_pair, encode_call, transact,
+    };
     use revm::database::CacheDB;
     use rustyfuzz_evm::fork_db::ForkDb;
 
@@ -130,7 +134,15 @@ mod tests {
         deploy_mock_token(&mut db, T0);
         deploy_mock_token(&mut db, T1);
         let e18 = U256::from(10u128.pow(18));
-        deploy_v2_pair(&mut db, PAIR, T0, T1, e18 * U256::from(1000), e18 * U256::from(500)).unwrap();
+        deploy_v2_pair(
+            &mut db,
+            PAIR,
+            T0,
+            T1,
+            e18 * U256::from(1000),
+            e18 * U256::from(500),
+        )
+        .unwrap();
         let (_a, _) = deploy_atomic_attacker(&mut db, &[T0, T1], e18).unwrap();
         let block = BlockEnv::default();
         assert_eq!(discover_pools(&mut db, &block), vec![PAIR]);

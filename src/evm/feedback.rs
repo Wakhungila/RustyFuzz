@@ -307,11 +307,7 @@ impl EvmCoverageFeedback {
 
         let mut interesting = false;
         // The map is almost entirely zero; skip 8-byte chunks with no hits.
-        for (seen_chunk, hit_chunk) in self
-            .virgin
-            .chunks_mut(8)
-            .zip(coverage.chunks(8))
-        {
+        for (seen_chunk, hit_chunk) in self.virgin.chunks_mut(8).zip(coverage.chunks(8)) {
             if hit_chunk.len() == 8 && u64::from_ne_bytes(hit_chunk.try_into().unwrap()) == 0 {
                 continue;
             }

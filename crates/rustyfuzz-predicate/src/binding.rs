@@ -856,7 +856,13 @@ mod extract_fast_path_tests {
     fn mapping_slot_memo_is_consistent() {
         let key = [7u8; 32];
         let base = [3u8; 32];
-        assert_eq!(mapping_slot(&key, &base), mapping_slot_uncached(&key, &base));
-        assert_eq!(mapping_slot(&key, &base), mapping_slot_uncached(&key, &base));
+        assert_eq!(
+            mapping_slot(&key, &base),
+            mapping_slot_uncached(&key, &base)
+        );
+        assert_eq!(
+            mapping_slot(&key, &base),
+            mapping_slot_uncached(&key, &base)
+        );
     }
 }

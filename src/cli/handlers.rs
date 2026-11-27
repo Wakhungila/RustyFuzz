@@ -237,9 +237,10 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 if let Some(bootstrap) = foundry_bootstrap.as_ref() {
                     Some(bootstrap.state.target)
                 } else if let Some(fixture_path) = fixture.as_deref() {
-                    let state = rusty_fuzz::engine::executable_fixture::ExecutableFixture::load_for_fuzz(
-                        std::path::Path::new(fixture_path),
-                    )?;
+                    let state =
+                        rusty_fuzz::engine::executable_fixture::ExecutableFixture::load_for_fuzz(
+                            std::path::Path::new(fixture_path),
+                        )?;
                     Some(state.target)
                 } else {
                     None

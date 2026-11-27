@@ -223,7 +223,11 @@ impl IncrementalChecker {
             if !matches!(outcome, Outcome::False) {
                 continue;
             }
-            if self.violations.iter().any(|v| v.predicate == evidence.predicate) {
+            if self
+                .violations
+                .iter()
+                .any(|v| v.predicate == evidence.predicate)
+            {
                 continue;
             }
             let terms: Vec<PredicateTerm> = evidence

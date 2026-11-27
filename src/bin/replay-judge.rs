@@ -19,7 +19,9 @@ use rusty_fuzz::common::types::ChainState;
 use rusty_fuzz::engine::executable_fixture::ExecutableFixture;
 use rusty_fuzz::engine::invariant_file::InvariantFile;
 use rusty_fuzz::engine::invariant_runtime::IncrementalChecker;
-use rusty_fuzz::evm::fork::{create_in_memory_fork_db_from_fixture, create_offline_fallback_block_env};
+use rusty_fuzz::evm::fork::{
+    create_in_memory_fork_db_from_fixture, create_offline_fallback_block_env,
+};
 use rusty_fuzz::evm::fuzz::EvmInput;
 use rustyfuzz_evm::dataflow::DataflowRegistry;
 use rustyfuzz_evm::executor::EvmExecutor;
@@ -51,8 +53,11 @@ fn main() -> anyhow::Result<()> {
     // Mirror campaign setup for `--attacker-harness`: inputs reference these accounts.
     rusty_fuzz::engine::attacker_harness::deploy_reentrancy_attacker(&mut base_db, target)
         .map_err(|e| anyhow::anyhow!("attacker deploy: {e}"))?;
-    rusty_fuzz::engine::sim_defi::setup_flashloan(&mut base_db, rusty_fuzz::engine::sim_defi::DEFAULT_FEE_BPS)
-        .map_err(|e| anyhow::anyhow!("flashloan setup: {e}"))?;
+    rusty_fuzz::engine::sim_defi::setup_flashloan(
+        &mut base_db,
+        rusty_fuzz::engine::sim_defi::DEFAULT_FEE_BPS,
+    )
+    .map_err(|e| anyhow::anyhow!("flashloan setup: {e}"))?;
     let block_env0 = create_offline_fallback_block_env(0);
 
     let mut ids: BTreeSet<u64> = BTreeSet::new();
@@ -87,7 +92,10 @@ fn main() -> anyhow::Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(&args.inputs)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false) && !p.to_string_lossy().ends_with(".meta.json"))
+        .filter(|p| {
+            p.extension().map(|x| x == "json").unwrap_or(false)
+                && !p.to_string_lossy().ends_with(".meta.json")
+        })
         .collect();
     entries.sort();
     for path in entries {
@@ -112,7 +120,15 @@ fn main() -> anyhow::Result<()> {
         for (idx, tx) in input.txs.iter().enumerate() {
             let mut cs = ChainState::Evm(db.clone());
             let mut wp = Vec::new();
-            match executor.execute_with_result(&mut cs, &mut block_env, tx, &mut coverage, &mut dataflow, &mut wp, idx) {
+            match executor.execute_with_result(
+                &mut cs,
+                &mut block_env,
+                tx,
+                &mut coverage,
+                &mut dataflow,
+                &mut wp,
+                idx,
+            ) {
                 Err(_) => {
                     ok = false;
                     break;
@@ -121,16 +137,35 @@ fn main() -> anyhow::Result<()> {
                     if std::env::var("JUDGE_DUMP").is_ok() {
                         if std::env::var("JUDGE_TRACE").is_ok() {
                             for c in r.call_trace.iter().take(30) {
-                                println!("  T d={} {:?} {:#x}->{:#x} sel={:?}", c.depth, c.phase, c.caller, c.target, c.input.get(..4).map(hex::encode));
+                                println!(
+                                    "  T d={} {:?} {:#x}->{:#x} sel={:?}",
+                                    c.depth,
+                                    c.phase,
+                                    c.caller,
+                                    c.target,
+                                    c.input.get(..4).map(hex::encode)
+                                );
                             }
                         }
-                        println!("  reads={:?} writes={:?}", r.storage_reads, r.storage_writes);
-                        println!("  tx{} status={:?} gas={} diffs={} writes={}", idx, r.status, r.gas_used, r.storage_diffs.len(), r.storage_writes.len());
+                        println!(
+                            "  reads={:?} writes={:?}",
+                            r.storage_reads, r.storage_writes
+                        );
+                        println!(
+                            "  tx{} status={:?} gas={} diffs={} writes={}",
+                            idx,
+                            r.status,
+                            r.gas_used,
+                            r.storage_diffs.len(),
+                            r.storage_writes.len()
+                        );
                     }
                     if let Some(registry) = &registry {
                         let block = rustyfuzz_predicate::BlockContext {
                             number: rustyfuzz_predicate::Int256(block_env.number.to_be_bytes()),
-                            timestamp: rustyfuzz_predicate::Int256(block_env.timestamp.to_be_bytes()),
+                            timestamp: rustyfuzz_predicate::Int256(
+                                block_env.timestamp.to_be_bytes(),
+                            ),
                         };
                         checker.observe(registry, &r, &cs, block, 16);
                     }
@@ -150,7 +185,12 @@ fn main() -> anyhow::Result<()> {
         if std::env::var("JUDGE_DUMP").is_ok() {
             if let Some(acc) = db.cache.accounts.get(&target) {
                 let nz: Vec<_> = acc.storage.iter().filter(|(_, v)| !v.is_zero()).collect();
-                println!("{} nonzero_slots={} {:?}", path.display(), nz.len(), nz.iter().take(4).collect::<Vec<_>>());
+                println!(
+                    "{} nonzero_slots={} {:?}",
+                    path.display(),
+                    nz.len(),
+                    nz.iter().take(4).collect::<Vec<_>>()
+                );
             }
         }
         for id in &ids {
@@ -160,7 +200,12 @@ fn main() -> anyhow::Result<()> {
             let slot = U256::from_be_bytes(keccak256(buf).0);
             if std::env::var("JUDGE_DUMP").is_ok() && *id == 16 {
                 use revm::DatabaseRef;
-                println!("  b16 slot={:#x} storage={:?} storage_ref={:?}", slot, db.storage(target, slot), db.storage_ref(target, slot));
+                println!(
+                    "  b16 slot={:#x} storage={:?} storage_ref={:?}",
+                    slot,
+                    db.storage(target, slot),
+                    db.storage_ref(target, slot)
+                );
             }
             if let Ok(v) = db.storage(target, slot) {
                 if !v.is_zero() {

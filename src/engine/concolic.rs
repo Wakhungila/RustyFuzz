@@ -300,7 +300,12 @@ pub fn prefix_flip_groups(tx_index: usize, waypoints: &[Waypoint]) -> Vec<Vec<Co
         if groups.len() >= MAX_FLIPS || started.elapsed() > std::time::Duration::from_millis(40) {
             break;
         }
-        let Waypoint::Comparison { pc, op, condition, .. } = cmps[end] else { continue };
+        let Waypoint::Comparison {
+            pc, op, condition, ..
+        } = cmps[end]
+        else {
+            continue;
+        };
         if !seen_pcs.insert(*pc) {
             continue;
         }
@@ -309,14 +314,26 @@ pub fn prefix_flip_groups(tx_index: usize, waypoints: &[Waypoint]) -> Vec<Vec<Co
         let t0 = std::time::Instant::now();
         let solved = smt_solver::solve_path_model(&slice, true);
         if debug {
-            eprintln!("PREFIX cmps={} slice={} pc={} sat={} us={}", cmps.len(), slice.len(), pc, solved.is_some(), t0.elapsed().as_micros());
+            eprintln!(
+                "PREFIX cmps={} slice={} pc={} sat={} us={}",
+                cmps.len(),
+                slice.len(),
+                pc,
+                solved.is_some(),
+                t0.elapsed().as_micros()
+            );
         }
         let Some(model) = solved else { continue };
-        let strategy = ConcolicStrategy::FlipComparison { opcode: *op, target_true: !*condition };
+        let strategy = ConcolicStrategy::FlipComparison {
+            opcode: *op,
+            target_true: !*condition,
+        };
         let hints: Vec<ConcolicHint> = model
             .into_iter()
             .filter(|(source, _)| matches!(source, TaintSource::Calldata(_)))
-            .map(|(source, value)| hint_from_source(&source, tx_index, *pc, value, strategy.clone()))
+            .map(|(source, value)| {
+                hint_from_source(&source, tx_index, *pc, value, strategy.clone())
+            })
             .collect();
         if !hints.is_empty() {
             groups.push(hints);
@@ -875,7 +892,10 @@ pub mod smt_solver {
     /// Like `solve_path_constraint_smt`, but returns the solved value of EVERY symbolic
     /// source so one model can repair several calldata words at once (prefix-preserving
     /// branch flip: all earlier path constraints stay satisfied while the target flips).
-    pub fn solve_path_model(waypoints: &[Waypoint], flip_last: bool) -> Option<Vec<(TaintSource, U256)>> {
+    pub fn solve_path_model(
+        waypoints: &[Waypoint],
+        flip_last: bool,
+    ) -> Option<Vec<(TaintSource, U256)>> {
         if waypoints.is_empty() {
             return None;
         }
@@ -896,7 +916,11 @@ pub mod smt_solver {
                 None if is_last => return None,
                 None => continue,
             };
-            let asserted = if is_last && flip_last { flip_target } else { flip_target.not() };
+            let asserted = if is_last && flip_last {
+                flip_target
+            } else {
+                flip_target.not()
+            };
             solver.assert(&asserted);
         }
         if solver.check() != SatResult::Sat {
@@ -912,7 +936,6 @@ pub mod smt_solver {
         Some(out)
     }
 }
-
 
 #[cfg(test)]
 mod tests {

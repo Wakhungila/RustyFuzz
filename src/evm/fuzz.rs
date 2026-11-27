@@ -443,7 +443,10 @@ impl EvmMutator {
 
     /// Enable the ReentrancyProbe mutator (the attacker contract is deployed
     /// at campaign setup via `--attacker-harness`).
-    pub fn with_flashloan_env(mut self, env: Option<crate::engine::sim_defi::FlashloanEnv>) -> Self {
+    pub fn with_flashloan_env(
+        mut self,
+        env: Option<crate::engine::sim_defi::FlashloanEnv>,
+    ) -> Self {
         self.flashloan = env;
         self
     }
@@ -855,11 +858,22 @@ impl EvmMutator {
             5 => (U256::from(1u8) << bits).wrapping_sub(U256::from(1u8)), // 2^bits - 1
             6 => U256::from(1u8) << bits.min(255),                        // 2^bits
             7 => word.wrapping_mul(U256::from(2u8)),
-            _ => !word & ((U256::from(1u8) << (8 * (1 + rand.below(NonZero::new(32).unwrap()))).min(255)) - U256::from(1u8)),
+            _ => {
+                !word
+                    & ((U256::from(1u8)
+                        << (8 * (1 + rand.below(NonZero::new(32).unwrap()))).min(255))
+                        - U256::from(1u8))
+            }
         };
         calldata[off..off + 32].copy_from_slice(&value.to_be_bytes::<32>());
         let selector: [u8; 4] = calldata[..4].try_into().unwrap_or([0u8; 4]);
-        self.record_mutation(metadata, "uint_havoc", Some(idx), Some(selector), "arithmetic havoc on an argument word");
+        self.record_mutation(
+            metadata,
+            "uint_havoc",
+            Some(idx),
+            Some(selector),
+            "arithmetic havoc on an argument word",
+        );
         MutationResult::Mutated
     }
 
@@ -900,16 +914,30 @@ impl EvmMutator {
                 1 => partner.saturating_sub(U256::from(1u8)),
                 _ => partner,
             };
-            (off, value, "replaced argument word with its comparison partner")
+            (
+                off,
+                value,
+                "replaced argument word with its comparison partner",
+            )
         } else {
             let Some(value) = rustyfuzz_evm::cmplog::pick_value(rand.next()) else {
                 return MutationResult::Skipped;
             };
             let off = 4 + rand.below(NonZero::new(words).unwrap()) * 32;
-            (off, value, "spliced a logged comparison operand into an argument word")
+            (
+                off,
+                value,
+                "spliced a logged comparison operand into an argument word",
+            )
         };
         input.txs[idx].input[off..off + 32].copy_from_slice(&value.to_be_bytes::<32>());
-        self.record_mutation(metadata, "i2s", Some(idx), Some(input.txs[idx].input[..4].try_into().unwrap_or([0u8; 4])), detail);
+        self.record_mutation(
+            metadata,
+            "i2s",
+            Some(idx),
+            Some(input.txs[idx].input[..4].try_into().unwrap_or([0u8; 4])),
+            detail,
+        );
         MutationResult::Mutated
     }
 
@@ -1033,7 +1061,9 @@ impl EvmMutator {
             metadata,
             "flashloan_atomic_attacker",
             Some(0),
-            Some(crate::engine::sim_defi::selector(crate::engine::sim_defi::RUN_SIGNATURE)),
+            Some(crate::engine::sim_defi::selector(
+                crate::engine::sim_defi::RUN_SIGNATURE,
+            )),
             "atomic attacker: borrow -> original calls -> repay+fee -> require profit",
         );
 
@@ -1294,7 +1324,12 @@ impl EvmMutator {
         MutationResult::Mutated
     }
 
-    fn encode_default_call<R: Rand>(&self, selector: [u8; 4], types: &[DynSolType], rand: &mut R) -> Vec<u8> {
+    fn encode_default_call<R: Rand>(
+        &self,
+        selector: [u8; 4],
+        types: &[DynSolType],
+        rand: &mut R,
+    ) -> Vec<u8> {
         let values: Vec<_> = types
             .iter()
             .map(|ty| self.generate_seed_sol_value(ty, rand))
@@ -1419,7 +1454,8 @@ impl EvmMutator {
                 // so draw from the dictionary (which carries the invariant's keys).
                 let roll = rand.below(NonZero::new(100).unwrap());
                 if !self.value_dictionary.is_empty() && roll < 60 {
-                    let v = self.value_dictionary[rand.below(NonZero::new(self.value_dictionary.len()).unwrap())];
+                    let v = self.value_dictionary
+                        [rand.below(NonZero::new(self.value_dictionary.len()).unwrap())];
                     *word = alloy_primitives::B256::from(v.to_be_bytes::<32>());
                 } else {
                     let i = rand.below(NonZero::new((*size).max(1)).unwrap());
@@ -1458,11 +1494,16 @@ impl EvmMutator {
         match ty {
             DynSolType::Uint(size) if roll < 55 => {
                 let v = if !self.value_dictionary.is_empty() && roll < 20 {
-                    self.value_dictionary[rand.below(NonZero::new(self.value_dictionary.len()).unwrap())]
+                    self.value_dictionary
+                        [rand.below(NonZero::new(self.value_dictionary.len()).unwrap())]
                 } else {
                     U256::from(10u64).pow(U256::from(rand.below(NonZero::new(19).unwrap()) as u64))
                 };
-                let v = if *size < 256 { v & ((U256::from(1u8) << *size) - U256::from(1u8)) } else { v };
+                let v = if *size < 256 {
+                    v & ((U256::from(1u8) << *size) - U256::from(1u8))
+                } else {
+                    v
+                };
                 DynSolValue::Uint(v, *size)
             }
             DynSolType::Address if roll < 70 => {
@@ -1475,12 +1516,16 @@ impl EvmMutator {
                 DynSolValue::Address(a)
             }
             DynSolType::FixedBytes(size) if !self.value_dictionary.is_empty() && roll < 70 => {
-                let v = self.value_dictionary[rand.below(NonZero::new(self.value_dictionary.len()).unwrap())];
+                let v = self.value_dictionary
+                    [rand.below(NonZero::new(self.value_dictionary.len()).unwrap())];
                 DynSolValue::FixedBytes(alloy_primitives::B256::from(v.to_be_bytes::<32>()), *size)
             }
             DynSolType::Bytes if roll < 60 => DynSolValue::Bytes(Vec::new()),
             DynSolType::Tuple(inner) => DynSolValue::Tuple(
-                inner.iter().map(|t| self.generate_seed_sol_value(t, rand)).collect(),
+                inner
+                    .iter()
+                    .map(|t| self.generate_seed_sol_value(t, rand))
+                    .collect(),
             ),
             _ => self.generate_default_sol_value(ty),
         }
@@ -1747,7 +1792,9 @@ mod tests {
         let mut hit = false;
         for _ in 0..64 {
             let mut trial = input.clone();
-            if mutator.input_to_state(&mut rand, &mut trial, &mut metadata) == MutationResult::Mutated {
+            if mutator.input_to_state(&mut rand, &mut trial, &mut metadata)
+                == MutationResult::Mutated
+            {
                 let word = U256::from_be_slice(&trial.txs[0].input[4..36]);
                 if word == wanted {
                     hit = true;
@@ -2347,7 +2394,9 @@ pub fn value_dictionary_from_state(
     values.dedup();
     if values.len() > limit && limit > 0 {
         let step = values.len() as f64 / limit as f64;
-        values = (0..limit).map(|i| values[(i as f64 * step) as usize]).collect();
+        values = (0..limit)
+            .map(|i| values[(i as f64 * step) as usize])
+            .collect();
     }
     values
 }
@@ -2355,8 +2404,14 @@ pub fn value_dictionary_from_state(
 /// Percentage knob read once per process (benchmark A/B runs flip these).
 fn env_pct(name: &'static str, default: usize) -> usize {
     use std::sync::OnceLock;
-    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str, usize>>> = OnceLock::new();
+    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str, usize>>> =
+        OnceLock::new();
     let map = CACHE.get_or_init(Default::default);
     let mut guard = map.lock().unwrap();
-    *guard.entry(name).or_insert_with(|| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default))
+    *guard.entry(name).or_insert_with(|| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    })
 }
